@@ -83,6 +83,10 @@ content:
 console:
     cd console && npm run dev
 
+# Run Rails SaaS control plane
+saas:
+    cd saas && bin/rails server
+
 # ---------------------------------------------------------------------------
 # Build & Test
 # ---------------------------------------------------------------------------

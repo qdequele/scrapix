@@ -3,3 +3,4 @@ frontier: set -a && source .env && set +a && cargo watch -w crates -w bins -x 'r
 crawler:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- crawler'
 content:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- content'
 console:  cd console && npm install && npm run dev
+saas:     set -a && source .env && set +a && cd saas && bin/rails server

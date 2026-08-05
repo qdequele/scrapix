@@ -149,8 +149,20 @@ pub async fn rate_limit_middleware(
 // Re-export from the scrapix-auth crate.
 pub use scrapix_auth::InMemoryAuthRateLimiter;
 
-const AUTH_RATE_LIMIT: u64 = 5; // 5 attempts per minute
 const AUTH_WINDOW_SECS: u64 = 60;
+
+/// Auth attempts allowed per IP per window. Defaults to 5/min; overridable via
+/// AUTH_RATE_LIMIT so contract-test runs can exercise auth endpoints freely
+/// against a dev stack. Production deployments should leave it unset.
+fn auth_rate_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("AUTH_RATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+    })
+}
 
 /// Stricter rate limit for auth endpoints (login, signup) — 5 req/min per IP.
 /// Uses Redis when available, falls back to in-memory counters.
@@ -189,7 +201,7 @@ pub async fn auth_rate_limit_middleware(
         }
     };
 
-    if count > AUTH_RATE_LIMIT {
+    if count > auth_rate_limit() {
         let remaining_secs: u64 = conn
             .ttl::<_, i64>(&key)
             .await
@@ -226,7 +238,7 @@ pub async fn auth_rate_limit_in_memory_middleware(
 
     let count = limiter.check(&ip, AUTH_WINDOW_SECS);
 
-    if count > AUTH_RATE_LIMIT {
+    if count > auth_rate_limit() {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", AUTH_WINDOW_SECS.to_string())],

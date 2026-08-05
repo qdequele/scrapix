@@ -352,6 +352,49 @@ services:
           path: ./Cargo.lock
 
   # ---------------------------------------------------------------------------
+  # SaaS control plane (Rails) — SCR-85 backend split
+  # ---------------------------------------------------------------------------
+
+  saas:
+    build:
+      context: ./saas
+      dockerfile: Dockerfile.dev
+    container_name: scrapix-saas
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SAAS_PORT: 8081
+      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
+      JWT_SECRET: dev-jwt-secret-change-in-production
+    volumes:
+      - saas-bundle:/usr/local/bundle
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./saas/app
+          target: /app/app
+        - action: sync
+          path: ./saas/lib
+          target: /app/lib
+        - action: sync+restart
+          path: ./saas/config
+          target: /app/config
+        - action: rebuild
+          path: ./saas/Gemfile
+        - action: rebuild
+          path: ./saas/Gemfile.lock
+
+  # ---------------------------------------------------------------------------
   # Console (Next.js Frontend)
   # ---------------------------------------------------------------------------
 
@@ -423,6 +466,8 @@ volumes:
   # Console build caches
   console-node-modules:
   console-next:
+  # SaaS (Rails) gem cache
+  saas-bundle:
 
 # -----------------------------------------------------------------------------
 # Networks
