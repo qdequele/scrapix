@@ -369,6 +369,10 @@ services:
       SAAS_PORT: 8081
       DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
       JWT_SECRET: dev-jwt-secret-change-in-production
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: scrapix
+      CLICKHOUSE_USER: scrapix
+      CLICKHOUSE_PASSWORD: scrapix
     volumes:
       - saas-bundle:/usr/local/bundle
     healthcheck:
