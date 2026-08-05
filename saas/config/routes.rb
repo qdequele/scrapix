@@ -9,6 +9,24 @@ Rails.application.routes.draw do
   # analytics pipes (phase 3, done) → configs/engines (phase 4, done) →
   # auth/sessions → account/team/keys → billing/Stripe → OAuth provider + MCP.
 
+  # Phase 5: password auth, sessions, and social login.
+  scope "auth", controller: :auth do
+    post "signup", action: :signup
+    post "login", action: :login
+    post "logout", action: :logout
+    get "verify-email", action: :verify_email
+    post "forgot-password", action: :forgot_password
+    post "reset-password", action: :reset_password
+    post "resend-verification", action: :resend_verification
+    get "me", action: :me
+    patch "me", action: :update_me
+    get "me/accounts", action: :my_accounts
+    post "me/accounts", action: :create_account
+    post "accept-invite", action: :accept_invite
+    get "social/:provider", to: "social_auth#initiate"
+    get "social/:provider/callback", to: "social_auth#callback"
+  end
+
   # Phase 4: saved crawl configs + Meilisearch engine registry.
   resources :configs, only: [ :create, :index, :show, :update, :destroy ] do
     post :trigger, on: :member

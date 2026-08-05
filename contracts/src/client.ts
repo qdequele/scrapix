@@ -10,18 +10,22 @@ export const BASE_URL =
   process.env.CONTRACT_BASE_URL ?? "http://localhost:8080";
 
 /**
- * During the migration, auth/account routes may live on a different backend
- * than the route group under test (mirroring the edge proxy's path routing).
- * CONTRACT_AUTH_BASE_URL points at the backend serving /auth and /account;
- * it defaults to CONTRACT_BASE_URL for single-backend runs.
+ * During the migration, route groups may live on different backends
+ * (mirroring the edge proxy's path routing). CONTRACT_AUTH_BASE_URL points at
+ * the backend serving /auth; CONTRACT_ACCOUNT_BASE_URL at the one serving
+ * /account and /webhooks. Both default to CONTRACT_BASE_URL.
  */
 export const AUTH_BASE_URL =
   process.env.CONTRACT_AUTH_BASE_URL ?? BASE_URL;
-
-const AUTH_PREFIXES = ["/auth", "/account", "/webhooks"];
+export const ACCOUNT_BASE_URL =
+  process.env.CONTRACT_ACCOUNT_BASE_URL ?? BASE_URL;
 
 function baseFor(path: string): string {
-  return AUTH_PREFIXES.some((p) => path.startsWith(p)) ? AUTH_BASE_URL : BASE_URL;
+  if (path.startsWith("/auth")) return AUTH_BASE_URL;
+  if (path.startsWith("/account") || path.startsWith("/webhooks")) {
+    return ACCOUNT_BASE_URL;
+  }
+  return BASE_URL;
 }
 
 export interface ApiResponse {

@@ -36,5 +36,9 @@ module Saas
     # Middleware like session, flash, cookies can be added back manually.
     # Skip views, helpers and assets when generating a new resource.
     config.api_only = true
+
+    # The auth endpoints set/clear the scrapix_session cookie; API mode
+    # excludes the cookie middleware that serializes the jar into headers.
+    config.middleware.use ActionDispatch::Cookies
   end
 end

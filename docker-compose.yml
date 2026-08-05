@@ -370,6 +370,9 @@ services:
       DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
       JWT_SECRET: dev-jwt-secret-change-in-production
       SCRAPIX_ENGINE_URL: http://scrapix-api:8080
+      REDIS_URL: redis://dragonfly:6379
+      CONSOLE_URL: http://localhost:3001
+      ENVIRONMENT: development
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: scrapix
       CLICKHOUSE_USER: scrapix
