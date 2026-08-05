@@ -47,3 +47,5 @@ gem "argon2", "~> 2.3"
 
 gem "rack-attack", "~> 6.8"
 gem "redis", "~> 6.0"
+
+gem "stripe", "~> 19.4"

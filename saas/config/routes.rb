@@ -48,7 +48,20 @@ Rails.application.routes.draw do
     patch "billing/auto-topup", to: "billing#auto_topup"
     patch "billing/spend-limit", to: "billing#spend_limit"
     get "billing/transactions", to: "billing#transactions"
+
+    # Phase 7: Stripe payment routes (404 when STRIPE_SECRET_KEY is unset,
+    # matching the Rust API's conditional mounting).
+    post "billing/setup-intent", to: "stripe_billing#setup_intent"
+    get "billing/payment-methods", to: "stripe_billing#payment_methods"
+    delete "billing/payment-methods/:id", to: "stripe_billing#delete_payment_method"
+    patch "billing/default-payment-method", to: "stripe_billing#set_default_payment_method"
+    post "billing/purchase", to: "stripe_billing#purchase"
+    get "billing/invoices", to: "stripe_billing#invoices"
+    get "billing/pricing", to: "stripe_billing#pricing"
   end
+
+  # Stripe webhook (signature-verified, no session auth).
+  post "webhooks/stripe", to: "stripe_webhooks#receive"
 
   # Phase 4: saved crawl configs + Meilisearch engine registry.
   resources :configs, only: [ :create, :index, :show, :update, :destroy ] do

@@ -421,8 +421,7 @@ services:
       NEXT_PUBLIC_SCRAPIX_API_URL: http://localhost:8080
       SCRAPIX_API_URL: http://scrapix-api:8080
       SAAS_API_URL: http://saas:8081
-      SAAS_PREFIXES: analytics,configs,engines,auth,account
-      SAAS_EXCLUDE_PREFIXES: account/billing/setup-intent,account/billing/payment-methods,account/billing/purchase,account/billing/invoices,account/billing/pricing
+      SAAS_PREFIXES: analytics,configs,engines,auth,account,webhooks
     volumes:
       - console-node-modules:/app/node_modules
       - console-next:/app/.next
