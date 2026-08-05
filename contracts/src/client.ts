@@ -9,6 +9,21 @@
 export const BASE_URL =
   process.env.CONTRACT_BASE_URL ?? "http://localhost:8080";
 
+/**
+ * During the migration, auth/account routes may live on a different backend
+ * than the route group under test (mirroring the edge proxy's path routing).
+ * CONTRACT_AUTH_BASE_URL points at the backend serving /auth and /account;
+ * it defaults to CONTRACT_BASE_URL for single-backend runs.
+ */
+export const AUTH_BASE_URL =
+  process.env.CONTRACT_AUTH_BASE_URL ?? BASE_URL;
+
+const AUTH_PREFIXES = ["/auth", "/account", "/webhooks"];
+
+function baseFor(path: string): string {
+  return AUTH_PREFIXES.some((p) => path.startsWith(p)) ? AUTH_BASE_URL : BASE_URL;
+}
+
 export interface ApiResponse {
   status: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -29,7 +44,7 @@ export class Session {
     if (body !== undefined) headers["content-type"] = "application/json";
     if (this.cookie) headers["cookie"] = this.cookie;
 
-    const res = await fetch(`${BASE_URL}${path}`, {
+    const res = await fetch(`${baseFor(path)}${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

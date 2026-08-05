@@ -2,5 +2,5 @@ api:      set -a && source .env && set +a && cargo watch -w crates -w bins -x 'r
 frontier: set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- frontier'
 crawler:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- crawler'
 content:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- content'
-console:  cd console && npm install && SAAS_API_URL=http://localhost:8081 SAAS_PREFIXES=analytics npm run dev
+console:  cd console && npm install && SAAS_API_URL=http://localhost:8081 SAAS_PREFIXES=analytics,configs,engines npm run dev
 saas:     set -a && source .env && set +a && cd saas && bin/rails server

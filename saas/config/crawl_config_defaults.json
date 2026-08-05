@@ -1,0 +1,53 @@
+{
+  "allowed_domains": [],
+  "concurrency": {
+    "browser_pool_size": 5,
+    "dns_concurrency": 100,
+    "max_concurrent_requests": 50
+  },
+  "crawler_type": "http",
+  "features": {
+    "ai_extraction": null,
+    "ai_summary": null,
+    "block_split": null,
+    "custom_selectors": null,
+    "markdown": null,
+    "metadata": null,
+    "pdf": null,
+    "schema": null
+  },
+  "headers": {},
+  "index_strategy": "update",
+  "index_uid": "",
+  "max_depth": null,
+  "max_pages": null,
+  "meilisearch": {
+    "api_key": "",
+    "batch_size": 1000,
+    "keep_settings": false,
+    "primary_key": null,
+    "settings": null,
+    "url": ""
+  },
+  "proxy": null,
+  "rate_limit": {
+    "default_crawl_delay_ms": 1000,
+    "per_domain_delay_ms": 100,
+    "requests_per_minute": null,
+    "requests_per_second": null,
+    "respect_robots_txt": true
+  },
+  "sitemap": {
+    "enabled": false,
+    "urls": []
+  },
+  "start_urls": [],
+  "url_patterns": {
+    "allowed_domains": [],
+    "exclude": [],
+    "include": [],
+    "index_only": []
+  },
+  "user_agents": [],
+  "webhooks": []
+}

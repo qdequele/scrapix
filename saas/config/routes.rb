@@ -6,8 +6,20 @@ Rails.application.routes.draw do
   get "health" => "health#show"
 
   # Routes migrate here from the Rust API phase by phase (SCR-85):
-  # analytics pipes (phase 3, done) → configs/engines → auth/sessions →
-  # account/team/keys → billing/Stripe → OAuth provider + MCP.
+  # analytics pipes (phase 3, done) → configs/engines (phase 4, done) →
+  # auth/sessions → account/team/keys → billing/Stripe → OAuth provider + MCP.
+
+  # Phase 4: saved crawl configs + Meilisearch engine registry.
+  resources :configs, only: [ :create, :index, :show, :update, :destroy ] do
+    post :trigger, on: :member
+  end
+  resources :engines, only: [ :create, :index, :show, :update, :destroy ] do
+    member do
+      post :default, action: :set_default
+      get :indexes
+      post "indexes/:index_uid/search", action: :search, constraints: { index_uid: %r{[^/]+} }
+    end
+  end
 
   # Phase 3: Tinybird-style analytics pipes (ClickHouse-backed, unauthenticated
   # to match the Rust API; 404 when ClickHouse is not configured).
