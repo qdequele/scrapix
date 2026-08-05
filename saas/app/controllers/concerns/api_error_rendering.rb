@@ -11,7 +11,17 @@ module ApiErrorRendering
     "conflict" => :conflict,
     "insufficient_credits" => :payment_required,
     "spend_limit_exceeded" => :forbidden,
-    "service_unavailable" => :service_unavailable
+    "service_unavailable" => :service_unavailable,
+    # Auth/team handler codes (the Rust `err()` helper passes these statuses
+    # explicitly; the code→status mapping is kept equivalent here)
+    "forbidden" => :forbidden,
+    "email_mismatch" => :forbidden,
+    "already_member" => :conflict,
+    "email_taken" => :conflict,
+    "invalid_token" => :bad_request,
+    "already_verified" => :bad_request,
+    "last_owner" => :bad_request,
+    "invalid_credentials" => :unauthorized
   }.freeze
 
   class ApiError < StandardError

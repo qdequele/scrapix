@@ -6,21 +6,34 @@ const SAAS_BACKEND = process.env.SAAS_API_URL || "";
 /**
  * Path prefixes served by the Rails SaaS app (SCR-85 backend split).
  *
- * A prefix only routes to Rails once it appears in SAAS_PREFIXES env var
- * (comma-separated), so cutover is per-route-group and instantly reversible:
- *   SAAS_API_URL=http://localhost:8081 SAAS_PREFIXES=analytics,configs
- * Everything else stays on the Rust engine. With SAAS_API_URL unset, all
- * traffic goes to Rust regardless of prefixes.
+ * A prefix only routes to Rails once it appears in the SAAS_PREFIXES env var
+ * (comma-separated, multi-segment allowed, e.g. "auth,account"), so cutover
+ * is per-route-group and instantly reversible. SAAS_EXCLUDE_PREFIXES lists
+ * deeper prefixes that stay on the Rust engine despite matching (e.g. the
+ * Stripe routes under account/billing until phase 7). Longest match wins.
+ * With SAAS_API_URL unset, all traffic goes to Rust regardless of prefixes.
  */
-const SAAS_PREFIXES = new Set(
-  (process.env.SAAS_PREFIXES || "")
+function parsePrefixes(value: string | undefined): string[] {
+  return (value || "")
     .split(",")
-    .map((p) => p.trim().replace(/^\//, ""))
-    .filter(Boolean),
-);
+    .map((p) => p.trim().replace(/^\//, "").replace(/\/$/, ""))
+    .filter(Boolean);
+}
+
+const SAAS_PREFIXES = parsePrefixes(process.env.SAAS_PREFIXES);
+const SAAS_EXCLUDE_PREFIXES = parsePrefixes(process.env.SAAS_EXCLUDE_PREFIXES);
+
+function matchesPrefix(joined: string, prefix: string): boolean {
+  return joined === prefix || joined.startsWith(`${prefix}/`);
+}
 
 function backendFor(path: string[]): string {
-  if (SAAS_BACKEND && path.length > 0 && SAAS_PREFIXES.has(path[0])) {
+  if (!SAAS_BACKEND || path.length === 0) return RUST_BACKEND;
+  const joined = path.join("/");
+  if (SAAS_EXCLUDE_PREFIXES.some((p) => matchesPrefix(joined, p))) {
+    return RUST_BACKEND;
+  }
+  if (SAAS_PREFIXES.some((p) => matchesPrefix(joined, p))) {
     return SAAS_BACKEND;
   }
   return RUST_BACKEND;

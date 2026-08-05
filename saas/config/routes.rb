@@ -27,6 +27,29 @@ Rails.application.routes.draw do
     get "social/:provider/callback", to: "social_auth#callback"
   end
 
+  # Phase 6: account, team, invites, API keys, non-Stripe billing.
+  # (Stripe routes under /account/billing stay on the Rust engine until
+  # phase 7 — the console proxy excludes them from the account prefix.)
+  get "account", to: "accounts#show"
+  patch "account", to: "accounts#update"
+  scope "account" do
+    get "members", to: "members#index"
+    post "members/invite", to: "members#invite"
+    patch "members/:user_id", to: "members#update_role"
+    delete "members/:user_id", to: "members#remove"
+    get "invites", to: "invites#index"
+    delete "invites/:id", to: "invites#revoke"
+    get "api-keys", to: "api_keys#index"
+    post "api-keys", to: "api_keys#create"
+    patch "api-keys/:id", to: "api_keys#revoke"
+    get "billing", to: "billing#show"
+    patch "billing", to: "billing#update"
+    post "billing/topup", to: "billing#topup"
+    patch "billing/auto-topup", to: "billing#auto_topup"
+    patch "billing/spend-limit", to: "billing#spend_limit"
+    get "billing/transactions", to: "billing#transactions"
+  end
+
   # Phase 4: saved crawl configs + Meilisearch engine registry.
   resources :configs, only: [ :create, :index, :show, :update, :destroy ] do
     post :trigger, on: :member
