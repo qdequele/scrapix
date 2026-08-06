@@ -49,3 +49,6 @@ gem "rack-attack", "~> 6.8"
 gem "redis", "~> 6.0"
 
 gem "stripe", "~> 19.4"
+
+# Official MCP Ruby SDK — powers the /mcp Streamable HTTP endpoint.
+gem "mcp", "~> 0.4"

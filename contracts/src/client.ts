@@ -19,11 +19,21 @@ export const AUTH_BASE_URL =
   process.env.CONTRACT_AUTH_BASE_URL ?? BASE_URL;
 export const ACCOUNT_BASE_URL =
   process.env.CONTRACT_ACCOUNT_BASE_URL ?? BASE_URL;
+/** Backend serving the OAuth provider (/oauth, /.well-known) and /mcp. */
+export const OAUTH_BASE_URL =
+  process.env.CONTRACT_OAUTH_BASE_URL ?? AUTH_BASE_URL;
 
 function baseFor(path: string): string {
   if (path.startsWith("/auth")) return AUTH_BASE_URL;
   if (path.startsWith("/account") || path.startsWith("/webhooks")) {
     return ACCOUNT_BASE_URL;
+  }
+  if (
+    path.startsWith("/oauth") ||
+    path.startsWith("/.well-known") ||
+    path.startsWith("/mcp")
+  ) {
+    return OAUTH_BASE_URL;
   }
   return BASE_URL;
 }
@@ -62,6 +72,34 @@ export class Session {
       this.cookie = match && match[1] ? `scrapix_session=${match[1]}` : null;
     }
 
+    const text = await res.text();
+    let parsed: unknown = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+    return { status: res.status, body: parsed, headers: res.headers };
+  }
+
+  /** POST an application/x-www-form-urlencoded body (OAuth endpoints). */
+  async postForm(
+    path: string,
+    params: Record<string, string>,
+    extraHeaders?: Record<string, string>,
+  ): Promise<ApiResponse> {
+    const headers: Record<string, string> = {
+      "content-type": "application/x-www-form-urlencoded",
+      ...extraHeaders,
+    };
+    if (this.cookie) headers["cookie"] = this.cookie;
+
+    const res = await fetch(`${baseFor(path)}${path}`, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams(params).toString(),
+      redirect: "manual",
+    });
     const text = await res.text();
     let parsed: unknown = null;
     try {

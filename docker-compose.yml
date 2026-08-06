@@ -377,8 +377,12 @@ services:
       CLICKHOUSE_DATABASE: scrapix
       CLICKHOUSE_USER: scrapix
       CLICKHOUSE_PASSWORD: scrapix
+      # MCP tools are generated from the frozen OpenAPI snapshot, mounted below.
+      MCP_OPENAPI_SPEC_PATH: /contracts/openapi.json
+      MCP_SAAS_BASE_URL: http://127.0.0.1:8081
     volumes:
       - saas-bundle:/usr/local/bundle
+      - ./contracts/openapi.json:/contracts/openapi.json:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/health || exit 1"]
       interval: 10s
@@ -421,7 +425,7 @@ services:
       NEXT_PUBLIC_SCRAPIX_API_URL: http://localhost:8080
       SCRAPIX_API_URL: http://scrapix-api:8080
       SAAS_API_URL: http://saas:8081
-      SAAS_PREFIXES: analytics,configs,engines,auth,account,webhooks
+      SAAS_PREFIXES: analytics,configs,engines,auth,account,webhooks,oauth,.well-known,mcp
     volumes:
       - console-node-modules:/app/node_modules
       - console-next:/app/.next

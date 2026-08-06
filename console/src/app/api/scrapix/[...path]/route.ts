@@ -59,6 +59,12 @@ async function proxy(req: NextRequest, { params }: { params: Promise<{ path: str
     headers["x-api-key"] = apiKey;
   }
 
+  // Forward OAuth Bearer tokens (developer API / MCP clients)
+  const authorization = req.headers.get("authorization");
+  if (authorization) {
+    headers["authorization"] = authorization;
+  }
+
   const res = await fetch(target, {
     method: req.method,
     headers,

@@ -146,3 +146,37 @@ export const ANALYTICS_RESPONSE: Spec = {
   rows: "number",
   statistics: { elapsed: "number", rows_read: "number", bytes_read: "number" },
 };
+
+// ── OAuth 2.1 provider (auth/oauth.rs) ──────────────────────────────────────
+
+export const OAUTH_METADATA: Spec = {
+  issuer: "string",
+  authorization_endpoint: "string",
+  token_endpoint: "string",
+  registration_endpoint: "string",
+  revocation_endpoint: "string",
+  response_types_supported: ["string"],
+  grant_types_supported: ["string"],
+  code_challenge_methods_supported: ["string"],
+  token_endpoint_auth_methods_supported: ["string"],
+  scopes_supported: ["string"],
+};
+
+export const OAUTH_CLIENT: Spec = {
+  client_id: "string",
+  client_name: "string|null",
+  redirect_uris: ["string"],
+};
+
+export const OAUTH_TOKENS: Spec = {
+  access_token: "string",
+  token_type: "string",
+  expires_in: "number",
+  refresh_token: "string|null",
+  scope: "string",
+};
+
+export const OAUTH_ERROR: Spec = {
+  error: "string",
+  error_description: "string",
+};

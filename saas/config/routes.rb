@@ -63,6 +63,18 @@ Rails.application.routes.draw do
   # Stripe webhook (signature-verified, no session auth).
   post "webhooks/stripe", to: "stripe_webhooks#receive"
 
+  # Phase 8: OAuth 2.1 provider (RFC 8414/7591/7636/7009) + MCP.
+  get "/.well-known/oauth-authorization-server", to: "oauth#metadata", format: false
+  get "/.well-known/oauth-protected-resource", to: "oauth#protected_resource", format: false
+  scope "oauth", controller: :oauth do
+    post "register", action: :register
+    get "authorize", action: :authorize_form
+    post "authorize", action: :authorize
+    post "token", action: :token
+    post "revoke", action: :revoke
+  end
+  match "mcp", to: "mcp#handle", via: [ :get, :post, :delete ]
+
   # Phase 4: saved crawl configs + Meilisearch engine registry.
   resources :configs, only: [ :create, :index, :show, :update, :destroy ] do
     post :trigger, on: :member
