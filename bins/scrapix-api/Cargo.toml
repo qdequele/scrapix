@@ -60,34 +60,19 @@ tracing-subscriber = { workspace = true }
 # Async traits
 async-trait = { workspace = true }
 
-# Auth
+# Credential validation (API keys, OAuth Bearer tokens, session JWTs)
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "tls-rustls"] }
 sha2 = "0.10"
 hex = "0.4"
-argon2 = "0.5"
-jsonwebtoken = "9"
 axum-extra = { version = "0.10", features = ["cookie"] }
-rand = { workspace = true }
-
-# OAuth
-base64 = { workspace = true }
-
-# Rate limiting
-redis = { workspace = true }
-dashmap = { workspace = true }
-
-# URL encoding for OAuth redirects
-urlencoding = "2.1"
-
-# MCP HTTP transport
-rmcp = { version = "1.2", features = ["server", "transport-streamable-http-server"] }
-rmcp-openapi = "0.25"
 
 # Cron scheduling
 croner = "3"
 
 # Stripe payments
-async-stripe = { version = "0.38", default-features = false, features = ["runtime-tokio-hyper", "checkout", "billing", "connect", "webhook-events"] }
+# "billing" alone doesn't compile in async-stripe 0.38 (its quote resource
+# references checkout types), so checkout stays enabled alongside it.
+async-stripe = { version = "0.38", default-features = false, features = ["runtime-tokio-hyper", "checkout", "billing"] }
 hmac = "0.12"
 
 # OpenAPI

@@ -310,10 +310,6 @@ impl EmailClient {
         }
     }
 
-    pub fn send_welcome(&self, to_email: &str, name: &str) {
-        self.send_owned(self.build_welcome_payload(to_email, name));
-    }
-
     // ------------------------------------------------------------------
     // 2. Payment receipt (Stripe payment succeeded)
     // ------------------------------------------------------------------
@@ -354,10 +350,6 @@ impl EmailClient {
             subject: format!("Payment receipt — {credits} credits"),
             html: wrap("Payment Received", &body),
         }
-    }
-
-    pub fn send_payment_receipt(&self, to_email: &str, credits: i64, amount_cents: i64) {
-        self.send_owned(self.build_payment_receipt_payload(to_email, credits, amount_cents));
     }
 
     // ------------------------------------------------------------------
@@ -615,10 +607,6 @@ impl EmailClient {
         }
     }
 
-    pub fn send_verification_email(&self, to_email: &str, name: &str, token: &str) {
-        self.send_owned(self.build_verification_email_payload(to_email, name, token));
-    }
-
     // ------------------------------------------------------------------
     // 8. Password reset
     // ------------------------------------------------------------------
@@ -653,10 +641,6 @@ impl EmailClient {
         }
     }
 
-    pub fn send_password_reset(&self, to_email: &str, token: &str) {
-        self.send_owned(self.build_password_reset_payload(to_email, token));
-    }
-
     // ------------------------------------------------------------------
     // 9. Password changed confirmation
     // ------------------------------------------------------------------
@@ -681,10 +665,6 @@ impl EmailClient {
             subject: "Your password has been changed — Scrapix".to_string(),
             html: wrap("Password Changed", &body),
         }
-    }
-
-    pub fn send_password_changed(&self, to_email: &str) {
-        self.send_owned(self.build_password_changed_payload(to_email));
     }
 
     // ------------------------------------------------------------------
@@ -735,23 +715,6 @@ impl EmailClient {
         }
     }
 
-    pub fn send_team_invite(
-        &self,
-        to_email: &str,
-        account_name: &str,
-        inviter_name: &str,
-        role: &str,
-        token: &str,
-    ) {
-        self.send_owned(self.build_team_invite_payload(
-            to_email,
-            account_name,
-            inviter_name,
-            role,
-            token,
-        ));
-    }
-
     // ------------------------------------------------------------------
     // 11. Invite accepted — notify the inviter
     // ------------------------------------------------------------------
@@ -792,21 +755,6 @@ impl EmailClient {
         }
     }
 
-    pub fn send_invite_accepted(
-        &self,
-        to_email: &str,
-        member_name: &str,
-        account_name: &str,
-        role: &str,
-    ) {
-        self.send_owned(self.build_invite_accepted_payload(
-            to_email,
-            member_name,
-            account_name,
-            role,
-        ));
-    }
-
     // ------------------------------------------------------------------
     // 12. Member removed from account
     // ------------------------------------------------------------------
@@ -840,10 +788,6 @@ impl EmailClient {
             subject: format!("You've been removed from {account_name}"),
             html: wrap("Removed from Team", &body),
         }
-    }
-
-    pub fn send_member_removed(&self, to_email: &str, account_name: &str, removed_by: &str) {
-        self.send_owned(self.build_member_removed_payload(to_email, account_name, removed_by));
     }
 
     // ------------------------------------------------------------------
@@ -881,81 +825,6 @@ impl EmailClient {
 }
 
 // ============================================================================
-// Queue-based delivery for critical emails
-// ============================================================================
-
-impl EmailClient {
-    /// Queue a verification email for reliable delivery via the scheduled_emails table.
-    pub async fn queue_verification_email(
-        &self,
-        pool: &sqlx::PgPool,
-        to_email: &str,
-        name: &str,
-        token: &str,
-    ) {
-        crate::email_scheduler::schedule_email_now(
-            pool,
-            "verification",
-            to_email,
-            serde_json::json!({ "name": name, "token": token }),
-        )
-        .await;
-    }
-
-    /// Queue a password reset email for reliable delivery.
-    pub async fn queue_password_reset(&self, pool: &sqlx::PgPool, to_email: &str, token: &str) {
-        crate::email_scheduler::schedule_email_now(
-            pool,
-            "password_reset",
-            to_email,
-            serde_json::json!({ "token": token }),
-        )
-        .await;
-    }
-
-    /// Queue a team invite email for reliable delivery.
-    pub async fn queue_team_invite(
-        &self,
-        pool: &sqlx::PgPool,
-        to_email: &str,
-        account_name: &str,
-        inviter_name: &str,
-        role: &str,
-        token: &str,
-    ) {
-        crate::email_scheduler::schedule_email_now(
-            pool,
-            "team_invite",
-            to_email,
-            serde_json::json!({
-                "account_name": account_name,
-                "inviter_name": inviter_name,
-                "role": role,
-                "token": token,
-            }),
-        )
-        .await;
-    }
-
-    /// Queue a payment receipt email for reliable delivery.
-    pub async fn queue_payment_receipt(
-        &self,
-        pool: &sqlx::PgPool,
-        to_email: &str,
-        credits: i64,
-        amount_cents: i64,
-    ) {
-        crate::email_scheduler::schedule_email_now(
-            pool,
-            "payment_receipt",
-            to_email,
-            serde_json::json!({ "credits": credits, "amount_cents": amount_cents }),
-        )
-        .await;
-    }
-}
-
-// ============================================================================
 // Database helpers
 // ============================================================================
 
@@ -972,26 +841,6 @@ pub async fn get_account_email(pool: &sqlx::PgPool, account_id: uuid::Uuid) -> O
     .await
     .ok()
     .flatten()
-}
-
-/// Fetch the email for a specific user by ID.
-pub async fn get_user_email(pool: &sqlx::PgPool, user_id: uuid::Uuid) -> Option<String> {
-    sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-}
-
-/// Fetch the account name by ID.
-pub async fn get_account_name(pool: &sqlx::PgPool, account_id: uuid::Uuid) -> Option<String> {
-    sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1")
-        .bind(account_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
 }
 
 /// Fetch the owner email for an account, only if they opted into job notifications.

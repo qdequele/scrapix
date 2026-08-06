@@ -1,7 +1,13 @@
-//! OpenAPI specification for the Scrapix API.
+//! OpenAPI specification for the Scrapix crawl engine.
 //!
-//! Generates an OpenAPI 3.1 spec from annotated handlers and types,
-//! and serves it at `/openapi.json` with a Scalar UI at `/docs`.
+//! Generates an OpenAPI 3.1 spec from annotated handlers and types, served at
+//! `/openapi.json` with a Scalar UI at `/docs`.
+//!
+//! This spec covers the engine surface only. The SaaS control plane (auth,
+//! account/team, configs/engines CRUD, billing, analytics pipes, OAuth,
+//! MCP) is served by the Rails app; the frozen full-platform public spec is
+//! `contracts/openapi.json`, and the engine-only snapshot pinned by
+//! `tests/openapi_snapshot.rs` is `contracts/openapi.engine.json`.
 
 use utoipa::OpenApi;
 
@@ -25,10 +31,7 @@ use utoipa::OpenApi;
         (name = "map", description = "Website URL discovery"),
         (name = "search", description = "Search indexed content"),
         (name = "crawl", description = "Distributed crawl jobs"),
-        (name = "jobs", description = "Job management"),
-        (name = "configs", description = "Saved crawl configurations"),
-        (name = "engines", description = "Meilisearch engine registry"),
-        (name = "auth", description = "Authentication and account management")
+        (name = "jobs", description = "Job management")
     ),
     paths(
         // Health & diagnostics
@@ -48,39 +51,6 @@ use utoipa::OpenApi;
         crate::list_jobs,
         crate::job_status,
         crate::cancel_job,
-        // Configs
-        crate::configs::create_config,
-        crate::configs::list_configs,
-        crate::configs::get_config,
-        crate::configs::update_config,
-        crate::configs::delete_config,
-        crate::configs::trigger_config,
-        // Engines
-        crate::engines::create_engine,
-        crate::engines::list_engines,
-        crate::engines::get_engine,
-        crate::engines::update_engine,
-        crate::engines::delete_engine,
-        crate::engines::set_default_engine,
-        crate::engines::list_engine_indexes,
-        crate::engines::search_engine_index,
-        // Auth
-        crate::auth::handlers::signup,
-        crate::auth::handlers::login,
-        crate::auth::handlers::logout,
-        crate::auth::handlers::get_me,
-        crate::auth::handlers::update_me,
-        crate::auth::handlers::get_account,
-        crate::auth::handlers::update_account,
-        crate::auth::handlers::list_api_keys,
-        crate::auth::handlers::create_api_key,
-        crate::auth::handlers::revoke_api_key,
-        crate::auth::handlers::get_billing,
-        crate::auth::handlers::update_billing,
-        crate::auth::handlers::topup_credits,
-        crate::auth::handlers::update_auto_topup,
-        crate::auth::handlers::update_spend_limit,
-        crate::auth::handlers::list_transactions,
     ),
     components(schemas(
         // Core API types
@@ -113,26 +83,6 @@ use utoipa::OpenApi;
         crate::ErrorRecord,
         crate::DomainsResponse,
         crate::DomainInfo,
-        // Config types
-        crate::configs::CrawlConfigRecord,
-        crate::configs::CreateConfigRequest,
-        crate::configs::UpdateConfigRequest,
-        crate::configs::TriggerResponse,
-        // Engine types
-        crate::engines::EngineRecord,
-        crate::engines::CreateEngineRequest,
-        crate::engines::UpdateEngineRequest,
-        crate::engines::EngineIndex,
-        // Auth types
-        crate::auth::handlers::SignupRequest,
-        crate::auth::handlers::LoginRequest,
-        crate::auth::handlers::UpdateMeRequest,
-        crate::auth::handlers::UpdateAccountRequest,
-        crate::auth::handlers::CreateApiKeyRequest,
-        crate::auth::handlers::UpdateBillingRequest,
-        crate::auth::handlers::TopupRequest,
-        crate::auth::handlers::AutoTopupRequest,
-        crate::auth::handlers::SpendLimitRequest,
     )),
     security(
         ("api_key" = [])

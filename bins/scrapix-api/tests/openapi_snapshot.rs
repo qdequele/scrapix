@@ -1,10 +1,18 @@
-//! Snapshot test pinning the OpenAPI spec to `contracts/openapi.json`.
+//! Snapshot test pinning the engine's OpenAPI spec to
+//! `contracts/openapi.engine.json`.
 //!
-//! The committed snapshot is the frozen API contract for the Rails SaaS
-//! migration (SCR-85): any change to routes or schemas fails this test so
-//! contract drift is always an explicit, reviewed decision.
+//! Since the SaaS split (SCR-85 phase 9) there are two specs:
 //!
-//! To update the snapshot after an intentional API change:
+//! - `contracts/openapi.json` — the **frozen full-platform public spec**
+//!   (engine + SaaS routes). It is the contract the Rails app implements and
+//!   the source the MCP server generates its tools from. The engine no
+//!   longer serves most of those routes, so it is *not* regenerated from
+//!   this crate — treat it as hand-frozen.
+//! - `contracts/openapi.engine.json` — the engine-only spec served at
+//!   `/openapi.json`, pinned here so route/schema drift is an explicit,
+//!   reviewed decision.
+//!
+//! To update the engine snapshot after an intentional API change:
 //!
 //! ```bash
 //! UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p scrapix-api --test openapi_snapshot
@@ -15,7 +23,7 @@ use std::path::PathBuf;
 use utoipa::OpenApi;
 
 fn snapshot_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/openapi.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/openapi.engine.json")
 }
 
 #[test]
@@ -44,8 +52,8 @@ fn openapi_snapshot_is_up_to_date() {
 
     assert_eq!(
         committed, spec,
-        "OpenAPI spec drifted from contracts/openapi.json. If the change is \
-         intentional, regenerate with UPDATE_OPENAPI_SNAPSHOT=1 cargo test \
-         -p scrapix-api --test openapi_snapshot and review the diff."
+        "OpenAPI spec drifted from contracts/openapi.engine.json. If the \
+         change is intentional, regenerate with UPDATE_OPENAPI_SNAPSHOT=1 \
+         cargo test -p scrapix-api --test openapi_snapshot and review the diff."
     );
 }
