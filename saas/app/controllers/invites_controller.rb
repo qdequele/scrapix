@@ -26,9 +26,9 @@ class InvitesController < ApplicationController
     require_role!(current_role!(account_id), %w[owner admin])
     api_error!("Invalid invite ID", "validation_error") unless uuid?(params[:id])
 
-    updated = AccountInvite.pending.where(id: params[:id], account_id: account_id)
-                           .update_all(status: "revoked")
-    api_error!("Invite not found or already processed", "not_found") if updated.zero?
+    invite = AccountInvite.pending.find_by(id: params[:id], account_id: account_id)
+    api_error!("Invite not found or already processed", "not_found") unless invite
+    invite.update!(status: "revoked")
 
     render json: { message: "Invite revoked" }
   end

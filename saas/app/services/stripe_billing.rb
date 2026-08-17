@@ -61,7 +61,7 @@ module StripeBilling
       name: name, email: email,
       metadata: { scrapix_account_id: account_id }
     )
-    Account.where(id: account_id).update_all(stripe_customer_id: customer.id)
+    Account.find(account_id).update!(stripe_customer_id: customer.id)
     customer.id
   end
 
@@ -105,19 +105,10 @@ module StripeBilling
       return
     end
 
-    ActiveRecord::Base.transaction do
-      new_balance = ActiveRecord::Base.connection.select_value(
-        ActiveRecord::Base.sanitize_sql_array(
-          [ "UPDATE accounts SET credits_balance = credits_balance + ? WHERE id = ? RETURNING credits_balance",
-            credits, account_id ]
-        )
-      )
-      Transaction.create!(
-        account_id: account_id, type: "manual_topup", amount: credits,
-        balance_after: new_balance, description: description,
-        metadata: { stripe_payment_intent_id: payment_intent_id }
-      )
-    end
+    Account.find(account_id).credit!(
+      credits, type: "manual_topup", description: description,
+      metadata: { stripe_payment_intent_id: payment_intent_id }
+    )
   end
 
   # First member's email for the account (payment receipts) — mirrors

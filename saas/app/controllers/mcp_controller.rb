@@ -39,19 +39,7 @@ class McpController < ApplicationController
       request.headers["Authorization"]&.start_with?("Bearer ")
   end
 
-  # Same lookup as auth/oauth.rs validate_bearer_token: an unexpired,
-  # unrevoked access token whose user has at least one account membership.
   def valid_bearer?(token)
-    token_hash = Digest::SHA256.hexdigest(token)
-    row = ActiveRecord::Base.connection.select_one(
-      ActiveRecord::Base.sanitize_sql_array([ <<~SQL, token_hash ])
-        SELECT t.expires_at, t.revoked
-        FROM oauth_tokens t
-        JOIN account_members m ON m.user_id = t.user_id
-        WHERE t.token_hash = ? AND t.token_type = 'access'
-        LIMIT 1
-      SQL
-    )
-    row.present? && !row["revoked"] && Time.current <= row["expires_at"]
+    OauthToken.account_for(token).present?
   end
 end

@@ -43,8 +43,9 @@ class ApiKeysController < ApplicationController
     require_role!(current_role!(account_id), %w[owner admin])
     api_error!("Invalid key ID", "validation_error") unless uuid?(params[:id])
 
-    updated = ApiKey.where(id: params[:id], account_id: account_id).update_all(active: false)
-    api_error!("Key not found", "not_found") if updated.zero?
+    key = ApiKey.find_by(id: params[:id], account_id: account_id)
+    api_error!("Key not found", "not_found") unless key
+    key.update!(active: false)
 
     render json: { message: "Key revoked" }
   end

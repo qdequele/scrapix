@@ -40,19 +40,11 @@ class MembersController < ApplicationController
     api_error!("User is already a member of this account", "already_member") if already_member
 
     raw_token = SecureRandom.alphanumeric(48)
-    token_hash = Digest::SHA256.hexdigest(raw_token)
-
-    row = ActiveRecord::Base.connection.select_one(
-      ActiveRecord::Base.sanitize_sql_array([ <<~SQL, account_id, email, role, @authenticated_user_id, token_hash ])
-        INSERT INTO account_invites (account_id, email, role, invited_by, token_hash)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (account_id, email) WHERE status = 'pending'
-        DO UPDATE SET role = EXCLUDED.role, token_hash = EXCLUDED.token_hash,
-            expires_at = now() + interval '7 days', invited_by = EXCLUDED.invited_by
-        RETURNING id, email, role, status, expires_at, created_at
-      SQL
+    invite = AccountInvite.issue!(
+      account_id: account_id, email: email, role: role,
+      invited_by: @authenticated_user_id,
+      token_hash: Digest::SHA256.hexdigest(raw_token)
     )
-    api_error!("Failed to create invite", "internal_error") unless row
 
     account_name = Account.where(id: account_id).pick(:name) || "Scrapix"
     EmailQueue.enqueue("team_invite", email, {
@@ -63,13 +55,13 @@ class MembersController < ApplicationController
     })
 
     render json: {
-      id: row["id"],
-      email: row["email"],
-      role: row["role"],
-      status: row["status"],
+      id: invite.id,
+      email: invite.email,
+      role: invite.role,
+      status: invite.status,
       invited_by: @authenticated_user_id,
-      expires_at: rfc3339_auto(row["expires_at"]),
-      created_at: rfc3339_auto(row["created_at"])
+      expires_at: rfc3339_auto(invite.expires_at),
+      created_at: rfc3339_auto(invite.created_at)
     }
   end
 
@@ -82,9 +74,9 @@ class MembersController < ApplicationController
     api_error!("Invalid role", "validation_error") unless ALL_ROLES.include?(params[:role].to_s)
     api_error!("Cannot change your own role", "validation_error") if target == @authenticated_user_id
 
-    updated = AccountMember.where(user_id: target, account_id: account_id)
-                           .update_all(role: params[:role])
-    api_error!("Member not found", "not_found") if updated.zero?
+    member = AccountMember.find_by(user_id: target, account_id: account_id)
+    api_error!("Member not found", "not_found") unless member
+    member.update!(role: params[:role])
 
     render json: { message: "Role updated to #{params[:role]}" }
   end

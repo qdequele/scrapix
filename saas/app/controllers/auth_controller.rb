@@ -123,8 +123,8 @@ class AuthController < ApplicationController
     end
 
     ActiveRecord::Base.transaction do
-      token.update_columns(used: true)
-      User.where(id: token.user_id).update_all(password_hash: Argon2::Password.create(params[:password].to_s))
+      token.update!(used: true)
+      User.find(token.user_id).update!(password_hash: Argon2::Password.create(params[:password].to_s))
     end
     if (email = User.where(id: token.user_id).pick(:email))
       EmailQueue.password_changed(email)
@@ -140,13 +140,12 @@ class AuthController < ApplicationController
   end
 
   def update_me
-    if params.key?(:full_name) && params[:full_name].present?
-      User.where(id: @authenticated_user_id).update_all(full_name: params[:full_name])
-    end
+    updates = {}
+    updates[:full_name] = params[:full_name] if params.key?(:full_name) && params[:full_name].present?
     unless params[:notify_job_emails].nil?
-      User.where(id: @authenticated_user_id)
-          .update_all(notify_job_emails: ActiveModel::Type::Boolean.new.cast(params[:notify_job_emails]))
+      updates[:notify_job_emails] = ActiveModel::Type::Boolean.new.cast(params[:notify_job_emails])
     end
+    User.find(@authenticated_user_id).update!(updates) if updates.any?
     render json: { message: "Updated" }
   end
 

@@ -10,4 +10,25 @@ class AccountInvite < ApplicationRecord
   validates :status, inclusion: { in: STATUSES }
 
   scope :pending, -> { where(status: "pending") }
+  scope :live, -> { pending.where(expires_at: Time.current..) }
+
+  # Create or refresh the single live invite for (account, email). Re-inviting
+  # updates the role, rotates the token, and extends the expiry — guarded by
+  # the partial unique index on pending invites.
+  def self.issue!(account_id:, email:, role:, invited_by:, token_hash:)
+    retried = false
+    begin
+      invite = pending.find_or_initialize_by(account_id: account_id, email: email)
+      invite.update!(
+        role: role, invited_by: invited_by, token_hash: token_hash,
+        expires_at: 7.days.from_now
+      )
+      invite
+    rescue ActiveRecord::RecordNotUnique
+      raise if retried
+
+      retried = true
+      retry
+    end
+  end
 end

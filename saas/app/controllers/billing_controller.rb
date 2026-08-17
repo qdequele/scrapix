@@ -28,7 +28,7 @@ class BillingController < ApplicationController
     account_id = current_account_id!
     require_role!(current_role!(account_id), %w[owner])
 
-    Account.where(id: account_id).update_all(tier: params[:tier])
+    Account.find(account_id).update!(tier: params[:tier])
     render json: { message: "Tier updated" }
   end
 
@@ -36,33 +36,20 @@ class BillingController < ApplicationController
     amount = params[:amount].to_i
     api_error!("Amount must be positive", "validation_error") if amount <= 0
 
-    account_id = current_account_id!
-    check_spend_limit!(account_id, amount)
+    account = Account.find(current_account_id!)
+    api_error!("Monthly spend limit reached", "spend_limit_exceeded") if account.spend_limit_exceeded?(amount)
 
-    new_balance = transaction_id = nil
-    ActiveRecord::Base.transaction do
-      new_balance = ActiveRecord::Base.connection.select_value(
-        ActiveRecord::Base.sanitize_sql_array(
-          [ "UPDATE accounts SET credits_balance = credits_balance + ? WHERE id = ? RETURNING credits_balance",
-            amount, account_id ]
-        )
-      )
-      record = Transaction.create!(
-        account_id: account_id, type: "manual_topup", amount: amount,
-        balance_after: new_balance, description: "Manual credit top-up"
-      )
-      transaction_id = record.id
-    end
+    entry = account.credit!(amount, type: "manual_topup", description: "Manual credit top-up")
 
     render json: {
-      credits_balance: new_balance,
-      transaction_id: transaction_id,
+      credits_balance: entry.balance_after,
+      transaction_id: entry.id,
       message: "Added #{amount} credits"
     }
   end
 
   def auto_topup
-    account_id = current_account_id!
+    account = Account.find(current_account_id!)
     enabled = ActiveModel::Type::Boolean.new.cast(params[:enabled])
 
     if enabled
@@ -71,12 +58,10 @@ class BillingController < ApplicationController
       if amount <= 0 || threshold.negative?
         api_error!("Amount must be positive and threshold non-negative", "validation_error")
       end
-      Account.where(id: account_id).update_all(
-        auto_topup_enabled: true, auto_topup_amount: amount, auto_topup_threshold: threshold
-      )
+      account.update!(auto_topup_enabled: true, auto_topup_amount: amount, auto_topup_threshold: threshold)
       render json: { message: "Auto top-up enabled" }
     else
-      Account.where(id: account_id).update_all(auto_topup_enabled: false)
+      account.update!(auto_topup_enabled: false)
       render json: { message: "Auto top-up disabled" }
     end
   end
@@ -87,8 +72,7 @@ class BillingController < ApplicationController
       api_error!("Spend limit must be positive", "validation_error")
     end
 
-    account_id = current_account_id!
-    Account.where(id: account_id).update_all(monthly_spend_limit: limit.nil? ? nil : limit.to_i)
+    Account.find(current_account_id!).update!(monthly_spend_limit: limit&.to_i)
     render json: {
       message: limit.nil? ? "Monthly spend limit removed" : "Monthly spend limit set to #{limit.to_i}"
     }
@@ -110,21 +94,5 @@ class BillingController < ApplicationController
       },
       total: scope.count
     }
-  end
-
-  private
-
-  # Mirrors scrapix_billing::check_spend_limit: sum of this calendar month's
-  # top-ups plus the requested amount must stay within monthly_spend_limit.
-  def check_spend_limit!(account_id, amount)
-    limit = Account.where(id: account_id).pick(:monthly_spend_limit)
-    return unless limit
-
-    spent = Transaction.where(account_id: account_id, type: %w[manual_topup auto_topup])
-                       .where("created_at >= date_trunc('month', now())")
-                       .sum(:amount)
-    return unless spent + amount > limit
-
-    api_error!("Monthly spend limit reached", "spend_limit_exceeded")
   end
 end

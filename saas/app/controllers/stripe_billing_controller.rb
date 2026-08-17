@@ -68,16 +68,15 @@ class StripeBillingController < ApplicationController
 
     StripeBilling.client.v1.payment_methods.detach(pm.id)
     if account.stripe_default_payment_method_id == pm.id
-      Account.where(id: account_id).update_all(stripe_default_payment_method_id: nil)
+      account.update!(stripe_default_payment_method_id: nil)
     end
 
     render json: { message: "Payment method removed" }
   end
 
   def set_default_payment_method
-    account_id = current_account_id!
-    Account.where(id: account_id)
-           .update_all(stripe_default_payment_method_id: params[:payment_method_id].to_s)
+    Account.find(current_account_id!)
+           .update!(stripe_default_payment_method_id: params[:payment_method_id].to_s)
     render json: { message: "Default payment method updated" }
   end
 

@@ -10,4 +10,7 @@ class Transaction < ApplicationRecord
   belongs_to :account
 
   validates :type, inclusion: { in: TYPES }
+
+  scope :topups, -> { where(type: %w[manual_topup auto_topup]) }
+  scope :this_month, -> { where(created_at: Time.current.beginning_of_month..) }
 end

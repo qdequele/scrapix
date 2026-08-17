@@ -21,7 +21,7 @@ class AccountsController < ApplicationController
     require_role!(current_role!(account_id), %w[owner])
 
     if params[:name].present?
-      Account.where(id: account_id).update_all(name: params[:name])
+      Account.find(account_id).update!(name: params[:name])
     end
     render json: { message: "Updated" }
   end

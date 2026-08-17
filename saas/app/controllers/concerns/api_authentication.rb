@@ -38,23 +38,13 @@ module ApiAuthentication
   end
 
   def authenticate_bearer!(token)
-    token_hash = Digest::SHA256.hexdigest(token)
-    row = ActiveRecord::Base.connection.select_one(
-      ActiveRecord::Base.sanitize_sql_array([ <<~SQL, token_hash ])
-        SELECT t.user_id, t.expires_at, t.revoked, a.id AS account_id, a.tier
-        FROM oauth_tokens t
-        JOIN account_members m ON m.user_id = t.user_id
-        JOIN accounts a ON a.id = m.account_id
-        WHERE t.token_hash = ? AND t.token_type = 'access'
-        LIMIT 1
-      SQL
-    )
-    if row.nil? || row["revoked"] || Time.current > row["expires_at"]
+    holder = OauthToken.account_for(token)
+    unless holder
       raise AuthenticationError.new("Invalid or expired Bearer token", "invalid_bearer_token")
     end
 
-    @authenticated_account_id = row["account_id"]
-    @authenticated_tier = row["tier"]
+    @authenticated_account_id = holder[:account_id]
+    @authenticated_tier = holder[:tier]
   end
 
   def authenticate_api_key!(api_key)
