@@ -8,14 +8,7 @@ class ApiKeysController < ApplicationController
 
   def index
     account_id = current_account_id!
-    keys = ApiKey.where(account_id: account_id).order(created_at: :desc)
-    render json: keys.map { |k|
-      {
-        id: k.id, name: k.name, prefix: k.prefix, active: k.active,
-        last_used_at: k.last_used_at && rfc3339_auto(k.last_used_at),
-        created_at: rfc3339_auto(k.created_at)
-      }
-    }
+    render json: ApiKey.where(account_id: account_id).order(created_at: :desc)
   end
 
   def create

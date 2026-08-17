@@ -26,7 +26,7 @@ class ConfigsController < ApplicationController
       cron_enabled: cron_enabled,
       next_run_at: next_run_at
     )
-    render json: serialize(record), status: :created
+    render json: record, status: :created
   rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => e
     handle_conflict(e, "A config with this name already exists")
   end
@@ -38,11 +38,11 @@ class ConfigsController < ApplicationController
     records = CrawlConfig.where(account_id: account_id)
                          .order(created_at: :desc)
                          .limit(limit).offset(offset)
-    render json: records.map { |r| serialize(r) }
+    render json: records
   end
 
   def show
-    render json: serialize(find_config!)
+    render json: find_config!
   end
 
   def update
@@ -76,7 +76,7 @@ class ConfigsController < ApplicationController
       cron_enabled: new_cron_enabled,
       next_run_at: next_run_at
     )
-    render json: serialize(record)
+    render json: record
   rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => e
     handle_conflict(e, "A config with this name already exists")
   end
@@ -153,23 +153,6 @@ class ConfigsController < ApplicationController
       bearer: request.headers["Authorization"],
       session_cookie: cookies["scrapix_session"],
       account_id: request.headers["X-Account-Id"]
-    }
-  end
-
-  def serialize(record)
-    {
-      id: record.id,
-      account_id: record.account_id,
-      name: record.name,
-      description: record.description,
-      config: record.config,
-      cron_expression: record.cron_expression,
-      cron_enabled: record.cron_enabled,
-      last_run_at: record.last_run_at && rfc3339_auto(record.last_run_at),
-      next_run_at: record.next_run_at && rfc3339_auto(record.next_run_at),
-      last_job_id: record.last_job_id,
-      created_at: rfc3339_auto(record.created_at),
-      updated_at: rfc3339_auto(record.updated_at)
     }
   end
 end

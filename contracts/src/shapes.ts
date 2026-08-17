@@ -41,8 +41,8 @@ export const API_KEY: Spec = {
   name: "string",
   prefix: "string",
   active: "boolean",
-  last_used_at: "string|null",
-  created_at: "string",
+  last_used_at: "timestamp|null",
+  created_at: "timestamp",
 };
 
 export const CREATED_API_KEY: Spec = {
@@ -68,7 +68,7 @@ export const TRANSACTION: Spec = {
   amount: "number",
   balance_after: "number",
   description: "string|null",
-  created_at: "string",
+  created_at: "timestamp",
 };
 
 export const TRANSACTIONS_LIST: Spec = {
@@ -87,7 +87,7 @@ export const MEMBER: Spec = {
   email: "string",
   full_name: "string|null",
   role: "string",
-  joined_at: "string",
+  joined_at: "timestamp",
 };
 
 export const INVITE: Spec = {
@@ -96,8 +96,8 @@ export const INVITE: Spec = {
   role: "string",
   status: "string",
   invited_by: "string",
-  expires_at: "string",
-  created_at: "string",
+  expires_at: "timestamp",
+  created_at: "timestamp",
 };
 
 export const SAVED_CONFIG: Spec = {
@@ -108,11 +108,11 @@ export const SAVED_CONFIG: Spec = {
   config: "any",
   cron_expression: "string|null",
   cron_enabled: "boolean",
-  last_run_at: "string|null",
-  next_run_at: "string|null",
+  last_run_at: "timestamp|null",
+  next_run_at: "timestamp|null",
   last_job_id: "string|null",
-  created_at: "string",
-  updated_at: "string",
+  created_at: "timestamp",
+  updated_at: "timestamp",
 };
 
 export const ENGINE: Spec = {
@@ -122,8 +122,8 @@ export const ENGINE: Spec = {
   url: "string",
   api_key: "string",
   is_default: "boolean",
-  created_at: "string",
-  updated_at: "string",
+  created_at: "timestamp",
+  updated_at: "timestamp",
 };
 
 export const PIPE_INFO: Spec = {

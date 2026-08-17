@@ -86,12 +86,7 @@ class BillingController < ApplicationController
     scope = Transaction.where(account_id: account_id)
     rows = scope.order(created_at: :desc).limit(limit).offset(offset)
     render json: {
-      transactions: rows.map { |t|
-        {
-          id: t.id, type: t.type, amount: t.amount, balance_after: t.balance_after,
-          description: t.description, created_at: rfc3339_auto(t.created_at)
-        }
-      },
+      transactions: rows.as_json,
       total: scope.count
     }
   end

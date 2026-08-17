@@ -1,19 +1,16 @@
 # Tinybird-style analytics pipes over ClickHouse.
 #
-# Byte-compatible port of the Rust implementation (bins/scrapix-api/src/
-# analytics.rs + crates/scrapix-storage/src/clickhouse.rs). The SQL, meta
-# arrays, row math, and timestamp formats are pinned by contracts/ and must
-# not drift — see contracts/tests/analytics.contract.test.ts and the parity
-# fixtures in SCR-85.
+# Originally a byte-compatible port of the Rust implementation; since the
+# split completed (SCR-87), timestamps are standard ISO8601 UTC (the Rust
+# `time`-crate Display mimicry is gone) and the contract lives in
+# contracts/tests/analytics.contract.test.ts.
 #
-# Notable quirks preserved on purpose:
-# - job_stats/job_timeline/job_event_summary timestamps use Rust's
-#   `time::OffsetDateTime` Display format ("2026-08-04 5:07:09.0 +00:00:00",
-#   hour not zero-padded); hourly_stats uses RFC3339; daily uses "YYYY-MM-DD".
+# Notable behaviors preserved on purpose:
 # - job_timeline's meta declares only 3 columns while rows carry 12 fields.
 # - domain_stats and account_usage return a single all-zeros row when there
 #   is no data; job_stats returns zero rows.
 # - kpis aggregates the top_domains query (limit 10000) in application code.
+# - daily_stats dates stay "YYYY-MM-DD".
 class AnalyticsController < ApplicationController
   before_action :require_clickhouse
 
@@ -95,7 +92,7 @@ class AnalyticsController < ApplicationController
     SQL
     data = rows.map do |r|
       {
-        hour: rfc3339(r["hour"]),
+        hour: iso_time(r["hour"]),
         requests: r["requests"],
         successes: r["successes"],
         failures: r["failures"],
@@ -202,8 +199,8 @@ class AnalyticsController < ApplicationController
         total_bytes: r["total_bytes"],
         avg_duration_ms: r["avg_duration_ms"],
         unique_domains: r["unique_domains"],
-        started_at: offset_dt(started_at),
-        last_activity_at: offset_dt(last_activity),
+        started_at: started_at.iso8601,
+        last_activity_at: last_activity.iso8601,
         duration_seconds: (last_activity - started_at).to_i
       }
     end
@@ -306,7 +303,7 @@ class AnalyticsController < ApplicationController
         bytes_downloaded: r["bytes_downloaded"],
         duration_secs: r["duration_secs"],
         error: r["error"],
-        timestamp: offset_dt(parse_ch_time(r["timestamp"]))
+        timestamp: iso_time(r["timestamp"])
       }
     end
     # The Rust handler declares only these three columns even though rows
@@ -335,8 +332,8 @@ class AnalyticsController < ApplicationController
       {
         event_type: r["event_type"],
         event_count: r["event_count"],
-        first_seen: offset_dt(parse_ch_time(r["first_seen"])),
-        last_seen: offset_dt(parse_ch_time(r["last_seen"]))
+        first_seen: iso_time(r["first_seen"]),
+        last_seen: iso_time(r["last_seen"])
       }
     end
     meta = [ { name: "event_type", type: "String" },
@@ -574,14 +571,8 @@ class AnalyticsController < ApplicationController
     Time.strptime("#{value} UTC", "%Y-%m-%d %H:%M:%S %Z").utc
   end
 
-  def rfc3339(value)
-    parse_ch_time(value).strftime("%Y-%m-%dT%H:%M:%SZ")
-  end
-
-  # Rust `time::OffsetDateTime` Display: hour without zero padding,
-  # ".0" fractional second, "+00:00:00" offset.
-  def offset_dt(time)
-    time.strftime("%Y-%m-%d %-H:%M:%S.0 +00:00:00")
+  def iso_time(value)
+    parse_ch_time(value).iso8601
   end
 
   PIPES = [

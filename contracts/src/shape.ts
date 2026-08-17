@@ -54,6 +54,10 @@ export function assertShape(value: unknown, spec: Spec, path = "$"): void {
   }
 }
 
+// Standard ISO8601 UTC (the SaaS API's timestamp format since SCR-87 I3).
+const ISO8601 =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
 function assertPrimitive(value: unknown, spec: string, path: string): void {
   const alternatives = spec.split("|");
   for (const alt of alternatives) {
@@ -62,6 +66,8 @@ function assertPrimitive(value: unknown, spec: string, path: string): void {
     if (alt === "string" && typeof value === "string") return;
     if (alt === "number" && typeof value === "number") return;
     if (alt === "boolean" && typeof value === "boolean") return;
+    if (alt === "timestamp" && typeof value === "string" && ISO8601.test(value))
+      return;
   }
   throw new Error(`${path}: expected ${spec}, got ${describe(value)}`);
 }

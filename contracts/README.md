@@ -39,7 +39,7 @@ engine, and the Rails server (with `AUTH_RATE_LIMIT=1000` — Rack::Attack's
 ```bash
 cd contracts
 npm install
-CONTRACT_BASE_URL=http://localhost:8081 npm test
+npm test   # defaults to the Rails app on :8081
 ```
 
 Each test file signs up fresh throwaway users (`contract-*@example.com`), so

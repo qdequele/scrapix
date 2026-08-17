@@ -1,13 +1,14 @@
 /**
- * HTTP client for contract tests. Points at whichever backend is under test
- * via CONTRACT_BASE_URL (default: the local Rust API).
+ * HTTP client for contract tests. Points at the backend under test via
+ * CONTRACT_BASE_URL (default: the local Rails SaaS app — since the SCR-85
+ * split completed, the Rust engine serves no SaaS routes).
  *
  * Sessions are the `scrapix_session` HS256 JWT cookie set by signup/login;
  * the client captures Set-Cookie and replays it, mimicking the console.
  */
 
 export const BASE_URL =
-  process.env.CONTRACT_BASE_URL ?? "http://localhost:8080";
+  process.env.CONTRACT_BASE_URL ?? "http://localhost:8081";
 
 /**
  * During the migration, route groups may live on different backends

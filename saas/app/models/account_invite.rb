@@ -12,6 +12,19 @@ class AccountInvite < ApplicationRecord
   scope :pending, -> { where(status: "pending") }
   scope :live, -> { pending.where(expires_at: Time.current..) }
 
+  # API representation (contracts/src/shapes.ts INVITE).
+  def as_json(*)
+    {
+      id: id,
+      email: email,
+      role: role,
+      status: status,
+      invited_by: invited_by,
+      expires_at: expires_at.utc.iso8601(3),
+      created_at: created_at.utc.iso8601(3)
+    }
+  end
+
   # Create or refresh the single live invite for (account, email). Re-inviting
   # updates the role, rotates the token, and extends the expiry — guarded by
   # the partial unique index on pending invites.

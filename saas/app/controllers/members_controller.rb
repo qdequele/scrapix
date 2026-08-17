@@ -15,7 +15,7 @@ class MembersController < ApplicationController
                         .pluck("users.id", "users.email", "users.full_name", :role, :joined_at)
     render json: rows.map { |user_id, email, full_name, role, joined_at|
       { user_id: user_id, email: email, full_name: full_name, role: role,
-        joined_at: rfc3339_auto(joined_at) }
+        joined_at: joined_at.utc.iso8601(3) }
     }
   end
 
@@ -54,15 +54,7 @@ class MembersController < ApplicationController
       token: raw_token
     })
 
-    render json: {
-      id: invite.id,
-      email: invite.email,
-      role: invite.role,
-      status: invite.status,
-      invited_by: @authenticated_user_id,
-      expires_at: rfc3339_auto(invite.expires_at),
-      created_at: rfc3339_auto(invite.created_at)
-    }
+    render json: invite
   end
 
   def update_role

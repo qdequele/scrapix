@@ -24,7 +24,7 @@ class EnginesController < ApplicationController
         is_default: is_default
       )
     end
-    render json: serialize(record), status: :created
+    render json: record, status: :created
   rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => e
     handle_conflict(e)
   end
@@ -33,11 +33,11 @@ class EnginesController < ApplicationController
     account_id = resolve_account_id!
     records = MeilisearchEngine.where(account_id: account_id)
                                .order(is_default: :desc, created_at: :desc)
-    render json: records.map { |r| serialize(r) }
+    render json: records
   end
 
   def show
-    render json: serialize(find_engine!)
+    render json: find_engine!
   end
 
   def update
@@ -50,7 +50,7 @@ class EnginesController < ApplicationController
     new_api_key = params.key?(:api_key) ? params[:api_key].to_s : record.api_key
 
     record.update!(name: new_name.strip, url: new_url.strip, api_key: new_api_key)
-    render json: serialize(record)
+    render json: record
   rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => e
     handle_conflict(e)
   end
@@ -67,7 +67,7 @@ class EnginesController < ApplicationController
                        .update_all(is_default: false)
       record.update_columns(is_default: true)
     end
-    render json: serialize(record.reload)
+    render json: record.reload
   end
 
   def indexes
@@ -113,18 +113,5 @@ class EnginesController < ApplicationController
 
   def uuid?(value)
     value.to_s.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i)
-  end
-
-  def serialize(record)
-    {
-      id: record.id,
-      account_id: record.account_id,
-      name: record.name,
-      url: record.url,
-      api_key: record.api_key,
-      is_default: record.is_default,
-      created_at: rfc3339_auto(record.created_at),
-      updated_at: rfc3339_auto(record.updated_at)
-    }
   end
 end

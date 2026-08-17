@@ -8,17 +8,7 @@ class InvitesController < ApplicationController
     account_id = current_account_id!
     require_role!(current_role!(account_id), %w[owner admin])
 
-    invites = AccountInvite.pending.where(account_id: account_id)
-                           .where("expires_at > now()")
-                           .order(created_at: :desc)
-    render json: invites.map { |i|
-      {
-        id: i.id, email: i.email, role: i.role, status: i.status,
-        invited_by: i.invited_by,
-        expires_at: rfc3339_auto(i.expires_at),
-        created_at: rfc3339_auto(i.created_at)
-      }
-    }
+    render json: AccountInvite.live.where(account_id: account_id).order(created_at: :desc)
   end
 
   def revoke
