@@ -5,4 +5,5 @@ RUN bundle install
 COPY . .
 EXPOSE 8081
 ENV SAAS_PORT=8081
+ENV SOLID_QUEUE_IN_PUMA=1
 CMD ["bash", "-c", "bin/rails db:prepare && bin/rails server -b 0.0.0.0"]

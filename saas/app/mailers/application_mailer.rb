@@ -1,4 +1,5 @@
 class ApplicationMailer < ActionMailer::Base
-  default from: "from@example.com"
+  default from: "Scrapix <noreply@scrapix.meilisearch.com>"
   layout "mailer"
+  helper MailerHelper
 end

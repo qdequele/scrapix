@@ -44,7 +44,6 @@ pub mod analytics;
 pub mod auth;
 pub mod billing;
 pub mod configs;
-pub mod email;
 pub mod email_scheduler;
 pub mod jobs_db;
 pub mod openapi;
@@ -128,10 +127,6 @@ pub struct Args {
     #[arg(long, env = "STRIPE_SECRET_KEY")]
     pub stripe_secret_key: Option<String>,
 
-    /// Resend API key for transactional emails (optional, disables emails if not set)
-    #[arg(long, env = "RESEND_API_KEY")]
-    pub resend_api_key: Option<String>,
-
     /// Maximum jobs to keep in memory
     #[arg(long, env = "MAX_JOBS", default_value = "10000")]
     pub max_jobs: usize,
@@ -197,7 +192,6 @@ struct AppState {
     /// PostgreSQL connection pool (for saved configs, cron scheduling)
     db_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
-    email_client: Option<email::EmailClient>,
     /// Optional Stripe client for payment-backed auto-topup
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
@@ -222,7 +216,6 @@ impl AppState {
         browser_renderer: Option<Arc<CdpRenderer>>,
         ai_service: Option<Arc<AiService>>,
         db_pool: Option<sqlx::PgPool>,
-        email_client: Option<email::EmailClient>,
         stripe_client: Option<::stripe::Client>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
     ) -> Self {
@@ -251,7 +244,6 @@ impl AppState {
             browser_renderer,
             ai_service,
             db_pool,
-            email_client,
             stripe_client,
             analytics_store,
         }
@@ -551,11 +543,8 @@ impl AppState {
                     tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
                 }
 
-                // Send job completion email
-                if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                    (&self.email_client, &self.db_pool, account_id)
-                {
-                    let mailer = mailer.clone();
+                // Queue job completion email (delivered by the Rails app)
+                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, account_id) {
                     let pool = pool.clone();
                     let acct_id = acct_id.clone();
                     let job_id = job_id.to_string();
@@ -566,16 +555,22 @@ impl AppState {
                     tokio::spawn(async move {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
                             if let Some(email_addr) =
-                                email::get_account_email_for_job_notification(&pool, uuid).await
+                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
+                                    .await
                             {
-                                mailer.send_job_completed(
+                                email_scheduler::schedule_email_now(
+                                    &pool,
+                                    "job_completed",
                                     &email_addr,
-                                    &job_id,
-                                    &index_uid,
-                                    pc,
-                                    di,
-                                    ds,
-                                );
+                                    serde_json::json!({
+                                        "job_id": job_id,
+                                        "index_uid": index_uid,
+                                        "pages_crawled": pc,
+                                        "documents_indexed": di,
+                                        "duration_secs": ds,
+                                    }),
+                                )
+                                .await;
                             }
                         }
                     });
@@ -625,7 +620,6 @@ impl AppState {
                                     "Job {} ({} pages × {} credits/page)",
                                     job_id, total_pages, cost_per_page
                                 ),
-                                None,
                                 stripe_cl.as_ref(),
                             )
                             .await
@@ -678,11 +672,8 @@ impl AppState {
                     tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
                 }
 
-                // Send job failure email
-                if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                    (&self.email_client, &self.db_pool, &account_id)
-                {
-                    let mailer = mailer.clone();
+                // Queue job failure email (delivered by the Rails app)
+                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, &account_id) {
                     let pool = pool.clone();
                     let acct_id = acct_id.clone();
                     let job_id = job_id.to_string();
@@ -690,9 +681,20 @@ impl AppState {
                     tokio::spawn(async move {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
                             if let Some(email_addr) =
-                                email::get_account_email_for_job_notification(&pool, uuid).await
+                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
+                                    .await
                             {
-                                mailer.send_job_failed(&email_addr, &job_id, &error, pages_crawled);
+                                email_scheduler::schedule_email_now(
+                                    &pool,
+                                    "job_failed",
+                                    &email_addr,
+                                    serde_json::json!({
+                                        "job_id": job_id,
+                                        "error_message": error,
+                                        "pages_crawled": pages_crawled,
+                                    }),
+                                )
+                                .await;
                             }
                         }
                     });
@@ -2049,7 +2051,6 @@ async fn scrape_url(
             scrape_cost,
             "scrape",
             &format!("{} ({} credits)", final_url, scrape_cost),
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -3194,7 +3195,6 @@ async fn map_url(
             billing::MAP_CREDITS,
             "map",
             &request.url,
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -3424,7 +3424,6 @@ async fn search_url(
             billing::SEARCH_CREDITS,
             "search",
             &format!("{} q={}", request.url, request.q),
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -4474,14 +4473,6 @@ pub async fn run_with_bus(
                 // The schema is owned by the Rails app (saas/db/migrate,
                 // `rails db:prepare`) — the engine no longer applies it.
 
-                // Initialize email client if RESEND_API_KEY is set
-                if let Some(ref api_key) = args.resend_api_key {
-                    state.email_client = Some(email::EmailClient::new(api_key.clone()));
-                    info!("Transactional emails enabled via Resend");
-                } else {
-                    info!("Transactional emails disabled (RESEND_API_KEY not set)");
-                }
-
                 info!("Authentication enabled via PostgreSQL");
                 Some(Arc::new(state))
             }
@@ -4564,7 +4555,6 @@ pub async fn run_with_bus(
         max_jobs: args.max_jobs,
     };
     let db_pool = auth_state.as_ref().map(|a| a.pool.clone());
-    let email_client = auth_state.as_ref().and_then(|a| a.email_client.clone());
     let stripe_client = args.stripe_secret_key.as_ref().map(::stripe::Client::new);
     let state = Arc::new(AppState::new(
         producer,
@@ -4577,7 +4567,6 @@ pub async fn run_with_bus(
         browser_renderer,
         ai_service,
         db_pool,
-        email_client,
         stripe_client,
         analytics_state.clone(),
     ));
@@ -4847,20 +4836,25 @@ pub async fn run_with_bus(
                                     idle_state.process_event(&job_id, &event);
                                     idle_state.broadcast_event(&job_id, event);
 
-                                    // Send job failure email
-                                    if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                                        (&idle_state.email_client, &idle_state.db_pool, &account_id)
+                                    // Queue job failure email (delivered by the Rails app)
+                                    if let (Some(ref pool), Some(ref acct_id)) =
+                                        (&idle_state.db_pool, &account_id)
                                     {
                                         if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
                                             if let Some(email_addr) =
-                                                email::get_account_email_for_job_notification(pool, uuid).await
+                                                email_scheduler::get_account_email_for_job_notification(pool, uuid).await
                                             {
-                                                mailer.send_job_failed(
+                                                email_scheduler::schedule_email_now(
+                                                    pool,
+                                                    "job_failed",
                                                     &email_addr,
-                                                    &job_id,
-                                                    &error_msg,
-                                                    pages_crawled,
-                                                );
+                                                    serde_json::json!({
+                                                        "job_id": job_id,
+                                                        "error_message": error_msg,
+                                                        "pages_crawled": pages_crawled,
+                                                    }),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -4919,22 +4913,27 @@ pub async fn run_with_bus(
                         idle_state.process_event(&job_id, &event);
                         idle_state.broadcast_event(&job_id, event);
 
-                        // Send job completion email
-                        if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                            (&idle_state.email_client, &idle_state.db_pool, &account_id)
+                        // Queue job completion email (delivered by the Rails app)
+                        if let (Some(ref pool), Some(ref acct_id)) =
+                            (&idle_state.db_pool, &account_id)
                         {
                             if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
                                 if let Some(email_addr) =
-                                    email::get_account_email_for_job_notification(pool, uuid).await
+                                    email_scheduler::get_account_email_for_job_notification(pool, uuid).await
                                 {
-                                    mailer.send_job_completed(
+                                    email_scheduler::schedule_email_now(
+                                        pool,
+                                        "job_completed",
                                         &email_addr,
-                                        &job_id,
-                                        &index_uid,
-                                        pages_crawled,
-                                        verified_documents_indexed,
-                                        duration_secs,
-                                    );
+                                        serde_json::json!({
+                                            "job_id": job_id,
+                                            "index_uid": index_uid,
+                                            "pages_crawled": pages_crawled,
+                                            "documents_indexed": verified_documents_indexed,
+                                            "duration_secs": duration_secs,
+                                        }),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -4962,19 +4961,8 @@ pub async fn run_with_bus(
         None
     };
 
-    // Start email scheduler if database + email are configured
-    let email_scheduler_handle =
-        if let (Some(ref pool), Some(ref mailer)) = (&state.db_pool, &state.email_client) {
-            let handle = email_scheduler::spawn_email_scheduler(
-                pool.clone(),
-                mailer.clone(),
-                shutdown_rx.clone(),
-            );
-            info!("Email scheduler started (30s tick interval)");
-            Some(handle)
-        } else {
-            None
-        };
+    // Email delivery moved to the Rails app (SolidQueue drains the shared
+    // scheduled_emails queue); the engine only inserts rows.
 
     // Build router
     // Public routes (no auth required)
@@ -5185,11 +5173,6 @@ pub async fn run_with_bus(
     if let Some(handle) = cron_handle {
         if let Err(e) = handle.await {
             warn!("Cron task failed during shutdown: {}", e);
-        }
-    }
-    if let Some(handle) = email_scheduler_handle {
-        if let Err(e) = handle.await {
-            warn!("Email scheduler task failed during shutdown: {}", e);
         }
     }
     if let Some(handle) = flush_handle {

@@ -1,0 +1,10 @@
+<% invite_url = console_url("/invite?token=#{@token}") %>
+<%= em_heading("You're invited!") %>
+<%= em_paragraph("#{em_strong(@inviter_name)} has invited you to join #{em_strong(@account_name)} on Scrapix.") %>
+<%= em_table do %>
+  <%= em_kv_row("Account", @account_name) %>
+  <%= em_kv_row("Role", @role, last: true) %>
+<% end %>
+<%= em_button(invite_url, "Accept Invite") %>
+<%= em_muted("Or copy this link: <span style=\"color: #818cf8; word-break: break-all;\">#{invite_url}</span>") %>
+<%= em_muted("This invite expires in 7 days. If you weren't expecting this, you can safely ignore it.") %>

@@ -1,0 +1,5 @@
+<%= em_heading("Auto Top-Up Failed") %>
+<%= em_paragraph("We tried to automatically top up your credits, but the charge was declined.") %>
+<%= em_alert("<strong>Reason:</strong> #{ERB::Util.html_escape(@reason)}", :error) %>
+<%= em_paragraph("Your crawl jobs may be paused until you have sufficient credits. Please check your #{em_link(console_url('/settings/billing'), 'payment method')} or manually purchase credits.") %>
+<%= em_button(console_url("/settings/billing"), "Update Payment Method") %>

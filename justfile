@@ -85,7 +85,7 @@ console:
 
 # Run Rails SaaS control plane (migrates the shared DB first — Rails owns the schema)
 saas:
-    cd saas && bin/rails db:prepare && bin/rails server
+    cd saas && bin/rails db:prepare && SOLID_QUEUE_IN_PUMA=1 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES bin/rails server
 
 # ---------------------------------------------------------------------------
 # Build & Test

@@ -47,12 +47,10 @@ class MembersController < ApplicationController
     )
 
     account_name = Account.where(id: account_id).pick(:name) || "Scrapix"
-    EmailQueue.enqueue("team_invite", email, {
-      account_name: account_name,
-      inviter_name: @authenticated_email,
-      role: role,
-      token: raw_token
-    })
+    TeamMailer.with(
+      to: email, account_name: account_name, inviter_name: @authenticated_email,
+      role: role, token: raw_token
+    ).invite.deliver_later
 
     render json: invite
   end
@@ -94,10 +92,9 @@ class MembersController < ApplicationController
 
     if !is_self && removed_email
       account_name = Account.where(id: account_id).pick(:name) || "Scrapix"
-      EmailQueue.enqueue("member_removed", removed_email, {
-        account_name: account_name,
-        removed_by: @authenticated_email
-      })
+      TeamMailer.with(
+        to: removed_email, account_name: account_name, removed_by: @authenticated_email
+      ).member_removed.deliver_later
     end
 
     render json: { message: "Member removed" }

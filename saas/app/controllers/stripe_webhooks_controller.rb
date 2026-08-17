@@ -97,7 +97,8 @@ class StripeWebhooksController < ApplicationController
     email = StripeBilling.account_email(account_id)
     return unless email
 
-    EmailQueue.enqueue("payment_receipt", email, { credits: credits, amount_cents: amount_cents })
+    BillingMailer.with(to: email, credits: credits, amount_cents: amount_cents)
+                 .payment_receipt.deliver_later
   end
 
   def valid_uuid?(value)

@@ -17,14 +17,11 @@ pub(crate) use middleware::validate_api_key_or_session;
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-use crate::email::EmailClient;
-
 /// Shared auth state: database pool + JWT secret
 #[derive(Clone)]
 pub struct AuthState {
     pub pool: PgPool,
     pub jwt_secret: String,
-    pub email_client: Option<EmailClient>,
 }
 
 impl AuthState {
@@ -42,10 +39,6 @@ impl AuthState {
             .max_connections(10)
             .connect(&url)
             .await?;
-        Ok(Self {
-            pool,
-            jwt_secret,
-            email_client: None,
-        })
+        Ok(Self { pool, jwt_secret })
     }
 }

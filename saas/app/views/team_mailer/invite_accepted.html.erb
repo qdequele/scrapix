@@ -1,0 +1,7 @@
+<%= em_heading("New Team Member") %>
+<%= em_paragraph("#{em_strong(@member_name)} has accepted your invitation and joined #{em_strong(@account_name)}.") %>
+<%= em_table do %>
+  <%= em_kv_row("Member", @member_name) %>
+  <%= em_kv_row("Role", @role, last: true) %>
+<% end %>
+<%= em_button(console_url("/settings/team"), "View Team") %>

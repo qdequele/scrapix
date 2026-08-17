@@ -39,7 +39,8 @@ class AuthController < ApplicationController
     end
 
     auto_accept_pending_invites(user)
-    EmailQueue.verification(email, full_name, verification_token)
+    AuthMailer.with(to: email, name: full_name, token: verification_token)
+              .verification.deliver_later
     set_session_cookie(user.id, email)
 
     render json: {
@@ -79,7 +80,8 @@ class AuthController < ApplicationController
     end
 
     user.update_columns(email_verified: true, email_verification_token: nil)
-    EmailQueue.welcome(user.email, user.full_name, send_at: 120.seconds.from_now)
+    AuthMailer.with(to: user.email, name: user.full_name)
+              .welcome.deliver_later(wait: 120.seconds)
     render json: { message: "Email verified successfully" }
   end
 
@@ -92,7 +94,8 @@ class AuthController < ApplicationController
 
     token = random_token(48)
     user.update_columns(email_verification_token: token)
-    EmailQueue.verification(user.email, user.full_name, token)
+    AuthMailer.with(to: user.email, name: user.full_name, token: token)
+              .verification.deliver_later
     render json: { message: "Verification email sent" }
   end
 
@@ -108,7 +111,7 @@ class AuthController < ApplicationController
       token_hash: Digest::SHA256.hexdigest(raw_token),
       expires_at: 1.hour.from_now
     )
-    EmailQueue.password_reset(user.email, raw_token)
+    AuthMailer.with(to: user.email, token: raw_token).password_reset.deliver_later
     render json: generic
   end
 
@@ -127,7 +130,7 @@ class AuthController < ApplicationController
       User.find(token.user_id).update!(password_hash: Argon2::Password.create(params[:password].to_s))
     end
     if (email = User.where(id: token.user_id).pick(:email))
-      EmailQueue.password_changed(email)
+      AuthMailer.with(to: email).password_changed.deliver_later
     end
     render json: { message: "Password reset successfully. Please log in with your new password." }
   end

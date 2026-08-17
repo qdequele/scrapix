@@ -167,7 +167,7 @@ class SocialAuthController < ApplicationController
     end
 
     auto_accept_invites(user)
-    EmailQueue.welcome(user.email, user.full_name)
+    AuthMailer.with(to: user.email, name: user.full_name).welcome.deliver_later
     [ user.id, user.email ]
   rescue ActiveRecord::ActiveRecordError => e
     Rails.logger.warn("Social find_or_create failed (#{provider}): #{e.message}")

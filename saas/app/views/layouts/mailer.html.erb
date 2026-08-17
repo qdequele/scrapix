@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="supported-color-schemes" content="dark">
+  <title><%= @title || message.subject %></title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #0a0a0f; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #0a0a0f;">
+    <tr>
+      <td align="center" style="padding: 40px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width: 560px; width: 100%;">
+          <tr>
+            <td style="padding-bottom: 32px;">
+              <a href="<%= console_url %>" style="text-decoration: none;">
+                <img src="<%= "#{MailerHelper::CONSOLE_URL}/logotype_dark@2x.png" %>" alt="Scrapix" width="120" height="35" style="display: block; border: 0; height: 35px; width: auto;" />
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color: #18181b; border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 40px 32px;">
+              <%= yield %>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-top: 32px; text-align: center;">
+              <p style="margin: 0 0 8px; color: #52525b; font-size: 12px; line-height: 1.5;">
+                <a href="<%= console_url %>" style="color: #52525b; text-decoration: underline;">Console</a>
+                &nbsp;&middot;&nbsp;
+                <a href="https://docs.scrapix.meilisearch.com" style="color: #52525b; text-decoration: underline;">Docs</a>
+                &nbsp;&middot;&nbsp;
+                <a href="<%= console_url("/settings") %>" style="color: #52525b; text-decoration: underline;">Settings</a>
+              </p>
+              <p style="margin: 0; color: #3f3f46; font-size: 11px;">Scrapix by Meilisearch</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

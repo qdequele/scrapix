@@ -1,0 +1,10 @@
+<%= em_heading("Crawl Failed") %>
+<%= em_paragraph("Your crawl job encountered an error and could not complete.") %>
+<div style="background: #27272a; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 16px; margin: 16px 0;">
+  <p style="margin: 0; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 13px; line-height: 1.5; color: #fca5a5; word-break: break-all;"><%= @error_message %></p>
+</div>
+<%= em_table do %>
+  <%= em_kv_row("Job ID", @job_id, mono: true) %>
+  <%= em_kv_row("Pages before failure", @pages_crawled, last: true) %>
+<% end %>
+<%= em_button(console_url("/jobs/#{@job_id}"), "View Details") %>

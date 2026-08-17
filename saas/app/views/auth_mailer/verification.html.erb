@@ -1,0 +1,6 @@
+<% verify_url = console_url("/auth/verify-email?token=#{@token}") %>
+<%= em_heading("Hey #{ERB::Util.html_escape(@name)}, verify your email") %>
+<%= em_paragraph("Please verify your email address to activate your Scrapix account and start crawling.") %>
+<%= em_button(verify_url, "Verify Email Address") %>
+<%= em_muted("Or copy this link: <span style=\"color: #818cf8; word-break: break-all;\">#{verify_url}</span>") %>
+<%= em_muted("If you didn't create a Scrapix account, you can safely ignore this email.") %>

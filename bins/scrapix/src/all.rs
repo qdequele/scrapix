@@ -126,7 +126,6 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         database_url: args.database_url.clone(),
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        resend_api_key: std::env::var("RESEND_API_KEY").ok(),
         max_jobs: 1000,
         verbose: args.verbose,
     };
@@ -368,7 +367,6 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         database_url: args.database_url.clone(),
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        resend_api_key: std::env::var("RESEND_API_KEY").ok(),
         max_jobs: 1000,
         verbose: args.verbose,
     };

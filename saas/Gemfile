@@ -52,3 +52,6 @@ gem "stripe", "~> 19.4"
 
 # Official MCP Ruby SDK — powers the /mcp Streamable HTTP endpoint.
 gem "mcp", "~> 0.4"
+
+# Database-backed Active Job backend (email delivery + recurring drains).
+gem "solid_queue", "~> 1.2"
