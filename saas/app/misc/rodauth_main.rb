@@ -153,6 +153,10 @@ class RodauthMain < Rodauth::Rails::Auth
     # ==> Remember Feature (remember_login runs in the after_login hook above)
     extend_remember_deadline? true
 
+    # ==> MFA
+    # Generate recovery codes automatically when a second factor is added.
+    auto_add_recovery_codes? true
+
     # ==> WebAuthn
     webauthn_rp_name "Scrapix"
 

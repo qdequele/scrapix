@@ -289,7 +289,7 @@ CREATE TABLE public.oauth_tokens (
     revoked boolean DEFAULT false NOT NULL,
     parent_token_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT oauth_tokens_token_type_check CHECK (((token_type)::text = ANY ((ARRAY['access'::character varying, 'refresh'::character varying])::text[])))
+    CONSTRAINT oauth_tokens_token_type_check CHECK (((token_type)::text = ANY (ARRAY[('access'::character varying)::text, ('refresh'::character varying)::text])))
 );
 
 
@@ -1333,6 +1333,13 @@ CREATE INDEX index_oauth_tokens_on_token_hash_live ON public.oauth_tokens USING 
 
 
 --
+-- Name: index_scheduled_emails_job_dedupe; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_scheduled_emails_job_dedupe ON public.scheduled_emails USING btree (email_type, ((payload ->> 'job_id'::text))) WHERE (email_type = ANY (ARRAY['job_completed'::text, 'job_failed'::text]));
+
+
+--
 -- Name: index_scheduled_emails_on_send_at_pending; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1810,6 +1817,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260817160001'),
 ('20260817131333'),
 ('20260817000015'),
 ('20260817000014'),

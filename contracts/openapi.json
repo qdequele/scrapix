@@ -586,26 +586,54 @@
         },
         "responses": {
           "200": {
-            "description": "Login successful",
+            "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserResponse"
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    },
+                    "two_factor_required": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
                 }
               }
             }
           },
           "401": {
-            "description": "Invalid credentials",
+            "description": "Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
                 }
               }
             }
           }
-        }
+        },
+        "summary": "Log in",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. When the account has a second factor configured, the response carries two_factor_required=true and the session cookie is withheld until /auth/otp-auth or /auth/webauthn-auth succeeds."
       }
     },
     "/auth/logout": {
@@ -616,16 +644,26 @@
         "operationId": "logout",
         "responses": {
           "200": {
-            "description": "Logged out successfully",
+            "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MessageResponse"
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
                 }
               }
             }
           }
-        }
+        },
+        "summary": "Log out",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me."
       }
     },
     "/auth/me": {
@@ -660,7 +698,8 @@
           {
             "api_key": []
           }
-        ]
+        ],
+        "description": "Current user profile. Since SCR-87 I5 the payload includes mfa: {totp: boolean, passkeys: number}."
       },
       "patch": {
         "tags": [
@@ -714,36 +753,76 @@
         },
         "responses": {
           "200": {
-            "description": "User created successfully",
+            "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserResponse"
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
                 }
               }
             }
           },
-          "400": {
-            "description": "Validation error",
+          "403": {
+            "description": "Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
                 }
               }
             }
           },
-          "409": {
-            "description": "Email already taken",
+          "422": {
+            "description": "Error",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
                 }
               }
             }
           }
-        }
+        },
+        "summary": "Create an account",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Signup provisions a billing account with 100 welcome credits and sets the scrapix_session cookie."
       }
     },
     "/configs": {
@@ -1633,7 +1712,7 @@
         "tags": [
           "health"
         ],
-        "summary": "Service health endpoint — reports liveness of each component",
+        "summary": "Service health endpoint \u2014 reports liveness of each component",
         "operationId": "health_services",
         "responses": {
           "200": {
@@ -1781,7 +1860,7 @@
           "map"
         ],
         "summary": "Map a website: sitemap-first discovery with optional BFS deep crawl",
-        "description": "Discovers URLs via:\n1. Sitemap parsing (robots.txt → sitemap.xml → sitemap indexes)\n2. Optional BFS link crawling when `depth > 0`\n\nEach URL can be enriched with title, description (from HTML head) and\nlastmod, priority, changefreq (from sitemap data) depending on `get_*` flags.",
+        "description": "Discovers URLs via:\n1. Sitemap parsing (robots.txt \u2192 sitemap.xml \u2192 sitemap indexes)\n2. Optional BFS link crawling when `depth > 0`\n\nEach URL can be enriched with title, description (from HTML head) and\nlastmod, priority, changefreq (from sitemap data) depending on `get_*` flags.",
         "operationId": "map_url",
         "requestBody": {
           "content": {
@@ -1921,6 +2000,989 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SystemStatsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/verify-email": {
+      "post": {
+        "summary": "Verify email address",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. The key comes from the verification email link.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/resend-verification": {
+      "post": {
+        "summary": "Resend the verification email",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Requires an authenticated session.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/forgot-password": {
+      "post": {
+        "summary": "Request a password reset",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Always responds generically; reveals nothing about account existence.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/reset-password": {
+      "post": {
+        "summary": "Reset the password",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. The key comes from the reset email link. Only redeemable for verified accounts.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "minLength": 12
+                  }
+                },
+                "required": [
+                  "key",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/otp-setup": {
+      "post": {
+        "summary": "TOTP enrollment",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Two-step: POST {password} returns otp_secret/otp_raw_secret (422); POST again with otp_secret, otp_raw_secret, and the current otp code to enable.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  },
+                  "otp_secret": {
+                    "type": "string"
+                  },
+                  "otp_raw_secret": {
+                    "type": "string"
+                  },
+                  "otp": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/otp-auth": {
+      "post": {
+        "summary": "TOTP second factor",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Completes a two-factor login; issues the scrapix_session cookie.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "otp": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "otp"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/otp-disable": {
+      "post": {
+        "summary": "Disable TOTP",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. ",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/recovery-auth": {
+      "post": {
+        "summary": "Recovery-code second factor",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Each code is single-use.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "recovery-code": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "recovery-code"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/recovery-codes": {
+      "post": {
+        "summary": "View recovery codes",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Requires TOTP or another second factor to be configured.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    },
+                    "codes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/webauthn-setup": {
+      "post": {
+        "summary": "Register a passkey",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Two-step WebAuthn ceremony: POST {password} returns creation options; POST the credential JSON back with the challenge params.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  },
+                  "webauthn_setup": {
+                    "type": "string"
+                  },
+                  "webauthn_setup_challenge": {
+                    "type": "string"
+                  },
+                  "webauthn_setup_challenge_hmac": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/webauthn-auth": {
+      "post": {
+        "summary": "Passkey second factor",
+        "description": "Rodauth JSON route (SCR-87 I5): 2xx responses are {success}, failures are {error} plus an optional [field, message] \"field-error\" pair. The user object lives at GET /auth/me. Two-step WebAuthn ceremony: POST {} returns request options; POST the assertion JSON back.",
+        "tags": [
+          "auth"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "webauthn_auth": {
+                    "type": "string"
+                  },
+                  "webauthn_auth_challenge": {
+                    "type": "string"
+                  },
+                  "webauthn_auth_challenge_hmac": {
+                    "type": "string"
+                  }
+                },
+                "required": []
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field-error": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "[field, message] pair for the failing field"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
                 }
               }
             }
@@ -2408,7 +3470,7 @@
           },
           "meilisearch": {
             "$ref": "#/components/schemas/MeilisearchConfig",
-            "description": "Meilisearch settings (optional — resolved from account's default engine when empty)"
+            "description": "Meilisearch settings (optional \u2014 resolved from account's default engine when empty)"
           },
           "proxy": {
             "oneOf": [

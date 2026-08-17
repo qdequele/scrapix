@@ -15,4 +15,12 @@ class User < ApplicationRecord
   def primary_membership
     account_members.order(joined_at: :asc).first
   end
+
+  def totp_enabled?
+    UserOtpKey.exists?(id: id)
+  end
+
+  def passkeys_count
+    UserWebauthnKey.where(account_id: id).count
+  end
 end

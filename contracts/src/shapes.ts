@@ -24,6 +24,7 @@ export const USER: Spec = {
   full_name: "string|null",
   email_verified: "boolean",
   notify_job_emails: "boolean",
+  mfa: { totp: "boolean", passkeys: "number" },
   account: ACCOUNT,
 };
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, Suspense } from "react";
-import { login, signup } from "@/lib/auth";
+import { login, signup, otpAuth, recoveryAuth, webauthnAuth } from "@/lib/auth";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,9 @@ function LoginPageInner() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [twoFactor, setTwoFactor] = useState(false);
+  const [code, setCode] = useState("");
+  const [useRecovery, setUseRecovery] = useState(false);
   const router = useRouter();
   const searchParams = useSearchParams();
   const isDev = checkIsDev();
@@ -49,11 +52,47 @@ function LoginPageInner() {
     setLoading(true);
 
     try {
-      await login(email, password);
+      const result = await login(email, password);
+      if (result.twoFactorRequired) {
+        setTwoFactor(true);
+        setLoading(false);
+        return;
+      }
       router.push("/dashboard");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
+      setLoading(false);
+    }
+  };
+
+  const handleSecondFactor = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+    try {
+      if (useRecovery) {
+        await recoveryAuth(code.trim());
+      } else {
+        await otpAuth(code.trim());
+      }
+      router.push("/dashboard");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid code");
+      setLoading(false);
+    }
+  };
+
+  const handlePasskey = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      await webauthnAuth();
+      router.push("/dashboard");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Passkey authentication failed");
       setLoading(false);
     }
   };
@@ -65,9 +104,14 @@ function LoginPageInner() {
     const devPassword = "dev123456";
 
     try {
-      await login(devEmail, devPassword);
-      router.push("/dashboard");
-      router.refresh();
+      const result = await login(devEmail, devPassword);
+      if (!result.twoFactorRequired) {
+        router.push("/dashboard");
+        router.refresh();
+        return;
+      }
+      setTwoFactor(true);
+      setLoading(false);
     } catch {
       try {
         await signup(devEmail, devPassword, "Dev User");
@@ -79,6 +123,74 @@ function LoginPageInner() {
       }
     }
   };
+
+  if (twoFactor) {
+    return (
+      <>
+        <div className="flex flex-col space-y-2 text-center">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Two-factor authentication
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {useRecovery
+              ? "Enter one of your recovery codes"
+              : "Enter the 6-digit code from your authenticator app"}
+          </p>
+        </div>
+        <div className="grid gap-6">
+          <form onSubmit={handleSecondFactor}>
+            <div className="grid gap-4">
+              {error && (
+                <div className="p-3 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 rounded-md">
+                  {error}
+                </div>
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="code">
+                  {useRecovery ? "Recovery code" : "Authentication code"}
+                </Label>
+                <Input
+                  id="code"
+                  inputMode={useRecovery ? "text" : "numeric"}
+                  autoComplete="one-time-code"
+                  autoFocus
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  disabled={loading}
+                  required
+                />
+              </div>
+              <Button type="submit" disabled={loading}>
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Verify
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={loading}
+                onClick={handlePasskey}
+              >
+                Use a passkey instead
+              </Button>
+            </div>
+          </form>
+          <p className="text-center text-sm text-muted-foreground">
+            <button
+              type="button"
+              className="underline underline-offset-4 hover:text-primary"
+              onClick={() => {
+                setUseRecovery(!useRecovery);
+                setCode("");
+                setError(null);
+              }}
+            >
+              {useRecovery ? "Use an authenticator code" : "Use a recovery code"}
+            </button>
+          </p>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -128,6 +240,14 @@ function LoginPageInner() {
               {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Sign in
             </Button>
+            <p className="text-center text-sm text-muted-foreground">
+              <Link
+                href="/forgot-password"
+                className="underline underline-offset-4 hover:text-primary"
+              >
+                Forgot your password?
+              </Link>
+            </p>
           </div>
         </form>
         <div className="relative">

@@ -16,3 +16,8 @@ Rails.application.configure do
   end
   config.action_mailer.raise_delivery_errors = true
 end
+
+# App classes aren't autoloadable at initializer time — defer to to_prepare.
+Rails.application.config.to_prepare do
+  ActionMailer::Base.register_interceptor(DevRecipientFilter) if Rails.env.development?
+end

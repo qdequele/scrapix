@@ -91,6 +91,7 @@ class AuthController < ApplicationController
       full_name: user.full_name,
       email_verified: user.verified?,
       notify_job_emails: user.notify_job_emails,
+      mfa: { totp: user.totp_enabled?, passkeys: user.passkeys_count },
       account: account
     }
   end

@@ -16,9 +16,11 @@ pub async fn schedule_email(
     payload: serde_json::Value,
     send_at: chrono::DateTime<chrono::Utc>,
 ) {
+    // ON CONFLICT: a partial unique index dedupes job notifications — the
+    // completion/failure email can be queued from more than one code path.
     let result = sqlx::query(
         "INSERT INTO scheduled_emails (email_type, recipient, payload, send_at) \
-         VALUES ($1, $2, $3, $4)",
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
     )
     .bind(email_type)
     .bind(recipient)
