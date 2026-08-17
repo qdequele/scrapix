@@ -1,0 +1,6 @@
+acme_default:
+  account: acme
+  name: default
+  url: http://localhost:7700
+  api_key: masterKey
+  is_default: true
