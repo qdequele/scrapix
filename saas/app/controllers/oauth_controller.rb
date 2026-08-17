@@ -93,8 +93,8 @@ class OauthController < ApplicationController
   # POST /oauth/authorize — validate credentials, issue code, redirect (307)
   def authorize
     user = User.find_by(email: params[:email].to_s)
-    valid = user.present? &&
-            (Argon2::Password.verify_password(params[:password].to_s, user.password_hash) rescue false)
+    valid = user&.password_hash.present? &&
+            (BCrypt::Password.new(user.password_hash) == params[:password].to_s rescue false)
     return authorize_error_page("Invalid email or password") unless valid
 
     unless OauthClient.exists?(client_id: params[:client_id].to_s)

@@ -22,7 +22,7 @@ module SessionToken
       path: "/",
       httponly: true,
       same_site: :lax,
-      secure: ENV.fetch("ENVIRONMENT", "production") != "development",
+      secure: Rails.env.production?,
       expires: VALIDITY.from_now
     }
   end

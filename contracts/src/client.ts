@@ -131,7 +131,11 @@ export class Session {
 
 let counter = 0;
 
-/** Create a fresh user + account and return an authenticated session. */
+/**
+ * Create a fresh user + account and return an authenticated session.
+ * Signup is a Rodauth route: the response is {success}, the user object
+ * comes from /auth/me.
+ */
 export async function signupFresh(): Promise<{
   session: Session;
   email: string;
@@ -147,10 +151,11 @@ export async function signupFresh(): Promise<{
     password,
     full_name: "Contract Test",
   });
-  if (res.status !== 200 && res.status !== 201) {
+  if (res.status !== 200) {
     throw new Error(
       `signup failed (${res.status}): ${JSON.stringify(res.body)} — is the backend running at ${BASE_URL} with auth enabled?`,
     );
   }
-  return { session, email, password, user: res.body };
+  const me = await session.get("/auth/me");
+  return { session, email, password, user: me.body };
 }

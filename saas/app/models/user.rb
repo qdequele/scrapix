@@ -1,8 +1,12 @@
 class User < ApplicationRecord
+  include Rodauth::Rails.model
+
+  # Rodauth account state.
+  enum :status, { unverified: 1, verified: 2, closed: 3 }
+
   has_many :account_members, dependent: :delete_all
   has_many :accounts, through: :account_members
   has_many :oauth_identities, dependent: :delete_all
-  has_many :password_reset_tokens, dependent: :delete_all
 
   validates :email, presence: true, uniqueness: true
 

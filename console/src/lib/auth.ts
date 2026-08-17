@@ -18,21 +18,35 @@ export interface AuthUser {
   } | null;
 }
 
+// Rodauth JSON responses: {success} on 2xx, {error, "field-error": [field, msg]}
+// on failure. The full user object comes from /auth/me afterwards.
+function rodauthError(body: Record<string, unknown>, fallback: string): string {
+  const fieldError = body["field-error"] as [string, string] | undefined;
+  if (fieldError) return `${fieldError[0]} ${fieldError[1]}`;
+  return (body.error as string) || fallback;
+}
+
 export async function login(
   email: string,
   password: string
 ): Promise<AuthUser> {
   const res = await fetch(`${BASE}/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ email, password }),
     credentials: "include",
   });
+  const body = await res.json().catch(() => ({ error: "Login failed" }));
   if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: "Login failed" }));
-    throw new Error(body.error || "Login failed");
+    throw new Error(rodauthError(body, "Login failed"));
   }
-  return res.json();
+  if (body.two_factor_required) {
+    // TOTP/passkey challenge UI is a follow-up; enrollment is API-only today.
+    throw new Error(
+      "This account requires two-factor authentication, which the console does not support yet."
+    );
+  }
+  return getMe();
 }
 
 export async function signup(
@@ -42,20 +56,22 @@ export async function signup(
 ): Promise<AuthUser> {
   const res = await fetch(`${BASE}/auth/signup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ email, password, full_name }),
     credentials: "include",
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: "Signup failed" }));
-    throw new Error(body.error || "Signup failed");
+    throw new Error(rodauthError(body, "Signup failed"));
   }
-  return res.json();
+  return getMe();
 }
 
 export async function logout(): Promise<void> {
   await fetch(`${BASE}/auth/logout`, {
     method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: "{}",
     credentials: "include",
   });
 }

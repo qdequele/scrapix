@@ -180,3 +180,14 @@ export const OAUTH_ERROR: Spec = {
   error: "string",
   error_description: "string",
 };
+
+// ── Rodauth JSON envelope (auth flows since SCR-87 I5) ──────────────────────
+
+export const RODAUTH_SUCCESS: Spec = {
+  success: "string",
+};
+
+export const RODAUTH_ERROR: Spec = {
+  error: "string",
+  "field-error": "any?",
+};

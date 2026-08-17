@@ -41,6 +41,11 @@ module Saas
     # excludes the cookie middleware that serializes the jar into headers.
     config.middleware.use ActionDispatch::Cookies
 
+    # Rodauth keeps its authentication state in the Rails session (the
+    # cross-service scrapix_session JWT is issued separately on login).
+    config.session_store :cookie_store, key: "_scrapix_saas_session", same_site: :lax
+    config.middleware.use config.session_store, config.session_options
+
     # The schema carries a PL/pgSQL function (validate_api_key, shared with
     # the Rust engine) and partial indexes — schema.rb can't express those.
     config.active_record.schema_format = :sql

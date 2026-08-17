@@ -11,6 +11,20 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: citext; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION citext; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION citext IS 'data type for case-insensitive character strings';
+
+
+--
 -- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -276,20 +290,6 @@ CREATE TABLE public.oauth_tokens (
     parent_token_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT oauth_tokens_token_type_check CHECK (((token_type)::text = ANY ((ARRAY['access'::character varying, 'refresh'::character varying])::text[])))
-);
-
-
---
--- Name: password_reset_tokens; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.password_reset_tokens (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    user_id uuid NOT NULL,
-    token_hash text NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    used boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -707,19 +707,110 @@ CREATE TABLE public.transactions (
 
 
 --
+-- Name: user_login_change_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_login_change_keys (
+    id uuid NOT NULL,
+    key character varying NOT NULL,
+    login character varying NOT NULL,
+    deadline timestamp(6) without time zone NOT NULL
+);
+
+
+--
+-- Name: user_otp_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_otp_keys (
+    id uuid NOT NULL,
+    key character varying NOT NULL,
+    num_failures integer DEFAULT 0 NOT NULL,
+    last_use timestamp(6) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: user_password_reset_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_password_reset_keys (
+    id uuid NOT NULL,
+    key character varying NOT NULL,
+    deadline timestamp(6) without time zone NOT NULL,
+    email_last_sent timestamp(6) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: user_recovery_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_recovery_codes (
+    id uuid NOT NULL,
+    code character varying NOT NULL
+);
+
+
+--
+-- Name: user_remember_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_remember_keys (
+    id uuid NOT NULL,
+    key character varying NOT NULL,
+    deadline timestamp(6) without time zone NOT NULL
+);
+
+
+--
+-- Name: user_verification_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_verification_keys (
+    id uuid NOT NULL,
+    key character varying NOT NULL,
+    requested_at timestamp(6) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    email_last_sent timestamp(6) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: user_webauthn_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_webauthn_keys (
+    account_id uuid NOT NULL,
+    webauthn_id character varying NOT NULL,
+    public_key character varying NOT NULL,
+    sign_count integer NOT NULL,
+    last_use timestamp(6) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+--
+-- Name: user_webauthn_user_ids; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_webauthn_user_ids (
+    id uuid NOT NULL,
+    webauthn_id character varying NOT NULL
+);
+
+
+--
 -- Name: users; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.users (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    email text NOT NULL,
+    email public.citext NOT NULL,
     password_hash text,
     full_name text,
-    email_verified boolean DEFAULT false NOT NULL,
-    email_verification_token text,
     notify_job_emails boolean DEFAULT true NOT NULL,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
-    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL
+    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    status integer DEFAULT 1 NOT NULL
 );
 
 
@@ -897,14 +988,6 @@ ALTER TABLE ONLY public.oauth_tokens
 
 
 --
--- Name: password_reset_tokens password_reset_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.password_reset_tokens
-    ADD CONSTRAINT password_reset_tokens_pkey PRIMARY KEY (id);
-
-
---
 -- Name: scheduled_emails scheduled_emails_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1014,6 +1097,70 @@ ALTER TABLE ONLY public.solid_queue_semaphores
 
 ALTER TABLE ONLY public.transactions
     ADD CONSTRAINT transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_login_change_keys user_login_change_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_login_change_keys
+    ADD CONSTRAINT user_login_change_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_otp_keys user_otp_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_otp_keys
+    ADD CONSTRAINT user_otp_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_password_reset_keys user_password_reset_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_password_reset_keys
+    ADD CONSTRAINT user_password_reset_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_recovery_codes user_recovery_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_recovery_codes
+    ADD CONSTRAINT user_recovery_codes_pkey PRIMARY KEY (id, code);
+
+
+--
+-- Name: user_remember_keys user_remember_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_remember_keys
+    ADD CONSTRAINT user_remember_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_verification_keys user_verification_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_verification_keys
+    ADD CONSTRAINT user_verification_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_webauthn_keys user_webauthn_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_webauthn_keys
+    ADD CONSTRAINT user_webauthn_keys_pkey PRIMARY KEY (account_id, webauthn_id);
+
+
+--
+-- Name: user_webauthn_user_ids user_webauthn_user_ids_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_webauthn_user_ids
+    ADD CONSTRAINT user_webauthn_user_ids_pkey PRIMARY KEY (id);
 
 
 --
@@ -1183,20 +1330,6 @@ CREATE UNIQUE INDEX index_oauth_tokens_on_token_hash ON public.oauth_tokens USIN
 --
 
 CREATE INDEX index_oauth_tokens_on_token_hash_live ON public.oauth_tokens USING btree (token_hash) WHERE (revoked = false);
-
-
---
--- Name: index_password_reset_tokens_on_token_hash_usable; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX index_password_reset_tokens_on_token_hash_usable ON public.password_reset_tokens USING btree (token_hash) WHERE (used = false);
-
-
---
--- Name: index_password_reset_tokens_on_user_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX index_password_reset_tokens_on_user_id ON public.password_reset_tokens USING btree (user_id);
 
 
 --
@@ -1439,11 +1572,19 @@ ALTER TABLE ONLY public.transactions
 
 
 --
--- Name: password_reset_tokens fk_rails_1dfd31e72f; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: user_password_reset_keys fk_rails_14f8ce8b45; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.password_reset_tokens
-    ADD CONSTRAINT fk_rails_1dfd31e72f FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.user_password_reset_keys
+    ADD CONSTRAINT fk_rails_14f8ce8b45 FOREIGN KEY (id) REFERENCES public.users(id);
+
+
+--
+-- Name: user_recovery_codes fk_rails_187ffe45a2; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_recovery_codes
+    ADD CONSTRAINT fk_rails_187ffe45a2 FOREIGN KEY (id) REFERENCES public.users(id);
 
 
 --
@@ -1487,6 +1628,14 @@ ALTER TABLE ONLY public.oauth_tokens
 
 
 --
+-- Name: user_webauthn_keys fk_rails_38d161fed3; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_webauthn_keys
+    ADD CONSTRAINT fk_rails_38d161fed3 FOREIGN KEY (account_id) REFERENCES public.users(id);
+
+
+--
 -- Name: solid_queue_failed_executions fk_rails_39bbc7a631; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1508,6 +1657,22 @@ ALTER TABLE ONLY public.solid_queue_blocked_executions
 
 ALTER TABLE ONLY public.account_members
     ADD CONSTRAINT fk_rails_691c5572ed FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_webauthn_user_ids fk_rails_70a7526cb9; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_webauthn_user_ids
+    ADD CONSTRAINT fk_rails_70a7526cb9 FOREIGN KEY (id) REFERENCES public.users(id);
+
+
+--
+-- Name: user_login_change_keys fk_rails_75ab774cc7; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_login_change_keys
+    ADD CONSTRAINT fk_rails_75ab774cc7 FOREIGN KEY (id) REFERENCES public.users(id);
 
 
 --
@@ -1567,6 +1732,14 @@ ALTER TABLE ONLY public.oauth_tokens
 
 
 --
+-- Name: user_verification_keys fk_rails_b5d6b8f85b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_verification_keys
+    ADD CONSTRAINT fk_rails_b5d6b8f85b FOREIGN KEY (id) REFERENCES public.users(id);
+
+
+--
 -- Name: jobs fk_rails_c31d0a1ae2; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1591,11 +1764,27 @@ ALTER TABLE ONLY public.oauth_tokens
 
 
 --
+-- Name: user_otp_keys fk_rails_e84eb0246f; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_otp_keys
+    ADD CONSTRAINT fk_rails_e84eb0246f FOREIGN KEY (id) REFERENCES public.users(id);
+
+
+--
 -- Name: crawl_configs fk_rails_eda3dae7b4; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.crawl_configs
     ADD CONSTRAINT fk_rails_eda3dae7b4 FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_remember_keys fk_rails_ee6b3c037b; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_remember_keys
+    ADD CONSTRAINT fk_rails_ee6b3c037b FOREIGN KEY (id) REFERENCES public.users(id);
 
 
 --
@@ -1621,6 +1810,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260817131333'),
 ('20260817000015'),
 ('20260817000014'),
 ('20260817000013'),

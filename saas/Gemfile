@@ -43,8 +43,6 @@ end
 gem "jwt", "~> 3.2"
 gem "fugit", "~> 1.13"
 
-gem "argon2", "~> 2.3"
-
 gem "rack-attack", "~> 6.8"
 gem "redis", "~> 6.0"
 
@@ -55,3 +53,18 @@ gem "mcp", "~> 0.4"
 
 # Database-backed Active Job backend (email delivery + recurring drains).
 gem "solid_queue", "~> 1.2"
+
+# Rodauth authentication (JSON API mode) + TOTP/WebAuthn/social login.
+gem "rodauth-rails", "~> 2.1"
+gem "rodauth-omniauth", "~> 0.6"
+gem "omniauth-google-oauth2", "~> 1.2"
+gem "omniauth-github", "~> 2.0"
+gem "rotp", "~> 6.3"
+gem "rqrcode", "~> 3.1"
+gem "webauthn", "~> 3.4"
+# Enables Sequel to use Active Record's database connection
+gem "sequel-activerecord_connection", "~> 2.0", require: false
+# Used by Rodauth for password hashing
+gem "bcrypt", "~> 3.1", require: false
+# Used by Rodauth for rendering built-in view and email templates
+gem "tilt", "~> 2.4", require: false

@@ -9,22 +9,16 @@ Rails.application.routes.draw do
   # analytics pipes (phase 3, done) → configs/engines (phase 4, done) →
   # auth/sessions → account/team/keys → billing/Stripe → OAuth provider + MCP.
 
-  # Phase 5: password auth, sessions, and social login.
+  # Authentication flows (signup/login/logout/verify/reset, TOTP 2FA,
+  # WebAuthn passkeys, Google/GitHub social login) are Rodauth routes under
+  # /auth, served by the Rodauth::Rails middleware (app/misc/rodauth_app.rb).
+  # What remains here is profile/membership data.
   scope "auth", controller: :auth do
-    post "signup", action: :signup
-    post "login", action: :login
-    post "logout", action: :logout
-    get "verify-email", action: :verify_email
-    post "forgot-password", action: :forgot_password
-    post "reset-password", action: :reset_password
-    post "resend-verification", action: :resend_verification
     get "me", action: :me
     patch "me", action: :update_me
     get "me/accounts", action: :my_accounts
     post "me/accounts", action: :create_account
     post "accept-invite", action: :accept_invite
-    get "social/:provider", to: "social_auth#initiate"
-    get "social/:provider/callback", to: "social_auth#callback"
   end
 
   # Phase 6: account, team, invites, API keys, non-Stripe billing.
