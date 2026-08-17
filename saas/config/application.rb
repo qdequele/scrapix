@@ -40,5 +40,9 @@ module Saas
     # The auth endpoints set/clear the scrapix_session cookie; API mode
     # excludes the cookie middleware that serializes the jar into headers.
     config.middleware.use ActionDispatch::Cookies
+
+    # The schema carries a PL/pgSQL function (validate_api_key, shared with
+    # the Rust engine) and partial indexes — schema.rb can't express those.
+    config.active_record.schema_format = :sql
   end
 end

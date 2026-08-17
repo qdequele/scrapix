@@ -5,4 +5,4 @@ RUN bundle install
 COPY . .
 EXPOSE 8081
 ENV SAAS_PORT=8081
-CMD ["bin/rails", "server", "-b", "0.0.0.0"]
+CMD ["bash", "-c", "bin/rails db:prepare && bin/rails server -b 0.0.0.0"]

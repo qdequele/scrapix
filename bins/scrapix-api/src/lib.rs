@@ -4471,12 +4471,8 @@ pub async fn run_with_bus(
         });
         match auth::AuthState::new(db_url, jwt_secret).await {
             Ok(mut state) => {
-                // Auto-apply schema (idempotent — safe to run on every startup)
-                let schema_sql = include_str!("../../../deploy/postgres/init.sql");
-                match sqlx::raw_sql(schema_sql).execute(&state.pool).await {
-                    Ok(_) => info!("PostgreSQL schema applied successfully"),
-                    Err(e) => warn!(error = %e, "Failed to apply PostgreSQL schema (non-fatal)"),
-                }
+                // The schema is owned by the Rails app (saas/db/migrate,
+                // `rails db:prepare`) — the engine no longer applies it.
 
                 // Initialize email client if RESEND_API_KEY is set
                 if let Some(ref api_key) = args.resend_api_key {

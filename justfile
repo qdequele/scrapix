@@ -83,9 +83,9 @@ content:
 console:
     cd console && npm run dev
 
-# Run Rails SaaS control plane
+# Run Rails SaaS control plane (migrates the shared DB first — Rails owns the schema)
 saas:
-    cd saas && bin/rails server
+    cd saas && bin/rails db:prepare && bin/rails server
 
 # ---------------------------------------------------------------------------
 # Build & Test

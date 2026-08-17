@@ -27,17 +27,16 @@ When `DATABASE_URL` is **not** set, all protected endpoints are accessible witho
 
 ## Setting Up the Database
 
-The PostgreSQL schema is applied automatically when using Docker Compose:
+The PostgreSQL schema is owned by the Rails SaaS app (`saas/db/migrate`,
+dumped to `saas/db/structure.sql`) and applied with standard Rails tasks:
 
 ```bash
-just infra   # Starts PostgreSQL with init.sql applied
+just infra                        # Starts PostgreSQL
+cd saas && bin/rails db:prepare   # Creates/migrates the shared database
 ```
 
-Or manually apply the schema:
-
-```bash
-psql $DATABASE_URL -f deploy/postgres/init.sql
-```
+`just saas` (and the Docker Compose saas service) run `db:prepare`
+automatically before starting the server.
 
 ## Creating an Account
 
