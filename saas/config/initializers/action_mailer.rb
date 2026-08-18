@@ -6,7 +6,9 @@ Rails.application.configure do
     config.action_mailer.delivery_method = :smtp
     config.action_mailer.smtp_settings = {
       address: "smtp.resend.com",
-      port: 465,
+      # Scaleway (and other hosts) block egress on 465/587; Resend also
+      # listens on 2465 (SMTPS) for exactly this case.
+      port: ENV.fetch("RESEND_SMTP_PORT", 465).to_i,
       user_name: "resend",
       password: ENV["RESEND_API_KEY"],
       tls: true
