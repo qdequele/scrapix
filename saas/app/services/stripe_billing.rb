@@ -90,7 +90,16 @@ module StripeBilling
     )
 
     invoice = client.v1.invoices.finalize_invoice(invoice.id, { auto_advance: false })
+    # With collection_method=charge_automatically and a default payment method,
+    # finalize can charge immediately; the explicit pay then 400s with
+    # "Invoice is already paid" even though the customer WAS charged. Treat
+    # that as success and re-fetch to continue the ledger-crediting flow.
+    # (Ports the fix/stripe-invoice-already-paid branch from the Rust API.)
     client.v1.invoices.pay(invoice.id, { expand: [ "payment_intent" ] })
+  rescue Stripe::InvalidRequestError => e
+    raise unless e.message.include?("already paid")
+
+    client.v1.invoices.retrieve(invoice.id, { expand: [ "payment_intent" ] })
   end
 
   # Idempotent credit grant keyed on the Stripe payment intent id — mirrors
