@@ -34,12 +34,25 @@ class RodauthMain < Rodauth::Rails::Auth
     omniauth_identities_provider_column :provider
     omniauth_identities_uid_column :provider_user_id
 
+    # request_path/callback_path pin the routes to /auth/<provider> —
+    # without them the OmniAuth app's own path prefix stacks on Rodauth's,
+    # yielding /auth/auth/<provider>.
     omniauth_provider :google_oauth2,
       ENV["GOOGLE_CLIENT_ID"].to_s, ENV["GOOGLE_CLIENT_SECRET"].to_s,
-      scope: "email profile", name: :google
+      scope: "email profile", name: :google,
+      request_path: "/auth/google", callback_path: "/auth/google/callback"
     omniauth_provider :github,
       ENV["GITHUB_CLIENT_ID"].to_s, ENV["GITHUB_CLIENT_SECRET"].to_s,
-      scope: "user:email"
+      scope: "user:email",
+      request_path: "/auth/github", callback_path: "/auth/github/callback"
+
+    # GET initiation (see config/initializers/omniauth.rb) — skip the
+    # POST-CSRF request validation; the callback still validates state.
+    omniauth_request_validation_phase { }
+
+    # Social login is a browser redirect flow that lands on the API host;
+    # send the user back to the console afterwards.
+    login_redirect { "#{ENV.fetch("CONSOLE_PUBLIC_URL", "http://localhost:3001")}/dashboard" }
 
     # The console is a JSON SPA; browser-driven flows (omniauth redirects,
     # email links) still get the HTML/redirect handling.

@@ -23,8 +23,11 @@ module SessionToken
       httponly: true,
       same_site: :lax,
       secure: Rails.env.production?,
-      expires: VALIDITY.from_now
-    }
+      expires: VALIDITY.from_now,
+      # Parent-domain scope (e.g. scrapix.meilisearch.com) so the social
+      # login callback on the API subdomain is visible to the console.
+      domain: ENV["SESSION_COOKIE_DOMAIN"].presence
+    }.compact
   end
 
   def self.clear_cookie
