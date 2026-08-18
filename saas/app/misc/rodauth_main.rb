@@ -116,8 +116,8 @@ class RodauthMain < Rodauth::Rails::Auth
       end
     end
     after_two_factor_authentication { issue_scrapix_session }
-    after_logout { rails_cookies["scrapix_session"] = SessionToken.clear_cookie }
-    after_close_account { rails_cookies["scrapix_session"] = SessionToken.clear_cookie }
+    after_logout { clear_scrapix_session }
+    after_close_account { clear_scrapix_session }
 
     auth_class_eval do
       # The gem computes its roda routes from omniauth_prefix, which would
@@ -152,6 +152,15 @@ class RodauthMain < Rodauth::Rails::Auth
       def issue_scrapix_session
         rails_cookies["scrapix_session"] =
           SessionToken.cookie(SessionToken.encode(account_id, account_from_id[:email]))
+      end
+
+      def clear_scrapix_session
+        # Jar clears the (possibly domain-scoped) variant; the raw header
+        # clears the host-only variant — the jar allows one entry per name.
+        rails_cookies["scrapix_session"] = SessionToken.clear_cookie
+        if ENV["SESSION_COOKIE_DOMAIN"].present?
+          rails_controller_instance.response.add_header("set-cookie", SessionToken.host_only_clear_header)
+        end
       end
 
       def account_from_id

@@ -91,6 +91,22 @@ class AuthFlowsTest < ActionDispatch::IntegrationTest
     assert_equal "invalid password", response.parsed_body["field-error"].last
   end
 
+  test "logout clears both cookie variants when a domain is configured" do
+    signup!
+    ENV["SESSION_COOKIE_DOMAIN"] = "example.com"
+    json_post "/auth/logout", {}
+    assert_response :success
+
+    set_cookies = response.headers["set-cookie"]
+    set_cookies = Array(set_cookies).flat_map { |v| v.split("\n") }
+    clears = set_cookies.grep(/\Ascrapix_session=;/i)
+    assert_equal 2, clears.size, "expected host-only AND domain clears, got: #{set_cookies}"
+    assert clears.any? { |c| c.match?(/domain=example\.com/i) }
+    assert clears.any? { |c| !c.match?(/domain=/i) }
+  ensure
+    ENV.delete("SESSION_COOKIE_DOMAIN")
+  end
+
   test "password reset round trip" do
     signup!
     # Rodauth only redeems reset tokens for verified accounts.

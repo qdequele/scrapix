@@ -33,4 +33,15 @@ module SessionToken
   def self.clear_cookie
     cookie("").merge(expires: Time.at(0))
   end
+
+  # Raw Set-Cookie header clearing the HOST-ONLY variant. Browsers treat a
+  # domain-scoped cookie and a host-only cookie with the same name as two
+  # different cookies, so logout must clear both — sessions issued before
+  # SESSION_COOKIE_DOMAIN existed are host-only and would otherwise survive.
+  def self.host_only_clear_header
+    attrs = [ "scrapix_session=", "path=/", "expires=Thu, 01 Jan 1970 00:00:00 GMT",
+              "httponly", "samesite=lax" ]
+    attrs << "secure" if Rails.env.production?
+    attrs.join("; ")
+  end
 end
