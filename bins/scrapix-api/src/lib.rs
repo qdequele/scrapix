@@ -611,11 +611,10 @@ impl AppState {
                         let job_id = job_id.to_string();
                         let stripe_cl = self.stripe_client.clone();
                         tokio::spawn(async move {
-                            match billing::check_credits_and_deduct(
+                            match billing::deduct_crawl_usage(
                                 &pool,
                                 &acct_id,
                                 credits,
-                                "crawl",
                                 &format!(
                                     "Job {} ({} pages × {} credits/page)",
                                     job_id, total_pages, cost_per_page

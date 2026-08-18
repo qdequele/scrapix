@@ -68,8 +68,15 @@ pub async fn deduct_credits(
     let new_balance = match new_balance {
         Some(b) => b,
         None => {
+            // Report the real balance, not a hardcoded zero.
+            let available: i64 =
+                sqlx::query_scalar("SELECT credits_balance FROM accounts WHERE id = $1")
+                    .bind(account_uuid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .unwrap_or(0);
             return Err(BillingError::InsufficientCredits {
-                available: 0,
+                available,
                 required: amount,
             });
         }
@@ -96,6 +103,57 @@ pub async fn deduct_credits(
         new_balance,
         operation,
         "Credits deducted"
+    );
+
+    Ok(new_balance)
+}
+
+/// Deduct credits for work that has ALREADY happened (post-hoc usage billing,
+/// e.g. crawl pages counted at completion). Unlike [`deduct_credits`], this
+/// never refuses: the balance may go negative, which is honest accounting —
+/// the pre-flight `check_credits` gates then block new work until a top-up.
+pub async fn deduct_credits_unchecked(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    amount: i64,
+    operation: &str,
+    description: &str,
+) -> Result<i64, BillingError> {
+    let account_uuid = parse_uuid(account_id)?;
+
+    let mut tx = pool.begin().await?;
+
+    let new_balance: i64 = sqlx::query_scalar(
+        "UPDATE accounts SET credits_balance = credits_balance - $1 \
+         WHERE id = $2 \
+         RETURNING credits_balance",
+    )
+    .bind(amount)
+    .bind(account_uuid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(BillingError::AccountNotFound)?;
+
+    let desc = format!("{}: {}", operation, description);
+    sqlx::query(
+        "INSERT INTO transactions (account_id, type, amount, balance_after, description) \
+         VALUES ($1, 'usage_deduction', $2, $3, $4)",
+    )
+    .bind(account_uuid)
+    .bind(-amount)
+    .bind(new_balance)
+    .bind(&desc)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    debug!(
+        account_id = %account_id,
+        amount,
+        new_balance,
+        operation,
+        "Usage credits deducted (unchecked)"
     );
 
     Ok(new_balance)

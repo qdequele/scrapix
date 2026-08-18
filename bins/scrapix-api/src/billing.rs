@@ -120,6 +120,34 @@ pub(crate) async fn check_credits(
     Ok(scrapix_billing::check_credits(pool, account_id, required_amount).await?)
 }
 
+/// Post-hoc billing for completed crawl work — always records the usage,
+/// letting the balance go negative rather than leaving pages unbilled.
+pub(crate) async fn deduct_crawl_usage(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    amount: i64,
+    description: &str,
+    stripe_client: Option<&stripe::Client>,
+) -> Result<i64, ApiError> {
+    let notifier = QueueBillingNotifier;
+    let notifier_ref: Option<&dyn scrapix_billing::BillingNotifier> = Some(&notifier);
+    let provider = stripe_client.map(|client| StripePaymentProvider { client });
+    let provider_ref: Option<&dyn scrapix_billing::PaymentProvider> = provider
+        .as_ref()
+        .map(|p| p as &dyn scrapix_billing::PaymentProvider);
+
+    Ok(scrapix_billing::auto_topup::deduct_usage(
+        pool,
+        account_id,
+        amount,
+        "crawl",
+        description,
+        provider_ref,
+        notifier_ref,
+    )
+    .await?)
+}
+
 pub(crate) async fn check_credits_and_deduct(
     pool: &sqlx::PgPool,
     account_id: &str,
