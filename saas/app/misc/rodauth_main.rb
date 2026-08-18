@@ -86,25 +86,14 @@ class RodauthMain < Rodauth::Rails::Auth
 
     # Every user gets a personal billing account with welcome credits, and
     # any live team invites for their email are auto-accepted. Signup logs
-    # the user in, so the engine JWT is issued here too.
+    # the user in, so the engine JWT is issued here too. NOTE: social signups
+    # go through omniauth_create_account, a SEPARATE hook — provision in both.
     after_create_account do
       issue_scrapix_session
-      name = account[:full_name].presence || account[:email]
-      billing_account = Account.create!(name: "#{name}'s Account")
-      AccountMember.create!(user_id: account_id, account_id: billing_account.id, role: "owner")
-      Transaction.create!(
-        account_id: billing_account.id, type: "initial_deposit", amount: 100,
-        balance_after: 100, description: "Welcome credit deposit"
-      )
-      AccountInvite.live.where(email: account[:email].to_s).find_each do |invite|
-        AccountMember.create_or_find_by(user_id: account_id, account_id: invite.account_id) do |m|
-          m.role = invite.role
-        end
-        invite.update!(status: "accepted")
-      rescue ActiveRecord::ActiveRecordError => e
-        Rails.logger.warn("Failed to auto-accept invite #{invite.id}: #{e.message}")
-      end
+      provision_new_user
     end
+    before_omniauth_create_account { account[:full_name] = omniauth_name }
+    after_omniauth_create_account { provision_new_user }
 
     # Welcome email shortly after the address is verified.
     after_verify_account do
@@ -131,6 +120,35 @@ class RodauthMain < Rodauth::Rails::Auth
     after_close_account { rails_cookies["scrapix_session"] = SessionToken.clear_cookie }
 
     auth_class_eval do
+      # The gem computes its roda routes from omniauth_prefix, which would
+      # stack on Rodauth's prefix (/auth/auth/github). Align them with the
+      # strategy-level request_path/callback_path above: /auth/<provider>.
+      def omniauth_request_route(provider)
+        provider.to_s
+      end
+
+      def omniauth_callback_route(provider)
+        "#{provider}/callback"
+      end
+
+      def provision_new_user
+        name = account[:full_name].presence || account[:email]
+        billing_account = Account.create!(name: "#{name}'s Account")
+        AccountMember.create!(user_id: account_id, account_id: billing_account.id, role: "owner")
+        Transaction.create!(
+          account_id: billing_account.id, type: "initial_deposit", amount: 100,
+          balance_after: 100, description: "Welcome credit deposit"
+        )
+        AccountInvite.live.where(email: account[:email].to_s).find_each do |invite|
+          AccountMember.create_or_find_by(user_id: account_id, account_id: invite.account_id) do |m|
+            m.role = invite.role
+          end
+          invite.update!(status: "accepted")
+        rescue ActiveRecord::ActiveRecordError => e
+          Rails.logger.warn("Failed to auto-accept invite #{invite.id}: #{e.message}")
+        end
+      end
+
       def issue_scrapix_session
         rails_cookies["scrapix_session"] =
           SessionToken.cookie(SessionToken.encode(account_id, account_from_id[:email]))
