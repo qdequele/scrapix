@@ -1,0 +1,8 @@
+<%= em_heading("Auto Top-Up Processed") %>
+<%= em_paragraph("Your balance dropped below your threshold, so we automatically topped up your account.") %>
+<%= em_table do %>
+  <%= em_kv_row("Credits added", @credits) %>
+  <%= em_kv_row("Amount charged", format_dollars(@amount_cents)) %>
+  <%= em_kv_row("New balance", "#{@new_balance} credits", last: true) %>
+<% end %>
+<%= em_muted("Manage auto top-up at #{em_link(console_url('/settings/billing'), 'billing settings')}") %>

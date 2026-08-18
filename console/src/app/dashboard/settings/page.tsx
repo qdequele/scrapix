@@ -20,6 +20,7 @@ import { Loader2, Database, CheckCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fetchEngines, createEngine, updateEngine } from "@/lib/api";
+import { SecurityCard } from "./security-card";
 import type { MeilisearchEngine } from "@/lib/api-types";
 
 const BASE = "/api/scrapix";
@@ -183,6 +184,8 @@ export default function SettingsPage() {
 
       {/* Meilisearch Engine */}
       <MeilisearchEngineCard />
+
+      <SecurityCard />
 
       {isOwner && <Separator />}
 

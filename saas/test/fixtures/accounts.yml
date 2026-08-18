@@ -1,0 +1,15 @@
+acme:
+  name: Acme
+  tier: free
+  active: true
+  credits_balance: 100
+  auto_topup_enabled: false
+  auto_topup_amount: 5000
+  auto_topup_threshold: 500
+
+globex:
+  name: Globex
+  tier: pro
+  active: true
+  credits_balance: 5000
+  monthly_spend_limit: 1000

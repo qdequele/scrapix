@@ -169,9 +169,9 @@ scrapix health
 
 ## Analytics API (Tinybird-style)
 
-When ClickHouse is configured (`CLICKHOUSE_URL` environment variable), the API server automatically:
-1. **Persists crawl events to ClickHouse** - PageCrawled and PageFailed events are batched (100 events) and flushed every 5 seconds
-2. **Enables the analytics API** at `/analytics/v0/pipes/`
+When ClickHouse is configured (`CLICKHOUSE_URL` environment variable):
+1. The **Rust engine persists crawl events to ClickHouse** - PageCrawled and PageFailed events are batched (100 events) and flushed every 5 seconds
+2. The **Rails SaaS app serves the analytics API** at `/analytics/v0/pipes/` (port 8081, or via the console proxy)
 
 This provides long-term analytics storage beyond the in-memory diagnostics.
 
@@ -242,6 +242,26 @@ curl "http://localhost:8080/analytics/v0/pipes/kpis.json?hours=24"
 ```
 
 ## Architecture
+
+### Two Backends (SCR-85 split)
+
+The backend is deliberately split into two services sharing one Postgres:
+
+- **Rails SaaS control plane (`saas/`, port 8081)** — auth + sessions, social
+  login, account/team/invites, API keys, billing + Stripe, saved crawl
+  configs + engines CRUD, analytics pipes, the OAuth 2.1 provider, and the
+  MCP server at `/mcp`. Contract-tested by `contracts/`.
+- **Rust crawl engine (`bins/scrapix-api`, port 8080)** — /scrape, /map,
+  /search, /crawl*, jobs, WebSockets, diagnostics, plus the background tasks
+  that belong to the data plane: cron scheduler (fires saved configs), email
+  scheduler (delivers the shared `scheduled_emails` queue via Resend),
+  OAuth token cleanup, and Stripe auto-topup on usage debits. It validates
+  credentials (API keys, Bearer tokens, session JWTs) but issues none.
+
+The console proxy (`console/src/app/api/scrapix/[...path]/route.ts`) routes
+by path prefix via `SAAS_API_URL` + `SAAS_PREFIXES`; the frozen full-platform
+spec is `contracts/openapi.json`, the engine-only spec is
+`contracts/openapi.engine.json`.
 
 ### Workspace Structure
 

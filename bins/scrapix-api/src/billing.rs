@@ -4,7 +4,6 @@
 //! error types and the API server's `ApiError`, and maps `ScrapeFormat` to
 //! the feature count expected by the billing crate.
 
-use crate::email::EmailClient;
 use crate::{ApiError, ScrapeFormat};
 use scrapix_core::{CrawlerType, FeaturesConfig};
 
@@ -44,13 +43,34 @@ impl scrapix_billing::PaymentProvider for StripePaymentProvider<'_> {
     }
 }
 
-/// Implements [`scrapix_billing::BillingNotifier`] by sending emails via the
-/// Resend-backed `EmailClient`.
-pub(crate) struct EmailBillingNotifier<'a> {
-    pub email_client: &'a EmailClient,
+/// Implements [`scrapix_billing::BillingNotifier`] by queueing rows in the
+/// shared `scheduled_emails` table (delivered by the Rails app).
+pub(crate) struct QueueBillingNotifier;
+
+impl QueueBillingNotifier {
+    fn queue(
+        pool: &sqlx::PgPool,
+        account_id: uuid::Uuid,
+        email_type: &'static str,
+        payload_for: impl FnOnce() -> serde_json::Value + Send + 'static,
+    ) {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Some(email) = crate::email_scheduler::get_account_email(&pool, account_id).await
+            {
+                crate::email_scheduler::schedule_email_now(
+                    &pool,
+                    email_type,
+                    &email,
+                    payload_for(),
+                )
+                .await;
+            }
+        });
+    }
 }
 
-impl scrapix_billing::BillingNotifier for EmailBillingNotifier<'_> {
+impl scrapix_billing::BillingNotifier for QueueBillingNotifier {
     fn notify_auto_topup_success(
         &self,
         pool: &sqlx::PgPool,
@@ -59,34 +79,32 @@ impl scrapix_billing::BillingNotifier for EmailBillingNotifier<'_> {
         amount_cents: i64,
         new_balance: i64,
     ) {
-        let mailer = self.email_client.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Some(email) = crate::email::get_account_email(&pool, account_id).await {
-                mailer.send_auto_topup_receipt(&email, credits, amount_cents, new_balance);
-            }
+        Self::queue(pool, account_id, "auto_topup_receipt", move || {
+            serde_json::json!({
+                "credits": credits,
+                "amount_cents": amount_cents,
+                "new_balance": new_balance,
+            })
         });
     }
 
     fn notify_auto_topup_failure(&self, pool: &sqlx::PgPool, account_id: uuid::Uuid, reason: &str) {
-        let mailer = self.email_client.clone();
-        let pool = pool.clone();
         let reason = reason.to_string();
-        tokio::spawn(async move {
-            if let Some(email) = crate::email::get_account_email(&pool, account_id).await {
-                mailer.send_auto_topup_failed(&email, &reason);
-            }
-        });
+        Self::queue(
+            pool,
+            account_id,
+            "auto_topup_failed",
+            move || serde_json::json!({ "reason": reason }),
+        );
     }
 
     fn notify_low_balance(&self, pool: &sqlx::PgPool, account_id: uuid::Uuid, balance: i64) {
-        let mailer = self.email_client.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Some(email) = crate::email::get_account_email(&pool, account_id).await {
-                mailer.send_low_balance_warning(&email, balance);
-            }
-        });
+        Self::queue(
+            pool,
+            account_id,
+            "low_balance",
+            move || serde_json::json!({ "balance": balance }),
+        );
     }
 }
 
@@ -102,19 +120,44 @@ pub(crate) async fn check_credits(
     Ok(scrapix_billing::check_credits(pool, account_id, required_amount).await?)
 }
 
+/// Post-hoc billing for completed crawl work — always records the usage,
+/// letting the balance go negative rather than leaving pages unbilled.
+pub(crate) async fn deduct_crawl_usage(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    amount: i64,
+    description: &str,
+    stripe_client: Option<&stripe::Client>,
+) -> Result<i64, ApiError> {
+    let notifier = QueueBillingNotifier;
+    let notifier_ref: Option<&dyn scrapix_billing::BillingNotifier> = Some(&notifier);
+    let provider = stripe_client.map(|client| StripePaymentProvider { client });
+    let provider_ref: Option<&dyn scrapix_billing::PaymentProvider> = provider
+        .as_ref()
+        .map(|p| p as &dyn scrapix_billing::PaymentProvider);
+
+    Ok(scrapix_billing::auto_topup::deduct_usage(
+        pool,
+        account_id,
+        amount,
+        "crawl",
+        description,
+        provider_ref,
+        notifier_ref,
+    )
+    .await?)
+}
+
 pub(crate) async fn check_credits_and_deduct(
     pool: &sqlx::PgPool,
     account_id: &str,
     amount: i64,
     operation: &str,
     description: &str,
-    email_client: Option<&EmailClient>,
     stripe_client: Option<&stripe::Client>,
 ) -> Result<i64, ApiError> {
-    let notifier = email_client.map(|ec| EmailBillingNotifier { email_client: ec });
-    let notifier_ref: Option<&dyn scrapix_billing::BillingNotifier> = notifier
-        .as_ref()
-        .map(|n| n as &dyn scrapix_billing::BillingNotifier);
+    let notifier = QueueBillingNotifier;
+    let notifier_ref: Option<&dyn scrapix_billing::BillingNotifier> = Some(&notifier);
 
     let provider = stripe_client.map(|client| StripePaymentProvider { client });
     let provider_ref: Option<&dyn scrapix_billing::PaymentProvider> = provider

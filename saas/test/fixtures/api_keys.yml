@@ -1,0 +1,7 @@
+# Raw key for tests: sk_live_TEST-KEY-TEST-KEY-TEST-KEY-TEST
+acme_key:
+  account: acme
+  name: CI key
+  prefix: "sk_live_TEST..."
+  key_hash: <%= Digest::SHA256.hexdigest("sk_live_TEST-KEY-TEST-KEY-TEST-KEY-TEST") %>
+  active: true

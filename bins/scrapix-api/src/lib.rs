@@ -44,13 +44,9 @@ pub mod analytics;
 pub mod auth;
 pub mod billing;
 pub mod configs;
-pub mod email;
 pub mod email_scheduler;
-pub mod engines;
 pub mod jobs_db;
-pub mod mcp;
 pub mod openapi;
-pub mod rate_limit;
 pub mod stripe;
 
 use axum::{
@@ -127,41 +123,9 @@ pub struct Args {
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
-    /// Redis URL for rate limiting (optional, disables rate limiting if not set)
-    #[arg(long, env = "REDIS_URL")]
-    pub redis_url: Option<String>,
-
-    /// Stripe secret key (enables payment processing)
+    /// Stripe secret key (enables engine-side auto-topup charges)
     #[arg(long, env = "STRIPE_SECRET_KEY")]
     pub stripe_secret_key: Option<String>,
-
-    /// Stripe webhook signing secret (for verifying webhook events)
-    #[arg(long, env = "STRIPE_WEBHOOK_SECRET")]
-    pub stripe_webhook_secret: Option<String>,
-
-    /// Resend API key for transactional emails (optional, disables emails if not set)
-    #[arg(long, env = "RESEND_API_KEY")]
-    pub resend_api_key: Option<String>,
-
-    /// Google OAuth client ID (enables "Login with Google")
-    #[arg(long, env = "GOOGLE_CLIENT_ID")]
-    pub google_client_id: Option<String>,
-
-    /// Google OAuth client secret
-    #[arg(long, env = "GOOGLE_CLIENT_SECRET")]
-    pub google_client_secret: Option<String>,
-
-    /// GitHub OAuth client ID (enables "Login with GitHub")
-    #[arg(long, env = "GITHUB_CLIENT_ID")]
-    pub github_client_id: Option<String>,
-
-    /// GitHub OAuth client secret
-    #[arg(long, env = "GITHUB_CLIENT_SECRET")]
-    pub github_client_secret: Option<String>,
-
-    /// Console URL for OAuth redirects (e.g., https://scrapix.meilisearch.com)
-    #[arg(long, env = "CONSOLE_URL", default_value = "http://localhost:3001")]
-    pub console_url: String,
 
     /// Maximum jobs to keep in memory
     #[arg(long, env = "MAX_JOBS", default_value = "10000")]
@@ -228,7 +192,6 @@ struct AppState {
     /// PostgreSQL connection pool (for saved configs, cron scheduling)
     db_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
-    email_client: Option<email::EmailClient>,
     /// Optional Stripe client for payment-backed auto-topup
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
@@ -253,7 +216,6 @@ impl AppState {
         browser_renderer: Option<Arc<CdpRenderer>>,
         ai_service: Option<Arc<AiService>>,
         db_pool: Option<sqlx::PgPool>,
-        email_client: Option<email::EmailClient>,
         stripe_client: Option<::stripe::Client>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
     ) -> Self {
@@ -282,7 +244,6 @@ impl AppState {
             browser_renderer,
             ai_service,
             db_pool,
-            email_client,
             stripe_client,
             analytics_store,
         }
@@ -582,11 +543,8 @@ impl AppState {
                     tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
                 }
 
-                // Send job completion email
-                if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                    (&self.email_client, &self.db_pool, account_id)
-                {
-                    let mailer = mailer.clone();
+                // Queue job completion email (delivered by the Rails app)
+                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, account_id) {
                     let pool = pool.clone();
                     let acct_id = acct_id.clone();
                     let job_id = job_id.to_string();
@@ -597,16 +555,22 @@ impl AppState {
                     tokio::spawn(async move {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
                             if let Some(email_addr) =
-                                email::get_account_email_for_job_notification(&pool, uuid).await
+                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
+                                    .await
                             {
-                                mailer.send_job_completed(
+                                email_scheduler::schedule_email_now(
+                                    &pool,
+                                    "job_completed",
                                     &email_addr,
-                                    &job_id,
-                                    &index_uid,
-                                    pc,
-                                    di,
-                                    ds,
-                                );
+                                    serde_json::json!({
+                                        "job_id": job_id,
+                                        "index_uid": index_uid,
+                                        "pages_crawled": pc,
+                                        "documents_indexed": di,
+                                        "duration_secs": ds,
+                                    }),
+                                )
+                                .await;
                             }
                         }
                     });
@@ -647,16 +611,14 @@ impl AppState {
                         let job_id = job_id.to_string();
                         let stripe_cl = self.stripe_client.clone();
                         tokio::spawn(async move {
-                            match billing::check_credits_and_deduct(
+                            match billing::deduct_crawl_usage(
                                 &pool,
                                 &acct_id,
                                 credits,
-                                "crawl",
                                 &format!(
                                     "Job {} ({} pages × {} credits/page)",
                                     job_id, total_pages, cost_per_page
                                 ),
-                                None,
                                 stripe_cl.as_ref(),
                             )
                             .await
@@ -709,11 +671,8 @@ impl AppState {
                     tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
                 }
 
-                // Send job failure email
-                if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                    (&self.email_client, &self.db_pool, &account_id)
-                {
-                    let mailer = mailer.clone();
+                // Queue job failure email (delivered by the Rails app)
+                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, &account_id) {
                     let pool = pool.clone();
                     let acct_id = acct_id.clone();
                     let job_id = job_id.to_string();
@@ -721,9 +680,20 @@ impl AppState {
                     tokio::spawn(async move {
                         if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
                             if let Some(email_addr) =
-                                email::get_account_email_for_job_notification(&pool, uuid).await
+                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
+                                    .await
                             {
-                                mailer.send_job_failed(&email_addr, &job_id, &error, pages_crawled);
+                                email_scheduler::schedule_email_now(
+                                    &pool,
+                                    "job_failed",
+                                    &email_addr,
+                                    serde_json::json!({
+                                        "job_id": job_id,
+                                        "error_message": error,
+                                        "pages_crawled": pages_crawled,
+                                    }),
+                                )
+                                .await;
                             }
                         }
                     });
@@ -2080,7 +2050,6 @@ async fn scrape_url(
             scrape_cost,
             "scrape",
             &format!("{} ({} credits)", final_url, scrape_cost),
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -3225,7 +3194,6 @@ async fn map_url(
             billing::MAP_CREDITS,
             "map",
             &request.url,
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -3455,7 +3423,6 @@ async fn search_url(
             billing::SEARCH_CREDITS,
             "search",
             &format!("{} q={}", request.url, request.q),
-            None,
             state.stripe_client.as_ref(),
         )
         .await
@@ -4501,21 +4468,9 @@ pub async fn run_with_bus(
             "dev-jwt-secret-change-in-production".to_string()
         });
         match auth::AuthState::new(db_url, jwt_secret).await {
-            Ok(mut state) => {
-                // Auto-apply schema (idempotent — safe to run on every startup)
-                let schema_sql = include_str!("../../../deploy/postgres/init.sql");
-                match sqlx::raw_sql(schema_sql).execute(&state.pool).await {
-                    Ok(_) => info!("PostgreSQL schema applied successfully"),
-                    Err(e) => warn!(error = %e, "Failed to apply PostgreSQL schema (non-fatal)"),
-                }
-
-                // Initialize email client if RESEND_API_KEY is set
-                if let Some(ref api_key) = args.resend_api_key {
-                    state.email_client = Some(email::EmailClient::new(api_key.clone()));
-                    info!("Transactional emails enabled via Resend");
-                } else {
-                    info!("Transactional emails disabled (RESEND_API_KEY not set)");
-                }
+            Ok(state) => {
+                // The schema is owned by the Rails app (saas/db/migrate,
+                // `rails db:prepare`) — the engine no longer applies it.
 
                 info!("Authentication enabled via PostgreSQL");
                 Some(Arc::new(state))
@@ -4527,23 +4482,6 @@ pub async fn run_with_bus(
         }
     } else {
         info!("Authentication disabled (DATABASE_URL not set)");
-        None
-    };
-
-    // Initialize Redis-backed rate limiter (optional)
-    let rate_limit_state = if let Some(ref redis_url) = args.redis_url {
-        match rate_limit::RateLimitState::new(redis_url).await {
-            Some(rl) => {
-                info!("Rate limiting enabled via Redis");
-                Some(Arc::new(rl))
-            }
-            None => {
-                warn!("Rate limiting disabled (Redis connection failed)");
-                None
-            }
-        }
-    } else {
-        info!("Rate limiting disabled (REDIS_URL not set)");
         None
     };
 
@@ -4616,7 +4554,6 @@ pub async fn run_with_bus(
         max_jobs: args.max_jobs,
     };
     let db_pool = auth_state.as_ref().map(|a| a.pool.clone());
-    let email_client = auth_state.as_ref().and_then(|a| a.email_client.clone());
     let stripe_client = args.stripe_secret_key.as_ref().map(::stripe::Client::new);
     let state = Arc::new(AppState::new(
         producer,
@@ -4629,7 +4566,6 @@ pub async fn run_with_bus(
         browser_renderer,
         ai_service,
         db_pool,
-        email_client,
         stripe_client,
         analytics_state.clone(),
     ));
@@ -4899,20 +4835,25 @@ pub async fn run_with_bus(
                                     idle_state.process_event(&job_id, &event);
                                     idle_state.broadcast_event(&job_id, event);
 
-                                    // Send job failure email
-                                    if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                                        (&idle_state.email_client, &idle_state.db_pool, &account_id)
+                                    // Queue job failure email (delivered by the Rails app)
+                                    if let (Some(ref pool), Some(ref acct_id)) =
+                                        (&idle_state.db_pool, &account_id)
                                     {
                                         if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
                                             if let Some(email_addr) =
-                                                email::get_account_email_for_job_notification(pool, uuid).await
+                                                email_scheduler::get_account_email_for_job_notification(pool, uuid).await
                                             {
-                                                mailer.send_job_failed(
+                                                email_scheduler::schedule_email_now(
+                                                    pool,
+                                                    "job_failed",
                                                     &email_addr,
-                                                    &job_id,
-                                                    &error_msg,
-                                                    pages_crawled,
-                                                );
+                                                    serde_json::json!({
+                                                        "job_id": job_id,
+                                                        "error_message": error_msg,
+                                                        "pages_crawled": pages_crawled,
+                                                    }),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -4971,22 +4912,27 @@ pub async fn run_with_bus(
                         idle_state.process_event(&job_id, &event);
                         idle_state.broadcast_event(&job_id, event);
 
-                        // Send job completion email
-                        if let (Some(ref mailer), Some(ref pool), Some(ref acct_id)) =
-                            (&idle_state.email_client, &idle_state.db_pool, &account_id)
+                        // Queue job completion email (delivered by the Rails app)
+                        if let (Some(ref pool), Some(ref acct_id)) =
+                            (&idle_state.db_pool, &account_id)
                         {
                             if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
                                 if let Some(email_addr) =
-                                    email::get_account_email_for_job_notification(pool, uuid).await
+                                    email_scheduler::get_account_email_for_job_notification(pool, uuid).await
                                 {
-                                    mailer.send_job_completed(
+                                    email_scheduler::schedule_email_now(
+                                        pool,
+                                        "job_completed",
                                         &email_addr,
-                                        &job_id,
-                                        &index_uid,
-                                        pages_crawled,
-                                        verified_documents_indexed,
-                                        duration_secs,
-                                    );
+                                        serde_json::json!({
+                                            "job_id": job_id,
+                                            "index_uid": index_uid,
+                                            "pages_crawled": pages_crawled,
+                                            "documents_indexed": verified_documents_indexed,
+                                            "duration_secs": duration_secs,
+                                        }),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -5014,19 +4960,8 @@ pub async fn run_with_bus(
         None
     };
 
-    // Start email scheduler if database + email are configured
-    let email_scheduler_handle =
-        if let (Some(ref pool), Some(ref mailer)) = (&state.db_pool, &state.email_client) {
-            let handle = email_scheduler::spawn_email_scheduler(
-                pool.clone(),
-                mailer.clone(),
-                shutdown_rx.clone(),
-            );
-            info!("Email scheduler started (30s tick interval)");
-            Some(handle)
-        } else {
-            None
-        };
+    // Email delivery moved to the Rails app (SolidQueue drains the shared
+    // scheduled_emails queue); the engine only inserts rows.
 
     // Build router
     // Public routes (no auth required)
@@ -5056,44 +4991,17 @@ pub async fn run_with_bus(
         .route("/job/{id}/events/history", get(get_job_events_history))
         .route("/job/{id}", delete(cancel_job));
 
-    // Protected routes (API key auth required when enabled)
-    let mut protected_routes = product_routes.merge(management_routes);
+    // Protected routes (API key auth required when enabled).
+    // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
+    // Stripe, analytics pipes, OAuth provider, /mcp) is served by the Rails
+    // app (saas/, SCR-85); the engine keeps only the crawl data plane.
+    let protected_routes = product_routes.merge(management_routes);
 
-    // Add saved config routes if database is available
-    if state.db_pool.is_some() {
-        protected_routes = protected_routes
-            .route(
-                "/configs",
-                post(configs::create_config).get(configs::list_configs),
-            )
-            .route(
-                "/configs/{id}",
-                get(configs::get_config)
-                    .patch(configs::update_config)
-                    .delete(configs::delete_config),
-            )
-            .route("/configs/{id}/trigger", post(configs::trigger_config))
-            .route(
-                "/engines",
-                post(engines::create_engine).get(engines::list_engines),
-            )
-            .route(
-                "/engines/{id}",
-                get(engines::get_engine)
-                    .patch(engines::update_engine)
-                    .delete(engines::delete_engine),
-            )
-            .route("/engines/{id}/default", post(engines::set_default_engine))
-            .route("/engines/{id}/indexes", get(engines::list_engine_indexes))
-            .route(
-                "/engines/{id}/indexes/{index_uid}/search",
-                post(engines::search_engine_index),
-            );
-    }
-
-    // Apply auth middleware if configured (accepts API key or session cookie)
+    // Apply auth middleware if configured (accepts API key, Bearer token, or
+    // session cookie). route_layer keeps it off the 404 fallback, so removed
+    // SaaS paths return 404 instead of a misleading 401.
     let protected_routes = if let Some(ref auth) = auth_state {
-        protected_routes.layer(middleware::from_fn_with_state(
+        protected_routes.route_layer(middleware::from_fn_with_state(
             auth.clone(),
             auth::validate_api_key_or_session,
         ))
@@ -5103,121 +5011,17 @@ pub async fn run_with_bus(
 
     // Per-account rate limiting on protected routes was removed — pricing is
     // usage-based (credits), not per-request, so there's nothing to gate on the
-    // request rate. The brute-force rate limiter on auth endpoints below is
-    // kept; it protects against credential stuffing regardless of plan.
-    let _ = &rate_limit_state;
-
+    // request rate. Brute-force protection on the auth endpoints lives with
+    // the auth endpoints themselves, in the Rails app (Rack::Attack).
     let mut app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Add auth and session routes if database is configured
+    // OAuth token cleanup: both backends validate tokens from the shared
+    // Postgres; the engine hosts the hourly expired-code/token sweep.
     if let Some(ref auth) = auth_state {
-        // Apply stricter rate limiting on auth endpoints (login/signup brute-force protection).
-        // Uses Redis when available, falls back to in-memory rate limiting otherwise.
-        // Auth endpoints are ALWAYS rate-limited — unlike general endpoints, there is no
-        // fail-open path.
-        let auth_public = if let Some(ref rl) = rate_limit_state {
-            auth::auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
-                rl.clone(),
-                rate_limit::auth_rate_limit_middleware,
-            ))
-        } else {
-            let fallback = Arc::new(rate_limit::InMemoryAuthRateLimiter::new());
-            warn!("Redis not available — using in-memory auth rate limiting (not shared across instances)");
-            auth::auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
-                fallback,
-                rate_limit::auth_rate_limit_in_memory_middleware,
-            ))
-        };
-        // Social OAuth login (Google, GitHub)
-        let google_config = match (&args.google_client_id, &args.google_client_secret) {
-            (Some(id), Some(secret)) => Some(auth::ProviderConfig {
-                client_id: id.clone(),
-                client_secret: secret.clone(),
-            }),
-            _ => None,
-        };
-        let github_config = match (&args.github_client_id, &args.github_client_secret) {
-            (Some(id), Some(secret)) => Some(auth::ProviderConfig {
-                client_id: id.clone(),
-                client_secret: secret.clone(),
-            }),
-            _ => None,
-        };
-        let has_social = google_config.is_some() || github_config.is_some();
-        let social_routes = if has_social {
-            let api_base_url = format!("http://{}:{}", args.host, args.port);
-            // In production, use the public API URL
-            let api_base_url = std::env::var("API_BASE_URL").unwrap_or(api_base_url);
-            let social_state = auth::SocialAuthState {
-                auth: auth.clone(),
-                config: auth::SocialOAuthConfig {
-                    google: google_config,
-                    github: github_config,
-                },
-                state_store: auth::OAuthStateStore::new(),
-                http_client: reqwest::Client::new(),
-                api_base_url,
-                console_url: args.console_url.clone(),
-            };
-            let providers: Vec<&str> = [
-                social_state.config.google.as_ref().map(|_| "Google"),
-                social_state.config.github.as_ref().map(|_| "GitHub"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            info!(providers = ?providers, "Social login enabled");
-            Some(auth::social_auth_routes(social_state))
-        } else {
-            None
-        };
-
-        app = app
-            .merge(auth_public)
-            .merge(auth::session_routes(auth.clone()))
-            .merge(auth::oauth_routes(auth.clone()));
-        if let Some(social) = social_routes {
-            app = app.merge(social);
-        }
-        info!("Auth routes enabled (/auth/signup, /auth/login, /auth/me, /account/*, /oauth/*)");
-
-        // Stripe payment routes
-        if let Some(ref stripe_key) = args.stripe_secret_key {
-            let stripe_state =
-                stripe::StripeState::new(stripe_key, args.stripe_webhook_secret.clone());
-            app = app
-                .merge(stripe::stripe_session_routes(
-                    auth.clone(),
-                    stripe_state.clone(),
-                ))
-                .merge(stripe::stripe_webhook_route(
-                    auth.pool.clone(),
-                    stripe_state,
-                    auth.email_client.clone(),
-                ));
-            info!("Stripe routes enabled (/account/billing/setup-intent, /account/billing/payment-methods, /account/billing/purchase, /webhooks/stripe)");
-        }
-
-        // MCP HTTP endpoint with Bearer token auth
-        let mcp_base_url = format!("http://{}:{}", args.host, args.port);
-        match mcp::build_mcp_service(&mcp_base_url) {
-            Ok(mcp_service) => {
-                let mcp_router = Router::new().route_service("/mcp", mcp_service).layer(
-                    middleware::from_fn_with_state(auth.clone(), mcp::validate_mcp_bearer),
-                );
-                app = app.merge(mcp_router);
-                info!("MCP HTTP endpoint enabled at /mcp (Bearer auth)");
-            }
-            Err(e) => {
-                warn!("Failed to initialize MCP HTTP service: {e}");
-            }
-        }
-
-        // Spawn OAuth token cleanup background task
         auth::oauth::spawn_token_cleanup(auth.pool.clone());
     }
 
@@ -5254,16 +5058,9 @@ pub async fn run_with_bus(
         info!("OpenAPI spec at /openapi.json, docs UI at /docs");
     }
 
-    // Add analytics routes if ClickHouse is available
-    if let Some(analytics) = analytics_state {
-        app = app.nest(
-            "/analytics/v0",
-            analytics::create_analytics_router(analytics),
-        );
-        info!("Analytics API enabled at /analytics/v0/pipes");
-    } else {
-        info!("Analytics API disabled (ClickHouse not available)");
-    }
+    // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
+    // app; the engine only writes events to ClickHouse (batchers above) and
+    // reads page-event history for /job/{id}/events/history.
 
     // Request body size limit (2 MB default, prevents DoS via large payloads)
     app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -5375,11 +5172,6 @@ pub async fn run_with_bus(
     if let Some(handle) = cron_handle {
         if let Err(e) = handle.await {
             warn!("Cron task failed during shutdown: {}", e);
-        }
-    }
-    if let Some(handle) = email_scheduler_handle {
-        if let Err(e) = handle.await {
-            warn!("Email scheduler task failed during shutdown: {}", e);
         }
     }
     if let Some(handle) = flush_handle {

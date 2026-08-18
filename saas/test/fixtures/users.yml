@@ -1,0 +1,17 @@
+quentin:
+  email: quentin@example.com
+  password_hash: unused-in-these-tests
+  full_name: Quentin
+  status: 2
+  notify_job_emails: true
+
+teammate:
+  email: teammate@example.com
+  password_hash: unused-in-these-tests
+  full_name: Team Mate
+  status: 2
+
+outsider:
+  email: outsider@example.com
+  password_hash: unused-in-these-tests
+  full_name: Out Sider

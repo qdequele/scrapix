@@ -106,7 +106,6 @@ services:
       POSTGRES_PASSWORD: scrapix
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U scrapix -d scrapix"]
       interval: 5s
@@ -352,6 +351,61 @@ services:
           path: ./Cargo.lock
 
   # ---------------------------------------------------------------------------
+  # SaaS control plane (Rails) — SCR-85 backend split
+  # ---------------------------------------------------------------------------
+
+  saas:
+    build:
+      context: ./saas
+      dockerfile: Dockerfile.dev
+    container_name: scrapix-saas
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SAAS_PORT: 8081
+      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
+      JWT_SECRET: dev-jwt-secret-change-in-production
+      SCRAPIX_ENGINE_URL: http://scrapix-api:8080
+      REDIS_URL: redis://dragonfly:6379
+      CONSOLE_URL: http://localhost:3001
+      ENVIRONMENT: development
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: scrapix
+      CLICKHOUSE_USER: scrapix
+      CLICKHOUSE_PASSWORD: scrapix
+      # MCP tools are generated from the frozen OpenAPI snapshot, mounted below.
+      MCP_OPENAPI_SPEC_PATH: /contracts/openapi.json
+      MCP_SAAS_BASE_URL: http://127.0.0.1:8081
+    volumes:
+      - saas-bundle:/usr/local/bundle
+      - ./contracts/openapi.json:/contracts/openapi.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    develop:
+      watch:
+        - action: sync
+          path: ./saas/app
+          target: /app/app
+        - action: sync
+          path: ./saas/lib
+          target: /app/lib
+        - action: sync+restart
+          path: ./saas/config
+          target: /app/config
+        - action: rebuild
+          path: ./saas/Gemfile
+        - action: rebuild
+          path: ./saas/Gemfile.lock
+
+  # ---------------------------------------------------------------------------
   # Console (Next.js Frontend)
   # ---------------------------------------------------------------------------
 
@@ -369,6 +423,8 @@ services:
       WATCHPACK_POLLING: "true"
       NEXT_PUBLIC_SCRAPIX_API_URL: http://localhost:8080
       SCRAPIX_API_URL: http://scrapix-api:8080
+      SAAS_API_URL: http://saas:8081
+      SAAS_PREFIXES: analytics,configs,engines,auth,account,webhooks,oauth,.well-known,mcp
     volumes:
       - console-node-modules:/app/node_modules
       - console-next:/app/.next
@@ -423,6 +479,8 @@ volumes:
   # Console build caches
   console-node-modules:
   console-next:
+  # SaaS (Rails) gem cache
+  saas-bundle:
 
 # -----------------------------------------------------------------------------
 # Networks

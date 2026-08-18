@@ -83,6 +83,14 @@ content:
 console:
     cd console && npm run dev
 
+# Run Rails SaaS control plane (migrates the shared DB first — Rails owns the schema)
+saas:
+    cd saas && bin/rails db:prepare && SOLID_QUEUE_IN_PUMA=1 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES bin/rails server
+
+# Rails-native test suite (isolated scrapix_test DB; fast, no live services)
+saas-test:
+    cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test
+
 # ---------------------------------------------------------------------------
 # Build & Test
 # ---------------------------------------------------------------------------

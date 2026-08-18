@@ -1,0 +1,6 @@
+acme_initial:
+  account: acme
+  type: initial_deposit
+  amount: 100
+  balance_after: 100
+  description: Welcome credit deposit

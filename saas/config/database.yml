@@ -1,0 +1,31 @@
+# The SaaS app shares the Scrapix Postgres database with the Rust services.
+#
+# Schema ownership (SCR-87): Rails owns the schema — migrations in db/migrate,
+# dumped to db/structure.sql (the schema carries a PL/pgSQL function and
+# partial indexes, so schema_format is :sql). The Rust engine reads shared
+# tables (api_keys, oauth_tokens, accounts, account_members, crawl_configs,
+# scheduled_emails, transactions) and owns the write path for jobs.
+#
+# Rails owns the write path for users, accounts, account_members, api_keys,
+# account_invites, crawl_configs, meilisearch_engines, transactions, and the
+# oauth_* tables.
+
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  max_connections: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+
+development:
+  <<: *default
+  url: <%= ENV.fetch("DATABASE_URL", "postgres://scrapix:scrapix@localhost:5433/scrapix") %>
+
+# Rails-native tests use an isolated database (scrapix_test) so they can
+# truncate freely. Contract tests are a separate vitest suite that talks to a
+# live backend + the shared dev database.
+test:
+  <<: *default
+  url: <%= ENV.fetch("TEST_DATABASE_URL", "postgres://scrapix:scrapix@localhost:5433/scrapix_test") %>
+
+production:
+  <<: *default
+  url: <%= ENV["DATABASE_URL"] %>

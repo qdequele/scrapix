@@ -1,0 +1,9 @@
+<% dollars = format_dollars(@amount_cents) %>
+<%= em_heading("Payment Received") %>
+<%= em_paragraph("Your payment of <strong style=\"color: #fafafa;\">#{dollars}</strong> has been processed.") %>
+<%= em_table do %>
+  <%= em_kv_row("Credits purchased", @credits) %>
+  <%= em_kv_row("Amount charged", dollars, last: true) %>
+<% end %>
+<%= em_muted("View billing at #{em_link(console_url('/settings/billing'), 'scrapix.meilisearch.com/settings/billing')}") %>
+<%= em_muted("If you did not make this purchase, contact us at support@meilisearch.com.") %>

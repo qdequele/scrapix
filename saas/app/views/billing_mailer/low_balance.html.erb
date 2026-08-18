@@ -1,0 +1,4 @@
+<%= em_heading("Low Credit Balance") %>
+<%= em_paragraph("Your Scrapix account has <strong style=\"color: #fcd34d;\">#{@balance} credits</strong> remaining.") %>
+<%= em_paragraph("To avoid interruptions to your crawl jobs, consider topping up your balance or enabling auto top-up.") %>
+<%= em_button(console_url("/settings/billing"), "Add Credits") %>

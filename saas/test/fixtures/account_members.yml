@@ -1,0 +1,14 @@
+quentin_acme:
+  user: quentin
+  account: acme
+  role: owner
+
+teammate_acme:
+  user: teammate
+  account: acme
+  role: member
+
+outsider_globex:
+  user: outsider
+  account: globex
+  role: owner

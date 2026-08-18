@@ -1,0 +1,10 @@
+<%= em_heading("Crawl Complete") %>
+<%= em_paragraph("Your crawl job has finished successfully.") %>
+<%= em_table do %>
+  <%= em_kv_row("Job ID", @job_id, mono: true) %>
+  <%= em_kv_row("Index", @index_uid) %>
+  <%= em_kv_row("Pages crawled", @pages_crawled) %>
+  <%= em_kv_row("Documents indexed", @documents_indexed) %>
+  <%= em_kv_row("Duration", format_duration(@duration_secs), last: true) %>
+<% end %>
+<%= em_button(console_url("/jobs/#{@job_id}"), "View Results") %>

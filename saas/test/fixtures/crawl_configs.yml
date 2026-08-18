@@ -1,0 +1,5 @@
+daily_docs:
+  account: acme
+  name: daily-docs
+  config: { start_urls: ["https://example.com"], index_uid: docs }
+  cron_enabled: false

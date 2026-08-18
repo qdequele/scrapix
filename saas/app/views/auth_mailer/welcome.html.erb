@@ -1,0 +1,17 @@
+<%= em_heading("Welcome, #{ERB::Util.html_escape(@name)}!") %>
+<%= em_paragraph("Your Scrapix account is ready.") %>
+<p style="margin: 0 0 20px; font-size: 15px; line-height: 1.6; color: #e4e4e7;">We've added <strong style="color: #fafafa;">100 free credits</strong> to your account.</p>
+<%= em_paragraph("Here's how to get started:") %>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin: 0 0 16px;">
+  <tr><td style="padding: 6px 0; font-size: 14px; color: #a1a1aa;">
+    <span style="color: #818cf8; font-weight: 600;">1.</span>&nbsp; <%= em_strong("Create an API key") %> in the <%= em_link(console_url("/settings/api-keys"), "console") %>
+  </td></tr>
+  <tr><td style="padding: 6px 0; font-size: 14px; color: #a1a1aa;">
+    <span style="color: #818cf8; font-weight: 600;">2.</span>&nbsp; <%= em_strong("Scrape a page") %> with <%= em_code("POST /scrape") %>
+  </td></tr>
+  <tr><td style="padding: 6px 0; font-size: 14px; color: #a1a1aa;">
+    <span style="color: #818cf8; font-weight: 600;">3.</span>&nbsp; <%= em_strong("Start a crawl") %> with <%= em_code("POST /crawl") %>
+  </td></tr>
+</table>
+<%= em_button(console_url, "Open Console") %>
+<%= em_muted("Read the docs at #{em_link('https://docs.scrapix.meilisearch.com', 'docs.scrapix.meilisearch.com')}") %>

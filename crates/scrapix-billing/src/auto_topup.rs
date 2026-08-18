@@ -92,6 +92,46 @@ pub async fn check_credits_and_deduct(
     Ok(new_balance)
 }
 
+/// Post-hoc usage billing: like [`check_credits_and_deduct`] but the work has
+/// already happened, so the deduction always lands (balance may go negative)
+/// and auto-topup / low-balance notifications still run.
+#[allow(clippy::too_many_arguments)]
+pub async fn deduct_usage(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    amount: i64,
+    operation: &str,
+    description: &str,
+    payment_provider: Option<&dyn PaymentProvider>,
+    notifier: Option<&dyn BillingNotifier>,
+) -> Result<i64, BillingError> {
+    let new_balance =
+        crate::ledger::deduct_credits_unchecked(pool, account_id, amount, operation, description)
+            .await?;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        maybe_auto_topup(pool, account_id, payment_provider, notifier),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => {
+            warn!(account_id, "Auto-topup timed out after 5s");
+        }
+    }
+
+    if new_balance <= 10 {
+        if let Some(notifier) = notifier {
+            if let Ok(uuid) = uuid::Uuid::parse_str(account_id) {
+                notifier.notify_low_balance(pool, uuid, new_balance);
+            }
+        }
+    }
+
+    Ok(new_balance)
+}
+
 // ============================================================================
 // Auto top-up
 // ============================================================================

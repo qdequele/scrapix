@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, Suspense } from "react";
-import { login, signup } from "@/lib/auth";
+import { login, signup, otpAuth, recoveryAuth, webauthnAuth } from "@/lib/auth";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,9 @@ function LoginPageInner() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [twoFactor, setTwoFactor] = useState(false);
+  const [code, setCode] = useState("");
+  const [useRecovery, setUseRecovery] = useState(false);
   const router = useRouter();
   const searchParams = useSearchParams();
   const isDev = checkIsDev();
@@ -49,11 +52,47 @@ function LoginPageInner() {
     setLoading(true);
 
     try {
-      await login(email, password);
+      const result = await login(email, password);
+      if (result.twoFactorRequired) {
+        setTwoFactor(true);
+        setLoading(false);
+        return;
+      }
       router.push("/dashboard");
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
+      setLoading(false);
+    }
+  };
+
+  const handleSecondFactor = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+    try {
+      if (useRecovery) {
+        await recoveryAuth(code.trim());
+      } else {
+        await otpAuth(code.trim());
+      }
+      router.push("/dashboard");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid code");
+      setLoading(false);
+    }
+  };
+
+  const handlePasskey = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      await webauthnAuth();
+      router.push("/dashboard");
+      router.refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Passkey authentication failed");
       setLoading(false);
     }
   };
@@ -65,9 +104,14 @@ function LoginPageInner() {
     const devPassword = "dev123456";
 
     try {
-      await login(devEmail, devPassword);
-      router.push("/dashboard");
-      router.refresh();
+      const result = await login(devEmail, devPassword);
+      if (!result.twoFactorRequired) {
+        router.push("/dashboard");
+        router.refresh();
+        return;
+      }
+      setTwoFactor(true);
+      setLoading(false);
     } catch {
       try {
         await signup(devEmail, devPassword, "Dev User");
@@ -79,6 +123,74 @@ function LoginPageInner() {
       }
     }
   };
+
+  if (twoFactor) {
+    return (
+      <>
+        <div className="flex flex-col space-y-2 text-center">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Two-factor authentication
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {useRecovery
+              ? "Enter one of your recovery codes"
+              : "Enter the 6-digit code from your authenticator app"}
+          </p>
+        </div>
+        <div className="grid gap-6">
+          <form onSubmit={handleSecondFactor}>
+            <div className="grid gap-4">
+              {error && (
+                <div className="p-3 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 rounded-md">
+                  {error}
+                </div>
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="code">
+                  {useRecovery ? "Recovery code" : "Authentication code"}
+                </Label>
+                <Input
+                  id="code"
+                  inputMode={useRecovery ? "text" : "numeric"}
+                  autoComplete="one-time-code"
+                  autoFocus
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  disabled={loading}
+                  required
+                />
+              </div>
+              <Button type="submit" disabled={loading}>
+                {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Verify
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={loading}
+                onClick={handlePasskey}
+              >
+                Use a passkey instead
+              </Button>
+            </div>
+          </form>
+          <p className="text-center text-sm text-muted-foreground">
+            <button
+              type="button"
+              className="underline underline-offset-4 hover:text-primary"
+              onClick={() => {
+                setUseRecovery(!useRecovery);
+                setCode("");
+                setError(null);
+              }}
+            >
+              {useRecovery ? "Use an authenticator code" : "Use a recovery code"}
+            </button>
+          </p>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -128,6 +240,14 @@ function LoginPageInner() {
               {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Sign in
             </Button>
+            <p className="text-center text-sm text-muted-foreground">
+              <Link
+                href="/forgot-password"
+                className="underline underline-offset-4 hover:text-primary"
+              >
+                Forgot your password?
+              </Link>
+            </p>
           </div>
         </form>
         <div className="relative">
@@ -144,7 +264,7 @@ function LoginPageInner() {
           <Button
             variant="outline"
             disabled={loading}
-            onClick={() => { window.location.href = "/api/scrapix/auth/social/github"; }}
+            onClick={() => { window.location.href = `${process.env.NEXT_PUBLIC_AUTH_ORIGIN ?? "/api/scrapix"}/auth/github`; }}
           >
             <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
@@ -154,7 +274,7 @@ function LoginPageInner() {
           <Button
             variant="outline"
             disabled={loading}
-            onClick={() => { window.location.href = "/api/scrapix/auth/social/google"; }}
+            onClick={() => { window.location.href = `${process.env.NEXT_PUBLIC_AUTH_ORIGIN ?? "/api/scrapix"}/auth/google`; }}
           >
             <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24">
               <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4" />

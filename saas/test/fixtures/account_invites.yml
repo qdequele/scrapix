@@ -1,0 +1,8 @@
+pending_invite:
+  account: acme
+  email: invited@example.com
+  role: member
+  invited_by: <%= ActiveRecord::FixtureSet.identify(:quentin, :uuid) %>
+  token_hash: <%= Digest::SHA256.hexdigest("invite-token-for-tests") %>
+  status: pending
+  expires_at: <%= 3.days.from_now.iso8601 %>

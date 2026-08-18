@@ -26,6 +26,9 @@ services:
   console:
     profiles: ["full"]
 
+  saas:
+    profiles: ["full"]
+
   # More verbose Redpanda logging for debugging
   redpanda:
     command:
