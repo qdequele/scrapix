@@ -4468,7 +4468,7 @@ pub async fn run_with_bus(
             "dev-jwt-secret-change-in-production".to_string()
         });
         match auth::AuthState::new(db_url, jwt_secret).await {
-            Ok(mut state) => {
+            Ok(state) => {
                 // The schema is owned by the Rails app (saas/db/migrate,
                 // `rails db:prepare`) — the engine no longer applies it.
 
