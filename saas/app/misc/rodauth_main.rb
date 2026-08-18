@@ -199,6 +199,16 @@ class RodauthMain < Rodauth::Rails::Auth
 
     # ==> WebAuthn
     webauthn_rp_name "Scrapix"
+    # Ceremonies run in the browser on the console origin, but the setup
+    # request reaches Rails through the console proxy (Host: 127.0.0.1), so
+    # the request-derived RP ID would never match the browser's domain
+    # ("relying party ID is not a registrable domain suffix..."). Pin both
+    # to the public console domain; the parent domain also covers the API
+    # subdomain for the webauthn-login flow.
+    if (console_url = ENV["CONSOLE_PUBLIC_URL"]).present?
+      webauthn_rp_id URI(console_url).host
+      webauthn_origin console_url
+    end
 
     # ==> Deadlines
     verify_account_skip_resend_email_within 0 # resend allowed anytime
