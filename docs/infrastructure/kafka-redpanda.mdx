@@ -41,7 +41,7 @@ export KAFKA_BROKERS=localhost:19092
 
 ## Topics
 
-Scrapix uses 7 Kafka topics. They are automatically created by the topic initialization job in Docker Compose, or you can create them manually:
+Scrapix uses 8 Kafka topics. They are automatically created by the topic initialization job in Docker Compose, or you can create them manually:
 
 ```bash
 # Using rpk (Redpanda CLI)
@@ -52,6 +52,7 @@ rpk topic create scrapix.documents -p 6 -r 1
 rpk topic create scrapix.events -p 3 -r 1
 rpk topic create scrapix.dlq.urls -p 3 -r 1
 rpk topic create scrapix.jobs.status -p 3 -r 1
+rpk topic create scrapix.fetch.feedback -p 6 -r 1
 ```
 
 Optional topics (enable with `PUBLISH_LINKS=true` or `PUBLISH_HISTORY=true`):
@@ -72,6 +73,7 @@ rpk topic create scrapix.crawl.history -p 6 -r 1
 | `scrapix.events` | 3 | Monitoring events (crawl stats, errors) |
 | `scrapix.dlq.urls` | 3 | Dead letter queue for failed messages |
 | `scrapix.jobs.status` | 3 | Job lifecycle updates |
+| `scrapix.fetch.feedback` | 6 | Crawler → frontier fetch feedback (releases per-domain politeness slots) |
 | `scrapix.links` | 6 | Link graph updates (optional) |
 | `scrapix.crawl.history` | 6 | Crawl history for incremental mode (optional) |
 

@@ -64,11 +64,14 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 |----------|---------|-------------|
 | `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches |
 | `DISPATCH_BATCH_SIZE` | `2000` | URLs per dispatch batch |
-| `DOMAIN_DELAY_MS` | `50` | Minimum delay between requests to same domain |
+| `DOMAIN_DELAY_MS` | `250` | Minimum delay between requests to same domain (jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it) |
 | `BLOOM_CAPACITY` | `10000000` | Bloom filter expected capacity per job |
 | `BLOOM_FP_RATE` | `0.01` | Bloom filter false positive rate |
 | `MAX_PENDING_PER_JOB` | `1000000` | Maximum pending URLs per job |
-| `CONCURRENT_PER_DOMAIN` | `50` | Maximum concurrent requests per domain |
+| `CONCURRENT_PER_DOMAIN` | `4` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
+| `REQUEST_TIMEOUT` | `30` | Crawler request timeout (s); a politeness slot without feedback expires after 2× this |
+| `ROBOTS_DELAY_MULTIPLIER` | `1.0` | Multiplier applied to robots.txt `Crawl-delay` |
+| `REDIS_URL` | — | When set, frontier state and per-domain politeness state are shared in Redis across instances |
 | `INSTANCE_ID` | — | Instance identifier for multi-instance frontier |
 
 ### Link Graph (optional)

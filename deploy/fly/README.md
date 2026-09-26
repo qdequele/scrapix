@@ -120,6 +120,22 @@ Add those records at the DNS registrar with a short TTL (60 s) while Heroku
 still serves the production domains. When you flip the A/AAAA records to Fly,
 traffic cuts over; flip them back to Heroku for rollback.
 
+## Politeness defaults
+
+The frontier holds a per-domain slot from dispatch until the crawler's
+`FetchFeedback` (topic `scrapix.fetch.feedback`, created by
+`create-topics.sh`) reports the fetch back; a slot without feedback expires
+after `2 × REQUEST_TIMEOUT`. Defaults: `CONCURRENT_PER_DOMAIN=4`,
+`DOMAIN_DELAY_MS=250`. Jobs' `rate_limit` (per-domain delay, rps/rpm,
+`default_crawl_delay_ms`) and robots.txt `Crawl-delay` can only raise the
+delay. With `REDIS_URL` set on the frontier, politeness state is shared by
+every frontier instance.
+
+The same values apply to the `qdq-server` deployment: set
+`CONCURRENT_PER_DOMAIN=4` and `DOMAIN_DELAY_MS=250` on the frontier there,
+and create the `scrapix.fetch.feedback` topic (6 partitions) before rolling
+out crawlers that publish it.
+
 ## Scaling
 
 ```bash

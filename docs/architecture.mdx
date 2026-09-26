@@ -51,6 +51,7 @@ All inter-service communication flows through these topics:
 | `scrapix.events` | All | Analytics | Crawl events for monitoring |
 | `scrapix.dlq.urls` | All | — | Dead letter queue for failed messages |
 | `scrapix.jobs.status` | All | API | Job status updates |
+| `scrapix.fetch.feedback` | Crawler | Frontier | Fetch outcome per dispatched URL (politeness slot release, robots crawl-delay, Retry-After) |
 | `scrapix.links` | Crawler | Frontier | Link graph updates |
 | `scrapix.crawl.history` | Crawler | Frontier | Incremental crawl tracking |
 

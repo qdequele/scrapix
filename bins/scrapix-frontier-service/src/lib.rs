@@ -14,14 +14,26 @@
 //!    job-scoped field (source, account, incremental, job spec, ...).
 //! 3. Dispatch ready URLs to the processing topic, per job, only while this
 //!    instance holds the job's dispatch lease, honoring per-domain
-//!    politeness (URLs that may not be fetched yet go back via `requeue`).
-//! 4. Publish `CrawlEvent::FrontierProgress` snapshots of the store
+//!    politeness and the job's rate limits (URLs that may not be fetched yet
+//!    go back via `requeue`).
+//! 4. Consume the crawler's `FetchFeedback` and release the politeness slot
+//!    taken at dispatch (spec R7): a domain slot is held until the fetch
+//!    finished, not until the URL reached the bus. robots.txt `Crawl-delay`
+//!    and `Retry-After` from the feedback feed the domain's delay/pause.
+//! 5. Publish `CrawlEvent::FrontierProgress` snapshots of the store
 //!    counters.
+//!
+//! Politeness state is in Redis when `REDIS_URL` is set (shared by every
+//! instance; one consumer group for feedback), otherwise in memory (one
+//! consumer group per instance so each instance sees the feedback for its
+//! own dispatches).
 //!
 //! ## Architecture
 //!
 //! ```text
 //! URL_FRONTIER → admit(store) → [lease] pop_ready → [Politeness] → URL_PROCESSING
+//!                                                        ↑
+//!                                  FETCH_FEEDBACK (crawler) ┘
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -39,13 +51,14 @@ use tracing::{debug, error, info, warn};
 
 use scrapix_core::{Ack, CrawlUrl};
 use scrapix_frontier::{
-    extract_domain, Admission, CrawlRecord, FrontierStore, JobCounters, JobRunState, LinkGraph,
-    LinkGraphConfig, MemoryFrontierStore, PolitenessConfig, PolitenessScheduler, RecrawlConfig,
-    RecrawlDecision, RecrawlScheduler, UrlHistory, UrlHistoryConfig,
+    extract_domain, Acquire, Admission, CrawlRecord, FetchReport, FetchSignal, FrontierStore,
+    JobCounters, JobLimits, JobRunState, LinkGraph, LinkGraphConfig, MemoryFrontierStore,
+    PolitenessConfig, PolitenessScheduler, PolitenessStore, RecrawlConfig, RecrawlDecision,
+    RecrawlScheduler, SlotRequest, UrlHistory, UrlHistoryConfig,
 };
 use scrapix_queue::{
     topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, CrawlHistoryMessage,
-    LinksMessage, ProducerBuilder, UrlMessage,
+    FetchFeedback, LinksMessage, ProducerBuilder, UrlMessage,
 };
 
 /// How many input messages are admitted concurrently.
@@ -64,6 +77,14 @@ const LEASE_TTL: Duration = Duration::from_secs(5);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// Upper bound on the per-process job caches (parsed templates, initialized jobs).
 const JOB_CACHE_CAP: usize = 1024;
+/// How many feedback messages are applied concurrently.
+const FEEDBACK_CONCURRENCY: usize = 64;
+/// A URL whose domain (or job) has every slot in flight is retried after this.
+const BUSY_RETRY: Duration = Duration::from_millis(200);
+/// Retry delay after a politeness-store or bus error.
+const ERROR_RETRY: Duration = Duration::from_secs(1);
+/// Upper bound on a `Retry-After` pause (same cap as the crawler's re-queue delay).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 /// Scrapix Frontier Service
 #[derive(Parser, Debug)]
@@ -108,13 +129,25 @@ pub struct Args {
     #[arg(long, env = "BLOOM_FP_RATE", default_value = "0.01")]
     pub bloom_fp_rate: f64,
 
-    /// Default delay between requests to the same domain (ms)
-    #[arg(long, env = "DOMAIN_DELAY_MS", default_value = "50")]
+    /// Default delay between requests to the same domain (ms). Jobs can
+    /// only raise it (`rate_limit`), as can robots.txt `Crawl-delay`.
+    #[arg(long, env = "DOMAIN_DELAY_MS", default_value = "250")]
     pub domain_delay_ms: u64,
 
-    /// Maximum concurrent requests per domain
-    #[arg(long, env = "CONCURRENT_PER_DOMAIN", default_value = "50")]
+    /// Maximum concurrent requests per domain (in flight until the crawler
+    /// reports the fetch back)
+    #[arg(long, env = "CONCURRENT_PER_DOMAIN", default_value = "4")]
     pub concurrent_per_domain: usize,
+
+    /// Crawler request timeout (s). A politeness slot whose feedback never
+    /// arrives expires after twice this.
+    #[arg(long, env = "REQUEST_TIMEOUT", default_value = "30")]
+    pub request_timeout_secs: u64,
+
+    /// Multiplier applied to robots.txt `Crawl-delay` (e.g. 1.5 to be extra
+    /// polite)
+    #[arg(long, env = "ROBOTS_DELAY_MULTIPLIER", default_value = "1.0")]
+    pub robots_delay_multiplier: f64,
 
     /// URL dispatch batch size
     #[arg(long, env = "DISPATCH_BATCH_SIZE", default_value = "2000")]
@@ -194,6 +227,71 @@ pub async fn build_store(args: &Args) -> anyhow::Result<Arc<dyn FrontierStore>> 
     }
 }
 
+/// Politeness settings from `args`.
+pub fn politeness_config(args: &Args) -> PolitenessConfig {
+    PolitenessConfig {
+        default_delay_ms: args.domain_delay_ms,
+        min_delay_ms: 100,
+        max_delay_ms: 30_000,
+        respect_robots_delay: true,
+        robots_delay_multiplier: args.robots_delay_multiplier,
+        concurrent_per_domain: args.concurrent_per_domain.max(1),
+        slot_ttl: Duration::from_secs(args.request_timeout_secs.max(1) * 2),
+    }
+}
+
+/// Build the politeness store selected by `args`: shared in Redis when
+/// `redis_url` is set (keys under `frontier_key_prefix`), otherwise in
+/// memory for this instance.
+pub async fn build_politeness(args: &Args) -> anyhow::Result<Arc<dyn PolitenessStore>> {
+    let config = politeness_config(args);
+    match args.redis_url.as_deref() {
+        Some(url) if !url.is_empty() => {
+            let p = scrapix_frontier::RedisPoliteness::new(url, &args.frontier_key_prefix, config)
+                .await?;
+            info!("Politeness state shared in Redis");
+            Ok(Arc::new(p))
+        }
+        _ => Ok(Arc::new(PolitenessScheduler::new(config))),
+    }
+}
+
+/// Consumer group for `FETCH_FEEDBACK`: one shared group when politeness
+/// state is shared (each message applied once), one group per instance
+/// otherwise (each instance sees the feedback for its own dispatches).
+pub fn feedback_group_id(group_id: &str, instance_id: &str, shared: bool) -> String {
+    if shared {
+        format!("{group_id}-feedback")
+    } else {
+        format!("{group_id}-feedback-{instance_id}")
+    }
+}
+
+/// The per-job politeness limits of a job template.
+fn job_limits(template: &UrlMessage) -> JobLimits {
+    match template.job {
+        Some(ref j) => JobLimits {
+            min_delay_ms: j.per_domain_delay_ms,
+            max_rps: j.requests_per_second,
+            respect_robots: j.respect_robots_txt,
+            default_crawl_delay_ms: j.default_crawl_delay_ms,
+            max_in_flight: j.max_concurrent_requests,
+        },
+        None => JobLimits::default(),
+    }
+}
+
+/// How crawler feedback affects the domain.
+fn feedback_signal(fb: &FetchFeedback) -> FetchSignal {
+    match fb.status {
+        Some(429 | 503) => FetchSignal::RateLimited,
+        Some(s) if s >= 500 => FetchSignal::Error,
+        Some(_) => FetchSignal::Success,
+        None if fb.transport_error => FetchSignal::Error,
+        None => FetchSignal::NoRequest,
+    }
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -243,6 +341,7 @@ struct ServiceMetrics {
     urls_delayed: AtomicU64,
     urls_recrawl_skipped: AtomicU64,
     admit_errors: AtomicU64,
+    feedback_received: AtomicU64,
     active_jobs: AtomicU64,
     active_domains: AtomicU64,
     links_recorded: AtomicU64,
@@ -264,6 +363,7 @@ impl ServiceMetrics {
             urls_delayed: self.urls_delayed.load(Ordering::Relaxed),
             urls_recrawl_skipped: self.urls_recrawl_skipped.load(Ordering::Relaxed),
             admit_errors: self.admit_errors.load(Ordering::Relaxed),
+            feedback_received: self.feedback_received.load(Ordering::Relaxed),
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
             active_domains: self.active_domains.load(Ordering::Relaxed),
             links_recorded: self.links_recorded.load(Ordering::Relaxed),
@@ -282,6 +382,7 @@ struct MetricsSnapshot {
     urls_delayed: u64,
     urls_recrawl_skipped: u64,
     admit_errors: u64,
+    feedback_received: u64,
     active_jobs: u64,
     active_domains: u64,
     links_recorded: u64,
@@ -292,6 +393,8 @@ struct FrontierService {
     consumer: Arc<AnyConsumer>,
     links_consumer: Option<Arc<AnyConsumer>>,
     history_consumer: Option<Arc<AnyConsumer>>,
+    /// `FETCH_FEEDBACK` consumer (politeness slot release)
+    feedback_consumer: Option<Arc<AnyConsumer>>,
     producer: Arc<AnyProducer>,
     store: Arc<dyn FrontierStore>,
     /// Parsed job templates (from `store.job_template`), used on dispatch.
@@ -304,7 +407,7 @@ struct FrontierService {
     pop_sizes: Mutex<HashMap<String, usize>>,
     /// Popped URLs whose `requeue` failed, retried first on the next tick.
     unrequeued: Mutex<HashMap<String, Vec<CrawlUrl>>>,
-    politeness: Arc<PolitenessScheduler>,
+    politeness: Arc<dyn PolitenessStore>,
     link_graph: Option<Arc<LinkGraph>>,
     recrawl_scheduler: Option<Arc<RecrawlScheduler>>,
     url_history: Option<Arc<UrlHistory>>,
@@ -315,6 +418,15 @@ struct FrontierService {
     dispatch_batch_size: usize,
     dispatch_interval: Duration,
     linkgraph_compute_interval: Duration,
+}
+
+/// Message bus handles of one service instance.
+struct Buses {
+    producer: Arc<AnyProducer>,
+    main: Arc<AnyConsumer>,
+    links: Option<Arc<AnyConsumer>>,
+    history: Option<Arc<AnyConsumer>>,
+    feedback: Option<Arc<AnyConsumer>>,
 }
 
 /// Link graph and recrawl components built from `Args`.
@@ -429,15 +541,37 @@ impl FrontierService {
             None
         };
 
+        let politeness = build_politeness(args).await?;
+        let feedback_group =
+            feedback_group_id(&args.group_id, &instance_id, politeness.is_shared());
+        let feedback_consumer = {
+            let c = ConsumerBuilder::new(&args.brokers, &feedback_group)
+                .client_id(format!("scrapix-frontier-{}-feedback", instance_id))
+                // Old feedback is meaningless (its slots already expired).
+                .auto_offset_reset("latest")
+                .build()?;
+            c.subscribe(&[topic_names::FETCH_FEEDBACK])?;
+            info!(
+                topic = topic_names::FETCH_FEEDBACK,
+                group = %feedback_group,
+                "Subscribed to fetch feedback topic"
+            );
+            Some(Arc::new(AnyConsumer::from(c)))
+        };
+
         let store = build_store(args).await?;
         Ok(Self::build(
             args,
             instance_id,
-            producer,
-            consumer,
-            links_consumer,
-            history_consumer,
+            Buses {
+                producer,
+                main: consumer,
+                links: links_consumer,
+                history: history_consumer,
+                feedback: feedback_consumer,
+            },
             store,
+            politeness,
         ))
     }
 
@@ -452,6 +586,7 @@ impl FrontierService {
         main_consumer: Arc<AnyConsumer>,
         links_consumer: Option<Arc<AnyConsumer>>,
         history_consumer: Option<Arc<AnyConsumer>>,
+        feedback_consumer: Option<Arc<AnyConsumer>>,
         store: Arc<dyn FrontierStore>,
     ) -> anyhow::Result<Self> {
         let instance_id = args
@@ -461,49 +596,47 @@ impl FrontierService {
 
         info!(instance_id = %instance_id, "Initializing frontier service (pre-built bus)");
 
+        let politeness = build_politeness(args).await?;
+        if feedback_consumer.is_none() {
+            warn!("No fetch feedback consumer: politeness slots only free on expiry");
+        }
         Ok(Self::build(
             args,
             instance_id,
-            producer,
-            main_consumer,
-            links_consumer,
-            history_consumer,
+            Buses {
+                producer,
+                main: main_consumer,
+                links: links_consumer,
+                history: history_consumer,
+                feedback: feedback_consumer,
+            },
             store,
+            politeness,
         ))
     }
 
     fn build(
         args: &Args,
         instance_id: String,
-        producer: Arc<AnyProducer>,
-        main_consumer: Arc<AnyConsumer>,
-        links_consumer: Option<Arc<AnyConsumer>>,
-        history_consumer: Option<Arc<AnyConsumer>>,
+        buses: Buses,
         store: Arc<dyn FrontierStore>,
+        politeness: Arc<dyn PolitenessStore>,
     ) -> Self {
-        let politeness = PolitenessScheduler::new(PolitenessConfig {
-            default_delay_ms: args.domain_delay_ms,
-            min_delay_ms: 100,
-            max_delay_ms: 30_000,
-            respect_robots_delay: true,
-            robots_delay_multiplier: 1.0,
-            concurrent_per_domain: args.concurrent_per_domain,
-        });
-
         let extras = build_extras(args);
 
         Self {
-            consumer: main_consumer,
-            links_consumer,
-            history_consumer,
-            producer,
+            consumer: buses.main,
+            links_consumer: buses.links,
+            history_consumer: buses.history,
+            feedback_consumer: buses.feedback,
+            producer: buses.producer,
             store,
             templates: BoundedCache::new(JOB_CACHE_CAP),
             initialized: BoundedCache::new(JOB_CACHE_CAP),
             held_leases: Mutex::new(HashSet::new()),
             pop_sizes: Mutex::new(HashMap::new()),
             unrequeued: Mutex::new(HashMap::new()),
-            politeness: Arc::new(politeness),
+            politeness,
             link_graph: extras.link_graph,
             recrawl_scheduler: extras.recrawl_scheduler,
             url_history: extras.url_history,
@@ -526,6 +659,7 @@ impl FrontierService {
         let links_handle = self.start_links_consumer();
         let history_handle = self.start_history_consumer();
         let pagerank_handle = self.start_pagerank_computer();
+        let feedback_handle = self.clone().start_feedback_consumer();
 
         let result = self.clone().process_messages().await;
 
@@ -533,9 +667,14 @@ impl FrontierService {
         metrics_handle.abort();
         dispatcher_handle.abort();
         progress_handle.abort();
-        for h in [links_handle, history_handle, pagerank_handle]
-            .into_iter()
-            .flatten()
+        for h in [
+            links_handle,
+            history_handle,
+            pagerank_handle,
+            feedback_handle,
+        ]
+        .into_iter()
+        .flatten()
         {
             h.abort();
         }
@@ -562,6 +701,7 @@ impl FrontierService {
                     delayed = snapshot.urls_delayed,
                     recrawl_skipped = snapshot.urls_recrawl_skipped,
                     admit_errors = snapshot.admit_errors,
+                    feedback = snapshot.feedback_received,
                     links_recorded = snapshot.links_recorded,
                     history_updates = snapshot.history_updates,
                     jobs = snapshot.active_jobs,
@@ -857,7 +997,7 @@ impl FrontierService {
         }
         *self.held_leases.lock() = held;
 
-        let domain_count = self.politeness.tracked_domains().len() as u64;
+        let domain_count = self.politeness.tracked_domain_count() as u64;
         self.metrics
             .active_domains
             .store(domain_count, Ordering::Relaxed);
@@ -901,12 +1041,13 @@ impl FrontierService {
             return Ok(true);
         }
 
+        let limits = job_limits(&template);
         let mut bounced = Vec::new();
         let mut dispatched = 0usize;
         let mut lease_held = true;
         let mut last_renew = std::time::Instant::now();
         let mut urls = urls.into_iter();
-        while let Some(mut url) = urls.next() {
+        while let Some(url) = urls.next() {
             if last_renew.elapsed() >= LEASE_RENEW_EVERY {
                 match self
                     .store
@@ -925,18 +1066,51 @@ impl FrontierService {
             }
 
             let domain = extract_domain(&url.url);
-            if !self.politeness.can_fetch(&domain) {
+            // The slot token becomes the dispatched message's id, which the
+            // crawler echoes back in its FetchFeedback.
+            let token = uuid::Uuid::new_v4().to_string();
+            let slot = SlotRequest {
+                domain: &domain,
+                job_id,
+                token: &token,
+                limits,
+            };
+            // Park a URL that may not be fetched yet until it is expected to
+            // be, so the next ticks don't pop and requeue it over and over.
+            let wait = match self.politeness.try_acquire(&slot).await {
+                Ok(Acquire::Granted) => None,
+                Ok(Acquire::Wait(wait)) => Some(wait),
+                Ok(Acquire::DomainBusy) => Some(BUSY_RETRY),
+                Ok(Acquire::JobBusy) => {
+                    // Every other URL of the job would be refused too.
+                    let until = Some(now + BUSY_RETRY.as_millis() as i64);
+                    let mut rest: Vec<CrawlUrl> =
+                        std::iter::once(url).chain(urls.by_ref()).collect();
+                    for u in &mut rest {
+                        u.not_before_ms = until;
+                    }
+                    self.metrics
+                        .urls_delayed
+                        .fetch_add(rest.len() as u64, Ordering::Relaxed);
+                    bounced.extend(rest);
+                    break;
+                }
+                Err(e) => {
+                    warn!(job_id = %job_id, domain = %domain, error = %e, "Politeness check failed");
+                    Some(ERROR_RETRY)
+                }
+            };
+            if let Some(wait) = wait {
                 self.metrics.urls_delayed.fetch_add(1, Ordering::Relaxed);
-                // Park it until the domain is expected to be fetchable, so the
-                // next ticks don't pop and requeue it over and over.
-                let wait = self.politeness.wait_time(&domain);
+                let mut url = url;
                 url.not_before_ms = (!wait.is_zero()).then(|| now + wait.as_millis() as i64);
                 bounced.push(url);
                 continue;
             }
 
-            self.politeness.start_request(&domain);
-            let msg = template.child(url);
+            let mut msg = template.child(url);
+            msg.message_id = token;
+
             match self
                 .producer
                 .send(
@@ -950,17 +1124,22 @@ impl FrontierService {
                     dispatched += 1;
                     self.metrics.urls_dispatched.fetch_add(1, Ordering::Relaxed);
                     debug!(url = %msg.url.url, job_id = %job_id, "Dispatched URL for crawling");
-                    // R-3: the politeness slot is released at dispatch
-                    // success for now (Task 12 moves it to crawler feedback).
-                    self.politeness.complete_request(&domain);
+                    // The slot stays taken until the crawler's FetchFeedback
+                    // (or its expiry).
                 }
                 Err(e) => {
                     error!(url = %msg.url.url, job_id = %job_id, error = %e, "Failed to dispatch URL");
                     // A bus outage is not the domain's fault: free the slot
                     // without error accounting (no backoff, no pause).
-                    self.politeness.release_slot(&domain);
+                    if let Err(e) = self
+                        .politeness
+                        .release(&domain, job_id, &msg.message_id)
+                        .await
+                    {
+                        warn!(domain = %domain, error = %e, "Failed to release politeness slot; it will expire");
+                    }
                     let mut url = msg.url;
-                    url.not_before_ms = Some(now + 1_000);
+                    url.not_before_ms = Some(now + ERROR_RETRY.as_millis() as i64);
                     bounced.push(url);
                 }
             }
@@ -1065,6 +1244,58 @@ impl FrontierService {
                     debug!(job_id = %job_id, error = %e, "Failed to publish FrontierProgress")
                 }
             }
+        }
+    }
+
+    /// Consume `FETCH_FEEDBACK`, releasing politeness slots. Feedback is
+    /// best-effort: a message that cannot be applied is logged and acked
+    /// (the slot expires on its own).
+    fn start_feedback_consumer(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let consumer = self.feedback_consumer.clone()?;
+        Some(tokio::spawn(async move {
+            let shutdown = self.shutdown.clone();
+            let service = self.clone();
+            let result = consumer
+                .process_with_ack::<FetchFeedback, _, _>(
+                    move |fb, _metadata, ack| {
+                        let service = service.clone();
+                        async move {
+                            service.apply_feedback(&fb).await;
+                            ack.ack();
+                        }
+                    },
+                    FEEDBACK_CONCURRENCY,
+                    shutdown,
+                )
+                .await;
+            if let Err(e) = result {
+                error!(error = %e, "Fetch feedback consumer stopped");
+            }
+        }))
+    }
+
+    async fn apply_feedback(&self, fb: &FetchFeedback) {
+        self.metrics
+            .feedback_received
+            .fetch_add(1, Ordering::Relaxed);
+        let domain = if fb.domain.is_empty() {
+            extract_domain(&fb.url)
+        } else {
+            fb.domain.clone()
+        };
+        let report = FetchReport {
+            domain: &domain,
+            job_id: &fb.job_id,
+            token: &fb.message_id,
+            signal: feedback_signal(fb),
+            crawl_delay_ms: fb.crawl_delay_ms,
+            retry_after: fb
+                .retry_after_ms
+                .map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER)),
+        };
+        debug!(domain = %domain, job_id = %fb.job_id, status = ?fb.status, "Fetch feedback");
+        if let Err(e) = self.politeness.report(&report).await {
+            warn!(domain = %domain, error = %e, "Failed to apply fetch feedback; the slot will expire");
         }
     }
 
@@ -1182,6 +1413,7 @@ impl FrontierService {
             dispatched = metrics.urls_dispatched,
             delayed = metrics.urls_delayed,
             admit_errors = metrics.admit_errors,
+            feedback = metrics.feedback_received,
             "Final frontier metrics"
         );
 
@@ -1212,6 +1444,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         brokers = %args.brokers,
         group_id = %args.group_id,
         domain_delay_ms = args.domain_delay_ms,
+        concurrent_per_domain = args.concurrent_per_domain,
         "Starting Scrapix frontier service"
     );
 
@@ -1248,6 +1481,7 @@ pub async fn run_with_bus(
     main_consumer: Arc<AnyConsumer>,
     links_consumer: Option<Arc<AnyConsumer>>,
     history_consumer: Option<Arc<AnyConsumer>>,
+    feedback_consumer: Option<Arc<AnyConsumer>>,
     store: Arc<dyn FrontierStore>,
 ) -> anyhow::Result<()> {
     info!(
@@ -1262,6 +1496,7 @@ pub async fn run_with_bus(
             main_consumer,
             links_consumer,
             history_consumer,
+            feedback_consumer,
             store,
         )
         .await?,
@@ -1278,7 +1513,7 @@ pub async fn run_with_bus(
 mod tests {
     use super::*;
     use scrapix_core::JobSpec;
-    use scrapix_queue::{ChannelBus, CrawlEvent};
+    use scrapix_queue::{ChannelBus, CrawlEvent, FetchFeedback};
     use std::time::Instant;
 
     fn test_args() -> Args {
@@ -1289,7 +1524,6 @@ mod tests {
 
     fn seed_message(job_id: &str, max_pages: Option<u64>) -> UrlMessage {
         let spec = JobSpec {
-            per_domain_delay_ms: 1234,
             user_agents: vec!["ua-test".to_string()],
             ..JobSpec::default()
         };
@@ -1309,8 +1543,10 @@ mod tests {
         let producer = Arc::new(AnyProducer::channel(bus.producer()));
         let consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
         consumer.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
+        let feedback = Arc::new(AnyConsumer::channel(bus.consumer()));
+        feedback.subscribe(&[topic_names::FETCH_FEEDBACK]).unwrap();
         Arc::new(
-            FrontierService::with_bus(args, producer, consumer, None, None, store)
+            FrontierService::with_bus(args, producer, consumer, None, None, Some(feedback), store)
                 .await
                 .unwrap(),
         )
@@ -1453,6 +1689,24 @@ mod tests {
         async fn publish(&self, msg: &UrlMessage) {
             AnyProducer::channel(self.bus.producer())
                 .send(topic_names::URL_FRONTIER, Some(&msg.job_id), msg)
+                .await
+                .unwrap();
+        }
+
+        /// Publish the crawler's `FetchFeedback` for a dispatched message.
+        async fn feedback(&self, m: &UrlMessage, status: Option<u16>, retry_after_ms: Option<u64>) {
+            let fb = FetchFeedback {
+                status,
+                retry_after_ms,
+                ..FetchFeedback::new(
+                    extract_domain(&m.url.url),
+                    m.job_id.clone(),
+                    m.message_id.clone(),
+                    m.url.url.clone(),
+                )
+            };
+            AnyProducer::channel(self.bus.producer())
+                .send(topic_names::FETCH_FEEDBACK, Some(&fb.domain), &fb)
                 .await
                 .unwrap();
         }
@@ -1665,6 +1919,8 @@ mod tests {
         seed_store(&*store, "job-churn", 500).await;
         let mut args = test_args();
         args.domain_delay_ms = 50;
+        // No crawler sends feedback here: don't let held slots cap the test.
+        args.concurrent_per_domain = 10_000;
         let h = Harness::start_with(args, store.clone()).await;
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         let dispatched = h.service.metrics.urls_dispatched.load(Ordering::Relaxed);
@@ -1692,6 +1948,8 @@ mod tests {
         seed_store(&*store, "job-bounce", 5).await;
         let mut args = test_args();
         args.domain_delay_ms = 50;
+        // No crawler sends feedback here: don't let held slots cap the test.
+        args.concurrent_per_domain = 10_000;
         let h = Harness::start_with(args, store.clone()).await;
         let dispatched = h.collect_dispatched(Duration::from_millis(1_500)).await;
         h.stop();
@@ -1715,6 +1973,8 @@ mod tests {
         seed_store(&*store, "job-requeue", 5).await;
         let mut args = test_args();
         args.domain_delay_ms = 50;
+        // No crawler sends feedback here: don't let held slots cap the test.
+        args.concurrent_per_domain = 10_000;
         let h = Harness::start_with(args, store.clone()).await;
         let dispatched = h.collect_dispatched(Duration::from_millis(1_500)).await;
         h.stop();
@@ -1791,5 +2051,205 @@ mod tests {
             (da, db) == (10, 0) || (da, db) == (0, 10),
             "one instance dispatched everything: a={da} b={db}"
         );
+    }
+
+    fn one_domain_job(job_id: &str, spec: Option<JobSpec>) -> UrlMessage {
+        UrlMessage::new(CrawlUrl::seed("https://one.test/"), job_id, "idx").with_job(spec)
+    }
+
+    #[tokio::test]
+    async fn domain_slot_is_held_until_fetch_feedback() {
+        let mut args = test_args();
+        args.concurrent_per_domain = 1;
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store).await;
+        let seed = one_domain_job("job-slot", None);
+        h.publish(&seed).await;
+        for i in 0..2 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://one.test/{i}"), 1)))
+                .await;
+        }
+
+        let first = h.collect_dispatched(Duration::from_millis(800)).await;
+        assert_eq!(first.len(), 1, "one slot: only one URL in flight");
+        h.feedback(&first[0], Some(200), None).await;
+        let second = h.collect_dispatched(Duration::from_millis(800)).await;
+        assert_eq!(second.len(), 1, "feedback frees exactly one slot");
+        assert_ne!(second[0].url.url, first[0].url.url);
+        // Feedback for an unknown message frees nothing.
+        let mut stranger = second[0].clone();
+        stranger.message_id = "not-dispatched".to_string();
+        h.feedback(&stranger, Some(200), None).await;
+        assert!(h
+            .collect_dispatched(Duration::from_millis(500))
+            .await
+            .is_empty());
+        h.feedback(&second[0], None, None).await; // fail-closed: still frees
+        let third = h.collect_dispatched(Duration::from_millis(800)).await;
+        h.stop();
+        assert_eq!(third.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn per_job_in_flight_cap_is_enforced_across_domains() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store).await;
+        let spec = JobSpec {
+            max_concurrent_requests: Some(2),
+            ..JobSpec::default()
+        };
+        let seed = UrlMessage::new(CrawlUrl::seed("https://d0.test/"), "job-cap", "idx")
+            .with_job(Some(spec));
+        h.publish(&seed).await;
+        for i in 1..5 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://d{i}.test/"), 1)))
+                .await;
+        }
+
+        let first = h.collect_dispatched(Duration::from_millis(800)).await;
+        assert_eq!(first.len(), 2, "max_concurrent_requests=2");
+        h.feedback(&first[0], Some(200), None).await;
+        let second = h.collect_dispatched(Duration::from_millis(800)).await;
+        h.stop();
+        assert_eq!(second.len(), 1, "one feedback, one more dispatch");
+    }
+
+    #[tokio::test]
+    async fn retry_after_feedback_pauses_the_domain() {
+        let mut args = test_args();
+        args.concurrent_per_domain = 1;
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store).await;
+        let seed = one_domain_job("job-429", None);
+        h.publish(&seed).await;
+        h.publish(&seed.child(CrawlUrl::new("https://one.test/a", 1)))
+            .await;
+
+        let first = h.collect_dispatched(Duration::from_millis(800)).await;
+        assert_eq!(first.len(), 1);
+        h.feedback(&first[0], Some(429), Some(60_000)).await;
+        let during_pause = h.collect_dispatched(Duration::from_millis(1_000)).await;
+        h.stop();
+        assert!(
+            during_pause.is_empty(),
+            "slot is free but the domain is paused by Retry-After: {:?}",
+            during_pause.iter().map(|m| &m.url.url).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn job_rate_limit_spaces_requests_to_a_domain() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 10_000;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store).await;
+        let spec = JobSpec {
+            requests_per_second: Some(2.0), // 500 ms apart
+            ..JobSpec::default()
+        };
+        let seed = one_domain_job("job-rps", Some(spec));
+        h.publish(&seed).await;
+        for i in 0..9 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://one.test/{i}"), 1)))
+                .await;
+        }
+        let got = h.collect_dispatched(Duration::from_millis(1_200)).await;
+        h.stop();
+        assert!(
+            (2..=3).contains(&got.len()),
+            "2 rps over 1.2 s dispatches 2-3 URLs, got {}",
+            got.len()
+        );
+    }
+
+    /// With `REDIS_URL` set, two frontier instances share one domain slot:
+    /// only one URL of the domain is in flight across both until feedback.
+    /// Needs `SCRAPIX_TEST_REDIS_URL`; skipped otherwise. Keys live under a
+    /// random prefix and expire on their own (slot TTL / one day).
+    #[tokio::test]
+    async fn redis_politeness_is_shared_between_instances() {
+        let Ok(url) = std::env::var("SCRAPIX_TEST_REDIS_URL") else {
+            eprintln!("SCRAPIX_TEST_REDIS_URL not set; skipping shared politeness test");
+            return;
+        };
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let bus = ChannelBus::new();
+        let prefix = format!("test-svc-{}", uuid::Uuid::new_v4());
+        let mut services = Vec::new();
+        for name in ["frontier-a", "frontier-b"] {
+            let mut args = test_args();
+            args.instance_id = Some(name.to_string());
+            args.redis_url = Some(url.clone());
+            args.frontier_key_prefix = prefix.clone();
+            args.concurrent_per_domain = 1;
+            args.domain_delay_ms = 0;
+            let s = spawn_service(&bus, &args, store.clone()).await;
+            services.push((s.clone(), tokio::spawn(s.run())));
+        }
+        let processing = AnyConsumer::channel(bus.consumer());
+        processing
+            .subscribe(&[topic_names::URL_PROCESSING])
+            .unwrap();
+        let producer = AnyProducer::channel(bus.producer());
+        // Two jobs on the same domain: whichever instance leases each, they
+        // compete for the same shared slot.
+        for job in ["job-shared-1", "job-shared-2"] {
+            let seed = one_domain_job(job, None);
+            producer
+                .send(topic_names::URL_FRONTIER, None, &seed)
+                .await
+                .unwrap();
+            producer
+                .send(
+                    topic_names::URL_FRONTIER,
+                    None,
+                    &seed.child(CrawlUrl::new(format!("https://one.test/{job}"), 1)),
+                )
+                .await
+                .unwrap();
+        }
+        let collect = |window: Duration| {
+            let processing = &processing;
+            async move {
+                let deadline = Instant::now() + window;
+                let mut out = Vec::new();
+                while Instant::now() < deadline {
+                    if let Some(m) = processing
+                        .poll_one::<UrlMessage>(Duration::from_millis(50))
+                        .await
+                        .unwrap()
+                    {
+                        out.push(m);
+                    }
+                }
+                out
+            }
+        };
+        let first = collect(Duration::from_millis(1_000)).await;
+        assert_eq!(first.len(), 1, "one shared slot across both instances");
+        let fb = FetchFeedback {
+            status: Some(200),
+            ..FetchFeedback::new(
+                "one.test",
+                first[0].job_id.clone(),
+                first[0].message_id.clone(),
+                first[0].url.url.clone(),
+            )
+        };
+        producer
+            .send(topic_names::FETCH_FEEDBACK, Some("one.test"), &fb)
+            .await
+            .unwrap();
+        let second = collect(Duration::from_millis(1_000)).await;
+        for (s, h) in services {
+            s.shutdown.store(true, Ordering::Relaxed);
+            h.abort();
+        }
+        assert_eq!(second.len(), 1, "feedback frees the shared slot once");
     }
 }

@@ -65,7 +65,7 @@ pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};
 pub use scrapix_core::Ack;
 pub use topics::{
     names as topic_names, CrawlEvent, CrawlHistoryMessage, DlqMessage, DocumentMessage,
-    LinksMessage, RawPageMessage, UrlMessage,
+    FetchFeedback, LinksMessage, RawPageMessage, UrlMessage,
 };
 
 // Message bus abstractions

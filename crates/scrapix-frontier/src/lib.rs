@@ -61,6 +61,8 @@ pub mod history;
 pub mod linkgraph;
 pub mod partition;
 pub mod politeness;
+#[cfg(feature = "redis-store")]
+pub mod politeness_redis;
 pub mod priority;
 pub mod recrawl;
 pub mod simhash;
@@ -74,7 +76,12 @@ pub use history::{
 };
 pub use linkgraph::{LinkGraph, LinkGraphBuilder, LinkGraphConfig, LinkGraphStats};
 pub use partition::{extract_domain, DomainGrouper, PartitionConfig, Partitioner};
-pub use politeness::{DomainStats, PolitenessConfig, PolitenessScheduler};
+pub use politeness::{
+    Acquire, DomainStats, FetchReport, FetchSignal, JobLimits, PolitenessConfig,
+    PolitenessScheduler, PolitenessStore, SlotRequest,
+};
+#[cfg(feature = "redis-store")]
+pub use politeness_redis::RedisPoliteness;
 pub use priority::{MultiLevelPriorityQueue, PriorityConfig, PriorityQueue};
 pub use recrawl::{
     RecrawlConfig, RecrawlDecision, RecrawlReason, RecrawlScheduler, RecrawlSchedulerBuilder,

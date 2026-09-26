@@ -21,7 +21,8 @@ The most impactful knobs for single-binary performance:
 | `DISPATCH_BATCH_SIZE` | 2000 | URLs dispatched per batch. Increase for high-throughput. |
 | `DISPATCH_INTERVAL_MS` | 20 | Lower = more frequent dispatches. |
 | `BATCH_SIZE` | 2000 | Meilisearch indexing batch size. Match to Meilisearch capacity. |
-| `DOMAIN_DELAY_MS` | 50 | Minimum per-domain delay. Lower = faster per-domain. |
+| `DOMAIN_DELAY_MS` | 250 | Minimum per-domain delay. Lower = faster per-domain. |
+| `CONCURRENT_PER_DOMAIN` | 4 | Requests in flight per domain (held until the crawler reports back). |
 
 ### Resource Guidelines
 

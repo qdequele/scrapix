@@ -110,6 +110,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let frontier_consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
     frontier_consumer.subscribe(&[topic_names::URL_FRONTIER])?;
 
+    // Frontier fetch-feedback consumer (FETCH_FEEDBACK, politeness slots)
+    let frontier_feedback = Arc::new(AnyConsumer::channel(bus.consumer()));
+    frontier_feedback.subscribe(&[topic_names::FETCH_FEEDBACK])?;
+
     // Crawler consumer (URL_PROCESSING)
     let crawler_consumer = AnyConsumer::channel(bus.consumer());
     crawler_consumer.subscribe(&[topic_names::URL_PROCESSING])?;
@@ -139,8 +143,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
-        domain_delay_ms: 50,
-        concurrent_per_domain: 50,
+        domain_delay_ms: 250,
+        concurrent_per_domain: 4,
+        request_timeout_secs: 30,
+        robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
         max_pending_per_job: 1_000_000,
@@ -212,6 +218,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
             frontier_consumer,
             None, // links consumer
             None, // history consumer
+            Some(frontier_feedback),
             frontier_store,
         )
         .await
@@ -337,6 +344,22 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         AnyConsumer::from(c)
     });
 
+    // One instance here: its feedback group is shared only with Redis
+    // politeness (see `feedback_group_id`).
+    let feedback_group = scrapix_frontier_service::feedback_group_id(
+        "scrapix-all-frontier",
+        "all-in-one",
+        std::env::var("REDIS_URL").is_ok_and(|u| !u.is_empty()),
+    );
+    let frontier_feedback: Arc<AnyConsumer> = Arc::new({
+        let c = ConsumerBuilder::new(brokers, &feedback_group)
+            .client_id("scrapix-all-frontier-feedback")
+            .auto_offset_reset("latest")
+            .build()?;
+        c.subscribe(&[topic_names::FETCH_FEEDBACK])?;
+        AnyConsumer::from(c)
+    });
+
     let crawler_producer: AnyProducer = ProducerBuilder::new(brokers)
         .client_id("scrapix-all-crawler")
         .compression("lz4")
@@ -390,8 +413,10 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
-        domain_delay_ms: 50,
-        concurrent_per_domain: 50,
+        domain_delay_ms: 250,
+        concurrent_per_domain: 4,
+        request_timeout_secs: 30,
+        robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
         max_pending_per_job: 1_000_000,
@@ -462,6 +487,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
             frontier_consumer,
             None,
             None,
+            Some(frontier_feedback),
             frontier_store,
         )
         .await

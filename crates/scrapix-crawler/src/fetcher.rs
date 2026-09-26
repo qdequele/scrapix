@@ -784,6 +784,11 @@ impl HttpFetcher {
         self.robots_cache.get_crawl_delay(domain).await
     }
 
+    /// Cached robots.txt `Crawl-delay` for `url`'s origin (never fetches).
+    pub fn cached_crawl_delay(&self, url: &str) -> Option<u64> {
+        self.robots_cache.cached_crawl_delay(url)
+    }
+
     /// Pre-resolve DNS for a hostname (warms the cache)
     ///
     /// This can be called before fetching to ensure DNS is cached.

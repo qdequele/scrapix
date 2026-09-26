@@ -133,6 +133,19 @@ impl RobotsCache {
         Ok(allowed)
     }
 
+    /// robots.txt `Crawl-delay` of `url`'s origin (scheme+host+port), from
+    /// the cache only: never fetches robots.txt, and returns `None` when the
+    /// origin is not cached (or its entry expired) or sets no crawl-delay.
+    pub fn cached_crawl_delay(&self, url: &str) -> Option<u64> {
+        let parsed = Url::parse(url).ok()?;
+        let key = robots_cache_key(&parsed).ok()?;
+        let cache = self.cache.read();
+        let entry = cache.get(&key)?;
+        (entry.cached_at.elapsed() < self.config.cache_ttl)
+            .then_some(entry.crawl_delay_ms)
+            .flatten()
+    }
+
     /// Get crawl delay for a domain
     pub async fn get_crawl_delay(&self, domain: &str) -> Result<Option<u64>> {
         let (robots_url, key) = domain_robots_url(domain)?;

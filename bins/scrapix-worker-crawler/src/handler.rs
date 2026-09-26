@@ -17,7 +17,7 @@ use scrapix_crawler::{
     ConditionalRequestHeaders, ExtractorConfig, FetchOptions, FetchResult, UrlExtractor,
 };
 use scrapix_queue::{
-    topic_names, CrawlEvent, DlqMessage, LinksMessage, RawPageMessage, UrlMessage,
+    topic_names, CrawlEvent, DlqMessage, FetchFeedback, LinksMessage, RawPageMessage, UrlMessage,
 };
 use tracing::{debug, info, warn};
 
@@ -35,6 +35,51 @@ pub(crate) const BROWSER_UNAVAILABLE: &str = "browser rendering unavailable on t
 /// which only exists with the `browser` feature.)
 pub(crate) const BROWSER_PROXY_UNSUPPORTED: &str =
     "per-job proxy is not supported for browser rendering";
+
+/// Upper bound on the best-effort `FetchFeedback` publish.
+const FEEDBACK_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build the `FetchFeedback` for one handled message (`crawl_delay_ms` is
+/// filled in by the caller). `result` is `None` when no fetch was attempted
+/// (fail-closed precheck). Transport errors through a job proxy are the
+/// proxy's, not the domain's, so they are not flagged as `transport_error`.
+fn fetch_feedback(
+    msg: &UrlMessage,
+    result: Option<&scrapix_core::Result<FetchResult>>,
+    via_proxy: bool,
+) -> FetchFeedback {
+    let mut fb = FetchFeedback::new(
+        scrapix_frontier::extract_domain(&msg.url.url),
+        msg.job_id.clone(),
+        msg.message_id.clone(),
+        msg.url.url.clone(),
+    );
+    match result {
+        None => {}
+        Some(Ok(FetchResult::Fetched(page))) => {
+            fb.status = Some(page.status);
+            if matches!(page.status, 429 | 503) {
+                fb.retry_after_ms = page
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| scrapix_crawler::parse_retry_after(v, chrono::Utc::now()))
+                    .map(|d| d.as_millis() as u64);
+            }
+        }
+        Some(Ok(FetchResult::NotModified { .. })) => fb.status = Some(304),
+        Some(Err(ScrapixError::Http { status, .. })) => fb.status = Some(*status),
+        Some(Err(ScrapixError::RateLimited { retry_after_secs })) => {
+            fb.status = Some(429);
+            fb.retry_after_ms = Some(retry_after_secs.saturating_mul(1000));
+        }
+        Some(Err(
+            ScrapixError::Timeout(_) | ScrapixError::Connection(_) | ScrapixError::Network(_),
+        )) => fb.transport_error = !via_proxy,
+        // Robots disallow, SSRF refusal, invalid URL, ...: no page request.
+        Some(Err(_)) => {}
+    }
+    fb
+}
 
 /// Result of one fetch attempt plus the proxy it went through (if any), so
 /// the proxy pool can be told whether the proxy worked.
@@ -81,6 +126,10 @@ impl CrawlerWorker {
         self.metrics.fetch_completed();
         let elapsed = start.elapsed();
 
+        // Release the frontier's politeness slot for this dispatch (every
+        // handled message, including fail-closed ones that made no request).
+        self.publish_feedback(&msg, result.as_ref()).await;
+
         let published = match outcome {
             Outcome::Crawled => match result {
                 Some(Ok(FetchResult::Fetched(page))) => self.on_crawled(&msg, page, elapsed).await,
@@ -116,6 +165,34 @@ impl CrawlerWorker {
                     "Failed to publish crawl results; leaving message unacked for redelivery"
                 );
             }
+        }
+    }
+
+    /// Publish the `FetchFeedback` for `msg` (keyed by domain). Best-effort:
+    /// a failed or slow publish is logged and never blocks the ack — the
+    /// frontier's slot expiry covers lost feedback.
+    async fn publish_feedback(
+        &self,
+        msg: &UrlMessage,
+        result: Option<&scrapix_core::Result<FetchResult>>,
+    ) {
+        let via_proxy = msg.job.as_ref().is_some_and(|j| j.proxy.is_some());
+        let mut feedback = fetch_feedback(msg, result, via_proxy);
+        let respects_robots = !matches!(msg.job, Some(ref j) if !j.respect_robots_txt);
+        if respects_robots && result.is_some() {
+            feedback.crawl_delay_ms = self.fetcher.cached_crawl_delay(&msg.url.url);
+        }
+        let send = self.producer.send(
+            topic_names::FETCH_FEEDBACK,
+            Some(&feedback.domain),
+            &feedback,
+        );
+        match tokio::time::timeout(FEEDBACK_SEND_TIMEOUT, send).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(url = %msg.url.url, error = %e, "Failed to publish fetch feedback")
+            }
+            Err(_) => warn!(url = %msg.url.url, "Timed out publishing fetch feedback"),
         }
     }
 
@@ -415,7 +492,6 @@ impl CrawlerWorker {
         };
         self.publish_event(&msg.job_id, &event).await?;
 
-        // Task 12: publish FetchFeedback (politeness slot release) here.
         Ok(())
     }
 
@@ -455,7 +531,6 @@ impl CrawlerWorker {
             url_message_id: msg.message_id.clone(),
         };
         self.publish_event(&msg.job_id, &event).await?;
-        // Task 12: publish FetchFeedback (politeness slot release) here.
         Ok(())
     }
 
@@ -502,7 +577,6 @@ impl CrawlerWorker {
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         self.publish_event(&msg.job_id, &event).await?;
-        // Task 12: publish FetchFeedback (politeness slot release) here.
         Ok(())
     }
 
@@ -551,7 +625,6 @@ impl CrawlerWorker {
             url_message_id: msg.message_id.clone(),
         };
         self.publish_event(&msg.job_id, &event).await?;
-        // Task 12: publish FetchFeedback (politeness slot release) here.
         Ok(())
     }
 }
@@ -562,7 +635,7 @@ mod tests {
     use crate::Args;
     use clap::Parser;
     use scrapix_core::JobSpec;
-    use scrapix_queue::{AnyConsumer, AnyProducer, ChannelBus};
+    use scrapix_queue::{AnyConsumer, AnyProducer, ChannelBus, FetchFeedback};
     use serde::de::DeserializeOwned;
     use std::sync::atomic::AtomicBool;
     use wiremock::matchers::{header, method, path};
@@ -571,9 +644,13 @@ mod tests {
     const MAX_RETRIES: u32 = 2;
 
     async fn worker(bus: &ChannelBus) -> Arc<CrawlerWorker> {
+        worker_with_robots(bus, false).await
+    }
+
+    async fn worker_with_robots(bus: &ChannelBus, respect_robots: bool) -> Arc<CrawlerWorker> {
         let mut args = Args::parse_from(["scrapix-worker-crawler"]);
         args.allow_private_ips = true; // wiremock listens on 127.0.0.1
-        args.respect_robots = false;
+        args.respect_robots = respect_robots;
         args.sitemap_discovery = false;
         args.redis_url = None;
         args.browser_render = false;
@@ -998,5 +1075,132 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(!requests[0].headers.contains_key("x-api-key"));
         assert_eq!(requests[1].headers.get("x-api-key").unwrap(), "secret");
+    }
+
+    /// The single `FetchFeedback` published for `msg` (fails on 0 or 2+).
+    async fn feedback_for(bus: &ChannelBus, msg: &UrlMessage) -> FetchFeedback {
+        let c = reader(bus, topic_names::FETCH_FEEDBACK);
+        let all: Vec<FetchFeedback> = drain(&c).await;
+        let mine: Vec<_> = all
+            .into_iter()
+            .filter(|f| f.message_id == msg.message_id)
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one feedback per message: {mine:?}");
+        let fb = mine.into_iter().next().unwrap();
+        assert_eq!(fb.job_id, msg.job_id);
+        assert_eq!(fb.url, msg.url.url);
+        assert_eq!(fb.domain, "localhost");
+        assert!(fb.timestamp > 0);
+        fb
+    }
+
+    #[tokio::test]
+    async fn success_publishes_fetch_feedback_keyed_by_domain() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let msg = message(url(&server, "/ok"), None);
+        let (ack, acked) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+
+        let fb = feedback_for(&bus, &msg).await;
+        assert_eq!(fb.status, Some(200));
+        assert!(!fb.transport_error);
+        assert_eq!(fb.retry_after_ms, None);
+        assert_eq!(fb.crawl_delay_ms, None, "robots not consulted");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_feedback_carries_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let msg = message(url(&server, "/slow"), None);
+        let (ack, _) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+
+        let fb = feedback_for(&bus, &msg).await;
+        assert_eq!(fb.status, Some(429));
+        assert_eq!(fb.retry_after_ms, Some(120_000));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_before_fetch_still_sends_feedback_without_status() {
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let job = JobSpec {
+            crawler_type: CrawlerType::Browser,
+            ..Default::default()
+        };
+        let msg = message("http://localhost:1/spa".into(), Some(job));
+        let (ack, acked) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+
+        let fb = feedback_for(&bus, &msg).await;
+        assert_eq!(fb.status, None);
+        assert!(!fb.transport_error, "no request was made");
+    }
+
+    #[tokio::test]
+    async fn transport_error_feedback_is_flagged() {
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        // Nothing listens on port 1: connection refused.
+        let msg = message("http://localhost:1/x".into(), None);
+        let (ack, _) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+
+        let fb = feedback_for(&bus, &msg).await;
+        assert_eq!(fb.status, None);
+        assert!(fb.transport_error);
+    }
+
+    #[tokio::test]
+    async fn robots_crawl_delay_is_reported_only_for_jobs_respecting_robots() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("User-agent: *\nCrawl-delay: 2\n", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let w = worker_with_robots(&bus, true).await;
+
+        let respects = message(url(&server, "/page"), Some(JobSpec::default()));
+        let (ack, _) = tracked_ack();
+        w.handle_message(respects.clone(), ack).await;
+        let fb = feedback_for(&bus, &respects).await;
+        assert_eq!(fb.status, Some(200));
+        assert_eq!(fb.crawl_delay_ms, Some(2_000));
+
+        let ignores = message(
+            url(&server, "/page"),
+            Some(JobSpec {
+                respect_robots_txt: false,
+                ..Default::default()
+            }),
+        );
+        let (ack, _) = tracked_ack();
+        w.handle_message(ignores.clone(), ack).await;
+        let fb = feedback_for(&bus, &ignores).await;
+        assert_eq!(fb.crawl_delay_ms, None);
     }
 }

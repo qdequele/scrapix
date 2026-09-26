@@ -24,6 +24,9 @@ pub mod names {
     pub const LINKS: &str = "scrapix.links";
     /// Crawl history updates (for incremental crawling)
     pub const CRAWL_HISTORY: &str = "scrapix.crawl.history";
+    /// Crawler → frontier feedback after every fetch attempt (politeness
+    /// slot release, robots crawl-delay, Retry-After)
+    pub const FETCH_FEEDBACK: &str = "scrapix.fetch.feedback";
 }
 
 /// Message types for the URL frontier queue
@@ -794,9 +797,82 @@ impl CrawlHistoryMessage {
     }
 }
 
+/// Crawler → frontier: one per dispatched `UrlMessage` the crawler handled,
+/// published to [`names::FETCH_FEEDBACK`] keyed by `domain`. It releases the
+/// politeness slot the frontier took at dispatch and carries what the fetch
+/// learned about the domain.
+///
+/// Every field is `#[serde(default)]` so old and new workers interoperate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FetchFeedback {
+    /// Politeness key of the URL (its host, as `extract_domain` returns it)
+    #[serde(default)]
+    pub domain: String,
+    /// Job the URL belongs to (per-job in-flight cap)
+    #[serde(default)]
+    pub job_id: String,
+    /// `message_id` of the dispatched `UrlMessage` (identifies the slot)
+    #[serde(default)]
+    pub message_id: String,
+    /// The URL fetched
+    #[serde(default)]
+    pub url: String,
+    /// HTTP status of the response (`304` for not-modified); `None` when no
+    /// response was received (transport error, or no request was made)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// A transport-level failure (timeout, connection, network) reached the
+    /// domain without a response
+    #[serde(default)]
+    pub transport_error: bool,
+    /// Server `Retry-After` (429/503), in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// robots.txt `Crawl-delay` of the URL's origin, in milliseconds (only
+    /// for jobs that respect robots.txt, and only when already cached)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crawl_delay_ms: Option<u64>,
+    /// When the feedback was produced (ms since epoch)
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+impl FetchFeedback {
+    /// Feedback for `url` of message `message_id`; fill in the rest with
+    /// struct update syntax.
+    pub fn new(
+        domain: impl Into<String>,
+        job_id: impl Into<String>,
+        message_id: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            job_id: job_id.into(),
+            message_id: message_id.into(),
+            url: url.into(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_feedback_tolerates_missing_fields_and_skips_nones() {
+        let fb: FetchFeedback = serde_json::from_str(r#"{"domain":"a.test"}"#).unwrap();
+        assert_eq!(fb.domain, "a.test");
+        assert_eq!(fb.status, None);
+        assert!(!fb.transport_error);
+        let json = serde_json::to_string(&FetchFeedback::new("a.test", "j", "m", "u")).unwrap();
+        assert!(!json.contains("status"), "{json}");
+        assert!(!json.contains("retry_after_ms"), "{json}");
+        let back: FetchFeedback = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message_id, "m");
+    }
 
     #[test]
     fn test_links_message_creation() {
