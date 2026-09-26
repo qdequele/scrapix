@@ -157,6 +157,37 @@ impl JobFetchShaper {
     }
 }
 
+/// Whether the job's custom headers may be sent to `url`: only to hosts in
+/// the job's `url_patterns.allowed_domains` (same matching as link
+/// extraction), or to every host when that list is empty. Keeps tenant
+/// secrets such as API keys from reaching unrelated hosts.
+///
+/// This gates the *initial* request only: reqwest follows redirects with the
+/// same headers (it strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` on a cross-host hop), so a
+/// custom header can still reach a redirect target on another host.
+pub fn headers_allowed_for(url: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.is_empty() {
+        return true;
+    }
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .is_some_and(|host| {
+            scrapix_crawler::UrlExtractor::host_in_allowed_domains(&host, allowed_domains)
+        })
+}
+
+/// Whether a response that came back through a proxy is the proxy's own
+/// failure rather than the origin's answer: `407 Proxy Authentication
+/// Required`, or a 502/503/504 carrying an RFC 9209 `Proxy-Status` header
+/// (set by the proxy when it could not reach the origin). Such a response
+/// counts against the proxy and is retried (through another proxy).
+pub fn is_proxy_failure(page: &scrapix_core::RawPage) -> bool {
+    page.status == 407
+        || (matches!(page.status, 502..=504) && page.headers.contains_key("proxy-status"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +285,45 @@ mod tests {
             .proxy
             .unwrap();
         assert_eq!(next, "http://t2:1");
+    }
+
+    #[test]
+    fn headers_only_for_allowed_hosts() {
+        let allowed = vec!["docs.example.com".to_string()];
+        assert!(headers_allowed_for("https://docs.example.com/a", &allowed));
+        assert!(headers_allowed_for(
+            "https://www.docs.example.com/a",
+            &allowed
+        ));
+        assert!(!headers_allowed_for("https://evil.test/a", &allowed));
+        assert!(!headers_allowed_for("not a url", &allowed));
+        assert!(headers_allowed_for("https://anything.test/", &[]));
+    }
+
+    #[test]
+    fn proxy_failure_detection() {
+        let page = |status: u16, headers: &[(&str, &str)]| scrapix_core::RawPage {
+            url: "u".into(),
+            final_url: "u".into(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            html: String::new(),
+            content_type: None,
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 0,
+        };
+        assert!(is_proxy_failure(&page(407, &[])));
+        assert!(is_proxy_failure(&page(
+            502,
+            &[("proxy-status", "squid; error=connection_refused")]
+        )));
+        assert!(!is_proxy_failure(&page(502, &[])));
+        assert!(!is_proxy_failure(&page(200, &[("proxy-status", "x")])));
+        assert!(!is_proxy_failure(&page(404, &[])));
     }
 
     #[test]

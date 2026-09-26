@@ -268,17 +268,26 @@ impl UrlExtractor {
             .unwrap_or(domain)
     }
 
+    /// Whether `host` is in an explicit `allowed_domains` whitelist, with
+    /// the same matching link extraction uses (case-insensitive, a leading
+    /// `www.` ignored on both sides). An empty list allows every host.
+    pub fn host_in_allowed_domains(host: &str, allowed_domains: &[String]) -> bool {
+        if allowed_domains.is_empty() {
+            return true;
+        }
+        let host = Self::normalize_domain(host);
+        allowed_domains
+            .iter()
+            .any(|d| Self::normalize_domain(d).eq_ignore_ascii_case(host))
+    }
+
     /// Check if a domain is allowed based on configuration
     fn is_allowed_domain(&self, url_domain: &str, base_domain: &str) -> bool {
         let url_norm = Self::normalize_domain(url_domain);
 
         // If explicit allowed_domains whitelist is set, use ONLY that (strict mode)
         if !self.config.allowed_domains.is_empty() {
-            return self
-                .config
-                .allowed_domains
-                .iter()
-                .any(|d| Self::normalize_domain(d).eq_ignore_ascii_case(url_norm));
+            return Self::host_in_allowed_domains(url_domain, &self.config.allowed_domains);
         }
 
         // Fallback to automatic domain inference

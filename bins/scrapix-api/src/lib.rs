@@ -2221,7 +2221,56 @@ pub(crate) fn validate_crawl_config(config: &CrawlConfig) -> Result<(), ApiError
     use validator::Validate;
     config
         .validate()
-        .map_err(|errors| ApiError::new(errors.to_string(), "validation_error"))
+        .map_err(|errors| ApiError::new(errors.to_string(), "validation_error"))?;
+    if let Some(ref proxy) = config.proxy {
+        validate_proxy_config(proxy)
+            .map_err(|msg| ApiError::new(format!("proxy: {msg}"), "validation_error"))?;
+    }
+    Ok(())
+}
+
+/// Reject proxy configs the crawler cannot use safely: no proxy at all
+/// (it would otherwise fall back to direct connections), URLs that are not
+/// `http`/`https` (the only proxy schemes the crawler supports — `socks5`
+/// is refused explicitly rather than failing every fetch), or a raw-IP host
+/// that is not a public address (SSRF: e.g. `http://169.254.169.254`).
+/// Hostnames are resolved and re-checked by the crawler at fetch time.
+fn validate_proxy_config(proxy: &scrapix_core::ProxyConfig) -> Result<(), String> {
+    let tiered = proxy.tiered.as_deref().unwrap_or_default();
+    if proxy.urls.is_empty() && tiered.iter().all(|tier| tier.is_empty()) {
+        return Err("at least one proxy URL is required in `urls` or `tiered`".to_string());
+    }
+    for entry in proxy.urls.iter().chain(tiered.iter().flatten()) {
+        let parsed =
+            url::Url::parse(entry).map_err(|e| format!("invalid proxy URL '{entry}': {e}"))?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            "socks5" | "socks5h" => {
+                return Err(format!(
+                    "socks5 proxies are not supported by the crawler ('{entry}'); use http or https"
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "unsupported proxy scheme '{other}' in '{entry}' (use http or https)"
+                ))
+            }
+        }
+        let ip = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+            Some(url::Host::Domain(_)) => None,
+            None => return Err(format!("proxy URL '{entry}' has no host")),
+        };
+        if let Some(ip) = ip {
+            if !scrapix_crawler::is_public_ip(ip) {
+                return Err(format!(
+                    "proxy URL '{entry}' points to a non-public address"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Warn about config fields that are accepted but cannot be honored per-job
@@ -2246,6 +2295,15 @@ pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
              startup) and is ignored per-job",
             config.concurrency.dns_concurrency
         ));
+    }
+
+    if config.crawler_type == CrawlerType::Browser && config.proxy.is_some() {
+        warnings.push(
+            "proxy is not supported with crawler_type \"browser\": the shared browser has a \
+             single worker-level proxy, so browser-rendered pages of this job will fail \
+             instead of connecting without the proxy"
+                .to_string(),
+        );
     }
 
     if let Some(pdf) = &config.features.pdf {
@@ -5645,6 +5703,56 @@ mod tests {
             err.into_response().status(),
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    fn config_with_proxy(proxy: serde_json::Value) -> CrawlConfig {
+        serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a", "proxy": proxy
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_crawl_config_rejects_unsafe_or_empty_proxies() {
+        for proxy in [
+            serde_json::json!({"urls": ["http://169.254.169.254:80"]}),
+            serde_json::json!({"urls": ["http://10.0.0.1:3128"]}),
+            serde_json::json!({"urls": ["http://[::1]:3128"]}),
+            serde_json::json!({"urls": [], "tiered": [["http://127.0.0.1:1"]]}),
+            serde_json::json!({"urls": ["ftp://proxy.test:21"]}),
+            serde_json::json!({"urls": ["socks5://proxy.test:1080"]}),
+            serde_json::json!({"urls": ["not a url"]}),
+            serde_json::json!({"urls": []}),
+            serde_json::json!({"urls": [], "tiered": [[]]}),
+        ] {
+            let err = validate_crawl_config(&config_with_proxy(proxy.clone()))
+                .expect_err(&format!("{proxy} must be rejected"));
+            let json = serde_json::to_value(&err).unwrap();
+            assert_eq!(json["code"], "validation_error", "{proxy}");
+        }
+    }
+
+    #[test]
+    fn validate_crawl_config_accepts_public_proxies() {
+        for proxy in [
+            serde_json::json!({"urls": ["http://proxy.example.com:8080"]}),
+            serde_json::json!({"urls": ["https://user:pass@1.2.3.4:8443"]}),
+            serde_json::json!({"urls": [], "tiered": [["http://p1.example.com:1"], ["http://p2.example.com:1"]]}),
+        ] {
+            assert!(
+                validate_crawl_config(&config_with_proxy(proxy.clone())).is_ok(),
+                "{proxy}"
+            );
+        }
+    }
+
+    #[test]
+    fn crawl_config_warnings_flags_browser_with_proxy() {
+        let mut cfg = config_with_proxy(serde_json::json!({"urls": ["http://p.example.com:1"]}));
+        assert!(crawl_config_warnings(&cfg).is_empty());
+        cfg.crawler_type = CrawlerType::Browser;
+        let w = crawl_config_warnings(&cfg);
+        assert!(w.iter().any(|m| m.contains("proxy")), "{w:?}");
     }
 
     #[test]

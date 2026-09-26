@@ -40,9 +40,52 @@ use tracing::{debug, instrument, warn};
 
 use scrapix_core::{CrawlUrl, RawPage, Result, ScrapixError};
 
+use chromiumoxide::cdp::browser_protocol::network::{Headers, SetExtraHttpHeadersParams};
+use chromiumoxide::ArcHttpRequest;
+
+use crate::fetcher::FetchOptions;
 use crate::robots::RobotsCache;
 use crate::safe_client::reject_ip_host;
 use crate::safe_dns::is_public_ip;
+
+/// Reason a browser render is refused when the job sets a proxy: the
+/// shared browser has a single, worker-level proxy.
+pub const BROWSER_PROXY_UNSUPPORTED: &str = "per-job proxy is not supported for browser rendering";
+
+/// Per-render request shaping (from the job's `FetchOptions`).
+#[derive(Default)]
+struct PageRequest<'a> {
+    user_agent: Option<&'a str>,
+    extra_headers: &'a [(String, String)],
+    respect_robots: Option<bool>,
+}
+
+/// HTTP status of the main document as reported by CDP (`Network.Response.status`),
+/// if it is a valid HTTP status code.
+pub(crate) fn document_status(status: Option<i64>) -> Option<u16> {
+    status
+        .and_then(|s| u16::try_from(s).ok())
+        .filter(|s| (100..=599).contains(s))
+}
+
+/// CDP response headers (a JSON object) as a lowercase-keyed map, so e.g.
+/// `retry-after` is found the same way as on the HTTP path.
+pub(crate) fn response_headers(headers: &serde_json::Value) -> HashMap<String, String> {
+    headers
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| {
+                    let value = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.to_ascii_lowercase(), value)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Check a URL before handing it to the browser: the same SSRF rules as the
 /// HTTP fetcher (raw-IP hosts refused; hostnames must resolve only to public
@@ -383,16 +426,17 @@ impl CdpRenderer {
     /// Render a page and return the result
     #[instrument(skip(self), fields(url = %url))]
     pub async fn render(&self, url: &str) -> Result<RenderResult> {
-        self.render_checked(url, true).await
+        self.render_checked(url, &PageRequest::default()).await
     }
 
-    /// Render a page after the SSRF check and (when `check_robots`) the
-    /// robots.txt check.
-    async fn render_checked(&self, url: &str, check_robots: bool) -> Result<RenderResult> {
-        let robots = if check_robots {
-            self.robots_cache.as_deref()
-        } else {
+    /// Render a page after the SSRF check and (unless `req.respect_robots`
+    /// is `Some(false)`) the robots.txt check, applying the per-request user
+    /// agent and extra headers to the page before navigating.
+    async fn render_checked(&self, url: &str, req: &PageRequest<'_>) -> Result<RenderResult> {
+        let robots = if req.respect_robots == Some(false) {
             None
+        } else {
+            self.robots_cache.as_deref()
         };
         check_render_target(url, self.config.allow_private_ips, robots).await?;
 
@@ -412,16 +456,50 @@ impl CdpRenderer {
             .await
             .map_err(|e| CdpError::LaunchFailed(format!("Failed to create page: {}", e)))?;
 
+        // Always close the page, including on error paths.
+        let result = self.render_on_page(&page, url, req, start).await;
+        let _ = page.close().await;
+        result
+    }
+
+    async fn render_on_page(
+        &self,
+        page: &Page,
+        url: &str,
+        req: &PageRequest<'_>,
+        start: Instant,
+    ) -> Result<RenderResult> {
         // Setup page
-        self.setup_page(&page).await?;
+        self.setup_page(page).await?;
+
+        // Per-job user agent and headers, set on this page only (the browser
+        // is shared by every job on the worker).
+        if let Some(ua) = req.user_agent {
+            page.set_user_agent(ua.to_string())
+                .await
+                .map_err(|e| CdpError::NavigationFailed(format!("set user agent: {e}")))?;
+        }
+        if !req.extra_headers.is_empty() {
+            let headers: serde_json::Map<String, serde_json::Value> = req
+                .extra_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            page.execute(SetExtraHttpHeadersParams::new(Headers::new(
+                serde_json::Value::Object(headers),
+            )))
+            .await
+            .map_err(|e| CdpError::NavigationFailed(format!("set extra headers: {e}")))?;
+        }
 
         // Navigate to URL
         page.goto(url)
             .await
             .map_err(|e| CdpError::NavigationFailed(e.to_string()))?;
 
-        // Wait for page load based on configuration
-        self.wait_for_page(&page).await?;
+        // Wait for page load based on configuration; yields the main-frame
+        // document request (with its HTTP response, when CDP reported one).
+        let navigation = self.wait_for_page(page).await?;
 
         // Extra wait if configured
         if let Some(extra_wait) = self.config.extra_wait {
@@ -441,17 +519,31 @@ impl CdpRenderer {
             .await
             .map_err(|e| CdpError::NavigationFailed(format!("Failed to get content: {}", e)))?;
 
-        // Default status and headers (CDP doesn't expose these easily)
-        let status = 200u16;
-        let headers = HashMap::new();
-        let content_type = Some("text/html".to_string());
+        // Status, headers and content type of the main document response.
+        let response = navigation.as_ref().and_then(|r| r.response.as_ref());
+        let status = match document_status(response.map(|r| r.status)) {
+            Some(status) => status,
+            None => {
+                debug!(url, "No main-document HTTP status from CDP; assuming 200");
+                200
+            }
+        };
+        let headers = response
+            .map(|r| response_headers(r.headers.inner()))
+            .unwrap_or_default();
+        let content_type = headers
+            .get("content-type")
+            .cloned()
+            .or_else(|| {
+                response
+                    .map(|r| r.mime_type.clone())
+                    .filter(|m| !m.is_empty())
+            })
+            .or_else(|| Some("text/html".to_string()));
 
         // Collect console logs and errors
         let console_logs = std::mem::take(&mut *self.console_logs.lock());
         let js_errors = std::mem::take(&mut *self.js_errors.lock());
-
-        // Close page
-        let _ = page.close().await;
 
         let render_duration = start.elapsed();
 
@@ -488,36 +580,26 @@ impl CdpRenderer {
     }
 
     /// Wait for page to load based on configuration
-    async fn wait_for_page(&self, page: &Page) -> Result<()> {
+    async fn wait_for_page(&self, page: &Page) -> Result<ArcHttpRequest> {
         let timeout = self.config.timeout;
 
-        match self.config.wait_until {
-            WaitUntil::Load => {
-                tokio::time::timeout(timeout, page.wait_for_navigation())
-                    .await
-                    .map_err(|_| CdpError::Timeout("Page load timeout".to_string()))?
-                    .map_err(|e| CdpError::NavigationFailed(e.to_string()))?;
-            }
-            WaitUntil::DomContentLoaded => {
-                // DOMContentLoaded is typically faster
-                tokio::time::timeout(timeout, page.wait_for_navigation())
-                    .await
-                    .map_err(|_| CdpError::Timeout("DOMContentLoaded timeout".to_string()))?
-                    .map_err(|e| CdpError::NavigationFailed(e.to_string()))?;
-            }
-            WaitUntil::NetworkIdle | WaitUntil::NetworkAlmostIdle => {
-                // Wait for navigation then additional time for network
-                tokio::time::timeout(timeout, page.wait_for_navigation())
-                    .await
-                    .map_err(|_| CdpError::Timeout("Navigation timeout".to_string()))?
-                    .map_err(|e| CdpError::NavigationFailed(e.to_string()))?;
-
-                // Additional wait for network to settle
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+        let (label, settle) = match self.config.wait_until {
+            WaitUntil::Load => ("Page load timeout", false),
+            // DOMContentLoaded is typically faster
+            WaitUntil::DomContentLoaded => ("DOMContentLoaded timeout", false),
+            // Wait for navigation then additional time for network
+            WaitUntil::NetworkIdle | WaitUntil::NetworkAlmostIdle => ("Navigation timeout", true),
+        };
+        let navigation = tokio::time::timeout(timeout, page.wait_for_navigation_response())
+            .await
+            .map_err(|_| CdpError::Timeout(label.to_string()))?
+            .map_err(|e| CdpError::NavigationFailed(e.to_string()))?;
+        if settle {
+            // Additional wait for network to settle
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        Ok(())
+        Ok(navigation)
     }
 
     /// Render a page and take a screenshot
@@ -607,13 +689,33 @@ impl CdpRenderer {
     /// Fetch a CrawlUrl and return a RawPage
     #[instrument(skip(self), fields(url = %url.url))]
     pub async fn fetch(&self, url: &CrawlUrl) -> Result<RawPage> {
-        self.fetch_with_robots(url, true).await
+        self.fetch_with_options(url, &FetchOptions::default()).await
     }
 
-    /// Fetch a CrawlUrl, checking robots.txt only when `respect_robots`
-    /// (per-job `respect_robots_txt`). The SSRF check always runs.
-    pub async fn fetch_with_robots(&self, url: &CrawlUrl, respect_robots: bool) -> Result<RawPage> {
-        let result = self.render_checked(&url.url, respect_robots).await?;
+    /// Fetch a CrawlUrl with per-job options: `user_agent` and
+    /// `extra_headers` are applied to this page via CDP, and
+    /// `respect_robots == Some(false)` skips robots.txt (the SSRF check
+    /// always runs).
+    ///
+    /// A per-job `proxy` cannot be honored by the shared browser, so it is
+    /// refused ([`BROWSER_PROXY_UNSUPPORTED`]) rather than silently ignored.
+    ///
+    /// Note: `Network.setExtraHTTPHeaders` applies to every request the page
+    /// makes, including subresources on other hosts.
+    pub async fn fetch_with_options(
+        &self,
+        url: &CrawlUrl,
+        options: &FetchOptions,
+    ) -> Result<RawPage> {
+        if options.proxy.is_some() {
+            return Err(ScrapixError::Config(BROWSER_PROXY_UNSUPPORTED.to_string()));
+        }
+        let req = PageRequest {
+            user_agent: options.user_agent.as_deref(),
+            extra_headers: &options.extra_headers,
+            respect_robots: options.respect_robots,
+        };
+        let result = self.render_checked(&url.url, &req).await?;
 
         Ok(RawPage {
             url: url.url.clone(),
@@ -768,6 +870,30 @@ impl Default for CdpRendererBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_status_accepts_only_http_codes() {
+        assert_eq!(document_status(Some(200)), Some(200));
+        assert_eq!(document_status(Some(404)), Some(404));
+        assert_eq!(document_status(Some(503)), Some(503));
+        assert_eq!(document_status(Some(0)), None);
+        assert_eq!(document_status(Some(-1)), None);
+        assert_eq!(document_status(Some(70_000)), None);
+        assert_eq!(document_status(None), None);
+    }
+
+    #[test]
+    fn response_headers_are_lowercased() {
+        let h = response_headers(&serde_json::json!({
+            "Content-Type": "text/html; charset=utf-8",
+            "Retry-After": "30",
+            "X-Num": 5
+        }));
+        assert_eq!(h.get("content-type").unwrap(), "text/html; charset=utf-8");
+        assert_eq!(h.get("retry-after").unwrap(), "30");
+        assert_eq!(h.get("x-num").unwrap(), "5");
+        assert!(response_headers(&serde_json::Value::Null).is_empty());
+    }
 
     #[tokio::test]
     async fn render_target_refuses_raw_ips_and_private_hosts() {

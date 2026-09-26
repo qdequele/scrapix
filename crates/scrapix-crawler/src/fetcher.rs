@@ -71,7 +71,7 @@ impl FetchOptions {
 use crate::dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 use crate::robots::RobotsCache;
 use crate::safe_client::{reject_ip_host, safe_client_builder, safe_redirect_policy};
-use crate::safe_dns::NonPublicAddress;
+use crate::safe_dns::{validate_proxy_url, NonPublicAddress};
 
 /// Conditional request headers for incremental crawling
 #[derive(Debug, Clone, Default)]
@@ -315,10 +315,22 @@ impl HttpFetcher {
 
     /// The client to use for one fetch: the default client, or the cached
     /// per-proxy client for `options.proxy`.
-    fn client_for(&self, options: &FetchOptions) -> Result<Client> {
+    ///
+    /// The proxy URL is validated on every call (see
+    /// [`validate_proxy_url`]): hyper connects to an IP-literal proxy without
+    /// consulting the SSRF-safe resolver, so an unchecked tenant proxy such
+    /// as `http://169.254.169.254` would bypass it. Validation goes through
+    /// the DNS cache, so repeat calls are cheap.
+    async fn client_for(&self, options: &FetchOptions) -> Result<Client> {
         let Some(proxy) = options.proxy.as_deref() else {
             return Ok(self.client.clone());
         };
+        validate_proxy_url(
+            proxy,
+            self.dns_resolver.as_ref(),
+            self.config.allow_private_ips,
+        )
+        .await?;
         if let Some(client) = self.proxy_clients.get(proxy) {
             return Ok(client.clone());
         }
@@ -422,7 +434,7 @@ impl HttpFetcher {
             });
         }
 
-        let client = self.client_for(&options)?;
+        let client = self.client_for(&options).await?;
 
         let mut last_error = None;
         // `backoff` is the pure exponential series (grows every attempt,

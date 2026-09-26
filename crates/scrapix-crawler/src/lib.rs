@@ -90,7 +90,7 @@ pub use robots::{
     RobotsPersistence, RocksDbOps, RocksRobotsPersistence,
 };
 pub use safe_client::safe_client_builder;
-pub use safe_dns::is_public_ip;
+pub use safe_dns::{is_public_ip, validate_proxy_url};
 pub use sitemap::{
     ChangeFrequency, SitemapConfig, SitemapContent, SitemapEntry, SitemapParser, SitemapUrl,
 };
@@ -99,6 +99,7 @@ pub use sitemap::{
 #[cfg(feature = "browser-cdp")]
 pub use renderer_cdp::{
     CdpConfig, CdpError, CdpRenderer, CdpRendererBuilder, RenderResult, WaitUntil,
+    BROWSER_PROXY_UNSUPPORTED,
 };
 
 // WebDriver renderer re-exports

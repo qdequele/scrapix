@@ -21,17 +21,36 @@ use scrapix_queue::{
 };
 use tracing::{debug, info, warn};
 
+use crate::job_fetch::{headers_allowed_for, is_proxy_failure};
 use crate::outcome::{classify, is_retryable, Outcome};
 use crate::CrawlerWorker;
 
 /// Reason used when a job needs JS rendering and this worker has no browser.
 pub(crate) const BROWSER_UNAVAILABLE: &str = "browser rendering unavailable on this worker";
 
+/// Reason used when a browser job sets a proxy: the worker's browser is
+/// shared by every job and has a single worker-level proxy, so a per-job
+/// proxy cannot be honored and the job fails closed instead of connecting
+/// directly. (Same text as `scrapix_crawler::BROWSER_PROXY_UNSUPPORTED`,
+/// which only exists with the `browser` feature.)
+pub(crate) const BROWSER_PROXY_UNSUPPORTED: &str =
+    "per-job proxy is not supported for browser rendering";
+
 /// Result of one fetch attempt plus the proxy it went through (if any), so
 /// the proxy pool can be told whether the proxy worked.
 struct FetchAttempt {
     result: scrapix_core::Result<FetchResult>,
     proxy: Option<String>,
+}
+
+/// The job (`crawler_type: browser`) or the URL (`requires_js`) needs JS
+/// rendering.
+fn requires_browser(msg: &UrlMessage) -> bool {
+    msg.url.requires_js
+        || msg
+            .job
+            .as_ref()
+            .is_some_and(|j| j.crawler_type == CrawlerType::Browser)
 }
 
 impl CrawlerWorker {
@@ -43,10 +62,10 @@ impl CrawlerWorker {
 
         let start = Instant::now();
         self.metrics.fetch_started();
-        let (outcome, result) = if self.browser_required_but_unavailable(&msg) {
+        let (outcome, result) = if let Some(reason) = self.precheck(&msg) {
             (
                 Outcome::Failed {
-                    reason: BROWSER_UNAVAILABLE.to_string(),
+                    reason: reason.to_string(),
                     status: None,
                 },
                 None,
@@ -65,8 +84,17 @@ impl CrawlerWorker {
         let published = match outcome {
             Outcome::Crawled => match result {
                 Some(Ok(FetchResult::Fetched(page))) => self.on_crawled(&msg, page, elapsed).await,
-                // `classify` only returns `Crawled` for `Ok(Fetched(2xx))`.
-                _ => unreachable!("Outcome::Crawled without a fetched page"),
+                // `classify` only returns `Crawled` for `Ok(Fetched(2xx))`;
+                // never panic here (a panicking handler would lose the ack).
+                _ => {
+                    self.on_failed(
+                        &msg,
+                        "internal error: crawled outcome without a fetched page",
+                        None,
+                        false,
+                    )
+                    .await
+                }
             },
             Outcome::NotModified => self.on_not_modified(&msg).await,
             Outcome::Retry { reason, delay } => self.on_retry(&msg, &reason, delay).await,
@@ -91,15 +119,22 @@ impl CrawlerWorker {
         }
     }
 
-    /// The job (or URL) requires JS rendering and this worker cannot do it.
-    /// Such URLs fail instead of being silently fetched over plain HTTP.
-    fn browser_required_but_unavailable(&self, msg: &UrlMessage) -> bool {
-        let required = msg.url.requires_js
-            || msg
-                .job
-                .as_ref()
-                .is_some_and(|j| j.crawler_type == CrawlerType::Browser);
-        required && !self.has_browser()
+    /// Terminal failures decided before fetching. A job (or URL) that
+    /// requires JS rendering fails instead of being silently fetched over
+    /// plain HTTP when:
+    /// - it also sets a per-job proxy (the shared browser cannot use it), or
+    /// - this worker has no browser renderer.
+    fn precheck(&self, msg: &UrlMessage) -> Option<&'static str> {
+        if !requires_browser(msg) {
+            return None;
+        }
+        if msg.job.as_ref().is_some_and(|j| j.proxy.is_some()) {
+            return Some(BROWSER_PROXY_UNSUPPORTED);
+        }
+        if !self.has_browser() {
+            return Some(BROWSER_UNAVAILABLE);
+        }
+        None
     }
 
     fn has_browser(&self) -> bool {
@@ -118,28 +153,6 @@ impl CrawlerWorker {
     async fn fetch(&self, msg: &UrlMessage) -> FetchAttempt {
         let url = &msg.url;
 
-        #[cfg(feature = "browser")]
-        if let Some(ref renderer) = self.browser_renderer {
-            let job_wants_browser = url.requires_js
-                || msg
-                    .job
-                    .as_ref()
-                    .is_some_and(|j| j.crawler_type == CrawlerType::Browser);
-            if job_wants_browser || self.browser_patterns.iter().any(|p| p.is_match(&url.url)) {
-                debug!(url = %url.url, "Using browser rendering");
-                self.metrics.record_browser_render();
-                let respect_robots = msg.job.as_ref().map_or(true, |j| j.respect_robots_txt);
-                return FetchAttempt {
-                    result: renderer
-                        .fetch_with_robots(url, respect_robots)
-                        .await
-                        .map(FetchResult::Fetched),
-                    proxy: None,
-                };
-            }
-        }
-        let conditional_headers = self.conditional_headers(msg).await;
-
         // PDF support travels with the UrlMessage so the fetcher can stay a
         // long-lived per-worker singleton while honoring per-job opt-ins.
         let base = match msg.features {
@@ -148,14 +161,70 @@ impl CrawlerWorker {
             }
             _ => FetchOptions::default(),
         };
-        let options = self.shaper.options_for(&msg.job_id, msg.job.as_ref(), base);
+        let mut options = self.shaper.options_for(&msg.job_id, msg.job.as_ref(), base);
+        let allowed_domains = msg
+            .url_patterns
+            .as_ref()
+            .map(|p| p.allowed_domains.as_slice())
+            .unwrap_or_default();
+        if !options.extra_headers.is_empty() && !headers_allowed_for(&url.url, allowed_domains) {
+            debug!(url = %url.url, "Host not in allowed_domains; not sending job headers");
+            options.extra_headers.clear();
+        }
+
+        #[cfg(feature = "browser")]
+        if let Some(ref renderer) = self.browser_renderer {
+            // A worker-level pattern match only routes to the browser when the
+            // job has no proxy (the browser cannot honor it; HTTP can).
+            let job_has_proxy = msg.job.as_ref().is_some_and(|j| j.proxy.is_some());
+            let pattern_match =
+                !job_has_proxy && self.browser_patterns.iter().any(|p| p.is_match(&url.url));
+            if requires_browser(msg) || pattern_match {
+                debug!(url = %url.url, "Using browser rendering");
+                self.metrics.record_browser_render();
+                return FetchAttempt {
+                    result: renderer
+                        .fetch_with_options(url, &options)
+                        .await
+                        .map(FetchResult::Fetched),
+                    proxy: None,
+                };
+            }
+        }
+
+        // The job configured proxies but all of them are in cooldown: never
+        // fall back to a direct connection. Transient → re-queued.
+        if msg.job.as_ref().is_some_and(|j| j.proxy.is_some()) && options.proxy.is_none() {
+            return FetchAttempt {
+                result: Err(ScrapixError::Connection(
+                    "no proxy available for this job (all proxies in cooldown)".to_string(),
+                )),
+                proxy: None,
+            };
+        }
+
+        let conditional_headers = self.conditional_headers(msg).await;
         let proxy = options.proxy.clone();
 
         self.metrics.record_http_fetch();
-        let result = self
+        let mut result = self
             .fetcher
             .fetch_conditional_with_options(url, &conditional_headers, options)
             .await;
+
+        // A proxy-generated error response (407, or 5xx with Proxy-Status)
+        // is the proxy's failure, not the origin's: make it a transient error
+        // so the URL is retried (through another proxy) instead of failing.
+        if proxy.is_some() {
+            if let Ok(FetchResult::Fetched(ref page)) = result {
+                if is_proxy_failure(page) {
+                    result = Err(ScrapixError::Connection(format!(
+                        "proxy error: HTTP {}",
+                        page.status
+                    )));
+                }
+            }
+        }
 
         if let Some(dns_stats) = self.fetcher.dns_cache_stats() {
             self.metrics
@@ -202,8 +271,10 @@ impl CrawlerWorker {
         headers
     }
 
-    /// Tell the job's proxy pool whether the proxy worked: any HTTP response
-    /// is a success; a transport-level error counts against the proxy.
+    /// Tell the job's proxy pool whether the proxy worked: an origin HTTP
+    /// response is a success; a transport-level error, or a proxy-generated
+    /// error response (turned into `Connection` in [`Self::fetch`]), counts
+    /// against the proxy so it enters cooldown.
     fn report_proxy(&self, job_id: &str, proxy: &str, result: &scrapix_core::Result<FetchResult>) {
         match result {
             Ok(_) => self.shaper.report_proxy(job_id, proxy, true),
@@ -397,6 +468,8 @@ impl CrawlerWorker {
         delay: Duration,
     ) -> scrapix_core::Result<()> {
         self.metrics.record_retry();
+        // Known gap (deferred): if a later publish for this message fails, the
+        // redelivered message re-queues the retry again (duplicate re-queue).
         let mut url = msg.url.clone();
         url.retry_count += 1;
         url.not_before_ms = Some(chrono::Utc::now().timestamp_millis() + delay.as_millis() as i64);
@@ -452,6 +525,8 @@ impl CrawlerWorker {
             "URL failed"
         );
 
+        // Known gap (deferred): if the PageFailed publish below fails, the
+        // redelivered message publishes this DLQ entry again (duplicate).
         if retries_exhausted {
             let mut dlq = DlqMessage::new(
                 serde_json::to_string(msg)?,
@@ -780,5 +855,148 @@ mod tests {
             CrawlEvent::PageFailed { error, status: None, .. } if error == BROWSER_UNAVAILABLE
         )));
         assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
+    }
+
+    fn proxy_spec(urls: Vec<String>) -> scrapix_core::ProxyConfig {
+        scrapix_core::ProxyConfig {
+            urls,
+            rotation: scrapix_core::ProxyRotation::RoundRobin,
+            tiered: None,
+        }
+    }
+
+    fn events_have_retry_with(events: &[CrawlEvent], needle: &str) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, CrawlEvent::PageRetried { error, .. } if error.contains(needle)))
+    }
+
+    #[tokio::test]
+    async fn browser_job_with_proxy_fails_closed() {
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+        let job = JobSpec {
+            crawler_type: CrawlerType::Browser,
+            proxy: Some(proxy_spec(vec!["http://proxy.test:8080".into()])),
+            ..Default::default()
+        };
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(message("https://spa.test/".into(), Some(job)), ack)
+            .await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        assert!(drain::<UrlMessage>(&t.frontier).await.is_empty());
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CrawlEvent::PageFailed { error, status: None, .. } if error == BROWSER_PROXY_UNSUPPORTED
+        )));
+    }
+
+    #[tokio::test]
+    async fn all_proxies_in_cooldown_retries_instead_of_direct_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .expect(0) // never fetched directly
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+        let proxy = "http://proxy.test:8080".to_string();
+        let job = JobSpec {
+            proxy: Some(proxy_spec(vec![proxy.clone()])),
+            ..Default::default()
+        };
+        // Populate the job's pool, then put its only proxy in cooldown.
+        w.shaper
+            .options_for("job-1", Some(&job), FetchOptions::default());
+        for _ in 0..crate::job_fetch::PROXY_MAX_FAILURES {
+            w.shaper.report_proxy("job-1", &proxy, false);
+        }
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(message(url(&server, "/p"), Some(job)), ack)
+            .await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        let requeued: Vec<UrlMessage> = drain(&t.frontier).await;
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].url.retry_count, 1);
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(
+            events_have_retry_with(&events, "no proxy available"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_failure_is_retried_not_indexed() {
+        // wiremock plays the proxy and answers 407 for everything.
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(407))
+            .mount(&proxy)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+        let job = JobSpec {
+            proxy: Some(proxy_spec(vec![proxy
+                .uri()
+                .replace("127.0.0.1", "localhost")])),
+            ..Default::default()
+        };
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(message("http://origin.invalid/x".into(), Some(job)), ack)
+            .await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(
+            events_have_retry_with(&events, "proxy error: HTTP 407"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_headers_not_sent_to_hosts_outside_allowed_domains() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let job = JobSpec {
+            headers: [("X-Api-Key".to_string(), "secret".to_string())].into(),
+            ..Default::default()
+        };
+        let send = |allowed: Vec<String>| {
+            let mut m = message(url(&server, "/h"), Some(job.clone()));
+            m.url_patterns = Some(scrapix_core::UrlPatterns {
+                allowed_domains: allowed,
+                ..Default::default()
+            });
+            m
+        };
+
+        let (ack, _) = tracked_ack();
+        w.handle_message(send(vec!["docs.example.com".into()]), ack)
+            .await;
+        let (ack, _) = tracked_ack();
+        w.handle_message(send(vec!["localhost".into()]), ack).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].headers.contains_key("x-api-key"));
+        assert_eq!(requests[1].headers.get("x-api-key").unwrap(), "secret");
     }
 }

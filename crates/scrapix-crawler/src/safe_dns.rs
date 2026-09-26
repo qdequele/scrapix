@@ -115,9 +115,98 @@ impl Resolve for SafeResolver {
     }
 }
 
+/// Resolve `host` the same way [`SafeResolver`] does (through the caching
+/// resolver when given, else `tokio::net::lookup_host`).
+async fn resolve_host(
+    cache: Option<&Arc<CachingDnsResolver>>,
+    host: &str,
+) -> scrapix_core::Result<Vec<IpAddr>> {
+    match cache {
+        Some(c) => c.resolve(host).await,
+        None => Ok(tokio::net::lookup_host((host, 0))
+            .await
+            .map_err(|e| {
+                scrapix_core::ScrapixError::Connection(format!("DNS lookup failed for {host}: {e}"))
+            })?
+            .map(|sa| sa.ip())
+            .collect()),
+    }
+}
+
+/// Validate a per-job proxy URL before any request goes through it.
+///
+/// hyper connects to an IP-literal proxy without consulting the client's
+/// resolver, so a proxy such as `http://169.254.169.254:80` would bypass
+/// [`SafeResolver`] entirely. Rules (unless `allow_private`):
+/// - the scheme must be `http` or `https` (the only proxy schemes this
+///   build of reqwest supports);
+/// - a raw-IP host must be a public address;
+/// - a hostname must resolve to at least one public address, and to no
+///   non-public one.
+///
+/// Refusals are `ScrapixError::Refused` (terminal, never retried).
+pub async fn validate_proxy_url(
+    proxy: &str,
+    cache: Option<&Arc<CachingDnsResolver>>,
+    allow_private: bool,
+) -> scrapix_core::Result<()> {
+    use scrapix_core::ScrapixError;
+
+    let parsed = url::Url::parse(proxy)
+        .map_err(|e| ScrapixError::Refused(format!("invalid proxy URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ScrapixError::Refused(format!(
+            "unsupported proxy scheme '{}' (use http or https)",
+            parsed.scheme()
+        )));
+    }
+    if allow_private {
+        return Ok(());
+    }
+    let ips = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => vec![IpAddr::V4(ip)],
+        Some(url::Host::Ipv6(ip)) => vec![IpAddr::V6(ip)],
+        Some(url::Host::Domain(host)) => resolve_host(cache, host).await?,
+        None => return Err(ScrapixError::Refused("proxy URL has no host".into())),
+    };
+    if ips.is_empty() || ips.iter().any(|ip| !is_public_ip(*ip)) {
+        return Err(ScrapixError::Refused(format!(
+            "proxy {} resolves to a non-public address",
+            parsed.host_str().unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_validation() {
+        use scrapix_core::ScrapixError;
+        let refused = |r: scrapix_core::Result<()>| matches!(r, Err(ScrapixError::Refused(_)));
+        assert!(refused(
+            validate_proxy_url("http://169.254.169.254:80", None, false).await
+        ));
+        assert!(refused(
+            validate_proxy_url("http://[::1]:3128", None, false).await
+        ));
+        assert!(refused(
+            validate_proxy_url("http://localhost:3128", None, false).await
+        ));
+        assert!(refused(
+            validate_proxy_url("socks5://1.1.1.1:1080", None, false).await
+        ));
+        assert!(refused(validate_proxy_url("not a url", None, false).await));
+        assert!(validate_proxy_url("http://1.1.1.1:8080", None, false)
+            .await
+            .is_ok());
+        // Opt-out (tests / self-hosting) allows private proxies.
+        assert!(validate_proxy_url("http://127.0.0.1:3128", None, true)
+            .await
+            .is_ok());
+    }
 
     #[test]
     fn classifies_ips() {

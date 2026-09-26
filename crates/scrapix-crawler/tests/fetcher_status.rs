@@ -328,3 +328,36 @@ async fn respect_robots_false_skips_robots_check() {
     let page = fetcher.fetch_with_options(&target, opts).await.unwrap();
     assert_eq!(page.status, 200);
 }
+
+#[tokio::test]
+async fn raw_ip_private_proxy_is_refused() {
+    let robots = Arc::new(
+        RobotsCache::new(RobotsConfig {
+            respect_robots: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    // Production SSRF policy: private addresses not allowed.
+    let fetcher = HttpFetcherBuilder::new()
+        .max_retries(0)
+        .build(robots)
+        .unwrap();
+    for proxy in [
+        "http://169.254.169.254:80",
+        "http://127.0.0.1:3128",
+        "http://localhost:3128",
+    ] {
+        let opts = scrapix_crawler::FetchOptions {
+            proxy: Some(proxy.into()),
+            ..Default::default()
+        };
+        let r = fetcher
+            .fetch_with_options(&CrawlUrl::seed("http://origin.invalid/x"), opts)
+            .await;
+        assert!(
+            matches!(r, Err(scrapix_core::ScrapixError::Refused(_))),
+            "{proxy}: {r:?}"
+        );
+    }
+}

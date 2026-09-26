@@ -17,6 +17,26 @@ use url::Url;
 
 use scrapix_core::{Result, ScrapixError};
 
+/// Cache key for a robots.txt entry: `scheme://host:port` of `url`.
+///
+/// robots.txt applies per origin (RFC 9309 §2.3), so `http://a.test`,
+/// `https://a.test` and `https://a.test:8443` each get their own entry.
+pub(crate) fn robots_cache_key(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ScrapixError::Crawl("URL has no host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(0);
+    Ok(format!("{}://{}:{}", url.scheme(), host, port))
+}
+
+/// robots.txt URL and cache key for a bare domain (callers that only know a
+/// domain, such as crawl-delay lookups, assume https on the default port).
+fn domain_robots_url(domain: &str) -> Result<(Url, String)> {
+    let url = Url::parse(&format!("https://{domain}/robots.txt"))?;
+    let key = robots_cache_key(&url)?;
+    Ok((url, key))
+}
+
 /// Configuration for robots.txt handling
 #[derive(Debug, Clone)]
 pub struct RobotsConfig {
@@ -98,9 +118,8 @@ impl RobotsCache {
         }
 
         let parsed = Url::parse(url)?;
-        let domain = parsed
-            .host_str()
-            .ok_or_else(|| ScrapixError::Crawl("URL has no host".to_string()))?;
+        let key = robots_cache_key(&parsed)?;
+        let domain = key.as_str();
 
         let robots_content = self.get_robots(domain, &parsed).await?;
         let path = parsed.path();
@@ -116,6 +135,8 @@ impl RobotsCache {
 
     /// Get crawl delay for a domain
     pub async fn get_crawl_delay(&self, domain: &str) -> Result<Option<u64>> {
+        let (robots_url, key) = domain_robots_url(domain)?;
+        let domain = key.as_str();
         // Check cache first
         {
             let cache = self.cache.read();
@@ -126,10 +147,7 @@ impl RobotsCache {
             }
         }
 
-        // We need a full URL to fetch robots.txt
-        let robots_url = format!("https://{}/robots.txt", domain);
-        let parsed = Url::parse(&robots_url)?;
-        let _ = self.get_robots(domain, &parsed).await?;
+        let _ = self.get_robots(domain, &robots_url).await?;
 
         // Now check cache again
         let cache = self.cache.read();
@@ -140,7 +158,8 @@ impl RobotsCache {
         Ok(self.config.default_crawl_delay_ms)
     }
 
-    /// Get robots.txt content for a domain, fetching if needed
+    /// Get robots.txt content for an origin, fetching if needed. `domain`
+    /// is the cache key from [`robots_cache_key`].
     async fn get_robots(&self, domain: &str, url: &Url) -> Result<String> {
         // Check cache first
         {
@@ -261,6 +280,21 @@ impl RobotsCache {
             .filter(|e| e.cached_at.elapsed() >= self.config.cache_ttl)
             .count();
         (total, total - expired)
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_scheme_host_port() {
+        let k = |u: &str| robots_cache_key(&Url::parse(u).unwrap()).unwrap();
+        assert_eq!(k("https://a.test/x"), "https://a.test:443");
+        assert_eq!(k("http://a.test/x"), "http://a.test:80");
+        assert_eq!(k("https://a.test:8443/x"), "https://a.test:8443");
+        assert_ne!(k("http://a.test/"), k("https://a.test/"));
+        assert_eq!(domain_robots_url("a.test").unwrap().1, "https://a.test:443");
     }
 }
 
@@ -532,9 +566,8 @@ impl PersistentRobotsCache {
         }
 
         let parsed = Url::parse(url)?;
-        let domain = parsed
-            .host_str()
-            .ok_or_else(|| ScrapixError::Crawl("URL has no host".to_string()))?;
+        let key = robots_cache_key(&parsed)?;
+        let domain = key.as_str();
 
         let robots_content = self.get_robots(domain, &parsed).await?;
         let path = parsed.path();
@@ -549,6 +582,8 @@ impl PersistentRobotsCache {
 
     /// Get crawl delay for a domain
     pub async fn get_crawl_delay(&self, domain: &str) -> Result<Option<u64>> {
+        let (robots_url, key) = domain_robots_url(domain)?;
+        let domain = key.as_str();
         // Check L1 memory cache first
         {
             let cache = self.memory_cache.read();
@@ -568,10 +603,7 @@ impl PersistentRobotsCache {
             }
         }
 
-        // Fetch fresh
-        let robots_url = format!("https://{}/robots.txt", domain);
-        let parsed = Url::parse(&robots_url)?;
-        let _ = self.get_robots(domain, &parsed).await?;
+        let _ = self.get_robots(domain, &robots_url).await?;
 
         // Now check L1 cache
         let cache = self.memory_cache.read();
@@ -584,6 +616,8 @@ impl PersistentRobotsCache {
 
     /// Get sitemap URLs discovered from robots.txt
     pub async fn get_sitemaps(&self, domain: &str) -> Result<Vec<String>> {
+        let (robots_url, key) = domain_robots_url(domain)?;
+        let domain = key.as_str();
         // Check L1 memory cache first
         {
             let cache = self.memory_cache.read();
@@ -602,10 +636,7 @@ impl PersistentRobotsCache {
             }
         }
 
-        // Fetch fresh
-        let robots_url = format!("https://{}/robots.txt", domain);
-        let parsed = Url::parse(&robots_url)?;
-        let _ = self.get_robots(domain, &parsed).await?;
+        let _ = self.get_robots(domain, &robots_url).await?;
 
         let cache = self.memory_cache.read();
         if let Some(entry) = cache.get(domain) {
@@ -615,7 +646,8 @@ impl PersistentRobotsCache {
         Ok(vec![])
     }
 
-    /// Get robots.txt content for a domain
+    /// Get robots.txt content for an origin. `domain` is the cache key from
+    /// [`robots_cache_key`] (also the persistence key).
     async fn get_robots(&self, domain: &str, url: &Url) -> Result<String> {
         // Check L1 memory cache
         {
@@ -797,9 +829,8 @@ impl PersistentRobotsCache {
     /// Prefetch robots.txt for multiple domains
     pub async fn prefetch(&self, domains: &[String]) -> Result<()> {
         for domain in domains {
-            let robots_url = format!("https://{}/robots.txt", domain);
-            if let Ok(parsed) = Url::parse(&robots_url) {
-                let _ = self.get_robots(domain, &parsed).await;
+            if let Ok((robots_url, key)) = domain_robots_url(domain) {
+                let _ = self.get_robots(&key, &robots_url).await;
             }
         }
         Ok(())
