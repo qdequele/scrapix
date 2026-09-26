@@ -385,6 +385,14 @@ pub enum CrawlEvent {
         /// Whether the page was rendered by a browser (browser billing)
         #[serde(default)]
         js_rendered: bool,
+        /// Whether this message is the one that spawned a first-time
+        /// sitemap discovery for (job, domain) (R-18). When true, a
+        /// `SitemapPublished` with this same `url_message_id` is
+        /// guaranteed to follow (with `count: 0` on the disabled/empty/
+        /// error paths), so job-completion accounting knows to wait for
+        /// it before balancing.
+        #[serde(default)]
+        sitemap_pending: bool,
     },
     /// Page crawl failed (terminal for this URL)
     PageFailed {
@@ -611,6 +619,7 @@ impl CrawlEvent {
             links_published: 0,
             url_message_id: String::new(),
             js_rendered: false,
+            sitemap_pending: false,
         }
     }
 
@@ -634,6 +643,7 @@ impl CrawlEvent {
             links_published: 0,
             url_message_id: String::new(),
             js_rendered: false,
+            sitemap_pending: false,
         }
     }
 

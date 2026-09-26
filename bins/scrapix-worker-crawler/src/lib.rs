@@ -742,24 +742,60 @@ impl CrawlerWorker {
         Ok(())
     }
 
-    /// Discover and publish sitemap URLs for a job's domain (if not already
-    /// done for this `(job_id, domain)` pair).
+    /// Whether `parent` is the message that owns `(job_id, domain)`'s
+    /// one-time sitemap discovery.
+    ///
+    /// This is a synchronous, side-effecting decision (it consumes
+    /// `sitemap_seen`'s one-shot dedup slot for the pair), so the caller
+    /// must call it at most once per page, before publishing that page's
+    /// `PageCrawled` (R-18): the result is exactly what `PageCrawled`'s
+    /// `sitemap_pending` flag must carry, and true here obligates the
+    /// caller to spawn [`Self::maybe_discover_sitemaps`], which then
+    /// guarantees a matching `SitemapPublished`.
+    ///
+    /// `parent.job.sitemap.enabled` (when the message carries a job spec)
+    /// decides whether discovery runs at all; `enabled == false` skips it
+    /// entirely, even if this worker's `SITEMAP_DISCOVERY` default is on.
+    /// No job spec at all (legacy/test messages) falls back to this
+    /// worker's `SITEMAP_DISCOVERY` default (whether a sitemap parser was
+    /// built).
+    fn sitemap_discovery_should_run(
+        &self,
+        job_id: &str,
+        domain: &str,
+        parent: &UrlMessage,
+    ) -> bool {
+        let enabled = match parent.job.as_ref() {
+            Some(job) => job.sitemap.enabled,
+            None => self.sitemap_parser.is_some(),
+        };
+        if !enabled {
+            return false;
+        }
+        // Dedupe per (job_id, domain): a second job on an already-seen
+        // domain still gets its own sitemap seeds.
+        self.sitemap_seen.first_time(job_id, domain)
+    }
+
+    /// Run `(job_id, domain)`'s sitemap discovery and publish every accepted
+    /// URL to the frontier as a child of `parent`.
+    ///
+    /// Only called after [`Self::sitemap_discovery_should_run`] returned
+    /// true for this exact `parent`, so this method's only job is to run
+    /// discovery and **unconditionally** publish `SitemapPublished` for
+    /// `parent.message_id` — with `count: 0` on every empty/error/disabled
+    /// path (no parser built, fetch error, nothing found, everything
+    /// filtered out) — so `JobAccounting::sitemaps_settled` is guaranteed to
+    /// eventually catch up with `sitemaps_expected` and the job can balance
+    /// (R-18). This is why the actual discovery work lives in
+    /// [`Self::run_sitemap_discovery`], which never returns an `Err`: every
+    /// failure mode collapses to a `0` count instead, so there is exactly
+    /// one exit path from this function and it always publishes.
     ///
     /// Sitemap URLs are derived from `parent` via `UrlMessage::child`, so
     /// they carry every job-scoped field (job spec, limits, features, ...).
     /// Runs in a background task spawned after a successful fetch, off the
-    /// hot path (R9). Discovery is keyed per `(job_id, domain)` via
-    /// `sitemap_seen`, so a second job crawling an already-seen domain still
-    /// gets its own sitemap seeds.
-    ///
-    /// `parent.job.sitemap` (when the message carries a job spec) decides
-    /// whether discovery runs at all and where seeds come from:
-    /// - `enabled == false` skips discovery entirely, even if this worker's
-    ///   `SITEMAP_DISCOVERY` default is on.
-    /// - non-empty `urls` are fetched directly instead of running robots.txt
-    ///   discovery.
-    /// - no job spec at all (legacy/test messages) falls back to this
-    ///   worker's `SITEMAP_DISCOVERY` default.
+    /// hot path (R9).
     ///
     /// Entries are filtered by [`url_allowed`], the same URL-pattern matcher
     /// link extraction uses, and by [`is_non_page_url_with_pdf`] honoring the
@@ -772,26 +808,67 @@ impl CrawlerWorker {
     ) -> scrapix_core::Result<usize> {
         let job_id = parent.job_id.as_str();
 
-        let (enabled, explicit_urls): (bool, &[String]) = match parent.job.as_ref() {
-            Some(job) => (job.sitemap.enabled, job.sitemap.urls.as_slice()),
-            // No job spec travels with this message: fall back to the
-            // worker-level default (SITEMAP_DISCOVERY env, reflected in
-            // whether a sitemap parser was built at all).
-            None => (self.sitemap_parser.is_some(), &[]),
-        };
-        if !enabled {
-            return Ok(0);
+        let discovered_count = self.run_sitemap_discovery(domain, parent).await;
+
+        if discovered_count > 0 {
+            self.metrics
+                .record_sitemap_discovery(discovered_count as u64);
+            info!(
+                domain,
+                discovered_count, "Published sitemap URLs to frontier"
+            );
+
+            let timestamp = chrono::Utc::now().timestamp_millis();
+            let event = CrawlEvent::UrlsDiscovered {
+                job_id: job_id.to_string(),
+                source_url: format!("https://{domain}/sitemap.xml"),
+                count: discovered_count,
+                timestamp,
+            };
+            if let Err(e) = self.publish_event(job_id, &event).await {
+                debug!(domain, error = %e, "Failed to publish sitemap discovery event");
+            }
         }
 
-        // Dedupe per (job_id, domain): a second job on an already-seen
-        // domain still gets its own sitemap seeds.
-        if !self.sitemap_seen.first_time(job_id, domain) {
-            return Ok(0);
+        // Counted separately from `UrlsDiscovered` so job completion
+        // accounting (links_published, sitemaps_settled) can attribute
+        // sitemap-seeded URLs to the message that triggered discovery (D1,
+        // R-18). Published unconditionally — see the doc comment above.
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let sitemap_published = CrawlEvent::SitemapPublished {
+            job_id: job_id.to_string(),
+            count: discovered_count,
+            url_message_id: parent.message_id.clone(),
+            timestamp,
+        };
+        if let Err(e) = self.publish_event(job_id, &sitemap_published).await {
+            warn!(
+                domain,
+                error = %e,
+                "Failed to publish SitemapPublished event; this job's work accounting may never balance for this domain"
+            );
         }
+
+        Ok(discovered_count)
+    }
+
+    /// Fetch, filter and publish this domain's sitemap URLs to the
+    /// frontier. Returns the count actually published to the frontier.
+    ///
+    /// Never fails outward: a missing parser, a fetch error, an empty
+    /// result, or every entry being filtered out all collapse to `0`, so
+    /// [`Self::maybe_discover_sitemaps`] can always publish
+    /// `SitemapPublished` afterward without an extra branch for "did
+    /// discovery even run".
+    async fn run_sitemap_discovery(&self, domain: &str, parent: &UrlMessage) -> usize {
+        let explicit_urls: &[String] = match parent.job.as_ref() {
+            Some(job) => job.sitemap.urls.as_slice(),
+            None => &[],
+        };
 
         let sitemap_parser = match &self.sitemap_parser {
             Some(parser) => parser,
-            None => return Ok(0),
+            None => return 0,
         };
 
         let sitemap_entries = if !explicit_urls.is_empty() {
@@ -812,7 +889,7 @@ impl CrawlerWorker {
                 Ok(urls) => urls,
                 Err(e) => {
                     debug!(domain, error = %e, "Sitemap discovery failed");
-                    return Ok(0);
+                    return 0;
                 }
             }
         };
@@ -859,40 +936,7 @@ impl CrawlerWorker {
             }
         }
 
-        if discovered_count > 0 {
-            self.metrics
-                .record_sitemap_discovery(discovered_count as u64);
-            info!(
-                domain,
-                discovered_count, "Published sitemap URLs to frontier"
-            );
-
-            let timestamp = chrono::Utc::now().timestamp_millis();
-            let event = CrawlEvent::UrlsDiscovered {
-                job_id: job_id.to_string(),
-                source_url: format!("https://{domain}/sitemap.xml"),
-                count: discovered_count,
-                timestamp,
-            };
-            if let Err(e) = self.publish_event(job_id, &event).await {
-                debug!(domain, error = %e, "Failed to publish sitemap discovery event");
-            }
-
-            // Counted separately from `UrlsDiscovered` so job completion
-            // accounting (links_published) can attribute sitemap-seeded
-            // URLs to the message that triggered discovery (D1).
-            let sitemap_published = CrawlEvent::SitemapPublished {
-                job_id: job_id.to_string(),
-                count: discovered_count,
-                url_message_id: parent.message_id.clone(),
-                timestamp,
-            };
-            if let Err(e) = self.publish_event(job_id, &sitemap_published).await {
-                debug!(domain, error = %e, "Failed to publish SitemapPublished event");
-            }
-        }
-
-        Ok(discovered_count)
+        discovered_count
     }
 
     /// Publish a crawl event

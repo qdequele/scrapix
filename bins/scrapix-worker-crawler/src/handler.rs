@@ -387,21 +387,36 @@ impl CrawlerWorker {
             "Page fetched successfully"
         );
 
+        // Whether *this* message is the one that owns (job, domain)'s
+        // one-time sitemap discovery (R-18). This must be decided
+        // synchronously, before `PageCrawled` is published below, because
+        // `PageCrawled.sitemap_pending` tells job-completion accounting
+        // whether to wait for a matching `SitemapPublished` — and because
+        // deciding is itself the (one-shot) dedup side effect, so it must
+        // happen at most once per page.
+        let domain = url::Url::parse(&url.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
+        let sitemap_pending = match &domain {
+            Some(domain) => self.sitemap_discovery_should_run(&msg.job_id, domain, msg),
+            None => false,
+        };
+
         // Sitemap discovery runs in the background so it never delays the
-        // first fetch (Task 7 moves it to a per-job flow).
-        if self.sitemap_parser.is_some() {
-            if let Some(domain) = url::Url::parse(&url.url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-            {
-                let worker = self.clone();
-                let parent = msg.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = worker.maybe_discover_sitemaps(&domain, &parent).await {
-                        debug!(domain, error = %e, "Sitemap discovery failed");
-                    }
-                });
-            }
+        // first fetch (Task 7 moves it to a per-job flow). Once
+        // `sitemap_pending` is true, `maybe_discover_sitemaps` guarantees a
+        // `SitemapPublished` for `msg.message_id` on every path (disabled
+        // parser, no sitemaps, fetch error), so accounting never waits
+        // forever for it.
+        if sitemap_pending {
+            let domain = domain.expect("sitemap_pending is only true when domain is Some");
+            let worker = self.clone();
+            let parent = msg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = worker.maybe_discover_sitemaps(&domain, &parent).await {
+                    debug!(domain, error = %e, "Sitemap discovery failed");
+                }
+            });
         }
 
         let discovered_urls = self.extract_links(msg, &page);
@@ -492,6 +507,7 @@ impl CrawlerWorker {
             links_published: discovered_count as u64,
             url_message_id: msg.message_id.clone(),
             js_rendered,
+            sitemap_pending,
         };
         self.publish_event(&msg.job_id, &event).await?;
 
@@ -670,6 +686,25 @@ mod tests {
         )
     }
 
+    async fn worker_with_sitemaps(bus: &ChannelBus) -> Arc<CrawlerWorker> {
+        let mut args = Args::parse_from(["scrapix-worker-crawler"]);
+        args.allow_private_ips = true; // wiremock listens on 127.0.0.1
+        args.sitemap_discovery = true;
+        args.redis_url = None;
+        args.browser_render = false;
+        args.max_retries = MAX_RETRIES;
+        Arc::new(
+            CrawlerWorker::build(
+                &args,
+                "test".into(),
+                AnyConsumer::from(bus.consumer()),
+                AnyProducer::from(bus.producer()),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
     fn reader(bus: &ChannelBus, topic: &str) -> AnyConsumer {
         let c = AnyConsumer::from(bus.consumer());
         c.subscribe(&[topic]).unwrap();
@@ -763,6 +798,53 @@ mod tests {
                 if *url_message_id == msg.message_id
         )));
         assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
+    }
+
+    /// R-18: even when the domain's sitemap discovery finds nothing (here,
+    /// neither `robots.txt` nor `sitemap.xml` are mounted, so both fetches
+    /// 404), the crawler still publishes `SitemapPublished { count: 0 }` for
+    /// the page that spawned it, and that page's `PageCrawled` carries
+    /// `sitemap_pending: true` — the two events job-completion accounting
+    /// needs to ever stop waiting on this domain's discovery.
+    #[tokio::test]
+    async fn sitemap_discovery_publishes_settled_event_even_when_it_finds_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<html><body>no links here</body></html>", "text/html"),
+            )
+            .mount(&server)
+            .await;
+        // robots.txt and sitemap.xml are intentionally left unmounted: the
+        // mock server 404s both, so sitemap discovery finds nothing.
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_sitemaps(&bus).await;
+        let msg = message(url(&server, "/"), None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::PageCrawled { sitemap_pending: true, url_message_id, .. }
+                    if *url_message_id == msg.message_id
+            )),
+            "expected PageCrawled.sitemap_pending=true for {msg:?}: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::SitemapPublished { count: 0, url_message_id, .. }
+                    if *url_message_id == msg.message_id
+            )),
+            "expected a settling SitemapPublished{{count:0}} for {msg:?}: {events:?}"
+        );
     }
 
     #[tokio::test]
