@@ -232,9 +232,15 @@ pub async fn flush_job_counters(pool: &PgPool, snapshots: &[JobState]) {
 /// engine runs against a database where the Rails migration adding the
 /// column has not been applied yet, only this statement fails (logged) and
 /// the counter flush keeps working.
-pub async fn flush_job_accounting(pool: &PgPool, entries: &[(String, serde_json::Value)]) {
+///
+/// Returns `Err` (after logging) when the statement fails, so the caller can
+/// keep the covered events un-acked.
+pub async fn flush_job_accounting(
+    pool: &PgPool,
+    entries: &[(String, serde_json::Value)],
+) -> Result<(), sqlx::Error> {
     if entries.is_empty() {
-        return;
+        return Ok(());
     }
     let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
     let values: Vec<serde_json::Value> = entries.iter().map(|(_, v)| v.clone()).collect();
@@ -252,11 +258,17 @@ pub async fn flush_job_accounting(pool: &PgPool, entries: &[(String, serde_json:
     .await;
 
     match result {
-        Ok(r) => debug!(
-            rows = r.rows_affected(),
-            "Flushed job accounting to Postgres"
-        ),
-        Err(e) => warn!(error = %e, "Failed to flush job accounting to Postgres"),
+        Ok(r) => {
+            debug!(
+                rows = r.rows_affected(),
+                "Flushed job accounting to Postgres"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to flush job accounting to Postgres");
+            Err(e)
+        }
     }
 }
 

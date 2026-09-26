@@ -94,8 +94,8 @@ use scrapix_parser::{
     html_to_main_content_minihtml, html_to_markdown, html_to_minihtml,
 };
 use scrapix_queue::{
-    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, JobAccounting, JobAction,
-    JobControl, ProducerBuilder, UrlMessage,
+    topic_names, Ack, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, EventPosition,
+    JobAccounting, JobAction, JobControl, ProducerBuilder, UrlMessage,
 };
 
 use completion::{finalize_decision, Finalize};
@@ -171,6 +171,10 @@ struct CrawlState {
     /// Start of the current uninterrupted balanced streak per Running job
     /// (completion grace period).
     balanced_since: RwLock<HashMap<String, std::time::Instant>>,
+    /// Acks of events that changed a job's accounting, held until the
+    /// accounting flush containing them succeeded (R-19): the Kafka offset
+    /// only advances past an event once its effect is durable.
+    pending_acks: parking_lot::Mutex<Vec<Ack>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -184,6 +188,10 @@ struct DiagnosticsState {
     /// Number of job completion/failure emails requested (one per terminal
     /// job; test hook for the single-email invariant, R5)
     job_emails_requested: std::sync::atomic::AtomicU64,
+    /// Number of job billing requests and total pages billed (test hook /
+    /// observability; one request per billed terminal job)
+    job_bills_requested: std::sync::atomic::AtomicU64,
+    pages_billed: std::sync::atomic::AtomicU64,
 }
 
 /// ClickHouse analytics batchers
@@ -223,6 +231,9 @@ struct AppState {
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
+    /// Defer event acks until the accounting flush (true when Postgres
+    /// persistence is configured; otherwise events are acked immediately).
+    defer_acks: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -271,12 +282,15 @@ impl AppState {
                 dirty_jobs: RwLock::new(HashSet::new()),
                 accounting: RwLock::new(HashMap::new()),
                 balanced_since: RwLock::new(HashMap::new()),
+                pending_acks: parking_lot::Mutex::new(Vec::new()),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
                 domain_counters: RwLock::new(HashMap::new()),
                 service_last_seen: RwLock::new(HashMap::new()),
                 job_emails_requested: std::sync::atomic::AtomicU64::new(0),
+                job_bills_requested: std::sync::atomic::AtomicU64::new(0),
+                pages_billed: std::sync::atomic::AtomicU64::new(0),
             },
             analytics: AnalyticsState {
                 request_batcher,
@@ -287,6 +301,7 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
+            defer_acks: db_pool.is_some(),
             db_pool,
             stripe_client,
             analytics_store,
@@ -465,7 +480,14 @@ impl AppState {
     /// on true completion, apply the terminal event through `process_event`
     /// (which alone schedules the email), and tell the pipeline to release
     /// the job's state.
-    async fn finalize_job(&self, job_id: &str, decision: Finalize) {
+    ///
+    /// The decision is re-validated against the job's current state first:
+    /// decisions are computed for all jobs up front and finalized one after
+    /// the other, so an earlier slow Replace cleanup can make a later
+    /// decision stale before its own destructive cleanup.
+    ///
+    /// `now` is the re-validation time (the loop passes `Instant::now()`).
+    async fn finalize_job(&self, job_id: &str, decision: Finalize, now: std::time::Instant) {
         let Some(job) = self.get_job(job_id) else {
             return;
         };
@@ -479,6 +501,29 @@ impl AppState {
             .get(job_id)
             .cloned()
             .unwrap_or_default();
+        let still_valid = match decision {
+            Finalize::Wait => false,
+            Finalize::Complete | Finalize::FailNoPages => acc.is_balanced(),
+            Finalize::FailStalled => {
+                !acc.is_balanced()
+                    && self
+                        .crawl
+                        .job_last_activity
+                        .read()
+                        .get(job_id)
+                        .map_or(true, |last| {
+                            now.saturating_duration_since(*last) >= self.config.job_stall_timeout
+                        })
+            }
+        };
+        if !still_valid {
+            debug!(job_id = %job_id, ?decision, "Finalize decision went stale, skipping");
+            if decision != Finalize::FailStalled {
+                self.crawl.balanced_since.write().remove(job_id);
+            }
+            return;
+        }
+
         let timestamp = chrono::Utc::now().timestamp_millis();
         let failed = |error: String| CrawlEvent::JobFailed {
             job_id: job_id.to_string(),
@@ -512,49 +557,254 @@ impl AppState {
             },
         };
 
-        // The job may have been cancelled while the Replace cleanup ran;
-        // process_event ignores a terminal event for a terminal job.
         info!(job_id = %job_id, ?decision, "Finalizing job from work accounting");
-        self.process_event(job_id, &event);
+        // The terminal transition is atomic in process_event: if the job was
+        // cancelled meanwhile (e.g. during the Replace cleanup), nothing is
+        // applied and nothing else happens here.
+        if !self.process_event(job_id, &event).applied {
+            debug!(job_id = %job_id, "Job became terminal before finalize, skipping");
+            return;
+        }
         self.broadcast_event(job_id, event);
 
-        let control = JobControl::new(job_id, JobAction::Finish);
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.producer
-                .send(topic_names::JOB_STATUS, Some(job_id), &control),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!(job_id = %job_id, error = %e, "Failed to publish JobControl Finish")
-            }
-            Err(_) => warn!(job_id = %job_id, "Timed out publishing JobControl Finish"),
+        // R-20: a stalled job still pays for the pages it crawled (the old
+        // idle detector completed, and so billed, such jobs). A Replace
+        // cleanup failure stays unbilled, as before.
+        if decision == Finalize::FailStalled {
+            self.bill_job(job_id, job.account_id.as_ref(), acc.pages_crawled_ok);
         }
+
+        // Tell the pipeline to release the job's state. Spawned so a slow or
+        // blocked publish never delays the next finalize.
+        let producer = self.producer.clone();
+        let job_id = job_id.to_string();
+        tokio::spawn(async move {
+            let control = JobControl::new(&job_id, JobAction::Finish);
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                producer.send(topic_names::JOB_STATUS, Some(&job_id), &control),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(job_id = %job_id, error = %e, "Failed to publish JobControl Finish")
+                }
+                Err(_) => warn!(job_id = %job_id, "Timed out publishing JobControl Finish"),
+            }
+        });
     }
 
-    /// Process an event and update job state accordingly
-    fn process_event(&self, job_id: &str, event: &CrawlEvent) {
-        // Terminal transitions are applied exactly once: a second
-        // JobCompleted/JobFailed for a job that is already terminal (a
-        // redelivered event, or a finalize racing a cancel) must not re-bill,
-        // re-email or re-record it (R5: exactly one completion email).
-        if matches!(
+    /// Deduct crawl credits for `pages` pages of a finished job
+    /// (fire-and-forget). Cost per page depends on the job's crawler_type and
+    /// enabled features. The single billing path for terminal jobs.
+    fn bill_job(&self, job_id: &str, account_id: Option<&String>, pages: u64) {
+        if pages == 0 {
+            return;
+        }
+        self.diagnostics
+            .job_bills_requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.diagnostics
+            .pages_billed
+            .fetch_add(pages, std::sync::atomic::Ordering::Relaxed);
+        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
+            return;
+        };
+        // Extract crawler_type and features from persisted job config
+        let (crawler_type, features) = {
+            let jobs = self.crawl.jobs.read();
+            jobs.get(job_id)
+                .and_then(|j| j.config.as_ref())
+                .map(|cfg| {
+                    let ct = cfg
+                        .get("crawler_type")
+                        .and_then(|v| serde_json::from_value::<CrawlerType>(v.clone()).ok())
+                        .unwrap_or_default();
+                    let ft = cfg
+                        .get("features")
+                        .and_then(|v| serde_json::from_value::<FeaturesConfig>(v.clone()).ok())
+                        .unwrap_or_default();
+                    (ct, ft)
+                })
+                .unwrap_or_default()
+        };
+        let cost_per_page = billing::crawl_credits_per_page(&crawler_type, &features);
+        let credits = pages as i64 * cost_per_page;
+        let job_id = job_id.to_string();
+        let stripe_cl = self.stripe_client.clone();
+        tokio::spawn(async move {
+            match billing::deduct_crawl_usage(
+                &pool,
+                &acct_id,
+                credits,
+                &format!(
+                    "Job {} ({} pages × {} credits/page)",
+                    job_id, pages, cost_per_page
+                ),
+                stripe_cl.as_ref(),
+            )
+            .await
+            {
+                Ok(new_balance) => {
+                    info!(
+                        account_id = %acct_id,
+                        credits_deducted = credits,
+                        cost_per_page,
+                        new_balance,
+                        job_id = %job_id,
+                        "Crawl credits deducted"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        account_id = %acct_id,
+                        credits = credits,
+                        job_id = %job_id,
+                        error = ?e,
+                        "Failed to deduct crawl credits"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Atomically apply the state change of a terminal event: check and set
+    /// under one `jobs.write()`, so two terminal events (or a terminal event
+    /// and a cancel) can never both transition the job.
+    fn transition_terminal(&self, job_id: &str, event: &CrawlEvent) -> TerminalTransition {
+        if !matches!(
             event,
             CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. }
         ) {
-            let already_terminal = self
-                .crawl
-                .jobs
-                .read()
-                .get(job_id)
-                .is_some_and(|j| is_terminal(&j.status));
-            if already_terminal {
-                debug!(job_id = %job_id, "Ignoring terminal event for an already terminal job");
-                return;
-            }
+            return TerminalTransition::NotTerminal;
         }
+        let now = chrono::Utc::now();
+        let mut jobs = self.crawl.jobs.write();
+        let Some(j) = jobs.get_mut(job_id) else {
+            return TerminalTransition::UnknownJob;
+        };
+        if is_terminal(&j.status) {
+            return TerminalTransition::AlreadyTerminal;
+        }
+        match event {
+            CrawlEvent::JobCompleted {
+                pages_crawled,
+                documents_indexed,
+                duration_secs,
+                ..
+            } => {
+                j.status = JobStatus::Completed;
+                j.pages_crawled = *pages_crawled;
+                j.pages_indexed = *documents_indexed;
+                j.completed_at = Some(now);
+                if *duration_secs > 0 {
+                    j.crawl_rate = j.pages_crawled as f64 / *duration_secs as f64;
+                }
+            }
+            CrawlEvent::JobFailed { error, .. } => {
+                j.status = JobStatus::Failed;
+                j.error_message = Some(error.clone());
+                j.completed_at = Some(now);
+            }
+            _ => unreachable!("checked above"),
+        }
+        TerminalTransition::Applied(Box::new(j.clone()))
+    }
+
+    /// Hand an event's ack back: acked now, unless the event changed a job's
+    /// accounting and accounting is persisted, in which case it is held
+    /// until the flush containing it succeeds (R-19).
+    fn settle_ack(&self, ack: Ack, outcome: EventOutcome) {
+        if self.defer_acks && outcome.accounting_touched {
+            self.crawl.pending_acks.lock().push(ack);
+        } else {
+            ack.ack();
+        }
+    }
+
+    /// Start a Postgres flush: take the held acks first, then the dirty jobs
+    /// and their snapshots, so every taken ack's event is in the snapshot
+    /// (an event is applied, and its job marked dirty, before its ack is
+    /// held).
+    fn begin_flush(&self) -> FlushBatch {
+        let acks = std::mem::take(&mut *self.crawl.pending_acks.lock());
+        let dirty_ids: Vec<String> = self.crawl.dirty_jobs.write().drain().collect();
+        let snapshots: Vec<JobState> = {
+            let jobs = self.crawl.jobs.read();
+            dirty_ids
+                .iter()
+                .filter_map(|id| jobs.get(id).cloned())
+                .collect()
+        };
+        let accounting = self.accounting_snapshots(&dirty_ids);
+        FlushBatch {
+            acks,
+            dirty_ids,
+            snapshots,
+            accounting,
+        }
+    }
+
+    /// Finish a flush: ack the held events once their accounting is durable;
+    /// otherwise keep them held and the jobs dirty for the next attempt.
+    /// (Acks may complete in any order: the offset tracker only commits the
+    /// contiguous acked prefix of each partition.)
+    fn finish_flush(&self, acks: Vec<Ack>, dirty_ids: Vec<String>, accounting_ok: bool) {
+        if accounting_ok {
+            for ack in acks {
+                ack.ack();
+            }
+        } else {
+            self.crawl.dirty_jobs.write().extend(dirty_ids);
+            self.crawl.pending_acks.lock().extend(acks);
+        }
+    }
+
+    /// Flush dirty job counters and accounting to Postgres, then release the
+    /// acks of the events they cover.
+    async fn flush_to_db(&self, pool: &sqlx::PgPool) {
+        let FlushBatch {
+            acks,
+            dirty_ids,
+            snapshots,
+            accounting,
+        } = self.begin_flush();
+        if !snapshots.is_empty() {
+            jobs_db::flush_job_counters(pool, &snapshots).await;
+        }
+        let ok = jobs_db::flush_job_accounting(pool, &accounting)
+            .await
+            .is_ok();
+        self.finish_flush(acks, dirty_ids, ok);
+    }
+
+    /// Process an event (not from the events topic) and update job state.
+    fn process_event(&self, job_id: &str, event: &CrawlEvent) -> EventOutcome {
+        self.process_event_at(job_id, event, None)
+    }
+
+    /// Process an event and update job state accordingly. `pos` is the
+    /// event's position in the (durable) events topic, used to skip
+    /// accounting events already folded into a restored snapshot (R-19).
+    fn process_event_at(
+        &self,
+        job_id: &str,
+        event: &CrawlEvent,
+        pos: Option<EventPosition>,
+    ) -> EventOutcome {
+        // Terminal transitions are applied exactly once, atomically: a second
+        // JobCompleted/JobFailed for a job that is already terminal (a
+        // redelivered event, or a finalize racing a cancel) must not re-bill,
+        // re-email or re-record it (R5: exactly one completion email).
+        let terminal_snapshot = match self.transition_terminal(job_id, event) {
+            TerminalTransition::AlreadyTerminal => {
+                debug!(job_id = %job_id, "Ignoring terminal event for an already terminal job");
+                return EventOutcome::default();
+            }
+            TerminalTransition::Applied(snapshot) => Some(*snapshot),
+            TerminalTransition::NotTerminal | TerminalTransition::UnknownJob => None,
+        };
 
         // Track last activity (stall detection) for live jobs only, so late
         // events for a finished/unknown job do not leak entries.
@@ -699,14 +949,32 @@ impl AppState {
         // once terminal) are tracked, so late events for a finished job do
         // not resurrect state. The JobState counters below mirror the
         // (deduplicated) accounting when it exists.
-        let accounted: Option<AccountedCounters> = {
+        //
+        // An accounting event at or below the job's persisted high-water mark
+        // was already folded into the restored snapshot and is skipped
+        // (redelivery after a restart, R-19).
+        let (accounted, accounting_touched) = {
             let mut accs = self.crawl.accounting.write();
-            accs.get_mut(job_id).map(|acc| {
-                acc.apply(event);
-                AccountedCounters::from(&*acc)
-            })
+            match accs.get_mut(job_id) {
+                None => (None, false),
+                Some(acc) => {
+                    let mut touched = false;
+                    if is_accounting_event(event) {
+                        if pos.is_some_and(|p| acc.already_applied(p)) {
+                            debug!(job_id = %job_id, ?pos, "Skipping already-accounted event");
+                        } else {
+                            acc.apply(event);
+                            if pos.is_some() {
+                                acc.event_hwm = pos;
+                            }
+                            touched = true;
+                        }
+                    }
+                    (Some(AccountedCounters::from(&*acc)), touched)
+                }
+            }
         };
-        if accounted.is_some() && is_accounting_event(event) {
+        if accounting_touched {
             self.crawl.dirty_jobs.write().insert(job_id.to_string());
         }
 
@@ -801,24 +1069,11 @@ impl AppState {
                 duration_secs,
                 ..
             } => {
-                // Get index_uid before updating
-                let index_uid = {
-                    let jobs = self.crawl.jobs.read();
-                    jobs.get(job_id)
-                        .map(|j| j.index_uid.clone())
-                        .unwrap_or_default()
-                };
-
-                let updated = self.update_job(job_id, |j| {
-                    j.status = JobStatus::Completed;
-                    j.pages_crawled = *pages_crawled;
-                    j.pages_indexed = *documents_indexed;
-                    j.completed_at = Some(chrono::Utc::now());
-                    if *duration_secs > 0 {
-                        j.crawl_rate = j.pages_crawled as f64 / *duration_secs as f64;
-                    }
-                });
-                self.on_terminal(job_id, updated);
+                let index_uid = terminal_snapshot
+                    .as_ref()
+                    .map(|j| j.index_uid.clone())
+                    .unwrap_or_default();
+                self.on_terminal(job_id, terminal_snapshot);
 
                 // Queue job completion email (delivered by the Rails app).
                 // The only place a completion email is scheduled (R5).
@@ -835,94 +1090,17 @@ impl AppState {
                 );
 
                 // Deduct credits for crawled pages (fire-and-forget)
-                // Cost per page depends on crawler_type and enabled features
-                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, account_id) {
-                    if *pages_crawled > 0 {
-                        // Extract crawler_type and features from persisted job config
-                        let (crawler_type, features) = {
-                            let jobs = self.crawl.jobs.read();
-                            jobs.get(job_id)
-                                .and_then(|j| j.config.as_ref())
-                                .map(|cfg| {
-                                    let ct = cfg
-                                        .get("crawler_type")
-                                        .and_then(|v| {
-                                            serde_json::from_value::<CrawlerType>(v.clone()).ok()
-                                        })
-                                        .unwrap_or_default();
-                                    let ft = cfg
-                                        .get("features")
-                                        .and_then(|v| {
-                                            serde_json::from_value::<FeaturesConfig>(v.clone()).ok()
-                                        })
-                                        .unwrap_or_default();
-                                    (ct, ft)
-                                })
-                                .unwrap_or_default()
-                        };
-                        let cost_per_page =
-                            billing::crawl_credits_per_page(&crawler_type, &features);
-                        let total_pages = *pages_crawled;
-                        let credits = total_pages as i64 * cost_per_page;
-                        let pool = pool.clone();
-                        let acct_id = acct_id.clone();
-                        let job_id = job_id.to_string();
-                        let stripe_cl = self.stripe_client.clone();
-                        tokio::spawn(async move {
-                            match billing::deduct_crawl_usage(
-                                &pool,
-                                &acct_id,
-                                credits,
-                                &format!(
-                                    "Job {} ({} pages × {} credits/page)",
-                                    job_id, total_pages, cost_per_page
-                                ),
-                                stripe_cl.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(new_balance) => {
-                                    info!(
-                                        account_id = %acct_id,
-                                        credits_deducted = credits,
-                                        cost_per_page,
-                                        new_balance,
-                                        job_id = %job_id,
-                                        "Crawl credits deducted"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        account_id = %acct_id,
-                                        credits = credits,
-                                        job_id = %job_id,
-                                        error = ?e,
-                                        "Failed to deduct crawl credits"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                }
+                self.bill_job(job_id, account_id.as_ref(), *pages_crawled);
             }
             CrawlEvent::JobFailed { error, .. } => {
                 // No temp index cleanup needed — Replace strategy writes directly to the real index.
                 // Stale documents from a failed job will be cleaned up by the next successful crawl.
 
-                // Capture job info before updating status
-                let (pages_crawled, account_id) = {
-                    let jobs = self.crawl.jobs.read();
-                    jobs.get(job_id)
-                        .map(|j| (j.pages_crawled, j.account_id.clone()))
-                        .unwrap_or((0, None))
-                };
-
-                let updated = self.update_job(job_id, |j| {
-                    j.status = JobStatus::Failed;
-                    j.error_message = Some(error.clone());
-                    j.completed_at = Some(chrono::Utc::now());
-                });
-                self.on_terminal(job_id, updated);
+                let (pages_crawled, account_id) = terminal_snapshot
+                    .as_ref()
+                    .map(|j| (j.pages_crawled, j.account_id.clone()))
+                    .unwrap_or((0, None));
+                self.on_terminal(job_id, terminal_snapshot);
 
                 // Queue job failure email (delivered by the Rails app).
                 // The only place a failure email is scheduled (R5).
@@ -975,7 +1153,43 @@ impl AppState {
             }
             _ => {}
         }
+        EventOutcome {
+            applied: true,
+            accounting_touched,
+        }
     }
+}
+
+/// Result of the atomic terminal check-and-set.
+#[derive(Debug)]
+enum TerminalTransition {
+    /// Not a JobCompleted/JobFailed event.
+    NotTerminal,
+    /// Terminal event for a job not in memory (applied as before).
+    UnknownJob,
+    /// The job was already terminal: nothing applied.
+    AlreadyTerminal,
+    /// The job transitioned; its new state.
+    Applied(Box<JobState>),
+}
+
+/// What `process_event` did with an event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EventOutcome {
+    /// False only for a terminal event ignored because the job already was
+    /// terminal.
+    applied: bool,
+    /// The event changed a job's work accounting (its ack must wait for the
+    /// accounting flush, R-19).
+    accounting_touched: bool,
+}
+
+/// One Postgres flush round (see `AppState::begin_flush`).
+struct FlushBatch {
+    acks: Vec<Ack>,
+    dirty_ids: Vec<String>,
+    snapshots: Vec<JobState>,
+    accounting: Vec<(String, serde_json::Value)>,
 }
 
 /// Maximum distinct warnings kept per job.
@@ -4953,17 +5167,25 @@ fn start_event_consumer(
     }
 
     // At-least-once (R2): the offset commits only after the event has been
-    // applied. Concurrency 1 keeps events applied in partition order.
+    // applied — and, for accounting events with Postgres persistence, only
+    // after the accounting flush containing it succeeded (R-19). Concurrency 1
+    // keeps events applied in partition order. Only Kafka positions are
+    // durable, so only they feed the accounting high-water mark.
+    let durable_positions = matches!(consumer, AnyConsumer::Kafka(_));
     let handle = tokio::spawn(async move {
         let result = consumer
             .process_with_ack::<CrawlEvent, _, _>(
-                move |event, _meta, ack| {
+                move |event, meta, ack| {
                     let state = state.clone();
                     async move {
                         let job_id = event_job_id(&event).to_string();
-                        state.process_event(&job_id, &event);
+                        let pos = durable_positions.then_some(EventPosition {
+                            partition: meta.partition,
+                            offset: meta.offset,
+                        });
+                        let outcome = state.process_event_at(&job_id, &event, pos);
                         state.broadcast_event(&job_id, event);
-                        ack.ack();
+                        state.settle_ack(ack, outcome);
                     }
                 },
                 1,
@@ -5238,7 +5460,11 @@ pub async fn run_with_bus(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Start event consumer for real-time job tracking
-    let consumer_handle = start_event_consumer(consumer, state.clone(), shutdown_rx.clone())?;
+    let mut consumer_handle = Some(start_event_consumer(
+        consumer,
+        state.clone(),
+        shutdown_rx.clone(),
+    )?);
     info!("Event consumer started for centralized job tracking");
 
     // Spawn AI usage receiver task: drains events from the AiClient channel into the ClickHouse batcher
@@ -5281,6 +5507,13 @@ pub async fn run_with_bus(
         let ai_batcher = ai_usage_batcher.clone();
         let job_batcher = job_event_batcher.clone();
         let flush_state = state.clone();
+        // With Postgres, the flush task owns the consumer's shutdown join: it
+        // must drain before the final flush (R-19).
+        let mut consumer_join = if state.db_pool.is_some() {
+            consumer_handle.take()
+        } else {
+            None
+        };
         let mut shutdown_rx = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -5302,22 +5535,10 @@ pub async fn run_with_bus(
                                 warn!(error = %e, "Failed to flush ClickHouse job event batcher");
                             }
                         }
-                        // Flush dirty job counters to Postgres
+                        // Flush dirty job counters + accounting to Postgres,
+                        // then release the acks they cover
                         if let Some(ref pool) = flush_state.db_pool {
-                            let dirty_ids: Vec<String> =
-                                flush_state.crawl.dirty_jobs.write().drain().collect();
-                            if !dirty_ids.is_empty() {
-                                let snapshots: Vec<JobState> = {
-                                    let jobs = flush_state.crawl.jobs.read();
-                                    dirty_ids
-                                        .iter()
-                                        .filter_map(|id| jobs.get(id).cloned())
-                                        .collect()
-                                };
-                                jobs_db::flush_job_counters(pool, &snapshots).await;
-                                let accounting = flush_state.accounting_snapshots(&dirty_ids);
-                                jobs_db::flush_job_accounting(pool, &accounting).await;
-                            }
+                            flush_state.flush_to_db(pool).await;
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -5337,22 +5558,16 @@ pub async fn run_with_bus(
                                 warn!(error = %e, "Failed final ClickHouse job event flush");
                             }
                         }
-                        // Final Postgres flush
+                        // Final Postgres flush — only once the event consumer
+                        // has drained and sync-committed (R-19), so the final
+                        // snapshot covers every event it applied.
                         if let Some(ref pool) = flush_state.db_pool {
-                            let dirty_ids: Vec<String> =
-                                flush_state.crawl.dirty_jobs.write().drain().collect();
-                            if !dirty_ids.is_empty() {
-                                let snapshots: Vec<JobState> = {
-                                    let jobs = flush_state.crawl.jobs.read();
-                                    dirty_ids
-                                        .iter()
-                                        .filter_map(|id| jobs.get(id).cloned())
-                                        .collect()
-                                };
-                                jobs_db::flush_job_counters(pool, &snapshots).await;
-                                let accounting = flush_state.accounting_snapshots(&dirty_ids);
-                                jobs_db::flush_job_accounting(pool, &accounting).await;
+                            if let Some(handle) = consumer_join.take() {
+                                if let Err(e) = handle.await {
+                                    warn!("Consumer task failed during shutdown: {}", e);
+                                }
                             }
+                            flush_state.flush_to_db(pool).await;
                         }
                         break;
                     }
@@ -5384,7 +5599,9 @@ pub async fn run_with_bus(
                     let decisions =
                         completion_state.completion_decisions(std::time::Instant::now());
                     for (job_id, decision) in decisions {
-                        completion_state.finalize_job(&job_id, decision).await;
+                        completion_state
+                            .finalize_job(&job_id, decision, std::time::Instant::now())
+                            .await;
                     }
                 }
                 _ = completion_shutdown_rx.changed() => {
@@ -5613,7 +5830,10 @@ pub async fn run_with_bus(
 
     // Wait for background tasks to finish cleanly
     info!("Waiting for background tasks to shut down...");
-    if let Err(e) = consumer_handle.await {
+    if let Some(Err(e)) = match consumer_handle {
+        Some(handle) => Some(handle.await),
+        None => None,
+    } {
         warn!("Consumer task failed during shutdown: {}", e);
     }
     if let Err(e) = completion_handle.await {
@@ -6216,7 +6436,9 @@ mod lifecycle_tests {
         let decisions = state.completion_decisions(t0 + Duration::from_secs(4));
         assert_eq!(decisions, vec![("j1".to_string(), Finalize::Complete)]);
 
-        state.finalize_job("j1", Finalize::Complete).await;
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
         let job = state.get_job("j1").unwrap();
         assert_eq!(job.status, JobStatus::Completed);
         assert_eq!(job.pages_crawled, 1);
@@ -6239,7 +6461,9 @@ mod lifecycle_tests {
         assert!(state
             .completion_decisions(t0 + Duration::from_secs(10))
             .is_empty());
-        state.finalize_job("j1", Finalize::Complete).await;
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
         state.process_event(
             "j1",
             &CrawlEvent::JobCompleted {
@@ -6315,7 +6539,9 @@ mod lifecycle_tests {
         assert!(state.completion_decisions(t0).is_empty());
         let decisions = state.completion_decisions(t0 + Duration::from_secs(4));
         assert_eq!(decisions, vec![("j1".to_string(), Finalize::FailNoPages)]);
-        state.finalize_job("j1", Finalize::FailNoPages).await;
+        state
+            .finalize_job("j1", Finalize::FailNoPages, Instant::now())
+            .await;
 
         let job = state.get_job("j1").unwrap();
         assert_eq!(job.status, JobStatus::Failed);
@@ -6340,7 +6566,7 @@ mod lifecycle_tests {
             state.completion_decisions(later),
             vec![("j1".to_string(), Finalize::FailStalled)]
         );
-        state.finalize_job("j1", Finalize::FailStalled).await;
+        state.finalize_job("j1", Finalize::FailStalled, later).await;
         let job = state.get_job("j1").unwrap();
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(
@@ -6360,7 +6586,13 @@ mod lifecycle_tests {
         assert!(state
             .completion_decisions(Instant::now() + Duration::from_secs(3600))
             .is_empty());
-        state.finalize_job("j1", Finalize::FailStalled).await;
+        state
+            .finalize_job(
+                "j1",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
         assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Cancelled);
         assert_eq!(emails(&state), 0);
     }
@@ -6400,7 +6632,13 @@ mod lifecycle_tests {
         let bus = ChannelBus::new();
         let state = test_state(&bus);
         running_job(&state, "j1", 1);
-        state.finalize_job("j1", Finalize::FailStalled).await;
+        state
+            .finalize_job(
+                "j1",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
         state.process_event("j1", &crawled("j1", "m9"));
         assert!(state.crawl.accounting.read().get("j1").is_none());
         assert!(state.crawl.job_last_activity.read().get("j1").is_none());
@@ -6447,6 +6685,293 @@ mod lifecycle_tests {
         let acc = restore_accounting(&job, Some(&serde_json::to_value(&persisted).unwrap()));
         assert_eq!(acc.seeds_published, 5);
         assert_eq!(acc.pages_crawled_ok, 3);
+    }
+
+    fn at(offset: i64) -> Option<EventPosition> {
+        Some(EventPosition {
+            partition: 3,
+            offset,
+        })
+    }
+
+    fn counting_ack(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Ack {
+        let c = counter.clone();
+        Ack::from_fn(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    /// Simulate a restart: a fresh state whose job accounting is restored
+    /// from `persisted` (the jsonb snapshot of the crashed instance).
+    fn restored_state(bus: &ChannelBus, job_id: &str, persisted: &serde_json::Value) -> AppState {
+        let state = test_state(bus);
+        let mut job = JobState::new(job_id, "idx");
+        job.start();
+        let acc = restore_accounting(&job, Some(persisted));
+        state.insert_job(job);
+        state
+            .crawl
+            .accounting
+            .write()
+            .insert(job_id.to_string(), acc);
+        state
+    }
+
+    fn persisted(state: &AppState, job_id: &str) -> serde_json::Value {
+        state
+            .accounting_snapshots(&[job_id.to_string()])
+            .pop()
+            .unwrap()
+            .1
+    }
+
+    /// R-19(c): replaying events at or below the restored high-water mark
+    /// does not double count; events past it still apply.
+    #[tokio::test]
+    async fn replayed_events_after_restore_are_not_double_counted() {
+        let bus = ChannelBus::new();
+        let before = test_state(&bus);
+        running_job(&before, "j1", 2);
+        let events = [
+            progress("j1", 2, 2, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ];
+        for (i, e) in events.iter().enumerate() {
+            before.process_event_at("j1", e, at(10 + i as i64));
+        }
+        let snapshot = persisted(&before, "j1");
+        assert_eq!(
+            snapshot["event_hwm"],
+            serde_json::json!({"partition": 3, "offset": 12})
+        );
+
+        let after = restored_state(&bus, "j1", &snapshot);
+        for (i, e) in events.iter().enumerate() {
+            let outcome = after.process_event_at("j1", e, at(10 + i as i64));
+            assert!(!outcome.accounting_touched, "replayed event {i} re-applied");
+        }
+        {
+            let accs = after.crawl.accounting.read();
+            let acc = accs.get("j1").unwrap();
+            assert_eq!(acc.crawl_outcomes, 1);
+            assert_eq!(acc.pages_crawled_ok, 1);
+            assert_eq!(acc.content_outcomes, 1);
+        }
+        // New events past the mark apply.
+        let outcome = after.process_event_at("j1", &failed("j1", "m2"), at(13));
+        assert!(outcome.accounting_touched);
+        assert!(after.crawl.accounting.read()["j1"].is_balanced());
+    }
+
+    /// R-19(c): without the high-water mark, replaying the tail (m1 crawled
+    /// + indexed) after a restore would count m1 twice and balance a job
+    /// whose second seed is still outstanding.
+    #[tokio::test]
+    async fn restored_job_does_not_complete_early_from_replayed_tail() {
+        let bus = ChannelBus::new();
+        let before = test_state(&bus);
+        running_job(&before, "j1", 2);
+        before.process_event_at("j1", &progress("j1", 2, 2, 0), at(1));
+        before.process_event_at("j1", &crawled("j1", "m1"), at(2));
+        before.process_event_at("j1", &indexed("j1", "m1"), at(3));
+        let after = restored_state(&bus, "j1", &persisted(&before, "j1"));
+
+        after.process_event_at("j1", &crawled("j1", "m1"), at(2));
+        after.process_event_at("j1", &indexed("j1", "m1"), at(3));
+        let t0 = Instant::now();
+        assert!(after.completion_decisions(t0).is_empty());
+        assert!(
+            after
+                .completion_decisions(t0 + Duration::from_secs(10))
+                .is_empty(),
+            "m2 is still outstanding"
+        );
+        assert!(!after.crawl.accounting.read()["j1"].is_balanced());
+    }
+
+    /// R-19(b): an accounting event's ack is held until the accounting flush
+    /// containing it succeeds; a failed flush keeps it held (and the job
+    /// dirty) for the next round. Other events are acked at once.
+    #[tokio::test]
+    async fn accounting_event_acks_wait_for_a_successful_flush() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        state.defer_acks = true; // as with a Postgres pool
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let outcome = state.process_event_at("j1", &progress("j1", 1, 1, 0), at(1));
+        state.settle_ack(counting_ack(&acked), outcome);
+        let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(2));
+        state.settle_ack(counting_ack(&acked), outcome);
+        assert_eq!(acked.load(Ordering::Relaxed), 0, "held until flushed");
+
+        // Non-accounting and replayed events are acked immediately.
+        let warning = CrawlEvent::JobWarning {
+            job_id: "j1".into(),
+            message: "w".into(),
+            timestamp: 0,
+        };
+        let outcome = state.process_event_at("j1", &warning, at(3));
+        state.settle_ack(counting_ack(&acked), outcome);
+        let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(2));
+        state.settle_ack(counting_ack(&acked), outcome);
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+
+        // Failed accounting flush: nothing acked, job still dirty.
+        let batch = state.begin_flush();
+        assert_eq!(batch.acks.len(), 2);
+        assert_eq!(batch.accounting.len(), 1);
+        state.finish_flush(batch.acks, batch.dirty_ids, false);
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+        assert!(state.crawl.dirty_jobs.read().contains("j1"));
+
+        // Successful retry: both held acks released.
+        let batch = state.begin_flush();
+        assert_eq!(batch.accounting.len(), 1, "retried with the job's snapshot");
+        state.finish_flush(batch.acks, batch.dirty_ids, true);
+        assert_eq!(acked.load(Ordering::Relaxed), 4);
+        assert!(state.crawl.pending_acks.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_persistence_acks_are_immediate() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        assert!(!state.defer_acks);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(1));
+        assert!(outcome.accounting_touched);
+        state.settle_ack(counting_ack(&acked), outcome);
+        assert_eq!(acked.load(Ordering::Relaxed), 1);
+    }
+
+    /// R-20: a stalled job that crawled pages is billed for them.
+    #[tokio::test]
+    async fn stalled_job_with_crawled_pages_is_billed() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &crawled("j1", "m1"));
+        state.process_event("j1", &indexed("j1", "m1")); // m2 never reports
+        let later = Instant::now() + Duration::from_secs(1801);
+        assert_eq!(
+            state.completion_decisions(later),
+            vec![("j1".to_string(), Finalize::FailStalled)]
+        );
+        state.finalize_job("j1", Finalize::FailStalled, later).await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Failed);
+        let d = &state.diagnostics;
+        assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
+        assert_eq!(d.pages_billed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_job_is_billed_once_and_no_pages_job_not_at_all() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "ok", 1);
+        for e in [
+            progress("ok", 1, 1, 0),
+            crawled("ok", "m1"),
+            indexed("ok", "m1"),
+        ] {
+            state.process_event("ok", &e);
+        }
+        running_job(&state, "none", 1);
+        for e in [progress("none", 1, 1, 0), failed("none", "m1")] {
+            state.process_event("none", &e);
+        }
+        let t0 = Instant::now();
+        state.completion_decisions(t0);
+        let mut decisions = state.completion_decisions(t0 + Duration::from_secs(4));
+        decisions.sort_by(|a, b| a.0.cmp(&b.0));
+        for (id, d) in decisions {
+            state.finalize_job(&id, d, Instant::now()).await;
+        }
+        state
+            .finalize_job("ok", Finalize::Complete, Instant::now())
+            .await;
+        let d = &state.diagnostics;
+        assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
+        assert_eq!(d.pages_billed.load(Ordering::Relaxed), 1);
+    }
+
+    /// A decision computed up front is re-validated right before finalizing
+    /// (and before any destructive Replace cleanup).
+    #[tokio::test]
+    async fn stale_complete_decision_is_skipped() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        let t0 = Instant::now();
+        state.completion_decisions(t0);
+        let decisions = state.completion_decisions(t0 + Duration::from_secs(4));
+        assert_eq!(decisions, vec![("j1".to_string(), Finalize::Complete)]);
+        // New work lands before this job's turn in the finalize batch.
+        state.process_event("j1", &progress("j1", 2, 1, 1));
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Running);
+        assert_eq!(emails(&state), 0);
+
+        // A stall decision is re-validated too: activity resumed.
+        state
+            .finalize_job("j1", Finalize::FailStalled, Instant::now())
+            .await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Running);
+    }
+
+    /// The terminal check-and-set is atomic: only the first terminal event
+    /// transitions; a finalize racing a cancel publishes nothing.
+    #[tokio::test]
+    async fn terminal_transition_happens_once_and_cancel_wins() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        let fail = CrawlEvent::JobFailed {
+            job_id: "j1".into(),
+            account_id: None,
+            error: "x".into(),
+            timestamp: 0,
+        };
+        assert!(matches!(
+            state.transition_terminal("j1", &fail),
+            TerminalTransition::Applied(_)
+        ));
+        assert!(matches!(
+            state.transition_terminal("j1", &fail),
+            TerminalTransition::AlreadyTerminal
+        ));
+        assert!(!state.process_event("j1", &fail).applied);
+
+        running_job(&state, "j2", 1);
+        state.update_job("j2", |j| j.status = JobStatus::Cancelled);
+        state
+            .finalize_job(
+                "j2",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        let got: Option<JobControl> = control.poll_one(Duration::from_millis(300)).await.unwrap();
+        assert!(
+            got.is_none(),
+            "no JobControl for a job that did not transition"
+        );
     }
 
     #[test]

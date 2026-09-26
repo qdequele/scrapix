@@ -60,7 +60,7 @@ pub mod topics;
 pub mod traits;
 
 // Re-exports
-pub use accounting::{FrontierSnapshot, JobAccounting};
+pub use accounting::{EventPosition, FrontierSnapshot, JobAccounting};
 pub use consumer::{ConsumerBuilder, ConsumerConfig, KafkaConsumer, MessageMetadata};
 pub use offsets::OffsetTracker;
 pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};

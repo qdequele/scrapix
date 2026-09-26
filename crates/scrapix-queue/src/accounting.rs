@@ -135,6 +135,14 @@ pub struct FrontierSnapshot {
     pub timestamp: i64,
 }
 
+/// Position of an event in the events topic (`partition`, `offset`).
+/// Events are keyed by `job_id`, so all of a job's events share a partition.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventPosition {
+    pub partition: i32,
+    pub offset: i64,
+}
+
 /// Exact, pure work-accounting state for a single crawl job.
 ///
 /// `#[serde(default)]` so a persisted snapshot (the `jobs.accounting` jsonb
@@ -172,6 +180,13 @@ pub struct JobAccounting {
     /// redelivered `SitemapPublished` for an id already in this set does
     /// not re-add its `count`). See `pending_sitemaps`.
     pub settled_sitemaps: HashSet<String>,
+    /// High-water mark of the events-topic position of the last event folded
+    /// in (maintained by the caller, not by `apply`). Persisted with the
+    /// snapshot so that, after a restart, events redelivered from before the
+    /// snapshot (at or below this position) are not applied twice — the
+    /// per-page seen-sets are not persisted (see "Memory" above).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_hwm: Option<EventPosition>,
 
     #[serde(skip)]
     seen_crawl: HashSet<String>,
@@ -180,6 +195,13 @@ pub struct JobAccounting {
 }
 
 impl JobAccounting {
+    /// Whether an event at `pos` is at or below the recorded high-water mark
+    /// of the same partition, i.e. already folded into this state.
+    pub fn already_applied(&self, pos: EventPosition) -> bool {
+        self.event_hwm
+            .is_some_and(|h| h.partition == pos.partition && pos.offset <= h.offset)
+    }
+
     /// Fold one pipeline event into the accounting state.
     ///
     /// Dedup is by `url_message_id`: an empty id (old workers) is counted
@@ -722,5 +744,26 @@ mod tests {
         assert_eq!(back.content_outcomes, 1);
         assert!(back.pending_sitemaps.contains("m1"));
         assert_eq!(back.is_balanced(), a.is_balanced());
+    }
+    /// R-19: the caller-maintained event high-water mark is persisted and
+    /// orders positions within one partition only.
+    #[test]
+    fn event_hwm_round_trips_and_orders_within_its_partition() {
+        let mut a = JobAccounting::default();
+        let p = |partition, offset| EventPosition { partition, offset };
+        assert!(!a.already_applied(p(0, 0)));
+        a.event_hwm = Some(p(2, 10));
+        assert!(a.already_applied(p(2, 10)));
+        assert!(a.already_applied(p(2, 3)));
+        assert!(!a.already_applied(p(2, 11)));
+        assert!(
+            !a.already_applied(p(1, 3)),
+            "other partition: not comparable"
+        );
+        let back: JobAccounting =
+            serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!(back.event_hwm, Some(p(2, 10)));
+        let json = serde_json::to_value(JobAccounting::default()).unwrap();
+        assert!(json.get("event_hwm").is_none());
     }
 }
