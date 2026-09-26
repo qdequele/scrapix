@@ -365,16 +365,19 @@ impl HttpFetcher {
         }
 
         let mut last_error = None;
-        let mut next_sleep = self.config.retry_config.initial_backoff;
+        // `backoff` is the pure exponential series (grows every attempt,
+        // independent of any server hint) — it's what determines the *next*
+        // attempt's default wait. `sleep_for` is what we actually sleep for
+        // before the next attempt: `max(backoff, Retry-After hint)`. Keeping
+        // them separate means a large one-off Retry-After hint doesn't
+        // permanently inflate the exponential backoff for later retries.
+        let mut backoff = self.config.retry_config.initial_backoff;
+        let mut sleep_for = backoff;
 
         for attempt in 0..=self.config.retry_config.max_retries {
             if attempt > 0 {
-                debug!(attempt, "Retrying request after {:?}", next_sleep);
-                tokio::time::sleep(next_sleep).await;
-                next_sleep = Duration::from_secs_f64(
-                    (next_sleep.as_secs_f64() * self.config.retry_config.backoff_multiplier)
-                        .min(self.config.retry_config.max_backoff.as_secs_f64()),
-                );
+                debug!(attempt, "Retrying request after {:?}", sleep_for);
+                tokio::time::sleep(sleep_for).await;
             }
 
             let start = Instant::now();
@@ -411,14 +414,16 @@ impl HttpFetcher {
                             .get(RETRY_AFTER)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| parse_retry_after(v, Utc::now()));
-                        next_sleep = hinted
-                            .map_or(next_sleep, |h| h.max(next_sleep))
+                        sleep_for = hinted
+                            .map_or(backoff, |h| h.max(backoff))
                             .min(self.config.retry_config.max_backoff);
-                        debug!(
-                            status,
-                            attempt,
-                            ?next_sleep,
-                            "Retryable status, backing off"
+                        debug!(status, attempt, ?sleep_for, "Retryable status, backing off");
+                        // Advance the pure exponential series independent of
+                        // the hint, so a one-off large Retry-After doesn't
+                        // inflate later retries.
+                        backoff = Duration::from_secs_f64(
+                            (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
+                                .min(self.config.retry_config.max_backoff.as_secs_f64()),
                         );
                         continue;
                     }
@@ -444,6 +449,13 @@ impl HttpFetcher {
                         }
                     }
                     last_error = Some(e);
+                    // No Retry-After hint available for a transport-level
+                    // error — fall back to the pure exponential backoff.
+                    sleep_for = backoff;
+                    backoff = Duration::from_secs_f64(
+                        (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
+                            .min(self.config.retry_config.max_backoff.as_secs_f64()),
+                    );
                 }
             }
         }
@@ -603,12 +615,22 @@ impl HttpFetcher {
             effective_cap.min(64 * 1024)
         };
 
+        // Whether exceeding `effective_cap` is a hard failure (2xx — the page
+        // would be indexed, so we must not silently truncate it) or just a
+        // truncation point (non-2xx — the body is never indexed, it's only
+        // kept for diagnostics, so R1 requires we still return `Ok` with the
+        // final status rather than turning it into an `Err`).
+        let hard_cap = is_success;
+
         // Reject up front when the server told us the size via Content-Length.
-        if let Some(len) = response.content_length() {
-            if len as usize > effective_cap {
-                return Err(ScrapixError::Crawl(format!(
-                    "Response body too large: {len} bytes (max: {effective_cap})"
-                )));
+        // Only for 2xx — a non-2xx body is truncated below instead.
+        if hard_cap {
+            if let Some(len) = response.content_length() {
+                if len as usize > effective_cap {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Response body too large: {len} bytes (max: {effective_cap})"
+                    )));
+                }
             }
         }
 
@@ -627,9 +649,17 @@ impl HttpFetcher {
             .map_err(|e| ScrapixError::Network(format!("Failed to read response body: {e}")))?
         {
             if bytes.len() + chunk.len() > effective_cap {
-                return Err(ScrapixError::Crawl(format!(
-                    "Response body too large: >{effective_cap} bytes (max: {effective_cap})"
-                )));
+                if hard_cap {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Response body too large: exceeded {effective_cap} bytes"
+                    )));
+                }
+                // Non-2xx: keep the prefix up to the cap and stop reading —
+                // never indexed, so a status is still never turned into an
+                // `Err` just because the error page happened to be large.
+                let remaining = effective_cap.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..remaining]);
+                break;
             }
             bytes.extend_from_slice(&chunk);
         }

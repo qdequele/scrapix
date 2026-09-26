@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use scrapix_core::CrawlUrl;
 use scrapix_crawler::{parse_retry_after, HttpFetcherBuilder, RobotsCache, RobotsConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -105,8 +107,12 @@ async fn honors_retry_after_seconds() {
     assert!(started.elapsed() >= Duration::from_millis(950));
 }
 
+// The mocked response carries a Content-Length (wiremock always sets one for
+// a non-chunked body), so this only exercises the up-front Content-Length
+// rejection, not the "enforced while streaming" path — see
+// `enforces_cap_while_streaming_without_content_length` below for that.
 #[tokio::test]
-async fn rejects_oversized_body_by_content_length_and_by_stream() {
+async fn rejects_oversized_body_via_content_length() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/big"))
@@ -127,6 +133,85 @@ async fn rejects_oversized_body_by_content_length_and_by_stream() {
         .unwrap();
     let err = f
         .fetch(&CrawlUrl::seed(url(&server, "/big")))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("too large"), "{err}");
+}
+
+/// R1: a status is never turned into an `Err`. An oversized *non-2xx* body
+/// (common for SPA/CDN error pages) must not fail the fetch — it's truncated
+/// to the (small, fixed) non-2xx cap and the final status is still returned.
+#[tokio::test]
+async fn truncates_oversized_non_2xx_body_instead_of_failing() {
+    let server = MockServer::start().await;
+    let big_body = "e".repeat(100 * 1024); // ~100 KB, well over the 64 KiB non-2xx cap
+    Mock::given(method("GET"))
+        .and(path("/not-found"))
+        .respond_with(ResponseTemplate::new(404).set_body_raw(big_body, "text/html"))
+        .mount(&server)
+        .await;
+    let page = fetcher()
+        .fetch(&CrawlUrl::seed(url(&server, "/not-found")))
+        .await
+        .unwrap();
+    assert_eq!(page.status, 404);
+    assert!(!page.is_success());
+    assert!(
+        page.html.len() <= 64 * 1024,
+        "expected truncated body <= 64 KiB, got {} bytes",
+        page.html.len()
+    );
+}
+
+/// R8: the body-size cap must be enforced while streaming, not just via an
+/// up-front Content-Length check — wiremock always sets Content-Length for a
+/// non-chunked body, so it can't exercise this path. This spins up a raw
+/// `TcpListener` and hand-writes an HTTP/1.1 response with
+/// `Transfer-Encoding: chunked` (no Content-Length) whose body exceeds
+/// `max_body_size`, and expects the streaming cap to still reject it.
+#[tokio::test]
+async fn enforces_cap_while_streaming_without_content_length() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            // We don't care about the request; just drain what's readily
+            // available before writing the response.
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+
+            let body = "y".repeat(4096); // over max_body_size(1024) below
+            let mut response = String::new();
+            response.push_str("HTTP/1.1 200 OK\r\n");
+            response.push_str("Content-Type: text/html\r\n");
+            response.push_str("Transfer-Encoding: chunked\r\n");
+            response.push_str("Connection: close\r\n");
+            response.push_str("\r\n");
+            response.push_str(&format!("{:x}\r\n", body.len()));
+            response.push_str(&body);
+            response.push_str("\r\n0\r\n\r\n");
+
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let robots = Arc::new(
+        RobotsCache::new(RobotsConfig {
+            respect_robots: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let f = HttpFetcherBuilder::new()
+        .allow_private_ips(true)
+        .max_body_size(1024)
+        .build(robots)
+        .unwrap();
+
+    let err = f
+        .fetch(&CrawlUrl::seed(format!("http://localhost:{port}/big")))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("too large"), "{err}");
