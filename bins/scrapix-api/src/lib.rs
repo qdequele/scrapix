@@ -185,6 +185,16 @@ struct CrawlState {
     /// Terminal job snapshots whose checked full write is still owed; their
     /// jobs' held acks are released only once it succeeded.
     terminal_pending: RwLock<HashMap<String, JobState>>,
+    /// Acks taken by the flush in progress (`begin_flush` .. `finish_flush`).
+    /// Counted against `max_pending_acks` together with `pending_acks`, and
+    /// only changed while holding the `pending_acks` lock, so
+    /// `pending_acks.len() + in_flight_acks` (everything held: waiting,
+    /// in flight, or retained for a failed terminal write) never exceeds the
+    /// cap.
+    in_flight_acks: std::sync::atomic::AtomicUsize,
+    /// When the "consumer blocked at the ack cap" warning last fired
+    /// (shared, so it fires at most once a minute across `settle_ack` calls).
+    ack_cap_warned_at: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -300,6 +310,8 @@ impl AppState {
                 balanced_since: RwLock::new(HashMap::new()),
                 pending_acks: parking_lot::Mutex::new(Vec::new()),
                 terminal_pending: RwLock::new(HashMap::new()),
+                in_flight_acks: std::sync::atomic::AtomicUsize::new(0),
+                ack_cap_warned_at: parking_lot::Mutex::new(None),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
@@ -770,7 +782,6 @@ impl AppState {
             return;
         }
         let mut ack = Some(ack);
-        let mut last_warn: Option<std::time::Instant> = None;
         loop {
             {
                 let mut pending = self.crawl.pending_acks.lock();
@@ -781,7 +792,7 @@ impl AppState {
                     }
                     return;
                 }
-                if pending.len() < self.config.max_pending_acks {
+                if pending.len() + self.in_flight_acks() < self.config.max_pending_acks {
                     if let Some(a) = ack.take() {
                         pending.push((job_id.to_string(), a));
                     }
@@ -794,13 +805,16 @@ impl AppState {
             {
                 return; // dropped un-acked: redelivered after restart
             }
-            if last_warn.is_none_or_elapsed(Duration::from_secs(60)) {
-                warn!(
-                    held = self.config.max_pending_acks,
-                    "Event consumer blocked: held acks at the cap, waiting for a successful \
-                     accounting flush (Postgres unavailable?)"
-                );
-                last_warn = Some(std::time::Instant::now());
+            {
+                let mut warned_at = self.crawl.ack_cap_warned_at.lock();
+                if warned_at.is_none_or_elapsed(Duration::from_secs(60)) {
+                    warn!(
+                        held = self.config.max_pending_acks,
+                        "Event consumer blocked: held acks at the cap, waiting for a \
+                         successful accounting flush (Postgres unavailable?)"
+                    );
+                    *warned_at = Some(std::time::Instant::now());
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -811,7 +825,15 @@ impl AppState {
     /// ack's event is covered (an event is applied, and its job marked dirty
     /// or terminal, before its ack is held).
     fn begin_flush(&self) -> FlushBatch {
-        let acks = std::mem::take(&mut *self.crawl.pending_acks.lock());
+        let acks = {
+            let mut pending = self.crawl.pending_acks.lock();
+            let acks = std::mem::take(&mut *pending);
+            // Still held until finish_flush: keep them counted.
+            self.crawl
+                .in_flight_acks
+                .store(acks.len(), std::sync::atomic::Ordering::SeqCst);
+            acks
+        };
         let dirty_ids: Vec<String> = self.crawl.dirty_jobs.write().drain().collect();
         let snapshots: Vec<JobState> = {
             let jobs = self.crawl.jobs.read();
@@ -869,6 +891,8 @@ impl AppState {
         let mut owed = self.crawl.terminal_pending.write();
         match accounting {
             AccountingFlush::SchemaMissing => {
+                // In this degraded mode nothing is persisted, so jobs still
+                // running at a restart end as FailStalled after the stall timeout.
                 error!(
                     "jobs.accounting column is missing (Rails migration \
                      20260926000001_add_accounting_to_jobs not applied): job accounting is \
@@ -878,7 +902,13 @@ impl AppState {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 owed.clear();
                 drop(owed);
-                let held = std::mem::take(&mut *self.crawl.pending_acks.lock());
+                let held = {
+                    let mut pending = self.crawl.pending_acks.lock();
+                    self.crawl
+                        .in_flight_acks
+                        .store(0, std::sync::atomic::Ordering::SeqCst);
+                    std::mem::take(&mut *pending)
+                };
                 for (_, ack) in acks.into_iter().chain(held) {
                     ack.ack();
                 }
@@ -889,7 +919,7 @@ impl AppState {
                 }
                 drop(owed);
                 self.crawl.dirty_jobs.write().extend(dirty_ids);
-                self.crawl.pending_acks.lock().extend(acks);
+                self.return_in_flight(acks);
             }
             AccountingFlush::Ok => {
                 for j in terminal {
@@ -906,11 +936,33 @@ impl AppState {
                         ack.ack();
                     }
                 }
-                if !keep.is_empty() {
-                    self.crawl.pending_acks.lock().extend(keep);
-                }
+                self.return_in_flight(keep);
             }
         }
+    }
+
+    /// End of a flush: put the batch acks still held back into
+    /// `pending_acks` and stop counting the batch as in flight, atomically
+    /// under the `pending_acks` lock (the held total never grows here).
+    fn return_in_flight(&self, keep: Vec<(String, Ack)>) {
+        let mut pending = self.crawl.pending_acks.lock();
+        pending.extend(keep);
+        self.crawl
+            .in_flight_acks
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn in_flight_acks(&self) -> usize {
+        self.crawl
+            .in_flight_acks
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Everything currently held: waiting, in flight, or retained.
+    #[cfg(test)]
+    fn held_acks(&self) -> usize {
+        let pending = self.crawl.pending_acks.lock();
+        pending.len() + self.in_flight_acks()
     }
 
     /// Flush dirty job counters, accounting and owed terminal writes to
@@ -7093,6 +7145,110 @@ mod lifecycle_tests {
             1,
             "third ack now held"
         );
+    }
+
+    /// Round 3: acks taken by an in-progress flush still count against the
+    /// cap, and a failed flush can never push the held total over it.
+    #[tokio::test]
+    async fn in_flight_flush_acks_count_against_the_cap() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        state.config.max_pending_acks = 2;
+        persist_on(&state);
+        let state = Arc::new(state);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (i, id) in ["m1", "m2"].iter().enumerate() {
+            let o = state.process_event_at("j1", &crawled("j1", id), at(i as i64));
+            state.settle_ack("j1", counting_ack(&acked), o).await;
+        }
+        assert_eq!(state.held_acks(), 2);
+
+        // A flush is in progress against a down DB.
+        let batch = state.begin_flush();
+        assert!(state.crawl.pending_acks.lock().is_empty());
+        assert_eq!(state.held_acks(), 2, "in-flight acks still held");
+        let o = state.process_event_at("j1", &crawled("j1", "m3"), at(2));
+        let blocked = {
+            let state = state.clone();
+            let ack = counting_ack(&acked);
+            tokio::spawn(async move { state.settle_ack("j1", ack, o).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !blocked.is_finished(),
+            "cap applies while the flush is in flight"
+        );
+
+        state.finish_flush(batch, AccountingFlush::Retry, &HashSet::new());
+        assert!(state.held_acks() <= 2, "Retry never grows past the cap");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!blocked.is_finished(), "still at the cap after Retry");
+        assert_eq!(acked.load(Ordering::Relaxed), 0);
+
+        // Repeated failing rounds stay bounded.
+        for _ in 0..3 {
+            let batch = state.begin_flush();
+            state.finish_flush(batch, AccountingFlush::Retry, &HashSet::new());
+            assert!(state.held_acks() <= 2);
+        }
+
+        ok_flush(&state);
+        tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("unblocked by a successful flush")
+            .unwrap();
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+        assert_eq!(state.held_acks(), 1);
+    }
+
+    /// Round 3: acks retained for a failed terminal write stay counted, so
+    /// the cap still holds on that path.
+    #[tokio::test]
+    async fn acks_retained_for_terminal_writes_count_against_the_cap() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        state.config.max_pending_acks = 2;
+        persist_on(&state);
+        let state = Arc::new(state);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (i, id) in ["m1", "m2"].iter().enumerate() {
+            let o = state.process_event_at("j1", &crawled("j1", id), at(i as i64));
+            state.settle_ack("j1", counting_ack(&acked), o).await;
+        }
+        state
+            .finalize_job(
+                "j1",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+
+        running_job(&state, "j2", 1);
+        let o = state.process_event_at("j2", &crawled("j2", "m1"), at(5));
+        let blocked = {
+            let state = state.clone();
+            let ack = counting_ack(&acked);
+            tokio::spawn(async move { state.settle_ack("j2", ack, o).await })
+        };
+        let failed: HashSet<String> = ["j1".to_string()].into();
+        for _ in 0..3 {
+            let batch = state.begin_flush();
+            state.finish_flush(batch, AccountingFlush::Ok, &failed);
+            assert!(state.held_acks() <= 2, "retained acks stay within the cap");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!blocked.is_finished());
+        assert_eq!(acked.load(Ordering::Relaxed), 0);
+
+        ok_flush(&state); // terminal write succeeds
+        tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("unblocked")
+            .unwrap();
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+        assert!(state.held_acks() <= 2);
     }
 
     #[tokio::test]
