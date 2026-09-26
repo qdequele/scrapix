@@ -143,6 +143,21 @@ mod tests {
         );
     }
 
+    /// R-12: a job built from a `CrawlConfig` that never set a `sitemap`
+    /// section (the common case — the field defaults on `CrawlConfig`
+    /// itself, exercised here via `default_crawl_config()`) still carries a
+    /// `JobSpec` with sitemap discovery enabled, so it behaves like a job
+    /// with no `JobSpec` at all used to (worker-level `SITEMAP_DISCOVERY`
+    /// default, which is on).
+    #[test]
+    fn from_config_without_sitemap_section_still_enables_discovery() {
+        let config = default_crawl_config();
+        let spec = JobSpec::from_config(&config);
+
+        assert!(spec.sitemap.enabled);
+        assert!(spec.sitemap.urls.is_empty());
+    }
+
     fn default_crawl_config() -> CrawlConfig {
         CrawlConfig {
             start_urls: vec!["https://example.com".to_string()],

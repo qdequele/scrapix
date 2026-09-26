@@ -183,15 +183,30 @@ pub struct UrlPatterns {
 }
 
 /// Sitemap discovery settings
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SitemapConfig {
-    /// Whether to discover and use sitemaps
-    #[serde(default)]
+    /// Whether to discover and use sitemaps (default: true)
+    #[serde(default = "default_true")]
+    #[schema(default = true)]
     pub enabled: bool,
 
     /// Explicit sitemap URLs to use
     #[serde(default)]
     pub urls: Vec<String>,
+}
+
+/// Matches the serde default (an empty `{}` deserializes to this), so a job
+/// whose `CrawlConfig`/`JobSpec` never sets `sitemap` at all still gets
+/// sitemap discovery — it's on for everyone today (R-12: every API, CLI or
+/// MCP job that omits `sitemap` must not silently lose discovery just
+/// because a `JobSpec` now travels with every job).
+impl Default for SitemapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            urls: Vec::new(),
+        }
+    }
 }
 
 /// Concurrency settings
@@ -849,5 +864,35 @@ mod tests {
     #[test]
     fn test_url_to_index_uid_empty() {
         assert_eq!(url_to_index_uid(""), "");
+    }
+
+    /// R-12: sitemap discovery is on for everyone today; a job that never
+    /// mentions `sitemap` at all — an empty object, or a `CrawlConfig` JSON
+    /// payload that omits the field entirely — must not silently lose it.
+    #[test]
+    fn sitemap_config_empty_object_deserializes_enabled_true() {
+        let config: SitemapConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.enabled);
+        assert!(config.urls.is_empty());
+        assert_eq!(config, SitemapConfig::default());
+    }
+
+    #[test]
+    fn sitemap_config_default_is_enabled() {
+        assert!(SitemapConfig::default().enabled);
+    }
+
+    #[test]
+    fn crawl_config_json_without_sitemap_section_defaults_to_enabled() {
+        let json = r#"{
+            "start_urls": ["https://example.com"],
+            "meilisearch": {
+                "url": "http://localhost:7700",
+                "api_key": "masterKey"
+            }
+        }"#;
+
+        let config: CrawlConfig = serde_json::from_str(json).unwrap();
+        assert!(config.sitemap.enabled);
     }
 }

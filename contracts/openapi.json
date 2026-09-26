@@ -5392,7 +5392,8 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether to discover and use sitemaps"
+            "description": "Whether to discover and use sitemaps (default: true)",
+            "default": true
           },
           "urls": {
             "type": "array",
