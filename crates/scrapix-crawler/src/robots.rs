@@ -30,6 +30,13 @@ pub struct RobotsConfig {
     pub respect_robots: bool,
     /// Default crawl delay if not specified
     pub default_crawl_delay_ms: Option<u64>,
+    /// Whether to allow fetching robots.txt from hosts that resolve to
+    /// private/internal IP ranges. Defaults to `false` (deny) for SSRF
+    /// safety, matching `FetcherConfig::allow_private_ips` — set this to the
+    /// same value as the fetcher's flag wherever both are constructed
+    /// together, so the robots.txt client isn't more permissive (or more
+    /// restrictive) than the main page fetcher for the same crawl.
+    pub allow_private_ips: bool,
 }
 
 impl Default for RobotsConfig {
@@ -40,6 +47,7 @@ impl Default for RobotsConfig {
             fetch_timeout: Duration::from_secs(10),
             respect_robots: true,
             default_crawl_delay_ms: None,
+            allow_private_ips: false,
         }
     }
 }
@@ -64,7 +72,7 @@ pub struct RobotsCache {
 impl RobotsCache {
     /// Create a new robots.txt cache
     pub fn new(config: RobotsConfig) -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::safe_client::safe_client_builder(None, config.allow_private_ips)
             .timeout(config.fetch_timeout)
             .user_agent(&config.user_agent)
             .build()
@@ -168,6 +176,12 @@ impl RobotsCache {
 
     /// Fetch robots.txt from a URL
     async fn fetch_robots(&self, url: &Url) -> Result<String> {
+        // Raw-IP hosts bypass `SafeResolver` entirely (reqwest never calls
+        // the DNS resolver for a URL whose host is already an address), so
+        // they must be refused explicitly here too, exactly like raw-IP
+        // seed URLs in `HttpFetcher::fetch_inner`.
+        crate::safe_client::reject_ip_host(url)?;
+
         let robots_url = format!(
             "{}://{}/robots.txt",
             url.scheme(),
@@ -493,7 +507,7 @@ struct CachedRobotsMemory {
 impl PersistentRobotsCache {
     /// Create a new persistent robots cache
     pub fn new(config: RobotsConfig, persistence: Arc<dyn RobotsPersistence>) -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::safe_client::safe_client_builder(None, config.allow_private_ips)
             .timeout(config.fetch_timeout)
             .user_agent(&config.user_agent)
             .build()
@@ -660,6 +674,10 @@ impl PersistentRobotsCache {
 
     /// Fetch robots.txt from URL
     async fn fetch_robots(&self, url: &Url) -> Result<String> {
+        // See the identical comment in `RobotsCache::fetch_robots`: raw-IP
+        // hosts bypass `SafeResolver` entirely and must be refused here too.
+        crate::safe_client::reject_ip_host(url)?;
+
         let robots_url = format!(
             "{}://{}/robots.txt",
             url.scheme(),

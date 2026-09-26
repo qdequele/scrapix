@@ -11,8 +11,13 @@ use crate::dns::CachingDnsResolver;
 
 /// Returns `true` if `ip` is a publicly routable address — i.e. not loopback,
 /// private, link-local, documentation, unspecified, multicast, broadcast,
-/// CGNAT (100.64.0.0/10), unique-local (fc00::/7), or an IPv4-mapped IPv6
-/// address wrapping any of the above.
+/// CGNAT (100.64.0.0/10), benchmarking (198.18.0.0/15), reserved
+/// (240.0.0.0/4), IETF protocol assignments (192.0.0.0/24), unique-local
+/// (fc00::/7), deprecated site-local (fec0::/10), documentation
+/// (2001:db8::/32), 6to4 (2002::/16, refused outright regardless of the
+/// embedded IPv4), NAT64 (64:ff9b::/96, refused outright), an IPv4-compatible
+/// IPv6 address (`::a.b.c.d`), or an IPv4-mapped IPv6 address wrapping any of
+/// the above.
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -25,21 +30,50 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT
-                || o[0] == 0)
+                || o[0] == 0
+                || (o[0] == 198 && (o[1] & 0b1111_1110) == 18) // 198.18.0.0/15 benchmarking
+                || (o[0] & 0b1111_0000) == 240 // 240.0.0.0/4 reserved (incl. 255.255.255.255)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)) // 192.0.0.0/24 IETF protocol assignments
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public_ip(IpAddr::V4(v4));
             }
-            let seg0 = v6.segments()[0];
+            let segs = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (seg0 & 0xfe00) == 0xfc00 // unique local
-                || (seg0 & 0xffc0) == 0xfe80) // link local
+                || (segs[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (segs[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (segs[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8) // documentation 2001:db8::/32
+                || segs[0] == 0x2002 // 6to4 2002::/16 — refused outright
+                || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6] == [0, 0, 0, 0]) // NAT64 64:ff9b::/96 — refused outright
+                || (segs[..6] == [0, 0, 0, 0, 0, 0] && (segs[6] != 0 || segs[7] != 0)))
+            // IPv4-compatible ::a.b.c.d
         }
     }
 }
+
+/// Error returned by [`SafeResolver`] when a hostname resolves only to
+/// non-public addresses (SSRF refusal). A typed error — rather than a bare
+/// `String` boxed into `reqwest::dns::Resolving`'s `BoxError` — lets
+/// `HttpFetcher::map_send_error` recover the *original* refusal message by
+/// walking `std::error::Error::source()` and `downcast_ref`-ing onto this
+/// type, instead of pattern-matching text out of `reqwest::Error`'s `Debug`
+/// output (which dumps the entire error chain, not just this message).
+#[derive(Debug)]
+pub(crate) struct NonPublicAddress {
+    pub host: String,
+}
+
+impl std::fmt::Display for NonPublicAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} resolves only to non-public addresses", self.host)
+    }
+}
+
+impl std::error::Error for NonPublicAddress {}
 
 /// A `reqwest::dns::Resolve` implementation that resolves through the
 /// caching DNS resolver (so reqwest and the crawler's own cache don't
@@ -72,7 +106,9 @@ impl Resolve for SafeResolver {
                 .map(|ip| SocketAddr::new(ip, 0))
                 .collect();
             if allowed.is_empty() {
-                return Err(format!("{host} resolves only to non-public addresses").into());
+                return Err(
+                    Box::new(NonPublicAddress { host }) as Box<dyn std::error::Error + Send + Sync>
+                );
             }
             Ok(Box::new(allowed.into_iter()) as Addrs)
         })
@@ -98,6 +134,24 @@ mod tests {
             "fe80::1",
             "fc00::1",
             "::ffff:127.0.0.1",
+            // 198.18.0.0/15 benchmarking
+            "198.18.0.1",
+            "198.19.255.255",
+            // 240.0.0.0/4 reserved
+            "240.0.0.1",
+            "255.255.255.254",
+            // 192.0.0.0/24 IETF protocol assignments
+            "192.0.0.1",
+            // fec0::/10 deprecated site-local
+            "fec0::1",
+            // 2001:db8::/32 documentation
+            "2001:db8::1",
+            // 2002::/16 6to4 — refused outright even though it embeds a public IPv4
+            "2002:0101:0101::1",
+            // 64:ff9b::/96 NAT64 — refused outright even though it embeds a public IPv4
+            "64:ff9b::0101:0101",
+            // IPv4-compatible ::a.b.c.d (distinct from the ::ffff: mapped form)
+            "::1.2.3.4",
         ] {
             assert!(
                 !is_public_ip(ip.parse::<IpAddr>().unwrap()),

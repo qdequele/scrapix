@@ -50,7 +50,8 @@ impl FetchOptions {
 
 use crate::dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 use crate::robots::RobotsCache;
-use crate::safe_dns::SafeResolver;
+use crate::safe_client::{reject_ip_host, safe_client_builder, safe_redirect_policy};
+use crate::safe_dns::NonPublicAddress;
 
 /// Conditional request headers for incremental crawling
 #[derive(Debug, Clone, Default)]
@@ -228,41 +229,26 @@ impl HttpFetcher {
             }
         }
 
-        let max_redirects = config.max_redirects;
-        let allow_private = config.allow_private_ips;
+        // Raw-IP redirect targets are always refused, the same as raw-IP
+        // seeds (`reject_ip_host`), regardless of `allow_private_ips` — that
+        // flag only relaxes the private-IP check on *resolved hostnames*
+        // (see `SafeResolver`). A redirect to a link-local address such as
+        // the cloud metadata endpoint (169.254.169.254) must still be
+        // refused even when `allow_private_ips` is set for tests that point
+        // the fetcher at a local wiremock server.
         let redirect_policy = if config.follow_redirects {
-            Policy::custom(move |attempt| {
-                if attempt.previous().len() >= max_redirects {
-                    return attempt.error("too many redirects");
-                }
-                // Raw-IP redirect targets are always refused, the same as
-                // raw-IP seeds (`reject_ip_host`), regardless of
-                // `allow_private_ips` — that flag only relaxes the
-                // private-IP check on *resolved hostnames* (see
-                // `SafeResolver`). A redirect to a link-local address such as
-                // the cloud metadata endpoint (169.254.169.254) must still be
-                // refused even when `allow_private_ips` is set for tests
-                // that point the fetcher at a local wiremock server.
-                match attempt.url().host() {
-                    Some(url::Host::Domain(_)) => attempt.follow(),
-                    _ => attempt.error("redirect to a raw IP address refused"),
-                }
-            })
+            safe_redirect_policy(config.max_redirects)
         } else {
             Policy::none()
         };
 
-        let client = Client::builder()
+        let client = safe_client_builder(dns_resolver.clone(), config.allow_private_ips)
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout)
             .redirect(redirect_policy)
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .default_headers(default_headers)
-            .dns_resolver(Arc::new(SafeResolver {
-                cache: dns_resolver.clone(),
-                allow_private,
-            }))
             .gzip(true)
             .brotli(true)
             .deflate(true)
@@ -279,21 +265,6 @@ impl HttpFetcher {
             robots_cache,
             dns_resolver,
         })
-    }
-
-    /// Reject URLs whose host is a raw IP address (v4 or v6) to prevent SSRF.
-    /// Only hostnames (domain names) are allowed.
-    fn reject_ip_host(url: &Url) -> Result<()> {
-        match url.host() {
-            Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
-                Err(ScrapixError::Crawl(format!(
-                    "Raw IP addresses are not allowed, use a hostname instead: {}",
-                    url
-                )))
-            }
-            Some(url::Host::Domain(_)) => Ok(()),
-            None => Err(ScrapixError::Crawl(format!("URL has no host: {}", url))),
-        }
     }
 
     /// Create a new HTTP fetcher with default configuration
@@ -379,7 +350,7 @@ impl HttpFetcher {
         let parsed_url = Url::parse(&url.url)?;
 
         // Block raw IP addresses to prevent SSRF
-        Self::reject_ip_host(&parsed_url)?;
+        reject_ip_host(&parsed_url)?;
 
         // Check robots.txt
         if !self.robots_cache.is_allowed(&url.url).await? {
@@ -458,6 +429,15 @@ impl HttpFetcher {
                     return Ok(FetchResult::Fetched(page));
                 }
                 Err(e) => {
+                    // SSRF refusals (raw-IP/non-public redirect target, or a
+                    // hostname resolving only to non-public addresses) are
+                    // never retryable: retrying re-runs the exact same
+                    // resolution/redirect and would just burn through
+                    // max_retries × backoff for a request that can never
+                    // succeed.
+                    if matches!(e, ScrapixError::Refused(_)) {
+                        return Err(e);
+                    }
                     // Check if this is a non-retryable HTTP error
                     if let ScrapixError::Http { status, .. } = e {
                         if !self
@@ -491,22 +471,28 @@ impl HttpFetcher {
 
     /// Classify a `reqwest::Error` from `send().await` into a `ScrapixError`.
     ///
-    /// Two SSRF-specific cases are checked first:
+    /// Two SSRF-specific cases are checked first, both mapped to
+    /// `ScrapixError::Refused` so `fetch_inner` can recognize them and skip
+    /// the retry loop entirely (retrying a refusal just re-runs the same
+    /// resolution/redirect and burns through the backoff for nothing):
     /// - A redirect the custom `Policy` refused (raw-IP or non-public
-    ///   redirect target) surfaces as `reqwest`'s `Kind::Redirect`, whose
-    ///   `Display` text already contains "redirect" — mapped to
-    ///   `ScrapixError::Crawl` so callers can match on "redirect".
+    ///   redirect target) surfaces as `reqwest`'s `Kind::Redirect`.
     /// - A `SafeResolver` refusal (hostname resolves only to non-public
-    ///   addresses) is wrapped deep inside the connect error's source chain,
-    ///   where `Display` doesn't reach it but `Debug` does — mapped to
-    ///   `ScrapixError::Connection` so callers can match on "non-public".
+    ///   addresses) is wrapped several layers deep inside the connect
+    ///   error's source chain as a typed `NonPublicAddress`. We walk
+    ///   `source()` and `downcast_ref` onto it rather than pattern-matching
+    ///   text out of `reqwest::Error`'s `Debug` output (which would dump the
+    ///   whole chain, not just this message).
     fn map_send_error(e: &reqwest::Error, url: &Url) -> ScrapixError {
         if e.is_redirect() {
-            return ScrapixError::Crawl(format!("Redirect refused: {e}"));
+            return ScrapixError::Refused(format!("redirect refused: {e}"));
         }
-        let debug = format!("{e:?}");
-        if debug.contains("non-public") {
-            return ScrapixError::Connection(format!("Refused: {debug}"));
+        let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+        while let Some(err) = source {
+            if let Some(non_public) = err.downcast_ref::<NonPublicAddress>() {
+                return ScrapixError::Refused(non_public.to_string());
+            }
+            source = err.source();
         }
         if e.is_timeout() {
             ScrapixError::Timeout(format!("Request timed out: {}", url))

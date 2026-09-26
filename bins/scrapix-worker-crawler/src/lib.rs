@@ -377,6 +377,9 @@ impl CrawlerWorker {
             fetch_timeout: Duration::from_secs(10),
             respect_robots: args.respect_robots,
             default_crawl_delay_ms: None,
+            // Matches the fetcher's own SSRF default (also unset here) —
+            // production crawls never opt into private-IP targets.
+            allow_private_ips: false,
         };
 
         // Create simple in-memory robots cache for the HTTP fetcher
