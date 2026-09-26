@@ -17,6 +17,7 @@ pub mod error;
 pub mod job_spec;
 pub mod telemetry;
 pub mod traits;
+pub mod url_glob;
 
 pub use ack::Ack;
 pub use billing::*;

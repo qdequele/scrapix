@@ -43,3 +43,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+wiremock = { workspace = true }
+tokio = { workspace = true }

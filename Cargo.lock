@@ -5756,6 +5756,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -5789,6 +5790,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "parking_lot",
  "scrapix-ai",
  "scrapix-core",
  "scrapix-extractor",
@@ -5797,12 +5799,14 @@ dependencies = [
  "scrapix-parser",
  "scrapix-queue",
  "scrapix-storage",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

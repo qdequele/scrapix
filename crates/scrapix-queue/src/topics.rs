@@ -420,6 +420,76 @@ pub enum CrawlEvent {
         url: String,
         document_id: String,
         timestamp: i64,
+        /// `message_id` of the `UrlMessage` this page was fetched for
+        #[serde(default)]
+        url_message_id: String,
+        /// Whether AI enrichment actually ran on this page (AI billing)
+        #[serde(default)]
+        ai_enriched: bool,
+    },
+    /// The content worker processed a page but indexed nothing for it
+    /// (non-2xx page from an old crawler, `index_only` mismatch, no content,
+    /// near-duplicate, non-HTML content type, ...). Terminal for the page.
+    DocumentSkipped {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// The content worker could not turn a page into a document (parse
+    /// error, ...). Terminal for the page.
+    DocumentFailed {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// One LLM call made by a content worker while enriching a page.
+    AiUsage {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        prompt_tokens: u32,
+        #[serde(default)]
+        completion_tokens: u32,
+        #[serde(default)]
+        duration_ms: u64,
+        /// AI feature that made the call (`ai_summary`, `ai_extraction`)
+        #[serde(default)]
+        feature: String,
+        /// Page the call was made for
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// Job-level warning raised by a worker (e.g. a requested feature that
+    /// this worker cannot honor). At most once per (job, message) per worker.
+    JobWarning {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        timestamp: i64,
     },
     /// URLs discovered
     UrlsDiscovered {
@@ -1025,5 +1095,39 @@ mod tests {
         assert_eq!(raw.content_length, page.html.len() as u64);
         assert_eq!(raw.etag, Some("etag-1".to_string()));
         assert_ne!(raw.message_id, parent.message_id);
+    }
+
+    #[test]
+    fn old_document_indexed_deserializes_with_defaults() {
+        let json =
+            r#"{"type":"document_indexed","job_id":"j","url":"u","document_id":"d","timestamp":1}"#;
+        match serde_json::from_str::<CrawlEvent>(json).unwrap() {
+            CrawlEvent::DocumentIndexed {
+                url_message_id,
+                ai_enriched,
+                ..
+            } => {
+                assert!(url_message_id.is_empty());
+                assert!(!ai_enriched);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_content_outcome_events_round_trip() {
+        for json in [
+            r#"{"type":"document_skipped","job_id":"j","url":"u","url_message_id":"m","reason":"index_only","timestamp":1}"#,
+            r#"{"type":"document_failed","job_id":"j","url":"u","url_message_id":"m","error":"e","timestamp":1}"#,
+            r#"{"type":"ai_usage","job_id":"j","model":"m","prompt_tokens":1,"completion_tokens":2,"feature":"ai_summary","timestamp":1}"#,
+            r#"{"type":"job_warning","job_id":"j","message":"w","timestamp":1}"#,
+        ] {
+            let event: CrawlEvent = serde_json::from_str(json).unwrap();
+            let back = serde_json::to_value(&event).unwrap();
+            let orig: serde_json::Value = serde_json::from_str(json).unwrap();
+            for (k, v) in orig.as_object().unwrap() {
+                assert_eq!(&back[k], v, "{json}: field {k}");
+            }
+        }
     }
 }

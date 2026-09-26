@@ -159,6 +159,26 @@ pub struct AiUsageEvent {
     pub total_tokens: u32,
     pub duration_ms: u64,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Attribution of the call (job, account, feature, page), when the
+    /// caller ran it inside [`AI_USAGE_CONTEXT`].
+    pub context: Option<AiUsageContext>,
+}
+
+/// Who an LLM call is made for. Set by a caller around its AI calls with
+/// `AI_USAGE_CONTEXT.scope(ctx, fut)`; the client copies it onto every
+/// [`AiUsageEvent`] emitted while the scoped future runs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AiUsageContext {
+    pub job_id: String,
+    pub account_id: Option<String>,
+    /// Feature that made the call (e.g. `ai_summary`, `ai_extraction`)
+    pub feature: String,
+    pub url: String,
+}
+
+tokio::task_local! {
+    /// Attribution for AI usage events emitted by calls made inside this scope.
+    pub static AI_USAGE_CONTEXT: AiUsageContext;
 }
 
 /// Receiver end of the AI usage tracking channel.
@@ -345,6 +365,7 @@ impl AiClient {
                             total_tokens: response.total_tokens,
                             duration_ms,
                             timestamp: chrono::Utc::now(),
+                            context: AI_USAGE_CONTEXT.try_with(|c| c.clone()).ok(),
                         }) {
                             debug!("Usage tracking channel closed: {}", e);
                         }

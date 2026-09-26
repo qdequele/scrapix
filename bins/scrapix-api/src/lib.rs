@@ -4476,6 +4476,10 @@ fn start_event_consumer(
                         CrawlEvent::RateLimited { job_id, .. } => job_id.clone(),
                         CrawlEvent::PageRetried { job_id, .. } => job_id.clone(),
                         CrawlEvent::SitemapPublished { job_id, .. } => job_id.clone(),
+                        CrawlEvent::DocumentSkipped { job_id, .. } => job_id.clone(),
+                        CrawlEvent::DocumentFailed { job_id, .. } => job_id.clone(),
+                        CrawlEvent::AiUsage { job_id, .. } => job_id.clone(),
+                        CrawlEvent::JobWarning { job_id, .. } => job_id.clone(),
                     };
 
                     // Update job state and broadcast

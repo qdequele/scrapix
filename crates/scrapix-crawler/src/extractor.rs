@@ -6,6 +6,9 @@ use scraper::{Html, Selector};
 use tracing::debug;
 use url::Url;
 
+#[cfg(test)]
+use scrapix_core::url_glob::matches_glob;
+use scrapix_core::url_glob::matches_include_exclude;
 use scrapix_core::{CrawlUrl, RawPage, UrlPatterns};
 
 /// URL extraction configuration
@@ -318,61 +321,7 @@ impl UrlExtractor {
 /// everything (subject to exclude). Shared by [`UrlExtractor::resolve_and_filter`]
 /// and [`url_allowed`] so link extraction and sitemap discovery can't diverge.
 fn matches_patterns(url: &str, patterns: &UrlPatterns) -> bool {
-    // Check exclude patterns first
-    for pattern in &patterns.exclude {
-        if matches_glob(url, pattern) {
-            return false;
-        }
-    }
-
-    // Check include patterns
-    if patterns.include.is_empty() {
-        return true;
-    }
-    for pattern in &patterns.include {
-        if matches_glob(url, pattern) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Simple glob-style pattern matching.
-///
-/// A single `*` matches any characters except `/`; `**` matches any
-/// characters including `/`.
-fn matches_glob(url: &str, pattern: &str) -> bool {
-    if pattern.contains("**") {
-        // Handle ** as "match anything"
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            return url.starts_with(parts[0]) && (parts[1].is_empty() || url.ends_with(parts[1]));
-        }
-    }
-
-    if pattern.contains('*') {
-        // Handle * as "match anything except /"
-        let parts: Vec<&str> = pattern.split('*').collect();
-        let mut pos = 0;
-        for part in parts {
-            if part.is_empty() {
-                continue;
-            }
-            if let Some(found) = url[pos..].find(part) {
-                // Check no / between pos and found
-                if url[pos..pos + found].contains('/') && !pattern.contains("**") {
-                    return false;
-                }
-                pos = pos + found + part.len();
-            } else {
-                return false;
-            }
-        }
-        true
-    } else {
-        // Exact match
-        url == pattern
-    }
+    matches_include_exclude(url, &patterns.include, &patterns.exclude)
 }
 
 /// Whether `url` is allowed by `patterns` — the same domain whitelist and

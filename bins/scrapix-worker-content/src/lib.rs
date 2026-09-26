@@ -11,8 +11,23 @@
 //! 5. Optionally split into blocks by headings
 //! 6. Publish processed documents to `scrapix.documents` topic
 //! 7. Index documents directly to Meilisearch
+//!
+//! ## Delivery (R2)
+//!
+//! Every `RawPageMessage` ends in exactly one outcome event carrying its
+//! `url_message_id`: `DocumentIndexed`, `DocumentSkipped` or
+//! `DocumentFailed`. Skipped/failed pages are acked right after their event
+//! is published. Indexed pages hand their `Ack` to the Meilisearch buffer;
+//! once Meilisearch accepted the batch containing all of the page's
+//! documents, `DocumentIndexed` is published and only then is the message
+//! acked. A failed publish or a rejected Meilisearch write leaves the
+//! message un-acked (redelivered).
 
-use std::collections::HashMap;
+mod features;
+
+pub use features::feature_applies;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,12 +37,14 @@ use scrapix_lifecycle::{
     idle_minutes_from_env, install_signal_handlers, spawn_idle_watchdog, spawn_wake_listener,
     wake_port_from_env,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use scrapix_ai::{AiClient, AiService};
-use scrapix_core::{Document, FeaturesConfig, RawPage, ScrapixError};
-use scrapix_extractor::{BlockConfig, BlockSplitter, ContentBlock, SelectorExtractor};
+use scrapix_ai::{AiClient, AiService, AiUsageContext, AiUsageEvent, AI_USAGE_CONTEXT};
+use scrapix_core::{Ack, Document, FeaturesConfig, RawPage};
+use scrapix_extractor::{
+    BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor, SelectorExtractor,
+};
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
 use scrapix_parser::{HtmlParser, HtmlParserConfig};
 use scrapix_queue::{
@@ -35,6 +52,15 @@ use scrapix_queue::{
     DocumentMessage, ProducerBuilder, RawPageMessage,
 };
 use scrapix_storage::{MeilisearchStorage, MeilisearchStorageBuilder};
+
+/// `JobWarning` when a job asks for AI enrichment on a worker without an
+/// AI provider.
+pub const WARN_AI_NO_PROVIDER: &str =
+    "AI enrichment requested but no AI provider configured on content workers";
+/// `JobWarning` when a job asks for AI enrichment together with block
+/// splitting (AI only runs on whole pages).
+pub const WARN_AI_BLOCK_SPLIT: &str =
+    "AI enrichment is skipped for block-split pages (features.block_split is enabled)";
 
 /// Content processing worker for parsing HTML and creating documents
 #[derive(Parser, Debug)]
@@ -49,9 +75,10 @@ pub struct Args {
     #[arg(short, long, env = "KAFKA_GROUP_ID", default_value = "scrapix-content")]
     pub group_id: String,
 
-    /// Number of concurrent processors
-    /// Higher concurrency enables faster document processing
-    #[arg(short, long, env = "CONCURRENCY", default_value = "40")]
+    /// Number of raw pages processed concurrently (in-flight messages).
+    /// Each page's offset commits only once its documents are accepted by
+    /// Meilisearch, so this also bounds un-committed work per worker.
+    #[arg(short, long, env = "CONCURRENCY", default_value = "8")]
     pub concurrency: usize,
 
     /// Meilisearch URL
@@ -195,10 +222,6 @@ struct WorkerMetrics {
 }
 
 impl WorkerMetrics {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn record_success(&self, bytes: u64, doc_count: u64) {
         self.pages_processed.fetch_add(1, Ordering::Relaxed);
         self.pages_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -224,14 +247,6 @@ impl WorkerMetrics {
 
     fn record_indexed(&self, count: u64) {
         self.documents_indexed.fetch_add(count, Ordering::Relaxed);
-    }
-
-    fn processor_started(&self) {
-        self.active_processors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn processor_completed(&self) {
-        self.active_processors.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
@@ -274,249 +289,117 @@ struct AiConfig {
     max_tokens: u32,
 }
 
+/// What processing a page produced.
+enum PageOutcome {
+    /// Index these documents (one per page, or one per block).
+    Index {
+        docs: Vec<Document>,
+        /// `document_id` reported in `DocumentIndexed`
+        document_id: String,
+        ai_enriched: bool,
+    },
+    /// Nothing to index (reason goes into `DocumentSkipped`).
+    Skipped(String),
+    /// The page could not be turned into a document.
+    Failed(String),
+}
+
+/// A page whose documents were all accepted by Meilisearch: publish its
+/// `DocumentIndexed`, then ack its message.
+struct IndexedNotice {
+    job_id: String,
+    event: CrawlEvent,
+    docs: u64,
+    ack: Ack,
+}
+
+/// Per-job Meilisearch target: `(url, api key, index uid, primary key,
+/// batch size)`. One buffered storage per key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StorageKey {
+    url: String,
+    api_key: String,
+    index_uid: String,
+    primary_key: String,
+    batch_size: usize,
+}
+
+/// Schema extractor cache key: `(sorted only_types, convert_dates)`.
+type SchemaKey = (Vec<String>, bool);
+
+/// Bound on remembered `(job_id, message)` warnings before the set resets.
+const MAX_REMEMBERED_WARNINGS: usize = 10_000;
+
 /// The main content worker
 struct ContentWorker {
     consumer: Arc<AnyConsumer>,
     producer: Arc<AnyProducer>,
     parser: HtmlParser,
+    /// Default storage (built at startup). `None` = indexing disabled
+    /// (`SKIP_MEILISEARCH`, or Meilisearch unreachable at startup).
     storage: Option<Arc<MeilisearchStorage>>,
-    /// Default Meilisearch URL (from env/args) for comparison
+    /// Default Meilisearch URL (from env/args)
     default_meilisearch_url: String,
-    /// Default Meilisearch API key (from env/args) for comparison
+    /// Default Meilisearch API key (from env/args)
     default_meilisearch_key: String,
-    /// Cache of per-job Meilisearch storage clients, keyed by (url, api_key)
-    storage_cache: tokio::sync::Mutex<HashMap<(String, String), Arc<MeilisearchStorage>>>,
+    /// Per-job buffered storages. A storage's index is configured (created,
+    /// settings applied unless `keep_settings`) when it is first created.
+    storage_cache: tokio::sync::Mutex<HashMap<StorageKey, Arc<MeilisearchStorage>>>,
     ai_service: Option<Arc<AiService>>,
     ai_config: AiConfig,
+    ai_usage_rx: parking_lot::Mutex<Option<scrapix_ai::AiUsageReceiver>>,
     dedup_detector: Option<Arc<NearDuplicateDetector>>,
     block_splitter: Option<BlockSplitter>,
-    /// Indexes that have already had feature-based settings configured
-    feature_configured_indexes: tokio::sync::Mutex<std::collections::HashSet<String>>,
-    semaphore: Arc<Semaphore>,
+    /// Schema extractors for jobs with `schema.only_types` / `convert_dates`,
+    /// keyed by those options.
+    schema_extractors: parking_lot::Mutex<HashMap<SchemaKey, Arc<SchemaExtractor>>>,
+    /// `(job_id, message)` pairs already reported as `JobWarning`.
+    warned: parking_lot::Mutex<HashSet<(String, String)>>,
+    indexed_tx: mpsc::UnboundedSender<IndexedNotice>,
+    indexed_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<IndexedNotice>>>,
+    /// Indexed notices sent but not yet published/acked.
+    pending_notices: Arc<AtomicU64>,
     metrics: Arc<WorkerMetrics>,
     shutdown: Arc<AtomicBool>,
     worker_id: String,
+    concurrency: usize,
     publish_to_kafka: bool,
     publish_history: bool,
-    #[allow(dead_code)]
-    skip_meilisearch: bool,
-    /// Default batch size for creating new Meilisearch storage clients
+    /// Default batch size for per-job storages without `meilisearch.batch_size`
     default_batch_size: usize,
     /// Default feature config built from CLI args, used when message has no features
     default_features: FeaturesConfig,
 }
 
 impl ContentWorker {
-    /// Create a new content worker
+    /// Create a new content worker (Kafka bus)
     async fn new(args: &Args) -> anyhow::Result<Self> {
-        let worker_id = args
-            .worker_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
-
+        let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker");
 
-        // Create Kafka consumer
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)
             .client_id(format!("scrapix-content-{}", worker_id))
             .auto_offset_reset("earliest")
             .build()?;
-
-        // Subscribe to raw pages topic
         kafka_consumer.subscribe(&[topic_names::PAGES_RAW])?;
         info!(
             topic = topic_names::PAGES_RAW,
             "Subscribed to raw pages topic"
         );
 
-        // Create Kafka producer
         let kafka_producer = ProducerBuilder::new(&args.brokers)
             .client_id(format!("scrapix-content-{}-producer", worker_id))
             .compression("lz4")
             .build()?;
 
-        let consumer: Arc<AnyConsumer> = Arc::new(kafka_consumer.into());
-        let producer: Arc<AnyProducer> = Arc::new(kafka_producer.into());
-
-        // Create Meilisearch storage (optional)
-        let storage = if !args.skip_meilisearch {
-            let mut builder =
-                MeilisearchStorageBuilder::new(&args.meilisearch_url, &args.default_index);
-
-            if let Some(ref key) = args.meilisearch_key {
-                builder = builder.api_key(key);
-            }
-
-            builder = builder.batch_size(args.batch_size);
-
-            match builder.build().await {
-                Ok(storage) => {
-                    info!(
-                        url = %args.meilisearch_url,
-                        index = %args.default_index,
-                        "Connected to Meilisearch"
-                    );
-                    Some(Arc::new(storage))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to connect to Meilisearch, indexing disabled");
-                    None
-                }
-            }
-        } else {
-            info!("Meilisearch indexing disabled");
-            None
-        };
-
-        // Create HTML parser — always extract everything; per-job features
-        // are applied as a post-parse filter so the parser can be reused.
-        let parser_config = HtmlParserConfig {
-            extract_content: true,
-            convert_to_markdown: true,
-            detect_language: true,
-            extract_schema: true,
-            extract_og_tags: true,
-            min_content_length: args.min_content_length,
-        };
-        let parser = HtmlParser::new(parser_config);
-
-        // Build default features from CLI args (fallback when message has no features)
-        let default_features = FeaturesConfig::from_cli_args(
-            args.extract_content,
-            args.convert_markdown,
-            args.extract_schema,
-            args.enable_block_split,
-            args.enable_summary,
-            args.enable_extraction,
-            args.extraction_prompt.clone(),
-        );
-
-        // Create concurrency limiter
-        let semaphore = Arc::new(Semaphore::new(args.concurrency));
-
-        // Create AI config
-        let ai_config = AiConfig {
-            enable_summary: args.enable_summary,
-            enable_extraction: args.enable_extraction,
-            extraction_prompt: args.extraction_prompt.clone(),
-            summary_model: args.summary_model.clone(),
-            extraction_model: args.extraction_model.clone(),
-            max_tokens: args.ai_max_tokens,
-        };
-
-        // Create AI service from environment if any AI feature is enabled
-        // Uses from_env_with_tracking() to emit per-call usage events
-        let (ai_service, ai_usage_rx) = if args.enable_summary || args.enable_extraction {
-            match AiClient::from_env_with_tracking() {
-                Ok((client, rx)) => {
-                    let client = Arc::new(client);
-                    let mut service = AiService::minimal(client);
-
-                    if args.enable_summary {
-                        service = service.with_summarization();
-                        info!(model = %args.summary_model, "AI summarization enabled");
-                    }
-
-                    if args.enable_extraction {
-                        service = service.with_extraction();
-                        info!(model = %args.extraction_model, "AI extraction enabled");
-                    }
-
-                    (Some(Arc::new(service)), Some(rx))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create AI client, AI features disabled");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        // Spawn a background task to drain AI usage events (logs them for now;
-        // could be wired to a ClickHouse batcher if CLICKHOUSE_URL is configured)
-        if let Some(mut rx) = ai_usage_rx {
-            tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    debug!(
-                        provider = %event.provider,
-                        model = %event.model,
-                        prompt_tokens = event.prompt_tokens,
-                        completion_tokens = event.completion_tokens,
-                        total_tokens = event.total_tokens,
-                        duration_ms = event.duration_ms,
-                        "AI usage event"
-                    );
-                }
-            });
-            info!("AI usage tracking receiver started (drain mode)");
-        }
-
-        // Create near-duplicate detector if enabled
-        let dedup_detector = if args.enable_dedup {
-            let config = NearDuplicateConfig {
-                use_simhash: args.dedup_use_simhash,
-                simhash_threshold: args.dedup_simhash_threshold,
-                minhash_threshold: args.dedup_minhash_threshold,
-                max_fingerprints: args.dedup_max_fingerprints,
-                ..Default::default()
-            };
-            info!(
-                use_simhash = args.dedup_use_simhash,
-                simhash_threshold = args.dedup_simhash_threshold,
-                minhash_threshold = args.dedup_minhash_threshold,
-                max_fingerprints = args.dedup_max_fingerprints,
-                "Near-duplicate detection enabled"
-            );
-            Some(Arc::new(NearDuplicateDetector::new(config)))
-        } else {
-            None
-        };
-
-        // Create block splitter if enabled
-        let block_splitter = if args.enable_block_split {
-            let config = BlockConfig {
-                min_level: args.block_split_min_level,
-                max_level: args.block_split_max_level,
-                min_content_length: args.block_split_min_length,
-                include_hierarchy: true,
-                extract_anchors: true,
-                ..Default::default()
-            };
-            info!(
-                min_level = args.block_split_min_level,
-                max_level = args.block_split_max_level,
-                min_content_length = args.block_split_min_length,
-                "Block splitting enabled - will create multiple documents per page"
-            );
-            Some(BlockSplitter::new(config))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            consumer,
-            producer,
-            parser,
-            storage,
-            default_meilisearch_url: args.meilisearch_url.clone(),
-            default_meilisearch_key: args.meilisearch_key.clone().unwrap_or_default(),
-            storage_cache: tokio::sync::Mutex::new(HashMap::new()),
-            ai_service,
-            ai_config,
-            dedup_detector,
-            block_splitter,
-            feature_configured_indexes: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-            semaphore,
-            metrics: Arc::new(WorkerMetrics::new()),
-            shutdown: Arc::new(AtomicBool::new(false)),
+        let storage = default_storage(args).await;
+        Ok(Self::build(
+            args,
             worker_id,
-            publish_to_kafka: args.publish_to_kafka,
-            publish_history: args.publish_history,
-            skip_meilisearch: args.skip_meilisearch,
-            default_batch_size: args.batch_size,
-            default_features,
-        })
+            Arc::new(kafka_consumer.into()),
+            Arc::new(kafka_producer.into()),
+            storage,
+        ))
     }
 
     /// Create a content worker with pre-built message bus objects.
@@ -524,62 +407,36 @@ impl ContentWorker {
     /// Used by `scrapix all` to inject in-process channel producer/consumer instead of Kafka.
     /// The caller is responsible for subscribing the consumer to the appropriate topic before
     /// calling this function.
-    #[allow(dead_code)]
-    pub async fn with_bus(
+    async fn with_bus(
         args: &Args,
         consumer: Arc<AnyConsumer>,
         producer: Arc<AnyProducer>,
     ) -> anyhow::Result<Self> {
-        let worker_id = args
-            .worker_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
-
+        let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker (pre-built bus)");
+        let storage = default_storage(args).await;
+        Ok(Self::build(args, worker_id, consumer, producer, storage))
+    }
 
-        // Create Meilisearch storage (optional)
-        let storage = if !args.skip_meilisearch {
-            let mut builder =
-                MeilisearchStorageBuilder::new(&args.meilisearch_url, &args.default_index);
-
-            if let Some(ref key) = args.meilisearch_key {
-                builder = builder.api_key(key);
-            }
-
-            builder = builder.batch_size(args.batch_size);
-
-            match builder.build().await {
-                Ok(storage) => {
-                    info!(
-                        url = %args.meilisearch_url,
-                        index = %args.default_index,
-                        "Connected to Meilisearch"
-                    );
-                    Some(Arc::new(storage))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to connect to Meilisearch, indexing disabled");
-                    None
-                }
-            }
-        } else {
-            info!("Meilisearch indexing disabled");
-            None
-        };
-
-        // Create HTML parser — always extract everything; per-job features
-        // are applied as a post-parse filter so the parser can be reused.
-        let parser_config = HtmlParserConfig {
+    /// Shared construction once the bus and default storage exist.
+    fn build(
+        args: &Args,
+        worker_id: String,
+        consumer: Arc<AnyConsumer>,
+        producer: Arc<AnyProducer>,
+        storage: Option<Arc<MeilisearchStorage>>,
+    ) -> Self {
+        // Always extract everything; per-job features are applied as a
+        // post-parse filter so the parser can be reused.
+        let parser = HtmlParser::new(HtmlParserConfig {
             extract_content: true,
             convert_to_markdown: true,
             detect_language: true,
             extract_schema: true,
             extract_og_tags: true,
             min_content_length: args.min_content_length,
-        };
-        let parser = HtmlParser::new(parser_config);
+        });
 
-        // Build default features from CLI args (fallback when message has no features)
         let default_features = FeaturesConfig::from_cli_args(
             args.extract_content,
             args.convert_markdown,
@@ -590,10 +447,6 @@ impl ContentWorker {
             args.extraction_prompt.clone(),
         );
 
-        // Create concurrency limiter
-        let semaphore = Arc::new(Semaphore::new(args.concurrency));
-
-        // Create AI config
         let ai_config = AiConfig {
             enable_summary: args.enable_summary,
             enable_extraction: args.enable_extraction,
@@ -603,52 +456,28 @@ impl ContentWorker {
             max_tokens: args.ai_max_tokens,
         };
 
-        // Create AI service from environment if any AI feature is enabled
-        let (ai_service, ai_usage_rx) = if args.enable_summary || args.enable_extraction {
-            match AiClient::from_env_with_tracking() {
-                Ok((client, rx)) => {
-                    let client = Arc::new(client);
-                    let mut service = AiService::minimal(client);
-
-                    if args.enable_summary {
-                        service = service.with_summarization();
-                        info!(model = %args.summary_model, "AI summarization enabled");
-                    }
-
-                    if args.enable_extraction {
-                        service = service.with_extraction();
-                        info!(model = %args.extraction_model, "AI extraction enabled");
-                    }
-
-                    (Some(Arc::new(service)), Some(rx))
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create AI client, AI features disabled");
-                    (None, None)
-                }
+        // The AI service is built whenever an AI provider is configured
+        // (AI_PROVIDER + its API key), so per-job `ai_summary` /
+        // `ai_extraction` work without worker-level ENABLE_* flags (those
+        // only set the default features for messages without features).
+        let (ai_service, ai_usage_rx) = match AiClient::from_env_with_tracking() {
+            Ok((client, rx)) => {
+                let service = AiService::minimal(Arc::new(client))
+                    .with_summarization()
+                    .with_extraction();
+                info!("AI provider configured; AI enrichment available to jobs");
+                (Some(Arc::new(service)), Some(rx))
             }
-        } else {
-            (None, None)
+            Err(e) => {
+                if args.enable_summary || args.enable_extraction {
+                    warn!(error = %e, "Failed to create AI client, AI features disabled");
+                } else {
+                    info!(reason = %e, "No AI provider configured; AI enrichment unavailable");
+                }
+                (None, None)
+            }
         };
 
-        if let Some(mut rx) = ai_usage_rx {
-            tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    debug!(
-                        provider = %event.provider,
-                        model = %event.model,
-                        prompt_tokens = event.prompt_tokens,
-                        completion_tokens = event.completion_tokens,
-                        total_tokens = event.total_tokens,
-                        duration_ms = event.duration_ms,
-                        "AI usage event"
-                    );
-                }
-            });
-            info!("AI usage tracking receiver started (drain mode)");
-        }
-
-        // Create near-duplicate detector if enabled
         let dedup_detector = if args.enable_dedup {
             let config = NearDuplicateConfig {
                 use_simhash: args.dedup_use_simhash,
@@ -662,35 +491,35 @@ impl ContentWorker {
                 simhash_threshold = args.dedup_simhash_threshold,
                 minhash_threshold = args.dedup_minhash_threshold,
                 max_fingerprints = args.dedup_max_fingerprints,
-                "Near-duplicate detection enabled"
+                "Near-duplicate detection enabled (scoped per index)"
             );
             Some(Arc::new(NearDuplicateDetector::new(config)))
         } else {
             None
         };
 
-        // Create block splitter if enabled
         let block_splitter = if args.enable_block_split {
-            let config = BlockConfig {
-                min_level: args.block_split_min_level,
-                max_level: args.block_split_max_level,
-                min_content_length: args.block_split_min_length,
-                include_hierarchy: true,
-                extract_anchors: true,
-                ..Default::default()
-            };
             info!(
                 min_level = args.block_split_min_level,
                 max_level = args.block_split_max_level,
                 min_content_length = args.block_split_min_length,
                 "Block splitting enabled - will create multiple documents per page"
             );
-            Some(BlockSplitter::new(config))
+            Some(BlockSplitter::new(BlockConfig {
+                min_level: args.block_split_min_level,
+                max_level: args.block_split_max_level,
+                min_content_length: args.block_split_min_length,
+                include_hierarchy: true,
+                extract_anchors: true,
+                ..Default::default()
+            }))
         } else {
             None
         };
 
-        Ok(Self {
+        let (indexed_tx, indexed_rx) = mpsc::unbounded_channel();
+
+        Self {
             consumer,
             producer,
             parser,
@@ -700,108 +529,206 @@ impl ContentWorker {
             storage_cache: tokio::sync::Mutex::new(HashMap::new()),
             ai_service,
             ai_config,
+            ai_usage_rx: parking_lot::Mutex::new(ai_usage_rx),
             dedup_detector,
             block_splitter,
-            feature_configured_indexes: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-            semaphore,
-            metrics: Arc::new(WorkerMetrics::new()),
+            schema_extractors: parking_lot::Mutex::new(HashMap::new()),
+            warned: parking_lot::Mutex::new(HashSet::new()),
+            indexed_tx,
+            indexed_rx: parking_lot::Mutex::new(Some(indexed_rx)),
+            pending_notices: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(WorkerMetrics::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
             worker_id,
+            concurrency: args.concurrency.max(1),
             publish_to_kafka: args.publish_to_kafka,
             publish_history: args.publish_history,
-            skip_meilisearch: args.skip_meilisearch,
-            default_batch_size: args.batch_size,
+            default_batch_size: args.batch_size.max(1),
             default_features,
-        })
+        }
     }
 
-    /// Get the appropriate Meilisearch storage for a message.
-    /// Returns the default storage if the message has no per-job override or matches defaults.
-    /// Creates and caches a new storage client for non-default (url, key) pairs.
-    async fn get_storage(&self, msg: &RawPageMessage) -> Option<Arc<MeilisearchStorage>> {
+    /// The Meilisearch target for a message: `(url, key)` from the message
+    /// (falling back to the worker defaults), the message's index, and the
+    /// job's `primary_key` / `batch_size`.
+    fn storage_key(&self, msg: &RawPageMessage) -> StorageKey {
         let msg_url = msg.meilisearch_url.as_deref().unwrap_or("");
-        let msg_key = msg.meilisearch_api_key.as_deref().unwrap_or("");
-
-        // Use default storage when no override or matches default
-        let is_default = msg_url.is_empty()
-            || (msg_url == self.default_meilisearch_url && msg_key == self.default_meilisearch_key);
-
-        if is_default {
-            return self.storage.clone();
+        let (url, api_key) = if msg_url.is_empty() {
+            (
+                self.default_meilisearch_url.clone(),
+                self.default_meilisearch_key.clone(),
+            )
+        } else {
+            (
+                msg_url.to_string(),
+                msg.meilisearch_api_key.clone().unwrap_or_default(),
+            )
+        };
+        let job = msg.job.as_ref();
+        StorageKey {
+            url,
+            api_key,
+            index_uid: msg.index_uid.clone(),
+            primary_key: job
+                .and_then(|j| j.primary_key.clone())
+                .filter(|pk| !pk.is_empty())
+                .unwrap_or_else(|| "uid".to_string()),
+            batch_size: job
+                .and_then(|j| j.batch_size)
+                .map(|b| b as usize)
+                .filter(|b| *b > 0)
+                .unwrap_or(self.default_batch_size),
         }
+    }
 
-        // Look up or create a cached storage for this (url, key) pair
-        let cache_key = (msg_url.to_string(), msg_key.to_string());
+    /// Get (or create and configure) the buffered storage for a message.
+    ///
+    /// `Ok(None)` = indexing disabled on this worker. `Err` = the job's
+    /// Meilisearch target is unusable (never falls back to another
+    /// Meilisearch, which could leak a tenant's documents).
+    async fn storage_for(
+        &self,
+        msg: &RawPageMessage,
+        features: &FeaturesConfig,
+    ) -> Result<Option<Arc<MeilisearchStorage>>, String> {
+        if self.storage.is_none() {
+            return Ok(None);
+        }
+        let key = self.storage_key(msg);
+        // Held across configuration so concurrent pages of a new index wait
+        // until its settings are submitted (before any of its documents).
         let mut cache = self.storage_cache.lock().await;
-
-        if let Some(storage) = cache.get(&cache_key) {
-            return Some(storage.clone());
+        if let Some(storage) = cache.get(&key) {
+            return Ok(Some(storage.clone()));
         }
 
-        // Create a new Meilisearch storage client
-        let mut builder = MeilisearchStorageBuilder::new(msg_url, &msg.index_uid);
-        if !msg_key.is_empty() {
-            builder = builder.api_key(msg_key);
+        let mut builder = MeilisearchStorageBuilder::new(&key.url, &key.index_uid)
+            .primary_key(&key.primary_key)
+            .batch_size(key.batch_size);
+        if !key.api_key.is_empty() {
+            builder = builder.api_key(&key.api_key);
         }
-        builder = builder.batch_size(self.default_batch_size);
+        let storage = Arc::new(
+            builder
+                .connect()
+                .map_err(|e| format!("Invalid Meilisearch target: {e}"))?,
+        );
+        storage
+            .configure_index(&key.index_uid, features, msg.job.as_ref())
+            .await;
+        info!(
+            url = %key.url,
+            index = %key.index_uid,
+            primary_key = %key.primary_key,
+            batch_size = key.batch_size,
+            "Created per-job Meilisearch storage"
+        );
+        cache.insert(key, storage.clone());
+        Ok(Some(storage))
+    }
 
-        match builder.build().await {
-            Ok(storage) => {
-                let storage = Arc::new(storage);
-                info!(
-                    url = msg_url,
-                    index = %msg.index_uid,
-                    "Created per-job Meilisearch client"
-                );
-                cache.insert(cache_key, storage.clone());
-                Some(storage)
-            }
-            Err(e) => {
-                warn!(
-                    url = msg_url,
+    /// Flush all buffered storages (acks follow Meilisearch acceptance).
+    async fn flush_all_storages(&self) {
+        let storages: Vec<(StorageKey, Arc<MeilisearchStorage>)> = self
+            .storage_cache
+            .lock()
+            .await
+            .iter()
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect();
+        for (key, storage) in storages {
+            match storage.flush().await {
+                Ok(count) if count > 0 => {
+                    debug!(count, index = %key.index_uid, "Flushed Meilisearch storage");
+                }
+                Err(e) => warn!(
                     error = %e,
-                    "Failed to create per-job Meilisearch client, falling back to default"
-                );
-                self.storage.clone()
+                    index = %key.index_uid,
+                    pending = storage.pending_count(),
+                    "Failed to flush Meilisearch storage; documents kept for retry"
+                ),
+                _ => {}
             }
         }
     }
 
-    /// Flush all Meilisearch storages (default + cached per-job ones)
-    async fn flush_all_storages(&self) {
-        // Flush default storage
-        if let Some(ref storage) = self.storage {
-            match storage.flush().await {
-                Ok(count) if count > 0 => {
-                    self.metrics.record_indexed(count as u64);
-                    debug!(count, "Flushed default Meilisearch storage");
+    /// Spawn the task that publishes `DocumentIndexed` for accepted pages
+    /// and then acks their messages. Call once.
+    fn spawn_indexed_publisher(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let mut rx = self.indexed_rx.lock().take()?;
+        let producer = self.producer.clone();
+        let metrics = self.metrics.clone();
+        let pending = self.pending_notices.clone();
+        Some(tokio::spawn(async move {
+            while let Some(notice) = rx.recv().await {
+                if publish_with_retry(&producer, &notice.job_id, &notice.event).await {
+                    notice.ack.ack();
+                    metrics.record_indexed(notice.docs);
                 }
-                Err(e) => warn!(error = %e, "Failed to flush default Meilisearch storage"),
-                _ => {}
+                // Not published: the ack is dropped, the message stays
+                // un-acked and is redelivered.
+                pending.fetch_sub(1, Ordering::AcqRel);
             }
-        }
+        }))
+    }
 
-        // Flush all cached storages
-        let cache = self.storage_cache.lock().await;
-        for ((url, _), storage) in cache.iter() {
-            match storage.flush().await {
-                Ok(count) if count > 0 => {
-                    self.metrics.record_indexed(count as u64);
-                    debug!(count, url = %url, "Flushed per-job Meilisearch storage");
+    /// Spawn the task forwarding AI usage events as `AiUsage` crawl events
+    /// (reaching ClickHouse through the events topic, R9). Call once.
+    fn spawn_ai_usage_forwarder(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let mut rx = self.ai_usage_rx.lock().take()?;
+        let producer = self.producer.clone();
+        Some(tokio::spawn(async move {
+            while let Some(usage) = rx.recv().await {
+                let Some(event) = ai_usage_event(usage) else {
+                    continue;
+                };
+                let job_id = match &event {
+                    CrawlEvent::AiUsage { job_id, .. } => job_id.clone(),
+                    _ => String::new(),
+                };
+                if let Err(e) = producer
+                    .send(topic_names::EVENTS, Some(&job_id), &event)
+                    .await
+                {
+                    warn!(job_id = %job_id, error = %e, "Failed to publish AiUsage event");
                 }
-                Err(e) => {
-                    warn!(error = %e, url = %url, "Failed to flush per-job Meilisearch storage")
-                }
-                _ => {}
             }
+        }))
+    }
+
+    /// Wait (bounded) until `cond` holds.
+    async fn wait_until(timeout: Duration, cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !cond() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    /// Flush every storage and wait (bounded) for the resulting
+    /// `DocumentIndexed` publishes and acks to go through.
+    async fn drain(&self) {
+        let _ = Self::wait_until(Duration::from_secs(30), || {
+            self.metrics.active_processors.load(Ordering::Acquire) == 0
+        })
+        .await;
+        self.flush_all_storages().await;
+        if !Self::wait_until(Duration::from_secs(10), || {
+            self.pending_notices.load(Ordering::Acquire) == 0
+        })
+        .await
+        {
+            warn!("Timed out publishing DocumentIndexed events during drain");
         }
     }
 
     /// Run the content worker
     async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
-        info!(worker_id = %self.worker_id, "Starting content worker main loop");
+        info!(worker_id = %self.worker_id, concurrency = self.concurrency, "Starting content worker main loop");
 
-        // Start metrics reporter
         let metrics = self.metrics.clone();
         let shutdown = self.shutdown.clone();
         let metrics_handle = tokio::spawn(async move {
@@ -824,13 +751,22 @@ impl ContentWorker {
             }
         });
 
-        // Start periodic flush task for all Meilisearch storages
-        // This ensures documents are indexed even when batch_size isn't reached
+        let publisher_handle = self.spawn_indexed_publisher();
+        let ai_usage_handle = self.spawn_ai_usage_forwarder();
+
+        // The consumer is stopped only after the final flush, so acks from
+        // documents buffered at shutdown still reach its last commit.
+        let consumer_stop = Arc::new(AtomicBool::new(false));
+        let consumer_done = Arc::new(AtomicBool::new(false));
+
+        // Periodic flush so documents are indexed (and acked) even when a
+        // batch never fills up.
         let flush_handle = if self.storage.is_some() {
             let worker = self.clone();
+            let done = consumer_stop.clone();
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
-                while !worker.shutdown.load(Ordering::Relaxed) {
+                while !done.load(Ordering::Relaxed) {
                     interval.tick().await;
                     worker.flush_all_storages().await;
                 }
@@ -839,73 +775,308 @@ impl ContentWorker {
             None
         };
 
-        // Process messages
-        let result = self.process_messages().await;
+        let coordinator = {
+            let worker = self.clone();
+            let (stop, done) = (consumer_stop.clone(), consumer_done.clone());
+            async move {
+                while !worker.shutdown.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !done.load(Ordering::Relaxed) {
+                    info!("Shutdown requested: flushing buffered documents before stopping the consumer");
+                    worker.drain().await;
+                }
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
 
-        // Cleanup: signal shutdown and wait for background tasks to finish
+        let processing = {
+            let worker = self.clone();
+            let (stop, done) = (consumer_stop.clone(), consumer_done.clone());
+            async move {
+                let result = worker.process_messages(stop).await;
+                done.store(true, Ordering::Relaxed);
+                result
+            }
+        };
+
+        let (result, ()) = tokio::join!(processing, coordinator);
+
+        // Cleanup
         self.shutdown.store(true, Ordering::Relaxed);
+        consumer_stop.store(true, Ordering::Relaxed);
         metrics_handle.abort();
         if let Some(handle) = flush_handle {
             // Wait for any in-flight flush to complete instead of aborting
             let _ = handle.await;
         }
-
-        // Final flush of any pending documents to all Meilisearch storages
-        self.flush_all_storages().await;
+        // Final flush (the in-process bus has no commits; with Kafka any
+        // ack that lands after the consumer's last commit is redelivered,
+        // which is correct for at-least-once).
+        self.drain().await;
+        if let Some(handle) = publisher_handle {
+            handle.abort();
+        }
+        if let Some(handle) = ai_usage_handle {
+            handle.abort();
+        }
 
         result
     }
 
-    /// Process messages from the raw pages queue
-    async fn process_messages(&self) -> anyhow::Result<()> {
+    /// Process messages from the raw pages queue with `CONCURRENCY`
+    /// in-flight pages, each finished by an explicit ack.
+    async fn process_messages(self: Arc<Self>, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+        let worker = self.clone();
         self.consumer
-            .process::<RawPageMessage, _, _>(|msg, metadata| async move {
-                if self.shutdown.load(Ordering::Relaxed) {
-                    return Err(ScrapixError::Parse("Worker shutting down".into()));
-                }
-
-                debug!(
-                    url = %msg.url,
-                    job_id = %msg.job_id,
-                    partition = metadata.partition,
-                    offset = metadata.offset,
-                    "Received raw page for processing"
-                );
-
-                // Acquire semaphore permit for concurrency limiting
-                let _permit = self.semaphore.acquire().await.map_err(|e| {
-                    ScrapixError::Parse(format!("Failed to acquire semaphore: {}", e))
-                })?;
-
-                self.metrics.processor_started();
-                let result = self.process_page(&msg).await;
-                self.metrics.processor_completed();
-
-                if let Err(ref e) = result {
-                    warn!(
-                        url = %msg.url,
-                        job_id = %msg.job_id,
-                        error = %e,
-                        "Failed to process page"
-                    );
-                }
-
-                result
-            })
+            .process_with_ack::<RawPageMessage, _, _>(
+                move |msg, metadata, ack| {
+                    let worker = worker.clone();
+                    async move {
+                        debug!(
+                            url = %msg.url,
+                            job_id = %msg.job_id,
+                            partition = metadata.partition,
+                            offset = metadata.offset,
+                            "Received raw page for processing"
+                        );
+                        worker.handle_message(msg, ack).await;
+                    }
+                },
+                self.concurrency,
+                stop,
+            )
             .await?;
-
         Ok(())
     }
 
-    /// Process a single raw page
-    async fn process_page(&self, msg: &RawPageMessage) -> scrapix_core::Result<()> {
-        let start = Instant::now();
-        let page_size = msg.html.len() as u64;
+    /// Process one raw page and finish it with exactly one outcome event.
+    async fn handle_message(&self, msg: RawPageMessage, ack: Ack) {
+        if self.shutdown.load(Ordering::Relaxed) {
+            // Not processed: left un-acked for redelivery.
+            return;
+        }
+        self.metrics
+            .active_processors
+            .fetch_add(1, Ordering::AcqRel);
+        let outcome = self.process_page(&msg).await;
+        match outcome {
+            PageOutcome::Skipped(reason) => {
+                debug!(url = %msg.url, reason = %reason, "Page skipped");
+                let event = CrawlEvent::DocumentSkipped {
+                    job_id: msg.job_id.clone(),
+                    url: msg.url.clone(),
+                    url_message_id: msg.url_message_id.clone(),
+                    reason,
+                    timestamp: now_ms(),
+                };
+                self.finish(&msg, event, ack).await;
+            }
+            PageOutcome::Failed(error) => {
+                warn!(url = %msg.url, job_id = %msg.job_id, error = %error, "Failed to process page");
+                self.metrics.record_failure();
+                let event = CrawlEvent::DocumentFailed {
+                    job_id: msg.job_id.clone(),
+                    url: msg.url.clone(),
+                    url_message_id: msg.url_message_id.clone(),
+                    error,
+                    timestamp: now_ms(),
+                };
+                self.finish(&msg, event, ack).await;
+            }
+            PageOutcome::Index {
+                docs,
+                document_id,
+                ai_enriched,
+            } => {
+                self.index_page(&msg, docs, document_id, ai_enriched, ack)
+                    .await;
+            }
+        }
+        self.metrics
+            .active_processors
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Publish a terminal event, then ack (a failed publish leaves the
+    /// message un-acked for redelivery).
+    async fn finish(&self, msg: &RawPageMessage, event: CrawlEvent, ack: Ack) {
+        if publish_with_retry(&self.producer, &msg.job_id, &event).await {
+            ack.ack();
+        }
+    }
+
+    /// Hand a page's documents to Meilisearch; `DocumentIndexed` + ack
+    /// happen once Meilisearch accepted all of them.
+    async fn index_page(
+        &self,
+        msg: &RawPageMessage,
+        docs: Vec<Document>,
+        document_id: String,
+        ai_enriched: bool,
+        ack: Ack,
+    ) {
+        // Publish documents to Kafka if enabled (a failure leaves the page
+        // un-acked; redelivery re-publishes).
+        if self.publish_to_kafka {
+            for doc in &docs {
+                let doc_msg = DocumentMessage::new(doc.clone(), &msg.job_id, &msg.index_uid);
+                if let Err(e) = self
+                    .producer
+                    .send(topic_names::DOCUMENTS, Some(&msg.job_id), &doc_msg)
+                    .await
+                {
+                    warn!(url = %msg.url, error = %e, "Failed to publish document to Kafka");
+                    return;
+                }
+            }
+        }
+
+        self.publish_history(msg).await;
+
+        let event = CrawlEvent::DocumentIndexed {
+            job_id: msg.job_id.clone(),
+            account_id: msg.account_id.clone(),
+            url: msg.url.clone(),
+            document_id,
+            timestamp: now_ms(),
+            url_message_id: msg.url_message_id.clone(),
+            ai_enriched,
+        };
+
+        let features = self.resolve_features(msg);
+        let storage = match self.storage_for(msg, &features).await {
+            Ok(Some(storage)) => storage,
+            Ok(None) => {
+                // Indexing disabled on this worker: nothing to wait for.
+                self.finish(msg, event, ack).await;
+                return;
+            }
+            Err(error) => {
+                warn!(url = %msg.url, error = %error, "Cannot index page");
+                let failed = CrawlEvent::DocumentFailed {
+                    job_id: msg.job_id.clone(),
+                    url: msg.url.clone(),
+                    url_message_id: msg.url_message_id.clone(),
+                    error,
+                    timestamp: now_ms(),
+                };
+                self.finish(msg, failed, ack).await;
+                return;
+            }
+        };
+
+        let notice_ack = {
+            let tx = self.indexed_tx.clone();
+            let pending = self.pending_notices.clone();
+            let notice = IndexedNotice {
+                job_id: msg.job_id.clone(),
+                event,
+                docs: docs.len() as u64,
+                ack,
+            };
+            Ack::from_fn(move || {
+                pending.fetch_add(1, Ordering::AcqRel);
+                if tx.send(notice).is_err() {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                }
+            })
+        };
+
+        let doc_count = docs.len();
+        for (doc, doc_ack) in docs.into_iter().zip(notice_ack.split(doc_count)) {
+            if let Err(e) = storage
+                .add_document_to_index(doc, &msg.index_uid, doc_ack)
+                .await
+            {
+                // The doc's ack is dropped: the page stays un-acked.
+                warn!(url = %msg.url, error = %e, "Failed to buffer document for Meilisearch");
+            }
+        }
+    }
+
+    /// Publish crawl history for recrawl scheduling if enabled
+    async fn publish_history(&self, msg: &RawPageMessage) {
+        if !self.publish_history {
+            return;
+        }
+        use sha2::{Digest, Sha256};
+
+        let content_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(msg.html.as_bytes());
+            hex::encode(hasher.finalize())
+        };
+
+        let mut history_msg = CrawlHistoryMessage::new(&msg.url, msg.status, &msg.job_id)
+            .with_content_hash(&content_hash)
+            .with_content_length(msg.html.len() as u64)
+            .with_content_changed(true); // Assume changed since we processed it
+        if let Some(ref etag) = msg.etag {
+            history_msg = history_msg.with_etag(etag);
+        }
+        if let Some(ref last_modified) = msg.last_modified {
+            history_msg = history_msg.with_last_modified(last_modified);
+        }
+
+        if let Err(e) = self
+            .producer
+            .send(topic_names::CRAWL_HISTORY, Some(&msg.job_id), &history_msg)
+            .await
+        {
+            debug!(error = %e, "Failed to publish crawl history");
+        }
+    }
+
+    /// Publish `JobWarning{message}` at most once per job per worker.
+    async fn warn_job_once(&self, job_id: &str, message: &str) {
+        let key = (job_id.to_string(), message.to_string());
+        {
+            let mut warned = self.warned.lock();
+            if warned.len() >= MAX_REMEMBERED_WARNINGS {
+                warned.clear();
+            }
+            if !warned.insert(key.clone()) {
+                return;
+            }
+        }
+        warn!(job_id = %job_id, warning = %message, "Job warning");
+        let event = CrawlEvent::JobWarning {
+            job_id: job_id.to_string(),
+            message: message.to_string(),
+            timestamp: now_ms(),
+        };
+        if let Err(e) = self
+            .producer
+            .send(topic_names::EVENTS, Some(job_id), &event)
+            .await
+        {
+            // Best effort; forget it so a later page retries the warning.
+            debug!(error = %e, "Failed to publish JobWarning");
+            self.warned.lock().remove(&key);
+        }
+    }
+
+    /// Process a single raw page into an outcome.
+    async fn process_page(&self, msg: &RawPageMessage) -> PageOutcome {
+        // Defense in depth (R1): current crawlers only forward 2xx pages.
+        if !(200..300).contains(&msg.status) {
+            self.metrics.record_skipped();
+            return PageOutcome::Skipped("non-2xx status".to_string());
+        }
+
+        let index_only = msg
+            .job
+            .as_ref()
+            .map(|j| j.index_only.as_slice())
+            .unwrap_or_default();
+        if !features::index_only_allows(index_only, &msg.url) {
+            self.metrics.record_skipped();
+            return PageOutcome::Skipped("index_only".to_string());
+        }
 
         // Route by content type: PDFs and markdown each get their own path,
-        // other non-HTML is skipped. PDF support requires the feature to have
-        // been enabled on the fetch side (otherwise `application/pdf` would
-        // have been rejected before reaching us).
+        // other non-HTML is skipped.
         if let Some(ref content_type) = msg.content_type {
             if content_type.contains("application/pdf") {
                 return self.process_pdf_page(msg).await;
@@ -914,17 +1085,14 @@ impl ContentWorker {
                 return self.process_markdown_page(msg).await;
             }
             if !content_type.contains("text/html") && !content_type.contains("application/xhtml") {
-                debug!(
-                    url = %msg.url,
-                    content_type = %content_type,
-                    "Skipping non-HTML content"
-                );
                 self.metrics.record_skipped();
-                return Ok(());
+                return PageOutcome::Skipped(format!("unsupported content type {content_type}"));
             }
         }
 
-        // Convert RawPageMessage to RawPage
+        let start = Instant::now();
+        let page_size = msg.html.len() as u64;
+
         let raw_page = RawPage {
             url: msg.url.clone(),
             final_url: msg.final_url.clone(),
@@ -938,124 +1106,47 @@ impl ContentWorker {
             fetch_duration_ms: msg.fetch_duration_ms,
         };
 
-        // Parse the page
-        let document = match self.parser.parse(&raw_page) {
+        let mut document = match self.parser.parse(&raw_page) {
             Ok(doc) => doc,
-            Err(e) => {
-                self.metrics.record_failure();
-
-                // Send failure event
-                let event = CrawlEvent::PageFailed {
-                    job_id: msg.job_id.clone(),
-                    account_id: msg.account_id.clone(),
-                    url: msg.url.clone(),
-                    error: format!("Parse error: {}", e),
-                    retry_count: 0,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    status: None,
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-
-                return Err(e);
-            }
+            Err(e) => return PageOutcome::Failed(format!("Parse error: {}", e)),
         };
 
-        // Resolve per-job features and filter disabled fields
-        let features = self.resolve_features(msg);
-        let mut document = document;
-        // Set crawl job ID for stale document cleanup (Replace index strategy)
-        document._crawl_job_id = Some(msg.job_id.clone());
-        // Set source for multi-tenant indexing (from crawl config, falls back to domain)
-        document.source = Some(
-            msg.source
-                .clone()
-                .unwrap_or_else(|| document.domain.clone()),
-        );
+        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        self.stamp(&mut document, msg);
         Self::filter_document(&mut document, &features);
-
-        // Configure index settings for enabled features (once per index)
-        {
-            let mut configured = self.feature_configured_indexes.lock().await;
-            if configured.insert(msg.index_uid.clone()) {
-                if let Some(storage) = self.get_storage(msg).await {
-                    storage
-                        .configure_index_for_features(&msg.index_uid, &features)
-                        .await;
-                }
+        if features.schema_enabled() {
+            if let Some(extractor) = self.schema_extractor_for(&features) {
+                document.schema = features::extract_schema(&extractor, &msg.html);
             }
         }
 
-        // Apply custom CSS selector extraction if enabled
         if features.custom_selectors_enabled() {
             document.custom = Self::extract_custom_selectors(&msg.html, &features);
         }
 
-        // Check if document has enough content
         let content_len = document.content.as_ref().map(|c| c.len()).unwrap_or(0);
         if content_len == 0 {
-            debug!(
-                url = %msg.url,
-                "Skipping page with no content"
-            );
             self.metrics.record_skipped();
-            return Ok(());
+            return PageOutcome::Skipped("no content".to_string());
         }
 
-        // Check for near-duplicates if enabled
-        if let Some(ref detector) = self.dedup_detector {
-            let content_for_dedup = document
-                .content
-                .as_ref()
-                .or(document.markdown.as_ref())
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            if let Some(duplicate_url) = detector.check_and_add(&msg.url, content_for_dedup) {
-                debug!(
-                    url = %msg.url,
-                    duplicate_of = %duplicate_url,
-                    "Skipping near-duplicate content"
-                );
-                self.metrics.record_duplicate();
-
-                // Send duplicate event
-                let event = CrawlEvent::PageSkipped {
-                    job_id: msg.job_id.clone(),
-                    url: msg.url.clone(),
-                    reason: format!("Near-duplicate of {}", duplicate_url),
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-
-                return Ok(());
-            }
+        if let Some(reason) = self.near_duplicate(&document, msg) {
+            return PageOutcome::Skipped(reason);
         }
-
-        let parse_duration = start.elapsed();
 
         info!(
             url = %msg.url,
             title = ?document.title,
             content_len = content_len,
             language = ?document.language,
-            duration_ms = parse_duration.as_millis(),
+            duration_ms = start.elapsed().as_millis(),
             "Page parsed successfully"
         );
 
-        // Apply AI enrichment if enabled by per-job features (only for non-block-split mode)
-        let document = if !features.block_split_enabled() {
-            self.enrich_with_ai(document, &features).await
-        } else {
-            document
-        };
-
-        let _process_duration = start.elapsed();
-
-        // Check if block splitting is enabled by per-job features
         if features.block_split_enabled() {
-            // Use existing block splitter or create a default one
+            if ai_requested(&features) {
+                self.warn_job_once(&msg.job_id, WARN_AI_BLOCK_SPLIT).await;
+            }
             let default_splitter;
             let splitter = match self.block_splitter.as_ref() {
                 Some(s) => s,
@@ -1068,285 +1159,93 @@ impl ContentWorker {
                     &default_splitter
                 }
             };
-            // Split HTML into content blocks
             match splitter.split(&msg.html) {
-                Ok(extracted_blocks) => {
-                    let block_count = extracted_blocks.count;
-
-                    if block_count == 0 {
-                        // No blocks extracted, fall back to indexing full document
-                        debug!(
-                            url = %msg.url,
-                            "No blocks extracted, indexing full document"
-                        );
-                        self.metrics.record_success(page_size, 1);
-                        self.index_single_document(&document, msg).await?;
-                    } else {
-                        info!(
-                            url = %msg.url,
-                            block_count = block_count,
-                            "Split page into content blocks"
-                        );
-
-                        self.metrics.record_success(page_size, block_count as u64);
-
-                        // Get per-job storage once for all blocks
-                        let block_storage = self.get_storage(msg).await;
-
-                        // Create and index a document for each block
-                        for block in &extracted_blocks.blocks {
-                            let block_doc = self.create_block_document(&document, block, msg);
-
-                            // Index block document
-                            if let Some(ref storage) = block_storage {
-                                if let Err(e) = storage
-                                    .add_document_to_index(block_doc.clone(), &msg.index_uid)
-                                    .await
-                                {
-                                    warn!(
-                                        url = %msg.url,
-                                        block_index = block.index,
-                                        error = %e,
-                                        "Failed to add block document to Meilisearch"
-                                    );
-                                } else {
-                                    self.metrics.record_indexed(1);
-                                }
-                            }
-
-                            // Publish block document to Kafka if enabled
-                            if self.publish_to_kafka {
-                                let doc_msg = DocumentMessage::new(
-                                    block_doc.clone(),
-                                    &msg.job_id,
-                                    &msg.index_uid,
-                                );
-                                let _ = self
-                                    .producer
-                                    .send(topic_names::DOCUMENTS, Some(&msg.job_id), &doc_msg)
-                                    .await;
-                            }
-                        }
-
-                        // Send success event for the page
-                        let event = CrawlEvent::DocumentIndexed {
-                            job_id: msg.job_id.clone(),
-                            account_id: msg.account_id.clone(),
-                            url: msg.url.clone(),
-                            document_id: format!("{}-blocks", document.uid),
-                            timestamp: chrono::Utc::now().timestamp_millis(),
-                        };
-                        self.publish_event(&msg.job_id, &event).await?;
-                    }
+                Ok(extracted) if extracted.count > 0 => {
+                    info!(url = %msg.url, block_count = extracted.count, "Split page into content blocks");
+                    self.metrics
+                        .record_success(page_size, extracted.count as u64);
+                    let docs = extracted
+                        .blocks
+                        .iter()
+                        .map(|block| Self::create_block_document(&document, block))
+                        .collect();
+                    return PageOutcome::Index {
+                        docs,
+                        document_id: format!("{}-blocks", document.uid),
+                        ai_enriched: false,
+                    };
+                }
+                Ok(_) => {
+                    debug!(url = %msg.url, "No blocks extracted, indexing full document");
                 }
                 Err(e) => {
-                    warn!(
-                        url = %msg.url,
-                        error = %e,
-                        "Block splitting failed, indexing full document"
-                    );
-                    self.metrics.record_success(page_size, 1);
-                    self.index_single_document(&document, msg).await?;
+                    warn!(url = %msg.url, error = %e, "Block splitting failed, indexing full document");
                 }
             }
-        } else {
-            // No block splitting, index single document
             self.metrics.record_success(page_size, 1);
-            self.index_single_document(&document, msg).await?;
+            return single(document, false);
         }
 
-        // Publish crawl history for recrawl scheduling if enabled
-        if self.publish_history {
-            use sha2::{Digest, Sha256};
-
-            // Compute content hash from HTML
-            let content_hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(msg.html.as_bytes());
-                hex::encode(hasher.finalize())
-            };
-
-            let history_msg = CrawlHistoryMessage::new(&msg.url, msg.status, &msg.job_id)
-                .with_content_hash(&content_hash)
-                .with_content_length(msg.html.len() as u64)
-                .with_content_changed(true); // Assume changed since we processed it
-
-            // Add etag and last_modified if available
-            let history_msg = if let Some(ref etag) = msg.etag {
-                history_msg.with_etag(etag)
-            } else {
-                history_msg
-            };
-            let history_msg = if let Some(ref last_modified) = msg.last_modified {
-                history_msg.with_last_modified(last_modified)
-            } else {
-                history_msg
-            };
-
-            if let Err(e) = self
-                .producer
-                .send(topic_names::CRAWL_HISTORY, Some(&msg.job_id), &history_msg)
-                .await
-            {
-                debug!(error = %e, "Failed to publish crawl history");
-            }
-        }
-
-        Ok(())
+        let (document, ai_enriched) = self.enrich_with_ai(document, &features, msg).await;
+        self.metrics.record_success(page_size, 1);
+        single(document, ai_enriched)
     }
 
     /// Process a page that was returned as server-provided markdown (e.g. Cloudflare "Markdown for Agents")
-    async fn process_markdown_page(&self, msg: &RawPageMessage) -> scrapix_core::Result<()> {
-        let start = Instant::now();
+    async fn process_markdown_page(&self, msg: &RawPageMessage) -> PageOutcome {
         let page_size = msg.html.len() as u64;
-
-        // Parse the markdown into a Document
-        let document = match scrapix_parser::parse_markdown_page(&msg.final_url, &msg.html) {
+        let mut document = match scrapix_parser::parse_markdown_page(&msg.final_url, &msg.html) {
             Ok(doc) => doc,
-            Err(e) => {
-                self.metrics.record_failure();
-                let event = CrawlEvent::PageFailed {
-                    job_id: msg.job_id.clone(),
-                    account_id: msg.account_id.clone(),
-                    url: msg.url.clone(),
-                    error: format!("Markdown parse error: {}", e),
-                    retry_count: 0,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    status: None,
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-                return Err(e);
-            }
+            Err(e) => return PageOutcome::Failed(format!("Markdown parse error: {}", e)),
         };
 
-        // Check if document has enough content
         let content_len = document.content.as_ref().map(|c| c.len()).unwrap_or(0);
         if content_len == 0 {
-            debug!(url = %msg.url, "Skipping markdown page with no content");
             self.metrics.record_skipped();
-            return Ok(());
+            return PageOutcome::Skipped("no content".to_string());
+        }
+        if let Some(reason) = self.near_duplicate(&document, msg) {
+            return PageOutcome::Skipped(reason);
         }
 
-        // Check for near-duplicates if enabled
-        if let Some(ref detector) = self.dedup_detector {
-            let content_for_dedup = document
-                .content
-                .as_ref()
-                .or(document.markdown.as_ref())
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            if let Some(duplicate_url) = detector.check_and_add(&msg.url, content_for_dedup) {
-                debug!(
-                    url = %msg.url,
-                    duplicate_of = %duplicate_url,
-                    "Skipping near-duplicate markdown content"
-                );
-                self.metrics.record_duplicate();
-                let event = CrawlEvent::PageSkipped {
-                    job_id: msg.job_id.clone(),
-                    url: msg.url.clone(),
-                    reason: format!("Near-duplicate of {}", duplicate_url),
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-                return Ok(());
-            }
-        }
-
-        // Resolve per-job features and filter disabled fields
-        let features = self.resolve_features(msg);
-        let mut document = document;
-        // Set crawl job ID for stale document cleanup (Replace index strategy)
-        document._crawl_job_id = Some(msg.job_id.clone());
-        // Set source for multi-tenant indexing (from crawl config, falls back to domain)
-        document.source = Some(
-            msg.source
-                .clone()
-                .unwrap_or_else(|| document.domain.clone()),
-        );
+        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        self.stamp(&mut document, msg);
         Self::filter_document(&mut document, &features);
 
-        // Configure index settings for enabled features (once per index)
-        {
-            let mut configured = self.feature_configured_indexes.lock().await;
-            if configured.insert(msg.index_uid.clone()) {
-                if let Some(storage) = self.get_storage(msg).await {
-                    storage
-                        .configure_index_for_features(&msg.index_uid, &features)
-                        .await;
-                }
-            }
-        }
-
-        let parse_duration = start.elapsed();
         info!(
             url = %msg.url,
             title = ?document.title,
             content_len = content_len,
-            language = ?document.language,
-            duration_ms = parse_duration.as_millis(),
             "Markdown page parsed successfully (server-provided)"
         );
 
-        // Apply AI enrichment using per-job features
-        let document = self.enrich_with_ai(document, &features).await;
-
-        // Index single document (no block splitting for server-provided markdown)
+        // No block splitting for server-provided markdown
+        let (document, ai_enriched) = self.enrich_with_ai(document, &features, msg).await;
         self.metrics.record_success(page_size, 1);
-        self.index_single_document(&document, msg).await?;
-
-        Ok(())
+        single(document, ai_enriched)
     }
 
     /// Process a page whose Content-Type is `application/pdf`.
     ///
     /// The upstream fetcher base64-encodes PDF bytes into `msg.html` so they
-    /// survive the JSON Kafka payload. Here we decode, run the PDF parser,
-    /// and build a `Document` with the extracted text + metadata.
-    ///
-    /// Empty PDFs (typical of scanned images without OCR) are indexed with
-    /// empty content so operators see the URL in their index and can identify
-    /// quality gaps; we log a warning for visibility.
-    async fn process_pdf_page(&self, msg: &RawPageMessage) -> scrapix_core::Result<()> {
+    /// survive the JSON Kafka payload. Empty PDFs (scanned images without
+    /// OCR) are indexed with empty content so operators see the URL.
+    async fn process_pdf_page(&self, msg: &RawPageMessage) -> PageOutcome {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        use scrapix_core::ScrapixError;
 
-        let start = Instant::now();
-
-        // Decode base64 back to raw PDF bytes.
-        let bytes = BASE64.decode(msg.html.as_bytes()).map_err(|e| {
-            ScrapixError::Parse(format!("Failed to base64-decode PDF payload: {}", e))
-        })?;
-
-        // Report true PDF size (not base64-inflated string size) in metrics.
-        let pdf_bytes_len = bytes.len();
-        let page_size = pdf_bytes_len as u64;
-
-        // Parse PDF bytes → text + metadata.
-        let parsed = match scrapix_parser::pdf::parse_pdf_bytes(&bytes, &msg.url) {
-            Ok(p) => p,
+        let bytes = match BASE64.decode(msg.html.as_bytes()) {
+            Ok(b) => b,
             Err(e) => {
-                self.metrics.record_failure();
-                let event = CrawlEvent::PageFailed {
-                    job_id: msg.job_id.clone(),
-                    account_id: msg.account_id.clone(),
-                    url: msg.url.clone(),
-                    error: format!("PDF parse error: {}", e),
-                    retry_count: 0,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    status: None,
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-                return Err(e);
+                return PageOutcome::Failed(format!("Failed to base64-decode PDF payload: {}", e))
             }
         };
+        let pdf_bytes_len = bytes.len();
 
-        // Build the indexable Document. The fallback title — derived from the
-        // URL basename — is only used when the PDF itself carries no title.
+        let parsed = match scrapix_parser::pdf::parse_pdf_bytes(&bytes, &msg.url) {
+            Ok(p) => p,
+            Err(e) => return PageOutcome::Failed(format!("PDF parse error: {}", e)),
+        };
+
         let fallback_title = scrapix_parser::pdf::title_from_url(&msg.final_url);
         let mut document = match scrapix_parser::pdf::build_pdf_document(
             &msg.final_url,
@@ -1355,136 +1254,68 @@ impl ContentWorker {
             fallback_title,
         ) {
             Ok(doc) => doc,
-            Err(e) => {
-                self.metrics.record_failure();
-                let event = CrawlEvent::PageFailed {
-                    job_id: msg.job_id.clone(),
-                    account_id: msg.account_id.clone(),
-                    url: msg.url.clone(),
-                    error: format!("PDF document build error: {}", e),
-                    retry_count: 0,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    status: None,
-                    url_message_id: msg.url_message_id.clone(),
-                };
-                self.publish_event(&msg.job_id, &event).await?;
-                return Err(e);
-            }
+            Err(e) => return PageOutcome::Failed(format!("PDF document build error: {}", e)),
         };
 
-        // Tag with job_id for stale-doc cleanup under Replace strategy.
+        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        self.stamp(&mut document, msg);
+        Self::filter_document(&mut document, &features);
+
+        info!(
+            url = %msg.url,
+            title = ?document.title,
+            pdf_bytes = pdf_bytes_len,
+            "PDF page parsed successfully"
+        );
+
+        // PDFs have no heading tree: no block splitting.
+        let (document, ai_enriched) = self.enrich_with_ai(document, &features, msg).await;
+        self.metrics.record_success(pdf_bytes_len as u64, 1);
+        single(document, ai_enriched)
+    }
+
+    /// Stamp job id (Replace strategy stale cleanup) and source
+    /// (multi-tenant indexing; falls back to the domain).
+    fn stamp(&self, document: &mut Document, msg: &RawPageMessage) {
         document._crawl_job_id = Some(msg.job_id.clone());
-        // Stamp source for multi-tenant indexing (falls back to domain).
         document.source = Some(
             msg.source
                 .clone()
                 .unwrap_or_else(|| document.domain.clone()),
         );
-
-        // Resolve per-job features for filter/AI enrichment parity with HTML.
-        let features = self.resolve_features(msg);
-        Self::filter_document(&mut document, &features);
-
-        // Configure index for the job's feature set (no-op after first call per index).
-        {
-            let mut configured = self.feature_configured_indexes.lock().await;
-            if configured.insert(msg.index_uid.clone()) {
-                if let Some(storage) = self.get_storage(msg).await {
-                    storage
-                        .configure_index_for_features(&msg.index_uid, &features)
-                        .await;
-                }
-            }
-        }
-
-        let parse_duration = start.elapsed();
-        let content_len = document.content.as_ref().map(|c| c.len()).unwrap_or(0);
-        info!(
-            url = %msg.url,
-            title = ?document.title,
-            content_len = content_len,
-            pdf_bytes = pdf_bytes_len,
-            language = ?document.language,
-            duration_ms = parse_duration.as_millis(),
-            "PDF page parsed successfully"
-        );
-
-        // Apply AI enrichment (summary/extraction) using per-job features.
-        let document = self.enrich_with_ai(document, &features).await;
-
-        // Index as a single document — PDFs have no semantic heading tree,
-        // so block-splitting does not apply.
-        self.metrics.record_success(page_size, 1);
-        self.index_single_document(&document, msg).await?;
-
-        Ok(())
     }
 
-    /// Publish a crawl event
-    async fn publish_event(&self, job_id: &str, event: &CrawlEvent) -> scrapix_core::Result<()> {
-        self.producer
-            .send(topic_names::EVENTS, Some(job_id), event)
-            .await?;
-        Ok(())
+    /// Near-duplicate check, scoped to the page's Meilisearch index (R9).
+    /// Returns the skip reason for a duplicate.
+    fn near_duplicate(&self, document: &Document, msg: &RawPageMessage) -> Option<String> {
+        let detector = self.dedup_detector.as_ref()?;
+        let content = document
+            .content
+            .as_ref()
+            .or(document.markdown.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let key = self.storage_key(msg);
+        let namespace = format!("{}|{}", key.url, key.index_uid);
+        let duplicate_of = detector.check_and_insert(&namespace, &msg.url, content)?;
+        self.metrics.record_duplicate();
+        Some(format!("Near-duplicate of {}", duplicate_of))
     }
 
-    /// Index a single document (non-block-split mode)
-    async fn index_single_document(
-        &self,
-        document: &Document,
-        msg: &RawPageMessage,
-    ) -> scrapix_core::Result<()> {
-        // Add document to Meilisearch (using per-job storage if configured)
-        if let Some(storage) = self.get_storage(msg).await {
-            if let Err(e) = storage
-                .add_document_to_index(document.clone(), &msg.index_uid)
-                .await
-            {
-                warn!(
-                    url = %msg.url,
-                    index_uid = %msg.index_uid,
-                    error = %e,
-                    "Failed to add document to Meilisearch"
-                );
-            } else {
-                self.metrics.record_indexed(1);
-            }
-        }
-
-        // Publish document to Kafka topic
-        if self.publish_to_kafka {
-            let doc_msg = DocumentMessage::new(document.clone(), &msg.job_id, &msg.index_uid);
-            self.producer
-                .send(topic_names::DOCUMENTS, Some(&msg.job_id), &doc_msg)
-                .await?;
-
-            debug!(
-                url = %msg.url,
-                topic = topic_names::DOCUMENTS,
-                "Published document to Kafka"
-            );
-        }
-
-        // Send success event
-        let event = CrawlEvent::DocumentIndexed {
-            job_id: msg.job_id.clone(),
-            account_id: msg.account_id.clone(),
-            url: msg.url.clone(),
-            document_id: document.uid.clone(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        };
-        self.publish_event(&msg.job_id, &event).await?;
-
-        Ok(())
+    /// The job's schema extractor, when it sets `only_types` / `convert_dates`.
+    fn schema_extractor_for(&self, features: &FeaturesConfig) -> Option<Arc<SchemaExtractor>> {
+        let key = features::schema_key(features)?;
+        let mut cache = self.schema_extractors.lock();
+        Some(
+            cache
+                .entry(key)
+                .or_insert_with_key(|k| Arc::new(features::schema_extractor(k)))
+                .clone(),
+        )
     }
 
     /// Create a document from a content block
-    fn create_block_document(
-        &self,
-        parent_doc: &Document,
-        block: &ContentBlock,
-        _msg: &RawPageMessage,
-    ) -> Document {
+    fn create_block_document(parent_doc: &Document, block: &ContentBlock) -> Document {
         // Build URL with anchor if available
         let block_url = if let Some(ref anchor) = block.anchor {
             format!("{}#{}", parent_doc.url, anchor)
@@ -1494,7 +1325,6 @@ impl ContentWorker {
 
         // Build title from heading hierarchy
         let block_title = if let Some(ref heading) = block.heading {
-            // Use parent page title + block heading
             match &parent_doc.title {
                 Some(page_title) => Some(format!("{} - {}", page_title, heading)),
                 None => Some(heading.clone()),
@@ -1504,19 +1334,11 @@ impl ContentWorker {
         };
 
         // Build URL tags from heading hierarchy
-        let mut urls_tags: Vec<String> = Vec::new();
-        if let Some(ref h1) = block.h1 {
-            urls_tags.push(h1.clone());
-        }
-        if let Some(ref h2) = block.h2 {
-            urls_tags.push(h2.clone());
-        }
-        if let Some(ref h3) = block.h3 {
-            urls_tags.push(h3.clone());
-        }
-        if let Some(ref h4) = block.h4 {
-            urls_tags.push(h4.clone());
-        }
+        let urls_tags: Vec<String> = [&block.h1, &block.h2, &block.h3, &block.h4]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
 
         Document {
             uid: Document::uid_from_url(&block_url),
@@ -1554,11 +1376,20 @@ impl ContentWorker {
         }
     }
 
-    /// Enrich document with AI-generated content (summary, extraction)
-    async fn enrich_with_ai(&self, mut document: Document, features: &FeaturesConfig) -> Document {
-        let ai_service = match &self.ai_service {
-            Some(s) => s,
-            None => return document,
+    /// Enrich document with AI-generated content (summary, extraction).
+    /// Returns whether any enrichment was actually produced.
+    async fn enrich_with_ai(
+        &self,
+        mut document: Document,
+        features: &FeaturesConfig,
+        msg: &RawPageMessage,
+    ) -> (Document, bool) {
+        if !ai_requested(features) {
+            return (document, false);
+        }
+        let Some(ai_service) = self.ai_service.as_ref() else {
+            self.warn_job_once(&msg.job_id, WARN_AI_NO_PROVIDER).await;
+            return (document, false);
         };
 
         // Get content to process - prefer markdown, fallback to content
@@ -1568,13 +1399,12 @@ impl ContentWorker {
             .or(document.content.as_ref())
             .cloned()
             .unwrap_or_default();
-
         if content.is_empty() {
-            return document;
+            return (document, false);
         }
 
-        // Truncate content if too long (keep first ~6000 tokens worth).
-        // Find a valid UTF-8 char boundary to avoid splitting multi-byte characters.
+        // Truncate content if too long (keep first ~6000 tokens worth),
+        // on a valid UTF-8 char boundary.
         let content_for_ai = if content.len() > 24000 {
             let mut end = 24000;
             while end > 0 && !content.is_char_boundary(end) {
@@ -1585,81 +1415,61 @@ impl ContentWorker {
             content
         };
 
-        // Run all AI enrichment calls in parallel for ~3x speedup.
-        // Each call is independent, so we use tokio::join! to run them concurrently.
-        // Individual failures are logged but don't affect the other calls.
+        let context = |feature: &str| AiUsageContext {
+            job_id: msg.job_id.clone(),
+            account_id: msg.account_id.clone(),
+            feature: feature.to_string(),
+            url: msg.url.clone(),
+        };
 
-        let summary_fut = async {
+        // Independent calls run concurrently; each carries its own usage
+        // attribution. Individual failures are logged.
+        let summary_fut = AI_USAGE_CONTEXT.scope(context("ai_summary"), async {
             if !features.ai_summary_enabled() {
                 return None;
             }
             match ai_service.tldr(&content_for_ai).await {
-                Ok(summary) => {
-                    debug!(
-                        url = %document.url,
-                        summary_len = summary.len(),
-                        "Generated AI summary"
-                    );
-                    Some(summary)
-                }
+                Ok(summary) => Some(summary),
                 Err(e) => {
-                    warn!(
-                        url = %document.url,
-                        error = %e,
-                        "Failed to generate AI summary"
-                    );
+                    warn!(url = %document.url, error = %e, "Failed to generate AI summary");
                     None
                 }
             }
-        };
+        });
 
-        let extraction_fut = async {
+        let extraction_fut = AI_USAGE_CONTEXT.scope(context("ai_extraction"), async {
             if !features.ai_extraction_enabled() {
                 return None;
             }
-            // Use per-job extraction prompt if available, otherwise fall back to CLI config
+            // Per-job extraction prompt, falling back to the CLI config
             let prompt = features
                 .ai_extraction
                 .as_ref()
                 .map(|c| &c.prompt)
+                .filter(|p| !p.is_empty())
                 .or(self.ai_config.extraction_prompt.as_ref());
-            if let Some(prompt) = prompt {
-                match ai_service.extract(&content_for_ai, prompt).await {
-                    Ok(result) => {
-                        debug!(
-                            url = %document.url,
-                            "Generated AI extraction"
-                        );
-                        Some(result.data)
-                    }
-                    Err(e) => {
-                        warn!(
-                            url = %document.url,
-                            error = %e,
-                            "Failed to run AI extraction"
-                        );
-                        None
-                    }
+            let Some(prompt) = prompt else {
+                warn!(url = %document.url, "AI extraction enabled but no prompt provided");
+                return None;
+            };
+            match ai_service.extract(&content_for_ai, prompt).await {
+                Ok(result) => Some(result.data),
+                Err(e) => {
+                    warn!(url = %document.url, error = %e, "Failed to run AI extraction");
+                    None
                 }
-            } else {
-                warn!(
-                    url = %document.url,
-                    "AI extraction enabled but no prompt provided"
-                );
-                None
             }
-        };
+        });
 
         let (summary, extraction) = tokio::join!(summary_fut, extraction_fut);
-
+        let enriched = summary.is_some() || extraction.is_some();
         if summary.is_some() {
             document.ai_summary = summary;
         }
         if extraction.is_some() {
             document.ai_extraction = extraction;
         }
-
-        document
+        (document, enriched)
     }
 
     /// Resolve per-job features: use message features if present, otherwise fall back to CLI defaults
@@ -1669,7 +1479,7 @@ impl ContentWorker {
             .unwrap_or_else(|| self.default_features.clone())
     }
 
-    /// Null out document fields that the per-job config says should be disabled
+    /// Null out document fields that the page's features say should be disabled
     fn filter_document(document: &mut Document, features: &FeaturesConfig) {
         if !features.metadata_enabled() {
             document.metadata = None;
@@ -1692,7 +1502,6 @@ impl ContentWorker {
             return None;
         }
 
-        // Convert SelectorDef map to simple HashMap<String, String> for from_simple()
         let simple: HashMap<String, String> = config
             .selectors
             .iter()
@@ -1713,6 +1522,96 @@ impl ContentWorker {
     }
 }
 
+fn worker_id(args: &Args) -> String {
+    args.worker_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string())
+}
+
+/// Build the default storage (startup connectivity check + default index).
+/// `None` disables indexing.
+async fn default_storage(args: &Args) -> Option<Arc<MeilisearchStorage>> {
+    if args.skip_meilisearch {
+        info!("Meilisearch indexing disabled");
+        return None;
+    }
+    let mut builder = MeilisearchStorageBuilder::new(&args.meilisearch_url, &args.default_index)
+        .batch_size(args.batch_size);
+    if let Some(ref key) = args.meilisearch_key {
+        builder = builder.api_key(key);
+    }
+    match builder.build().await {
+        Ok(storage) => {
+            info!(
+                url = %args.meilisearch_url,
+                index = %args.default_index,
+                "Connected to Meilisearch"
+            );
+            Some(Arc::new(storage))
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to connect to Meilisearch, indexing disabled");
+            None
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn single(document: Document, ai_enriched: bool) -> PageOutcome {
+    PageOutcome::Index {
+        document_id: document.uid.clone(),
+        docs: vec![document],
+        ai_enriched,
+    }
+}
+
+fn ai_requested(features: &FeaturesConfig) -> bool {
+    features.ai_summary_enabled() || features.ai_extraction_enabled()
+}
+
+/// Publish an event to the events topic, retrying transient failures.
+/// Returns whether it was published.
+async fn publish_with_retry(producer: &AnyProducer, job_id: &str, event: &CrawlEvent) -> bool {
+    let mut delay = Duration::from_millis(100);
+    for attempt in 1..=3 {
+        match producer
+            .send(topic_names::EVENTS, Some(job_id), event)
+            .await
+        {
+            Ok(_) => return true,
+            Err(e) => {
+                warn!(job_id = %job_id, attempt, error = %e, "Failed to publish event");
+                if attempt < 3 {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Convert an AI client usage event into an `AiUsage` crawl event. Calls
+/// made outside a job context (no attribution) are not reported.
+fn ai_usage_event(usage: AiUsageEvent) -> Option<CrawlEvent> {
+    let ctx = usage.context?;
+    Some(CrawlEvent::AiUsage {
+        job_id: ctx.job_id,
+        account_id: ctx.account_id,
+        provider: usage.provider,
+        model: usage.model,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        duration_ms: usage.duration_ms,
+        feature: ctx.feature,
+        url: ctx.url,
+        timestamp: usage.timestamp.timestamp_millis(),
+    })
+}
+
 pub async fn run(args: Args) -> anyhow::Result<()> {
     info!(
         concurrency = args.concurrency,
@@ -1722,7 +1621,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         "Starting Scrapix content worker"
     );
 
-    // Create and run worker
     let worker = Arc::new(ContentWorker::new(&args).await?);
 
     // Install SIGTERM + Ctrl-C handler.
@@ -1739,15 +1637,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         worker.shutdown.clone(),
     );
 
-    // Run the worker
     let result = worker.run().await;
 
-    // Cleanup
     signal_handle.abort();
     wake_handle.abort();
     idle_handle.abort();
 
-    // Print final metrics
     let metrics = worker.metrics.snapshot();
     info!(
         processed = metrics.pages_processed,
@@ -1790,4 +1685,388 @@ pub async fn run_with_bus(
     );
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scrapix_core::{FeatureToggle, JobSpec};
+    use scrapix_queue::{ChannelBus, UrlMessage};
+    use serde::de::DeserializeOwned;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PAGE: &str = "<html><head><title>Guide</title></head><body><main><h1>Guide</h1>\
+        <p>This page explains in detail how the crawler, the frontier and the content worker \
+        cooperate to index documents into Meilisearch with at-least-once delivery.</p>\
+        <p>Every raw page ends in exactly one outcome event, and offsets commit only after \
+        Meilisearch accepted the batch containing the page's documents.</p></main></body></html>";
+
+    fn task_accepted() -> ResponseTemplate {
+        ResponseTemplate::new(202).set_body_json(serde_json::json!({
+            "taskUid": 1, "indexUid": "idx", "status": "enqueued",
+            "type": "documentAdditionOrUpdate", "enqueuedAt": "2026-01-01T00:00:00Z"}))
+    }
+
+    /// Meilisearch mock: index lookups 404 (fresh index), index creation
+    /// and settings accepted, document additions answered by `docs`.
+    async fn meilisearch(docs: ResponseTemplate) -> MockServer {
+        let ms = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/indexes/[^/]+$"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "message": "not found", "code": "index_not_found",
+                "type": "invalid_request", "link": "https://docs.meilisearch.com"})))
+            .mount(&ms)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(task_accepted())
+            .mount(&ms)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/indexes/[^/]+/settings$"))
+            .respond_with(task_accepted())
+            .mount(&ms)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/indexes/[^/]+/documents$"))
+            .respond_with(docs)
+            .mount(&ms)
+            .await;
+        ms
+    }
+
+    fn worker(bus: &ChannelBus, ms: &MockServer) -> Arc<ContentWorker> {
+        let args = Args::parse_from(["scrapix-worker-content", "--meilisearch-url", &ms.uri()]);
+        let consumer = Arc::new(AnyConsumer::from(bus.consumer()));
+        let producer = Arc::new(AnyProducer::from(bus.producer()));
+        // A connected (not initialized) default storage enables indexing
+        // without mocking the startup index initialization.
+        let storage = MeilisearchStorageBuilder::new(ms.uri(), "documents")
+            .connect()
+            .unwrap();
+        let w = Arc::new(ContentWorker::build(
+            &args,
+            "test".into(),
+            consumer,
+            producer,
+            Some(Arc::new(storage)),
+        ));
+        w.spawn_indexed_publisher();
+        w
+    }
+
+    fn events_reader(bus: &ChannelBus) -> AnyConsumer {
+        let c = AnyConsumer::from(bus.consumer());
+        c.subscribe(&[topic_names::EVENTS]).unwrap();
+        c
+    }
+
+    async fn drain<T: DeserializeOwned + Send>(c: &AnyConsumer) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Some(m) = c.poll_one::<T>(Duration::from_millis(50)).await.unwrap() {
+            out.push(m);
+        }
+        out
+    }
+
+    fn tracked_ack() -> (Ack, Arc<AtomicBool>) {
+        let acked = Arc::new(AtomicBool::new(false));
+        let flag = acked.clone();
+        (
+            Ack::from_fn(move || flag.store(true, Ordering::SeqCst)),
+            acked,
+        )
+    }
+
+    fn page(url: &str, status: u16, job: Option<JobSpec>) -> RawPageMessage {
+        let parent = UrlMessage::new(scrapix_core::CrawlUrl::seed(url), "job-1", "idx")
+            .account("acct")
+            .with_job(job);
+        let raw = RawPage {
+            url: url.to_string(),
+            final_url: url.to_string(),
+            status,
+            headers: HashMap::new(),
+            html: PAGE.to_string(),
+            content_type: Some("text/html".to_string()),
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 1,
+        };
+        RawPageMessage::from_url_message(&parent, raw, None, None)
+    }
+
+    async fn wait_for(flag: &AtomicBool) -> bool {
+        ContentWorker::wait_until(Duration::from_secs(5), || flag.load(Ordering::SeqCst)).await
+    }
+
+    #[tokio::test]
+    async fn indexed_event_and_ack_follow_meilisearch_acceptance() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let msg = page("https://a.test/guide", 200, None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        // Buffered, not yet sent: no ack, no DocumentIndexed.
+        assert!(!acked.load(Ordering::SeqCst));
+        assert!(drain::<CrawlEvent>(&events).await.is_empty());
+
+        w.flush_all_storages().await;
+        assert!(wait_for(&acked).await, "acked after Meilisearch accepted");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::DocumentIndexed { url_message_id, ai_enriched: false, account_id: Some(_), .. }
+                    if *url_message_id == msg.url_message_id
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_is_not_acked_and_not_reported() {
+        let ms = meilisearch(ResponseTemplate::new(500)).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(page("https://a.test/guide", 200, None), ack)
+            .await;
+        w.flush_all_storages().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!acked.load(Ordering::SeqCst));
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CrawlEvent::DocumentIndexed { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_2xx_page_is_skipped_and_acked() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let msg = page("https://a.test/missing", 404, None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::DocumentSkipped { reason, url_message_id, .. }
+                    if reason == "non-2xx status" && *url_message_id == msg.url_message_id
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_only_mismatch_is_skipped() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let job = JobSpec {
+            index_only: vec!["https://a.test/docs/*".into()],
+            ..Default::default()
+        };
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(page("https://a.test/blog/1", 200, Some(job)), ack)
+            .await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, CrawlEvent::DocumentSkipped { reason, .. } if reason == "index_only")
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_primary_key_and_batch_size_are_honored() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let job = JobSpec {
+            primary_key: Some("id".into()),
+            batch_size: Some(1),
+            ..Default::default()
+        };
+        let (ack, acked) = tracked_ack();
+
+        // batch_size 1: the add itself sends the batch, no flush needed.
+        w.handle_message(page("https://a.test/guide", 200, Some(job)), ack)
+            .await;
+        assert!(wait_for(&acked).await);
+
+        let requests = ms.received_requests().await.unwrap();
+        let add = requests
+            .iter()
+            .find(|r| r.url.path() == "/indexes/idx/documents")
+            .expect("documents sent");
+        assert!(add.url.query().unwrap_or("").contains("primaryKey=id"));
+        let create = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/indexes")
+            .expect("index created");
+        let body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+        assert_eq!(body["primaryKey"], "id");
+    }
+
+    #[tokio::test]
+    async fn ai_without_provider_indexes_and_warns_once_per_job() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        if w.ai_service.is_some() {
+            // An AI provider is configured in this environment.
+            return;
+        }
+        let features = FeaturesConfig {
+            ai_summary: Some(FeatureToggle {
+                enabled: true,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            ..Default::default()
+        };
+        let mut acks = Vec::new();
+        for p in ["https://a.test/1", "https://a.test/2"] {
+            let mut msg = page(p, 200, None);
+            msg.features = Some(features.clone());
+            let (ack, acked) = tracked_ack();
+            w.handle_message(msg, ack).await;
+            acks.push(acked);
+        }
+        w.flush_all_storages().await;
+        for acked in &acks {
+            assert!(wait_for(acked).await);
+        }
+
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        let warnings = events
+            .iter()
+            .filter(|e| matches!(e, CrawlEvent::JobWarning { message, .. } if message == WARN_AI_NO_PROVIDER))
+            .count();
+        assert_eq!(warnings, 1, "{events:?}");
+        let indexed = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    CrawlEvent::DocumentIndexed {
+                        ai_enriched: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(indexed, 2, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn near_duplicates_are_scoped_per_index_and_ignore_recrawls() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let args = Args::parse_from([
+            "scrapix-worker-content",
+            "--meilisearch-url",
+            &ms.uri(),
+            "--enable-dedup",
+        ]);
+        let storage = MeilisearchStorageBuilder::new(ms.uri(), "documents")
+            .connect()
+            .unwrap();
+        let w = ContentWorker::build(
+            &args,
+            "test".into(),
+            Arc::new(AnyConsumer::from(bus.consumer())),
+            Arc::new(AnyProducer::from(bus.producer())),
+            Some(Arc::new(storage)),
+        );
+
+        let a = page("https://a.test/guide", 200, None);
+        let recrawl = page("https://a.test/guide", 200, None);
+        let mut other_index = page("https://b.test/guide", 200, None);
+        other_index.index_uid = "other".into();
+        let copy = page("https://a.test/copy", 200, None);
+
+        for m in [&a, &recrawl, &other_index] {
+            let (ack, _) = tracked_ack();
+            w.handle_message(m.clone(), ack).await;
+        }
+        let (ack, acked) = tracked_ack();
+        w.handle_message(copy.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst), "duplicate skip is acked");
+
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        let skipped: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                CrawlEvent::DocumentSkipped { url_message_id, .. } => Some(url_message_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skipped, vec![&copy.url_message_id], "{events:?}");
+    }
+
+    #[test]
+    fn ai_usage_events_carry_job_attribution() {
+        let usage = AiUsageEvent {
+            provider: "openai".into(),
+            model: "m".into(),
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            total_tokens: 7,
+            duration_ms: 5,
+            timestamp: chrono::Utc::now(),
+            context: Some(AiUsageContext {
+                job_id: "job".into(),
+                account_id: Some("acct".into()),
+                feature: "ai_summary".into(),
+                url: "https://a.test/".into(),
+            }),
+        };
+        match ai_usage_event(usage.clone()) {
+            Some(CrawlEvent::AiUsage {
+                job_id,
+                account_id,
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                feature,
+                ..
+            }) => {
+                assert_eq!(job_id, "job");
+                assert_eq!(account_id.as_deref(), Some("acct"));
+                assert_eq!(feature, "ai_summary");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let unattributed = AiUsageEvent {
+            context: None,
+            ..usage
+        };
+        assert!(ai_usage_event(unattributed).is_none());
+    }
 }

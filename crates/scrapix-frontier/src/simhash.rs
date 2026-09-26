@@ -336,20 +336,32 @@ impl Default for NearDuplicateConfig {
     }
 }
 
-type MinHashBuckets = Vec<HashMap<u64, Vec<(String, Vec<u64>)>>>;
+/// Fingerprints of one namespace (typically one Meilisearch index).
+///
+/// Entries are keyed by URL so a recrawl of a page replaces its previous
+/// fingerprint instead of being flagged as a duplicate of itself.
+#[derive(Default)]
+struct Namespace {
+    /// SimHash fingerprints: url -> hash
+    simhashes: HashMap<String, u64>,
+    /// MinHash signatures: url -> signature
+    signatures: HashMap<String, Vec<u64>>,
+    /// MinHash LSH buckets (one map per band): band_hash -> urls
+    bands: Vec<HashMap<u64, HashSet<String>>>,
+}
 
 /// Near-duplicate detector using LSH (Locality-Sensitive Hashing)
 ///
-/// Uses either SimHash or MinHash with LSH for efficient near-duplicate detection.
+/// Uses either SimHash or MinHash with LSH for efficient near-duplicate
+/// detection. Fingerprints are scoped by a namespace (the index UID in the
+/// content worker), so tenants writing to different indexes never suppress
+/// each other's pages (R9).
 pub struct NearDuplicateDetector {
     config: NearDuplicateConfig,
     simhash: SimHash,
     minhash: MinHash,
-    /// SimHash fingerprints: hash -> list of (url, original_hash)
-    simhash_buckets: RwLock<HashMap<u64, Vec<(String, u64)>>>,
-    /// MinHash LSH buckets: band_hash -> list of (url, signature)
-    minhash_buckets: RwLock<MinHashBuckets>,
-    /// Total fingerprints stored
+    namespaces: RwLock<HashMap<String, Namespace>>,
+    /// Total fingerprints stored (all namespaces)
     fingerprint_count: AtomicU64,
     /// Statistics
     stats: RwLock<NearDuplicateStats>,
@@ -368,17 +380,18 @@ pub struct NearDuplicateStats {
     pub avg_duplicate_similarity: f64,
 }
 
+/// Namespace used by the namespace-less convenience methods.
+const DEFAULT_NAMESPACE: &str = "";
+
 impl NearDuplicateDetector {
     /// Create a new near-duplicate detector
     pub fn new(config: NearDuplicateConfig) -> Self {
         let minhash = MinHash::with_seed(config.num_minhash_functions, 0x12345678);
-        let num_bands = config.lsh_bands;
 
         Self {
             simhash: SimHash::new(),
             minhash,
-            simhash_buckets: RwLock::new(HashMap::new()),
-            minhash_buckets: RwLock::new(vec![HashMap::new(); num_bands]),
+            namespaces: RwLock::new(HashMap::new()),
             fingerprint_count: AtomicU64::new(0),
             stats: RwLock::new(NearDuplicateStats::default()),
             config,
@@ -390,44 +403,87 @@ impl NearDuplicateDetector {
         Self::new(NearDuplicateConfig::default())
     }
 
-    /// Check if content is a near-duplicate of previously seen content
+    /// Check if `content` at `url` is a near-duplicate of another URL's
+    /// content in `namespace`, and record it when it is not.
     ///
-    /// Returns Some(url) if a near-duplicate was found, None otherwise.
-    /// Also adds the content to the index if it's not a duplicate.
-    pub fn check_and_add(&self, url: &str, content: &str) -> Option<String> {
+    /// Returns `Some(other_url)` when a near-duplicate was found (nothing is
+    /// recorded), `None` otherwise. The page's own previous fingerprint
+    /// (same URL) is ignored and replaced.
+    pub fn check_and_insert(&self, namespace: &str, url: &str, content: &str) -> Option<String> {
         let mut stats = self.stats.write();
         stats.documents_checked += 1;
 
-        if self.config.use_simhash {
-            self.check_simhash(url, content, &mut stats)
+        let found = if self.config.use_simhash {
+            let hash = self.simhash.hash(content);
+            let mut namespaces = self.namespaces.write();
+            let ns = namespaces.entry(namespace.to_string()).or_default();
+            match self.find_similar_simhash(ns, url, hash) {
+                Some((dup, distance)) => Some((dup, 1.0 - (distance as f64 / 64.0))),
+                None => {
+                    self.insert_simhash(ns, url, hash);
+                    None
+                }
+            }
         } else {
-            self.check_minhash(url, content, &mut stats)
+            let signature = self.minhash.signature(content);
+            let mut namespaces = self.namespaces.write();
+            let ns = namespaces.entry(namespace.to_string()).or_default();
+            match self.find_similar_minhash(ns, url, &signature) {
+                Some(found) => Some(found),
+                None => {
+                    self.insert_minhash(ns, url, signature);
+                    None
+                }
+            }
+        };
+
+        match found {
+            Some((dup_url, similarity)) => {
+                stats.duplicates_found += 1;
+                stats.avg_duplicate_similarity = (stats.avg_duplicate_similarity
+                    * (stats.duplicates_found - 1) as f64
+                    + similarity)
+                    / stats.duplicates_found as f64;
+                Some(dup_url)
+            }
+            None => {
+                stats.unique_documents += 1;
+                None
+            }
         }
     }
 
-    /// Check if content is a near-duplicate (without adding to index)
+    /// [`check_and_insert`](Self::check_and_insert) in the default namespace.
+    pub fn check_and_add(&self, url: &str, content: &str) -> Option<String> {
+        self.check_and_insert(DEFAULT_NAMESPACE, url, content)
+    }
+
+    /// Check if content is a near-duplicate in the default namespace
+    /// (without recording it)
     pub fn is_near_duplicate(&self, url: &str, content: &str) -> bool {
+        let namespaces = self.namespaces.read();
+        let Some(ns) = namespaces.get(DEFAULT_NAMESPACE) else {
+            return false;
+        };
         if self.config.use_simhash {
             let hash = self.simhash.hash(content);
-            self.find_similar_simhash(hash).is_some()
+            self.find_similar_simhash(ns, url, hash).is_some()
         } else {
             let signature = self.minhash.signature(content);
-            self.find_similar_minhash(&signature, url).is_some()
+            self.find_similar_minhash(ns, url, &signature).is_some()
         }
     }
 
-    /// Add content to the index without checking for duplicates
+    /// Record content in the default namespace without checking for duplicates
     pub fn add(&self, url: &str, content: &str) {
-        if self.fingerprint_count.load(Ordering::Relaxed) >= self.config.max_fingerprints as u64 {
-            return;
-        }
-
+        let mut namespaces = self.namespaces.write();
+        let ns = namespaces.entry(DEFAULT_NAMESPACE.to_string()).or_default();
         if self.config.use_simhash {
             let hash = self.simhash.hash(content);
-            self.add_simhash(url, hash);
+            self.insert_simhash(ns, url, hash);
         } else {
             let signature = self.minhash.signature(content);
-            self.add_minhash(url, signature);
+            self.insert_minhash(ns, url, signature);
         }
     }
 
@@ -453,122 +509,76 @@ impl NearDuplicateDetector {
 
     /// Clear all stored fingerprints
     pub fn clear(&self) {
-        self.simhash_buckets.write().clear();
-        let mut minhash_buckets = self.minhash_buckets.write();
-        for bucket in minhash_buckets.iter_mut() {
-            bucket.clear();
-        }
+        self.namespaces.write().clear();
         self.fingerprint_count.store(0, Ordering::Relaxed);
         *self.stats.write() = NearDuplicateStats::default();
     }
 
-    // SimHash-based detection
-
-    fn check_simhash(
-        &self,
-        url: &str,
-        content: &str,
-        stats: &mut NearDuplicateStats,
-    ) -> Option<String> {
-        let hash = self.simhash.hash(content);
-
-        // Check for similar hashes
-        if let Some((dup_url, distance)) = self.find_similar_simhash(hash) {
-            stats.duplicates_found += 1;
-            let similarity = 1.0 - (distance as f64 / 64.0);
-            stats.avg_duplicate_similarity =
-                (stats.avg_duplicate_similarity * (stats.duplicates_found - 1) as f64 + similarity)
-                    / stats.duplicates_found as f64;
-            return Some(dup_url);
-        }
-
-        // Not a duplicate - add to index
-        self.add_simhash(url, hash);
-        stats.unique_documents += 1;
-        None
+    /// Whether a new (not replacing) fingerprint may be stored.
+    fn has_capacity(&self) -> bool {
+        self.fingerprint_count.load(Ordering::Relaxed) < self.config.max_fingerprints as u64
     }
 
-    fn find_similar_simhash(&self, hash: u64) -> Option<(String, u32)> {
+    // SimHash-based detection
+
+    fn find_similar_simhash(&self, ns: &Namespace, url: &str, hash: u64) -> Option<(String, u32)> {
         // Zero-hash means empty/no-token content — treat as unique to avoid
         // false collisions between unrelated empty pages.
         if hash == 0 {
             return None;
         }
 
-        let buckets = self.simhash_buckets.read();
-
-        // For small datasets, check all buckets (brute force)
-        // For large datasets, you'd want a more sophisticated LSH approach
-        // Here we use a simple bucketing scheme but check all entries
-        // since the bucket-based optimization can miss near-duplicates
-        // when the top bits differ
-
-        // Check all buckets for similarity
-        for entries in buckets.values() {
-            for (url, stored_hash) in entries {
-                // Skip zero-hash stored entries too
-                if *stored_hash == 0 {
-                    continue;
-                }
-                let distance = SimHash::hamming_distance(hash, *stored_hash);
-                if distance <= self.config.simhash_threshold {
-                    return Some((url.clone(), distance));
-                }
+        // Brute force over the namespace: bucketing by top bits can miss
+        // near-duplicates whose top bits differ.
+        for (stored_url, stored_hash) in &ns.simhashes {
+            if stored_url == url || *stored_hash == 0 {
+                continue;
+            }
+            let distance = SimHash::hamming_distance(hash, *stored_hash);
+            if distance <= self.config.simhash_threshold {
+                return Some((stored_url.clone(), distance));
             }
         }
 
         None
     }
 
-    fn add_simhash(&self, url: &str, hash: u64) {
-        let bucket_key = hash >> 58;
-        let mut buckets = self.simhash_buckets.write();
-        buckets
-            .entry(bucket_key)
-            .or_default()
-            .push((url.to_string(), hash));
+    fn insert_simhash(&self, ns: &mut Namespace, url: &str, hash: u64) {
+        if let Some(existing) = ns.simhashes.get_mut(url) {
+            *existing = hash;
+            return;
+        }
+        if !self.has_capacity() {
+            return;
+        }
+        ns.simhashes.insert(url.to_string(), hash);
         self.fingerprint_count.fetch_add(1, Ordering::Relaxed);
     }
 
     // MinHash-based detection with LSH
 
-    fn check_minhash(
+    fn find_similar_minhash(
         &self,
+        ns: &Namespace,
         url: &str,
-        content: &str,
-        stats: &mut NearDuplicateStats,
-    ) -> Option<String> {
-        let signature = self.minhash.signature(content);
-
-        // Check for similar signatures using LSH
-        if let Some((dup_url, similarity)) = self.find_similar_minhash(&signature, url) {
-            stats.duplicates_found += 1;
-            stats.avg_duplicate_similarity =
-                (stats.avg_duplicate_similarity * (stats.duplicates_found - 1) as f64 + similarity)
-                    / stats.duplicates_found as f64;
-            return Some(dup_url);
-        }
-
-        // Not a duplicate - add to index
-        self.add_minhash(url, signature);
-        stats.unique_documents += 1;
-        None
-    }
-
-    fn find_similar_minhash(&self, signature: &[u64], url: &str) -> Option<(String, f64)> {
+        signature: &[u64],
+    ) -> Option<(String, f64)> {
         let band_hashes = self.compute_band_hashes(signature);
-        let buckets = self.minhash_buckets.read();
 
         for (band_idx, band_hash) in band_hashes.iter().enumerate() {
-            if let Some(entries) = buckets[band_idx].get(band_hash) {
-                for (stored_url, stored_sig) in entries {
-                    if stored_url == url {
-                        continue; // Skip self
-                    }
-                    let similarity = MinHash::jaccard_similarity(signature, stored_sig);
-                    if similarity >= self.config.minhash_threshold {
-                        return Some((stored_url.clone(), similarity));
-                    }
+            let Some(urls) = ns.bands.get(band_idx).and_then(|b| b.get(band_hash)) else {
+                continue;
+            };
+            for stored_url in urls {
+                if stored_url == url {
+                    continue; // Skip the page's own previous version
+                }
+                let Some(stored_sig) = ns.signatures.get(stored_url) else {
+                    continue;
+                };
+                let similarity = MinHash::jaccard_similarity(signature, stored_sig);
+                if similarity >= self.config.minhash_threshold {
+                    return Some((stored_url.clone(), similarity));
                 }
             }
         }
@@ -576,18 +586,33 @@ impl NearDuplicateDetector {
         None
     }
 
-    fn add_minhash(&self, url: &str, signature: Vec<u64>) {
-        let band_hashes = self.compute_band_hashes(&signature);
-        let mut buckets = self.minhash_buckets.write();
-
-        for (band_idx, band_hash) in band_hashes.into_iter().enumerate() {
-            buckets[band_idx]
-                .entry(band_hash)
-                .or_default()
-                .push((url.to_string(), signature.clone()));
+    fn insert_minhash(&self, ns: &mut Namespace, url: &str, signature: Vec<u64>) {
+        if ns.bands.is_empty() {
+            ns.bands = vec![HashMap::new(); self.config.lsh_bands];
+        }
+        if let Some(old) = ns.signatures.remove(url) {
+            // Replace: drop the previous version from its LSH buckets.
+            for (band_idx, band_hash) in self.compute_band_hashes(&old).into_iter().enumerate() {
+                if let Some(urls) = ns.bands[band_idx].get_mut(&band_hash) {
+                    urls.remove(url);
+                    if urls.is_empty() {
+                        ns.bands[band_idx].remove(&band_hash);
+                    }
+                }
+            }
+        } else if !self.has_capacity() {
+            return;
+        } else {
+            self.fingerprint_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.fingerprint_count.fetch_add(1, Ordering::Relaxed);
+        for (band_idx, band_hash) in self.compute_band_hashes(&signature).into_iter().enumerate() {
+            ns.bands[band_idx]
+                .entry(band_hash)
+                .or_default()
+                .insert(url.to_string());
+        }
+        ns.signatures.insert(url.to_string(), signature);
     }
 
     fn compute_band_hashes(&self, signature: &[u64]) -> Vec<u64> {
@@ -597,7 +622,7 @@ impl NearDuplicateDetector {
         for band in 0..self.config.lsh_bands {
             let start = band * rows_per_band;
             let end = start + rows_per_band;
-            let band_slice = &signature[start..end.min(signature.len())];
+            let band_slice = &signature[start.min(signature.len())..end.min(signature.len())];
 
             // Hash the band
             let mut hasher = SipHasher13::new();
@@ -730,6 +755,59 @@ impl DuplicateClusterer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ~500 words of text for namespace / recrawl tests.
+    const LONG_TEXT: &str = "alpha data bravo charlie delta echo foxtrot golf hotel data india juliet kilo lima mike november oscar data papa quebec romeo sierra tango uniform victor data whiskey xray yankee zulu crawler index search data engine document frontier worker content parser markdown data language schema metadata block heading anchor summary data extraction token vector alpha bravo charlie delta data echo foxtrot golf hotel india juliet kilo data lima mike november oscar papa quebec romeo data sierra tango uniform victor whiskey xray yankee data zulu crawler index search engine document frontier data worker content parser markdown language schema metadata data block heading anchor summary extraction token vector data alpha bravo charlie delta echo foxtrot golf data hotel india juliet kilo lima mike november data oscar papa quebec romeo sierra tango uniform data victor whiskey xray yankee zulu crawler index data search engine document frontier worker content parser data markdown language schema metadata block heading anchor data summary extraction token vector alpha bravo charlie data delta echo foxtrot golf hotel india juliet data kilo lima mike november oscar papa quebec data romeo sierra tango uniform victor whiskey xray data yankee zulu crawler index search engine document data frontier worker content parser markdown language schema data metadata block heading anchor summary extraction token data vector alpha bravo charlie delta echo foxtrot data golf hotel india juliet kilo lima mike data november oscar papa quebec romeo sierra tango data uniform victor whiskey xray yankee zulu crawler data index search engine document frontier worker content data parser markdown language schema metadata block heading data anchor summary extraction token vector alpha bravo data charlie delta echo foxtrot golf hotel india data juliet kilo lima mike november oscar papa data quebec romeo sierra tango uniform victor whiskey data xray yankee zulu crawler index search engine data document frontier worker content parser markdown language data schema metadata block heading anchor summary extraction data token vector alpha bravo charlie delta echo data foxtrot golf hotel india juliet kilo lima data mike november oscar papa quebec romeo sierra data tango uniform victor whiskey xray yankee zulu data crawler index search engine document frontier worker data content parser markdown language schema metadata block data heading anchor summary extraction token vector alpha data bravo charlie delta echo foxtrot golf hotel data india juliet kilo lima mike november oscar data papa quebec romeo sierra tango uniform victor data whiskey xray yankee zulu crawler index search data engine document frontier worker content parser markdown data language schema metadata block heading anchor summary data extraction token vector alpha bravo charlie delta data echo foxtrot golf hotel india juliet kilo data lima mike november oscar papa quebec romeo data sierra tango uniform victor whiskey xray yankee data zulu crawler index search engine document frontier data worker content parser markdown language schema metadata data block heading anchor summary extraction token vector data alpha bravo charlie delta echo foxtrot golf data hotel india juliet kilo lima mike november data oscar papa";
+
+    #[test]
+    fn same_url_recrawl_is_not_a_duplicate() {
+        let d = NearDuplicateDetector::new(Default::default());
+        assert!(d
+            .check_and_insert("idx", "https://a.test/p", LONG_TEXT)
+            .is_none());
+        assert!(d
+            .check_and_insert("idx", "https://a.test/p", LONG_TEXT)
+            .is_none());
+        // The recrawl replaced the entry instead of adding a second one.
+        assert_eq!(d.fingerprint_count(), 1);
+    }
+
+    #[test]
+    fn namespaces_do_not_collide() {
+        let d = NearDuplicateDetector::new(Default::default());
+        assert!(d
+            .check_and_insert("idx1", "https://a.test/p", LONG_TEXT)
+            .is_none());
+        assert!(d
+            .check_and_insert("idx2", "https://b.test/p", LONG_TEXT)
+            .is_none());
+        assert_eq!(
+            d.check_and_insert("idx1", "https://a.test/copy", LONG_TEXT)
+                .as_deref(),
+            Some("https://a.test/p")
+        );
+    }
+
+    #[test]
+    fn minhash_same_url_recrawl_and_namespaces() {
+        let d = NearDuplicateDetector::new(NearDuplicateConfig {
+            use_simhash: false,
+            ..Default::default()
+        });
+        assert!(d
+            .check_and_insert("idx1", "https://a.test/p", LONG_TEXT)
+            .is_none());
+        assert!(d
+            .check_and_insert("idx1", "https://a.test/p", LONG_TEXT)
+            .is_none());
+        assert!(d
+            .check_and_insert("idx2", "https://b.test/p", LONG_TEXT)
+            .is_none());
+        assert!(d
+            .check_and_insert("idx1", "https://a.test/copy", LONG_TEXT)
+            .is_some());
+        assert_eq!(d.fingerprint_count(), 2);
+    }
 
     #[test]
     fn test_simhash_similar_documents() {

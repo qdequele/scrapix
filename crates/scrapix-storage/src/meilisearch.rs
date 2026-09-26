@@ -2,6 +2,7 @@
 //!
 //! Primary storage for documents with full-text search, metadata, and vector capabilities.
 
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,8 +16,8 @@ use meilisearch_sdk::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use scrapix_core::config::FeaturesConfig;
-use scrapix_core::{Document, Result, ScrapixError};
+use scrapix_core::config::{FeaturesConfig, MeilisearchSettings};
+use scrapix_core::{Ack, Document, JobSpec, Result, ScrapixError};
 
 /// Meilisearch configuration
 #[derive(Debug, Clone)]
@@ -82,35 +83,64 @@ impl Default for MeilisearchConfig {
     }
 }
 
+/// Buffered documents waiting to be sent, each with the [`Ack`] of the
+/// message it came from.
+type PendingBatch = VecDeque<(Document, Ack)>;
+
 /// Meilisearch storage backend
+///
+/// Documents are buffered per target index together with an [`Ack`]. A
+/// flush sends each index's buffer in batches of `batch_size`; the acks of a
+/// batch fire only once Meilisearch accepted it (HTTP 202 + task uid). A
+/// rejected batch keeps its (document, ack) pairs, in order, for the next
+/// flush. Waiting for the Meilisearch task itself to succeed is out of scope
+/// (the API checks failed tasks at job completion).
 pub struct MeilisearchStorage {
     client: Client,
     config: MeilisearchConfig,
     index: Index,
-    pending_docs: parking_lot::Mutex<Vec<Document>>,
+    pending: parking_lot::Mutex<HashMap<String, PendingBatch>>,
+    /// Serializes flushes so a failed batch is re-queued before the next
+    /// attempt reads the buffer (keeps per-index order, no double sends).
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl MeilisearchStorage {
-    /// Create a new Meilisearch storage client
+    /// Create a new Meilisearch storage client and initialize the default
+    /// index (created if missing, base settings applied).
     pub async fn new(config: MeilisearchConfig) -> Result<Self> {
+        let storage = Self::connect(config)?;
+        storage.initialize_index().await?;
+        Ok(storage)
+    }
+
+    /// Create a storage client without touching Meilisearch (no index
+    /// creation, no settings). Index setup is left to
+    /// [`configure_index`](Self::configure_index), which honors per-job
+    /// `keep_settings`.
+    pub fn connect(config: MeilisearchConfig) -> Result<Self> {
         let client = Client::new(&config.url, config.api_key.as_deref()).map_err(|e| {
             ScrapixError::Storage(format!("Failed to create Meilisearch client: {}", e))
         })?;
-
-        // Get or create index
         let index = client.index(&config.index_uid);
 
-        let storage = Self {
+        Ok(Self {
             client,
             config,
             index,
-            pending_docs: parking_lot::Mutex::new(Vec::new()),
-        };
+            pending: parking_lot::Mutex::new(HashMap::new()),
+            flush_lock: tokio::sync::Mutex::new(()),
+        })
+    }
 
-        // Initialize index settings
-        storage.initialize_index().await?;
+    /// Primary key used for index creation and document additions.
+    pub fn primary_key(&self) -> &str {
+        &self.config.primary_key
+    }
 
-        Ok(storage)
+    /// Documents per Meilisearch request.
+    pub fn batch_size(&self) -> usize {
+        self.config.batch_size.max(1)
     }
 
     /// Initialize index with configured settings
@@ -164,191 +194,159 @@ impl MeilisearchStorage {
         Ok(())
     }
 
-    /// Add a single document to the index
-    #[instrument(skip(self, doc), fields(url = %doc.url))]
+    /// Add a single document to the default index (no ack tracking)
     pub async fn add_document(&self, doc: Document) -> Result<()> {
-        // Extract docs to flush in a separate scope
-        let docs_to_flush = {
-            let mut pending = self.pending_docs.lock();
-            pending.push(doc);
-
-            // Check if we need to flush
-            if pending.len() >= self.config.batch_size {
-                Some(std::mem::take(&mut *pending))
-            } else {
-                None
-            }
-        };
-
-        // Flush outside the lock
-        if let Some(docs) = docs_to_flush {
-            self.index_documents(docs).await?;
-        }
-
-        Ok(())
+        let index_uid = self.config.index_uid.clone();
+        self.add_document_to_index(doc, &index_uid, Ack::noop())
+            .await
     }
 
-    /// Add multiple documents to the index
+    /// Add multiple documents to the default index (no ack tracking)
     pub async fn add_documents(&self, docs: Vec<Document>) -> Result<()> {
-        if docs.is_empty() {
-            return Ok(());
+        for doc in docs {
+            self.add_document(doc).await?;
         }
-
-        // Extract docs to flush in a separate scope
-        let docs_to_flush = {
-            let mut pending = self.pending_docs.lock();
-            pending.extend(docs);
-
-            // Check if we need to flush
-            if pending.len() >= self.config.batch_size {
-                Some(std::mem::take(&mut *pending))
-            } else {
-                None
-            }
-        };
-
-        // Flush outside the lock
-        if let Some(docs) = docs_to_flush {
-            self.index_documents(docs).await?;
-        }
-
         Ok(())
     }
 
-    /// Flush pending documents to the index
-    /// Returns the number of documents flushed
-    pub async fn flush(&self) -> Result<usize> {
-        let docs = {
-            let mut pending = self.pending_docs.lock();
-            std::mem::take(&mut *pending)
-        };
-
-        let count = docs.len();
-        if !docs.is_empty() {
-            self.index_documents(docs).await?;
-        }
-
-        Ok(count)
-    }
-
-    /// Index documents (internal, fire-and-forget)
+    /// Buffer `doc` for `index_uid`; `ack` fires once Meilisearch accepted
+    /// the batch containing it.
     ///
-    /// Submits documents to Meilisearch and returns immediately without waiting
-    /// for the indexing task to complete. Meilisearch processes tasks asynchronously.
-    /// Use `wait_for_task()` if you need to confirm completion.
-    async fn index_documents(&self, docs: Vec<Document>) -> Result<()> {
-        if docs.is_empty() {
-            return Ok(());
+    /// Reaching `batch_size` buffered documents for the index sends them
+    /// right away. Backpressure: while `4 * batch_size` documents are
+    /// already buffered for the index (Meilisearch keeps rejecting them),
+    /// this waits and retries the flush before buffering more.
+    #[instrument(skip(self, doc, ack), fields(url = %doc.url, index = %index_uid))]
+    pub async fn add_document_to_index(
+        &self,
+        doc: Document,
+        index_uid: &str,
+        ack: Ack,
+    ) -> Result<()> {
+        let batch_size = self.batch_size();
+        let mut backoff = Duration::from_millis(500);
+        while self.pending_for(index_uid) >= 4 * batch_size {
+            if let Err(e) = self.flush_index(index_uid).await {
+                warn!(
+                    index = %index_uid,
+                    error = %e,
+                    retry_in_ms = backoff.as_millis() as u64,
+                    "Meilisearch buffer full and flush failed; waiting before retry"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+            }
         }
 
-        let count = docs.len();
-        debug!(count, "Submitting documents to Meilisearch");
+        let buffered = {
+            let mut pending = self.pending.lock();
+            let queue = pending.entry(index_uid.to_string()).or_default();
+            queue.push_back((doc, ack));
+            queue.len()
+        };
 
-        let task = self
-            .index
-            .add_documents(&docs, Some(&self.config.primary_key))
-            .await
-            .map_err(|e| ScrapixError::Storage(format!("Failed to add documents: {}", e)))?;
-
-        info!(
-            count,
-            task_uid = task.task_uid,
-            index = %self.config.index_uid,
-            "Documents submitted to Meilisearch (fire-and-forget)"
-        );
+        if buffered >= batch_size {
+            // A failed send keeps the documents buffered; the periodic flush
+            // (or the next add) retries them.
+            if let Err(e) = self.flush_index(index_uid).await {
+                warn!(index = %index_uid, error = %e, "Batch flush failed; documents kept for retry");
+            }
+        }
 
         Ok(())
     }
 
-    /// Add a document directly to a specific index (bypasses batching)
-    /// This is used when messages specify their own index_uid
-    #[instrument(skip(self, doc), fields(url = %doc.url, index = %index_uid))]
-    pub async fn add_document_to_index(&self, doc: Document, index_uid: &str) -> Result<()> {
-        // Use the default index if the index_uid matches
-        if index_uid == self.config.index_uid {
-            return self.add_document(doc).await;
-        }
-
-        // Get or create the target index
-        let index = self.client.index(index_uid);
-
-        // Create the index if it doesn't exist (fire and forget, might already exist)
-        let _ = self
-            .client
-            .create_index(index_uid, Some(&self.config.primary_key))
-            .await;
-
-        // Configure index settings (same as default index)
-        let mut settings = Settings::new();
-        settings = settings
-            .with_searchable_attributes(&self.config.searchable_attributes)
-            .with_filterable_attributes(&self.config.filterable_attributes)
-            .with_sortable_attributes(&self.config.sortable_attributes)
-            .with_pagination(PaginationSetting {
-                max_total_hits: self.config.max_total_hits,
-            });
-
-        if let Some(ref distinct) = self.config.distinct_attribute {
-            settings = settings.with_distinct_attribute(Some(distinct));
-        }
-
-        let _ = index.set_settings(&settings).await;
-
-        // Index the document (fire-and-forget)
-        let task = index
-            .add_documents(&[doc], Some(&self.config.primary_key))
-            .await
-            .map_err(|e| {
-                ScrapixError::Storage(format!("Failed to add document to {}: {}", index_uid, e))
-            })?;
-
-        debug!(
-            task_uid = task.task_uid,
-            index = %index_uid,
-            "Document submitted to specific index (fire-and-forget)"
-        );
-
-        Ok(())
+    /// Number of buffered (not yet accepted) documents, all indexes.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().values().map(VecDeque::len).sum()
     }
 
-    /// Add multiple documents directly to a specific index (bypasses batching)
-    pub async fn add_documents_to_index(&self, docs: Vec<Document>, index_uid: &str) -> Result<()> {
-        if docs.is_empty() {
-            return Ok(());
+    fn pending_for(&self, index_uid: &str) -> usize {
+        self.pending.lock().get(index_uid).map_or(0, VecDeque::len)
+    }
+
+    /// Flush every index's buffer. Returns the number of documents accepted
+    /// by Meilisearch (and acked); errors if any batch was rejected (its
+    /// documents stay buffered, un-acked).
+    pub async fn flush(&self) -> Result<usize> {
+        let indexes: Vec<String> = self.pending.lock().keys().cloned().collect();
+        let mut accepted = 0;
+        let mut first_error = None;
+        for index_uid in indexes {
+            match self.flush_index(&index_uid).await {
+                Ok(n) => accepted += n,
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
         }
-
-        // Use the default index if the index_uid matches
-        if index_uid == self.config.index_uid {
-            return self.add_documents(docs).await;
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(accepted),
         }
+    }
 
-        let count = docs.len();
-
-        // Get or create the target index
+    /// Send `index_uid`'s buffer in `batch_size` batches, acking each batch
+    /// once accepted. Stops at the first rejected batch, putting it back at
+    /// the front of the buffer.
+    async fn flush_index(&self, index_uid: &str) -> Result<usize> {
+        let _guard = self.flush_lock.lock().await;
+        let batch_size = self.batch_size();
         let index = self.client.index(index_uid);
+        let mut accepted = 0;
 
-        // Create the index if it doesn't exist
-        let _ = self
-            .client
-            .create_index(index_uid, Some(&self.config.primary_key))
-            .await;
+        loop {
+            let batch: Vec<(Document, Ack)> = {
+                let mut pending = self.pending.lock();
+                let Some(queue) = pending.get_mut(index_uid) else {
+                    break;
+                };
+                let n = queue.len().min(batch_size);
+                let batch = queue.drain(..n).collect();
+                if queue.is_empty() {
+                    pending.remove(index_uid);
+                }
+                batch
+            };
+            if batch.is_empty() {
+                break;
+            }
 
-        // Index the documents (fire-and-forget)
-        let task = index
-            .add_documents(&docs, Some(&self.config.primary_key))
-            .await
-            .map_err(|e| {
-                ScrapixError::Storage(format!("Failed to add documents to {}: {}", index_uid, e))
-            })?;
+            let (docs, acks): (Vec<Document>, Vec<Ack>) = batch.into_iter().unzip();
+            let count = docs.len();
+            debug!(count, index = %index_uid, "Submitting documents to Meilisearch");
 
-        info!(
-            count,
-            task_uid = task.task_uid,
-            index = %index_uid,
-            "Documents submitted to specific index (fire-and-forget)"
-        );
+            match index
+                .add_documents(&docs, Some(&self.config.primary_key))
+                .await
+            {
+                Ok(task) => {
+                    for ack in acks {
+                        ack.ack();
+                    }
+                    accepted += count;
+                    info!(
+                        count,
+                        task_uid = task.task_uid,
+                        index = %index_uid,
+                        "Documents accepted by Meilisearch"
+                    );
+                }
+                Err(e) => {
+                    let mut pending = self.pending.lock();
+                    let queue = pending.entry(index_uid.to_string()).or_default();
+                    for pair in docs.into_iter().zip(acks).rev() {
+                        queue.push_front(pair);
+                    }
+                    return Err(ScrapixError::Storage(format!(
+                        "Failed to add documents to {}: {}",
+                        index_uid, e
+                    )));
+                }
+            }
+        }
 
-        Ok(())
+        Ok(accepted)
     }
 
     /// Wait for a Meilisearch task to complete by polling.
@@ -381,18 +379,74 @@ impl MeilisearchStorage {
         }
     }
 
-    /// Configure index settings based on enabled features.
+    /// Prepare `index_uid` for a job: create it (with this storage's
+    /// primary key) when missing, then apply settings derived from the
+    /// job's features with the job's `index_settings` merged over them.
     ///
-    /// Dynamically adjusts searchable, filterable, and sortable attributes
-    /// depending on which features are active for the crawl job. Also sets
-    /// the distinct attribute when block splitting is enabled.
-    pub async fn configure_index_for_features(&self, index_uid: &str, features: &FeaturesConfig) {
-        let index = if index_uid == self.config.index_uid {
-            self.index.clone()
-        } else {
-            self.client.index(index_uid)
+    /// With `spec.keep_settings` an already existing index is left
+    /// untouched. Failures are logged, not returned: documents are still
+    /// indexed with whatever settings the index has.
+    pub async fn configure_index(
+        &self,
+        index_uid: &str,
+        features: &FeaturesConfig,
+        spec: Option<&JobSpec>,
+    ) {
+        let keep_settings = spec.is_some_and(|s| s.keep_settings);
+        let exists = match self.client.get_index(index_uid).await {
+            Ok(_) => true,
+            Err(meilisearch_sdk::errors::Error::Meilisearch(e))
+                if e.error_code == meilisearch_sdk::errors::ErrorCode::IndexNotFound =>
+            {
+                false
+            }
+            Err(e) => {
+                // Unknown: don't create it, and never overwrite settings the
+                // job asked to keep.
+                warn!(index = %index_uid, error = %e, "Failed to look up index");
+                if keep_settings {
+                    return;
+                }
+                true
+            }
         };
 
+        if !exists {
+            // Tasks on one index run in order, so settings and documents
+            // submitted after this are applied to the created index.
+            if let Err(e) = self
+                .client
+                .create_index(index_uid, Some(&self.config.primary_key))
+                .await
+            {
+                warn!(index = %index_uid, error = %e, "Failed to create index");
+            }
+        } else if keep_settings {
+            info!(index = %index_uid, "keep_settings: leaving existing index settings untouched");
+            return;
+        }
+
+        let overrides = spec.and_then(|s| s.index_settings.as_ref());
+        let settings = self.job_settings(features, overrides);
+        match self.client.index(index_uid).set_settings(&settings).await {
+            Ok(_) => info!(index = %index_uid, "Configured index settings for job"),
+            Err(e) => warn!(
+                index = %index_uid,
+                error = %e,
+                "Failed to configure index settings for job"
+            ),
+        }
+    }
+
+    /// Settings for a job: attributes dynamically derived from the enabled
+    /// features, then each field the job set in `overrides` replaces the
+    /// derived value. `_crawl_job_id` always stays filterable (the Replace
+    /// index strategy deletes stale documents by filtering on it).
+    fn job_settings(
+        &self,
+        features: &FeaturesConfig,
+        overrides: Option<&MeilisearchSettings>,
+    ) -> Settings {
         // Start from the base configured attributes
         let mut searchable = self.config.searchable_attributes.clone();
         let mut filterable = self.config.filterable_attributes.clone();
@@ -431,6 +485,7 @@ impl MeilisearchStorage {
         }
 
         // Block split: add heading sub-levels, block navigation fields, and distinct
+        let mut distinct = None;
         if features.block_split_enabled() {
             searchable.extend(["h4".to_string(), "h5".to_string(), "h6".to_string()]);
             filterable.extend([
@@ -439,34 +494,45 @@ impl MeilisearchStorage {
                 "anchor".to_string(),
             ]);
             sortable.push("page_block".to_string());
+            distinct = Some("parent_document_id".to_string());
         }
 
-        // Build settings
-        let mut settings = Settings::new()
+        let mut settings = Settings::new();
+        if let Some(o) = overrides {
+            if let Some(ref v) = o.searchable_attributes {
+                searchable = v.clone();
+            }
+            if let Some(ref v) = o.filterable_attributes {
+                filterable = v.clone();
+            }
+            if let Some(ref v) = o.sortable_attributes {
+                sortable = v.clone();
+            }
+            if let Some(ref v) = o.distinct_attribute {
+                distinct = Some(v.clone());
+            }
+            if let Some(ref v) = o.ranking_rules {
+                settings = settings.with_ranking_rules(v);
+            }
+            if let Some(ref v) = o.stop_words {
+                settings = settings.with_stop_words(v);
+            }
+            if let Some(ref v) = o.synonyms {
+                settings = settings.with_synonyms(v.clone());
+            }
+        }
+        if !filterable.iter().any(|f| f == "_crawl_job_id") {
+            filterable.push("_crawl_job_id".to_string());
+        }
+
+        settings = settings
             .with_searchable_attributes(&searchable)
             .with_filterable_attributes(&filterable)
             .with_sortable_attributes(&sortable);
-
-        // Set distinct attribute for block-split mode
-        if features.block_split_enabled() {
-            settings = settings.with_distinct_attribute(Some("parent_document_id"));
+        if let Some(ref d) = distinct {
+            settings = settings.with_distinct_attribute(Some(d));
         }
-
-        match index.set_settings(&settings).await {
-            Ok(_) => {
-                info!(
-                    index = %index_uid,
-                    "Configured index settings for enabled features"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    index = %index_uid,
-                    error = %e,
-                    "Failed to configure index settings for features"
-                );
-            }
-        }
+        settings
     }
 
     /// Get document count in the index
@@ -892,6 +958,11 @@ impl MeilisearchStorageBuilder {
 
     pub async fn build(self) -> Result<MeilisearchStorage> {
         MeilisearchStorage::new(self.config).await
+    }
+
+    /// Build without touching Meilisearch (see [`MeilisearchStorage::connect`]).
+    pub fn connect(self) -> Result<MeilisearchStorage> {
+        MeilisearchStorage::connect(self.config)
     }
 }
 
