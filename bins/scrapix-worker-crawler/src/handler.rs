@@ -406,16 +406,15 @@ impl CrawlerWorker {
         // first fetch (Task 7 moves it to a per-job flow). Once
         // `sitemap_pending` is true, `maybe_discover_sitemaps` guarantees a
         // `SitemapPublished` for `msg.message_id` on every path (disabled
-        // parser, no sitemaps, fetch error), so accounting never waits
-        // forever for it.
+        // parser, no sitemaps, fetch error) and cannot itself fail, so
+        // accounting never waits forever for it and there's nothing for the
+        // spawned task to report back.
         if sitemap_pending {
             let domain = domain.expect("sitemap_pending is only true when domain is Some");
             let worker = self.clone();
             let parent = msg.clone();
             tokio::spawn(async move {
-                if let Err(e) = worker.maybe_discover_sitemaps(&domain, &parent).await {
-                    debug!(domain, error = %e, "Sitemap discovery failed");
-                }
+                worker.maybe_discover_sitemaps(&domain, &parent).await;
             });
         }
 
@@ -719,6 +718,42 @@ mod tests {
         out
     }
 
+    /// Poll `c` until an item matching `pred` is seen, or `overall` elapses,
+    /// returning every item observed along the way (matched or not) for use
+    /// in assertion failure messages. Needed for events published from a
+    /// task the handler spawns and detaches (e.g. background sitemap
+    /// discovery, R-18): `handle_message` can return, and this function's
+    /// caller can start draining, before that task's publish lands.
+    async fn wait_for_event<T, F>(c: &AnyConsumer, overall: Duration, mut pred: F) -> Vec<T>
+    where
+        T: DeserializeOwned + Send,
+        F: FnMut(&T) -> bool,
+    {
+        let deadline = Instant::now() + overall;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return seen;
+            }
+            match c
+                .poll_one::<T>(remaining.min(Duration::from_millis(100)))
+                .await
+                .unwrap()
+            {
+                Some(item) => {
+                    let matched = pred(&item);
+                    seen.push(item);
+                    if matched {
+                        return seen;
+                    }
+                }
+                None if Instant::now() >= deadline => return seen,
+                None => {}
+            }
+        }
+    }
+
     fn tracked_ack() -> (Ack, Arc<AtomicBool>) {
         let acked = Arc::new(AtomicBool::new(false));
         let flag = acked.clone();
@@ -817,8 +852,13 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // robots.txt and sitemap.xml are intentionally left unmounted: the
-        // mock server 404s both, so sitemap discovery finds nothing.
+        // Discovery derives its target from the crawled page's *host only*
+        // (`url::Url::host_str()`, no port) and always uses `https://`, so
+        // it requests `https://{domain}:443/robots.txt` — not the wiremock
+        // server's own (HTTP, random-port) address. Nothing listens on
+        // port 443 here, so both the robots.txt and (fallback) sitemap.xml
+        // fetches fail with a connection error, not a 404, and discovery
+        // finds nothing.
         let bus = ChannelBus::new();
         let t = topics(&bus);
         let w = worker_with_sitemaps(&bus).await;
@@ -828,7 +868,17 @@ mod tests {
         w.handle_message(msg.clone(), ack).await;
         assert!(acked.load(Ordering::SeqCst));
 
-        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        // `SitemapPublished` comes from a task `on_crawled` spawns and
+        // detaches, so it can still be in flight after `handle_message`
+        // returns — poll with a bounded timeout instead of draining once.
+        let events: Vec<CrawlEvent> = wait_for_event(&t.events, Duration::from_secs(10), |e| {
+            matches!(
+                e,
+                CrawlEvent::SitemapPublished { url_message_id, .. }
+                    if *url_message_id == msg.message_id
+            )
+        })
+        .await;
         assert!(
             events.iter().any(|e| matches!(
                 e,

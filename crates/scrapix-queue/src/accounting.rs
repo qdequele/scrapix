@@ -56,11 +56,24 @@
 //! finish well after the page's own crawl/content outcomes have landed — and
 //! after the job would otherwise look balanced. `PageCrawled.sitemap_pending`
 //! marks the one message per `(job, domain)` that spawned a first-time
-//! discovery; `sitemaps_expected` counts those, and `sitemaps_settled` counts
-//! the matching `SitemapPublished` events (which the crawler is required to
-//! publish on every path — success, empty, disabled, or error — so this
-//! always eventually catches up). `is_balanced` additionally requires
-//! `sitemaps_settled >= sitemaps_expected`.
+//! discovery; its `url_message_id` is recorded in `pending_sitemaps`, and
+//! each `SitemapPublished`'s `url_message_id` is recorded in
+//! `settled_sitemaps` (the crawler is required to publish `SitemapPublished`
+//! on every path — success, empty, disabled, or error — so every pending id
+//! is guaranteed to eventually settle). `is_balanced` requires
+//! `pending_sitemaps` to be a subset of `settled_sitemaps`: every *specific*
+//! pending id must have its own matching settlement.
+//!
+//! An earlier version of this compared **counts**
+//! (`sitemaps_settled >= sitemaps_expected`) instead of identities. That is
+//! unsound: an unrelated/surplus settlement (any `SitemapPublished` not
+//! matching a currently-pending id) inflates the settled count without
+//! resolving anyone's actual pending discovery, so the count check can pass
+//! while a real pending id is still outstanding — the job then balances
+//! early. Tracking the ids themselves and requiring the subset relation
+//! closes this: a settled id with no pending entry is simply ignored
+//! (harmless), and a pending id is never satisfied by any settlement other
+//! than its own.
 //!
 //! ## Empty `url_message_id` and rolling deploys
 //!
@@ -77,14 +90,26 @@
 //!
 //! ## Memory
 //!
-//! `seen_crawl`, `seen_content` and `seen_sitemap` grow with the number of
-//! distinct `url_message_id`s observed for the job (one entry per
-//! crawled/retried page, one per content outcome, and one per sitemap-
-//! discovery-triggering page). They are unbounded for the lifetime of a
-//! single `JobAccounting` instance, which is why they are `#[serde(skip)]`:
-//! the persisted (Task 14) representation only keeps the aggregate counters,
-//! and the caller is expected to drop the whole `JobAccounting` (seen-sets
-//! included) once a job completes, rather than keep accumulating across jobs.
+//! `seen_crawl` and `seen_content` grow with the number of distinct
+//! `url_message_id`s observed for the job (one entry per crawled/retried
+//! page, one per content outcome) — unbounded for the lifetime of a single
+//! `JobAccounting` instance, which is why they are `#[serde(skip)]`: the
+//! persisted (Task 14) representation only keeps the aggregate counters for
+//! them, and the caller is expected to drop the whole `JobAccounting`
+//! (seen-sets included) once a job completes, rather than keep accumulating
+//! across jobs.
+//!
+//! `pending_sitemaps` and `settled_sitemaps` are different: `is_balanced`
+//! needs their actual *contents* (the subset check above), not just a count,
+//! so a count alone would not let a restarted caller resume correctly from a
+//! persisted (Task 14, jsonb) snapshot. Rather than keep them `#[serde(skip)]`
+//! and separately persist counts (which would have to be kept in exact sync
+//! with the sets by hand, for no real memory saving), the simplest correct
+//! choice is to make both sets part of the persisted struct directly. This
+//! is safe to do because — unlike `seen_crawl`/`seen_content`, which have one
+//! entry per *page* — these two have at most one entry per distinct
+//! sitemap-discovery-triggering `(job, domain)` pair, i.e. one per domain the
+//! job crawls, which is small relative to the page count for any real job.
 
 use std::collections::HashSet;
 
@@ -130,19 +155,23 @@ pub struct JobAccounting {
     pub content_outcomes: u64,
     pub documents_indexed: u64,
     pub pages_ai: u64,
-    /// Number of messages that spawned a first-time sitemap discovery for
-    /// their `(job, domain)` (`PageCrawled.sitemap_pending`, R-18).
-    pub sitemaps_expected: u64,
-    /// Number of matching `SitemapPublished` events observed (deduped by
-    /// `url_message_id`).
-    pub sitemaps_settled: u64,
+    /// `url_message_id`s of `PageCrawled` messages that spawned a
+    /// first-time sitemap discovery for their `(job, domain)`
+    /// (`PageCrawled.sitemap_pending`, R-18). `is_balanced` requires this
+    /// to be a subset of `settled_sitemaps` — see the module-level R-18
+    /// docs for why identity, not just count, is tracked. Persisted (not
+    /// `#[serde(skip)]`): see the module-level "Memory" docs.
+    pub pending_sitemaps: HashSet<String>,
+    /// `url_message_id`s of observed `SitemapPublished` events. Also
+    /// doubles as the dedup set for `links_published` accumulation (a
+    /// redelivered `SitemapPublished` for an id already in this set does
+    /// not re-add its `count`). See `pending_sitemaps`.
+    pub settled_sitemaps: HashSet<String>,
 
     #[serde(skip)]
     seen_crawl: HashSet<String>,
     #[serde(skip)]
     seen_content: HashSet<String>,
-    #[serde(skip)]
-    seen_sitemap: HashSet<String>,
 }
 
 impl JobAccounting {
@@ -172,8 +201,13 @@ impl JobAccounting {
                     if *js_rendered {
                         self.pages_browser += 1;
                     }
-                    if *sitemap_pending {
-                        self.sitemaps_expected += 1;
+                    // An empty id can't be tracked by identity; it also
+                    // can't happen in practice (sitemap_pending is only
+                    // ever set alongside a real `parent.message_id`), but
+                    // guard it anyway rather than let `""` poison the
+                    // subset check.
+                    if *sitemap_pending && !url_message_id.is_empty() {
+                        self.pending_sitemaps.insert(url_message_id.clone());
                     }
                 }
             }
@@ -222,9 +256,14 @@ impl JobAccounting {
                 url_message_id,
                 ..
             } => {
-                if Self::first_time(&mut self.seen_sitemap, url_message_id) {
+                // `first_time` both dedupes the `links_published` add (a
+                // redelivered SitemapPublished must not double-count its
+                // links) and records the id in `settled_sitemaps` as a side
+                // effect (an empty id is never inserted, matching how an
+                // empty-id `pending_sitemaps` entry is never created
+                // either — see above).
+                if Self::first_time(&mut self.settled_sitemaps, url_message_id) {
                     self.links_published += *count as u64;
-                    self.sitemaps_settled += 1;
                 }
             }
             CrawlEvent::FrontierProgress {
@@ -281,7 +320,7 @@ impl JobAccounting {
             && self.frontier.queued == 0
             && self.crawl_outcomes >= self.frontier.dispatched
             && self.content_outcomes >= self.pages_crawled_ok
-            && self.sitemaps_settled >= self.sitemaps_expected
+            && self.pending_sitemaps.is_subset(&self.settled_sitemaps)
             && self.frontier.received > 0
     }
 }
@@ -569,10 +608,10 @@ mod tests {
         let mut a = JobAccounting::default();
         a.apply(&sitemap_published("m1", 3));
         assert_eq!(a.links_published, 3);
-        assert_eq!(a.sitemaps_settled, 1);
+        assert!(a.settled_sitemaps.contains("m1"));
         a.apply(&sitemap_published("m1", 3)); // redelivered
         assert_eq!(a.links_published, 3);
-        assert_eq!(a.sitemaps_settled, 1);
+        assert_eq!(a.settled_sitemaps.len(), 1);
     }
 
     /// Events with an empty `url_message_id` (old workers, pre-upgrade) are
@@ -627,6 +666,33 @@ mod tests {
         a.apply(&failed("s1"));
         a.apply(&failed("s2"));
         a.apply(&failed("s3"));
+        assert!(a.is_balanced());
+    }
+
+    /// Fix round 2 (R-18 follow-up): a settlement for an id that isn't
+    /// (yet, or ever) pending must never mask a *different* message's still-
+    /// pending discovery. A count-based check (`settled >= expected`) would
+    /// wrongly see this as balanced once both counts reach 1; the identity-
+    /// based subset check must not.
+    #[test]
+    fn surplus_settlement_does_not_mask_a_different_pending_discovery() {
+        let mut a = JobAccounting {
+            seeds_published: 1,
+            ..Default::default()
+        };
+        a.apply(&progress("f1", 1, 1, 0));
+        // A settlement for an id that has no matching pending entry at all
+        // (unrelated to this job's real pending discoveries) — a surplus
+        // settlement.
+        a.apply(&sitemap_published("a", 0));
+        // "b" is genuinely pending and has not settled yet.
+        a.apply(&crawled_with("b", 0, true));
+        a.apply(&indexed("b"));
+        assert!(
+            !a.is_balanced(),
+            "b's discovery is still pending; a's unrelated settlement must not count for it"
+        );
+        a.apply(&sitemap_published("b", 0));
         assert!(a.is_balanced());
     }
 }

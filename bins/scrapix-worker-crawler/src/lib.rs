@@ -785,12 +785,14 @@ impl CrawlerWorker {
     /// discovery and **unconditionally** publish `SitemapPublished` for
     /// `parent.message_id` — with `count: 0` on every empty/error/disabled
     /// path (no parser built, fetch error, nothing found, everything
-    /// filtered out) — so `JobAccounting::sitemaps_settled` is guaranteed to
-    /// eventually catch up with `sitemaps_expected` and the job can balance
-    /// (R-18). This is why the actual discovery work lives in
+    /// filtered out) — so `JobAccounting`'s `pending_sitemaps` is guaranteed
+    /// to eventually get its matching `settled_sitemaps` entry and the job
+    /// can balance (R-18). This is why the actual discovery work lives in
     /// [`Self::run_sitemap_discovery`], which never returns an `Err`: every
     /// failure mode collapses to a `0` count instead, so there is exactly
-    /// one exit path from this function and it always publishes.
+    /// one exit path from this function and it always publishes. This
+    /// method itself cannot fail either — it always returns the discovered
+    /// count, publish failures included (they're logged, not propagated).
     ///
     /// Sitemap URLs are derived from `parent` via `UrlMessage::child`, so
     /// they carry every job-scoped field (job spec, limits, features, ...).
@@ -801,11 +803,7 @@ impl CrawlerWorker {
     /// link extraction uses, and by [`is_non_page_url_with_pdf`] honoring the
     /// job's PDF opt-in, so a PDF sitemap entry is kept when the job enables
     /// PDF scraping.
-    async fn maybe_discover_sitemaps(
-        &self,
-        domain: &str,
-        parent: &UrlMessage,
-    ) -> scrapix_core::Result<usize> {
+    async fn maybe_discover_sitemaps(&self, domain: &str, parent: &UrlMessage) -> usize {
         let job_id = parent.job_id.as_str();
 
         let discovered_count = self.run_sitemap_discovery(domain, parent).await;
@@ -849,7 +847,7 @@ impl CrawlerWorker {
             );
         }
 
-        Ok(discovered_count)
+        discovered_count
     }
 
     /// Fetch, filter and publish this domain's sitemap URLs to the
