@@ -154,6 +154,27 @@ fn is_permanent(e: &meilisearch_sdk::errors::Error) -> bool {
     }
 }
 
+/// JSON text with object keys sorted at every level (array order kept).
+fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let body: Vec<String> = entries
+                .into_iter()
+                .map(|(k, v)| format!("{}:{}", Value::String(k.clone()), canonical_json(v)))
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(items) => {
+            let body: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", body.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Outcome of one bounded Meilisearch call.
 enum CallError {
     Permanent(String),
@@ -323,6 +344,10 @@ impl MeilisearchStorage {
                 return Err(ScrapixError::Storage(format!("{reason} ({index_uid})")));
             }
             if let Err(e) = self.flush_index(index_uid).await {
+                if self.pending_for(index_uid) < 4 * batch_size {
+                    // A permanently refused batch freed space: re-check now.
+                    continue;
+                }
                 let wait =
                     backoff.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
                 warn!(
@@ -524,14 +549,7 @@ impl MeilisearchStorage {
         features: &FeaturesConfig,
         spec: Option<&JobSpec>,
     ) {
-        use std::hash::{Hash, Hasher};
-        let overrides = spec.and_then(|s| s.index_settings.as_ref());
-        let settings =
-            serde_json::to_string(&self.job_settings(features, overrides)).unwrap_or_default();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (index_uid, spec.is_some_and(|s| s.keep_settings), settings).hash(&mut hasher);
-        let fingerprint = hasher.finish();
-
+        let fingerprint = self.settings_fingerprint(index_uid, features, spec);
         let cell = self
             .configured
             .lock()
@@ -547,6 +565,29 @@ impl MeilisearchStorage {
                 }
             })
             .await;
+    }
+
+    /// Stable fingerprint of a job's index configuration: (index,
+    /// keep_settings, derived settings). Settings are hashed in a canonical
+    /// form (object keys sorted recursively) so maps such as `synonyms`,
+    /// deserialized into a freshly seeded `HashMap` per message, fingerprint
+    /// identically whatever their iteration order (serde_json's
+    /// `preserve_order` is enabled in this workspace, so `to_value` alone
+    /// would keep that order).
+    pub fn settings_fingerprint(
+        &self,
+        index_uid: &str,
+        features: &FeaturesConfig,
+        spec: Option<&JobSpec>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let overrides = spec.and_then(|s| s.index_settings.as_ref());
+        let settings = serde_json::to_value(self.job_settings(features, overrides))
+            .map(|v| canonical_json(&v))
+            .unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (index_uid, spec.is_some_and(|s| s.keep_settings), settings).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Prepare `index_uid` for a job: create it (with this storage's

@@ -1615,15 +1615,22 @@ async fn startup_check(args: &Args) {
     if let Some(ref key) = args.meilisearch_key {
         builder = builder.api_key(key);
     }
-    match builder.build().await {
-        Ok(_) => info!(
+    // `build()` waits for the index-creation task; bound it so a
+    // blackholed Meilisearch cannot hang startup.
+    let timeout = scrapix_storage::MeilisearchConfig::default().timeout;
+    match tokio::time::timeout(timeout, builder.build()).await {
+        Ok(Ok(_)) => info!(
             url = %args.meilisearch_url,
             index = %args.default_index,
             "Connected to Meilisearch"
         ),
-        Err(e) => warn!(
+        Ok(Err(e)) => warn!(
             error = %e,
             "Meilisearch not reachable at startup; indexing stays enabled and will retry"
+        ),
+        Err(_) => warn!(
+            timeout_secs = timeout.as_secs(),
+            "Meilisearch startup check timed out; indexing stays enabled and will retry"
         ),
     }
 }

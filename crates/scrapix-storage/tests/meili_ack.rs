@@ -330,3 +330,67 @@ async fn job_settings_are_merged_over_feature_defaults() {
     assert_eq!(body["stopWords"], serde_json::json!(["the"]));
     assert_eq!(body["pagination"]["maxTotalHits"], 10000);
 }
+
+/// Settings JSON with synonyms keys in the given order.
+fn spec_with_synonyms(keys: &[&str]) -> scrapix_core::JobSpec {
+    let synonyms: Vec<String> = keys
+        .iter()
+        .map(|k| format!("\"{k}\": [\"{k}-alt\", \"{k}-other\"]"))
+        .collect();
+    let json = format!(
+        r#"{{"index_settings": {{"synonyms": {{{}}}, "stop_words": ["a"]}}}}"#,
+        synonyms.join(",")
+    );
+    serde_json::from_str(&json).unwrap()
+}
+
+#[tokio::test]
+async fn settings_fingerprint_is_independent_of_map_order() {
+    let ms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/indexes/syn$"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "message": "not found", "code": "index_not_found",
+            "type": "invalid_request", "link": "https://docs.meilisearch.com"})))
+        .mount(&ms)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes$"))
+        .respond_with(task_accepted())
+        .mount(&ms)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/indexes/syn/settings$"))
+        .respond_with(task_accepted())
+        .expect(1)
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "syn")
+        .connect()
+        .unwrap();
+    let keys = [
+        "car", "phone", "house", "tv", "laptop", "shoe", "bike", "book",
+    ];
+    let mut reversed = keys;
+    reversed.reverse();
+    let features = Default::default();
+    let first = spec_with_synonyms(&keys);
+    let fp = storage.settings_fingerprint("syn", &features, Some(&first));
+    // Many independent deserializations (fresh HashMap seeds each time).
+    for i in 0..20 {
+        let spec = spec_with_synonyms(if i % 2 == 0 { &keys } else { &reversed });
+        assert_eq!(
+            storage.settings_fingerprint("syn", &features, Some(&spec)),
+            fp
+        );
+    }
+
+    storage
+        .ensure_configured("syn", &features, Some(&first))
+        .await;
+    storage
+        .ensure_configured("syn", &features, Some(&spec_with_synonyms(&reversed)))
+        .await;
+    // PATCH expect(1) is verified when the mock server drops.
+}
