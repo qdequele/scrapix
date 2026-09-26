@@ -79,8 +79,8 @@ pub use extractor::{
     is_non_page_url, is_non_page_url_with_pdf, ExtractorConfig, UrlExtractor, UrlExtractorBuilder,
 };
 pub use fetcher::{
-    ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig, HttpFetcher,
-    HttpFetcherBuilder, RetryConfig,
+    parse_retry_after, ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig,
+    HttpFetcher, HttpFetcherBuilder, RetryConfig,
 };
 pub use proxy::{ProxyConfig, ProxyPool, RotationStrategy};
 pub use robots::{

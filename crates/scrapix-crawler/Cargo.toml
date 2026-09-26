@@ -58,6 +58,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+wiremock = { workspace = true }
 
 [features]
 default = []

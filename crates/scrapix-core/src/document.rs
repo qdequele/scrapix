@@ -231,6 +231,13 @@ pub struct RawPage {
     pub fetch_duration_ms: u64,
 }
 
+impl RawPage {
+    /// Whether the HTTP status indicates a successful response (200..=299).
+    pub fn is_success(&self) -> bool {
+        (200..=299).contains(&self.status)
+    }
+}
+
 /// URL to be crawled
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlUrl {

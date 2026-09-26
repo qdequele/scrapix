@@ -10,7 +10,7 @@ use chrono::Utc;
 use reqwest::{
     header::{
         HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
-        IF_MODIFIED_SINCE, IF_NONE_MATCH,
+        IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER,
     },
     redirect::Policy,
     Client, Response, StatusCode,
@@ -119,6 +119,10 @@ pub struct FetcherConfig {
     pub custom_headers: HashMap<String, String>,
     /// Retry configuration
     pub retry_config: RetryConfig,
+    /// Whether to allow fetching hosts that resolve to private/internal IP
+    /// ranges. Defaults to `false` (deny) for SSRF safety. Not yet enforced —
+    /// wired up when the fetcher gains DNS-based private-IP checks.
+    pub allow_private_ips: bool,
 }
 
 impl Default for FetcherConfig {
@@ -134,8 +138,22 @@ impl Default for FetcherConfig {
             follow_redirects: true,
             custom_headers: HashMap::new(),
             retry_config: RetryConfig::default(),
+            allow_private_ips: false,
         }
     }
+}
+
+/// Parse a `Retry-After` header value, which may be either a number of
+/// seconds or an HTTP-date (RFC 2822 format).
+///
+/// Returns `None` if the value is neither form.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(v).ok()?.to_utc();
+    Some((when - now).to_std().unwrap_or(Duration::ZERO))
 }
 
 /// Retry configuration
@@ -272,69 +290,21 @@ impl HttpFetcher {
     }
 
     /// Fetch a URL with retry logic and per-call options (e.g., PDF support).
-    #[instrument(skip(self, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
     pub async fn fetch_with_options(
         &self,
         url: &CrawlUrl,
         options: FetchOptions,
     ) -> Result<RawPage> {
-        let parsed_url = Url::parse(&url.url)?;
-
-        // Block raw IP addresses to prevent SSRF
-        Self::reject_ip_host(&parsed_url)?;
-
-        // Check robots.txt
-        if !self.robots_cache.is_allowed(&url.url).await? {
-            return Err(ScrapixError::RobotsDisallowed {
-                url: url.url.clone(),
-            });
+        match self.fetch_inner(url, None, options).await? {
+            FetchResult::Fetched(page) => Ok(page),
+            // Can't happen without conditional headers (no If-None-Match /
+            // If-Modified-Since was sent, so a well-behaved server has no
+            // basis to return 304), but handle it defensively rather than
+            // panicking or silently dropping the response.
+            FetchResult::NotModified { url, .. } => Err(ScrapixError::Crawl(format!(
+                "Received unexpected 304 Not Modified for {url} without conditional headers"
+            ))),
         }
-
-        let mut last_error = None;
-        let mut backoff = self.config.retry_config.initial_backoff;
-
-        for attempt in 0..=self.config.retry_config.max_retries {
-            if attempt > 0 {
-                debug!(attempt, "Retrying request after {:?}", backoff);
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
-                        .min(self.config.retry_config.max_backoff.as_secs_f64()),
-                );
-            }
-
-            let start = Instant::now();
-
-            match self.fetch_once(&parsed_url).await {
-                Ok((response, final_url)) => {
-                    let fetch_duration = start.elapsed();
-                    return self
-                        .process_response(url, response, final_url, fetch_duration, &options)
-                        .await;
-                }
-                Err(e) => {
-                    // Check if this is a non-retryable HTTP error
-                    if let ScrapixError::Http { status, .. } = e {
-                        if !self
-                            .config
-                            .retry_config
-                            .retryable_status_codes
-                            .contains(&status)
-                        {
-                            return Err(ScrapixError::Http {
-                                status,
-                                url: url.url.clone(),
-                            });
-                        }
-                    }
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            ScrapixError::Crawl(format!("Failed to fetch {} after retries", url.url))
-        }))
     }
 
     /// Fetch a URL with conditional headers for incremental crawling.
@@ -355,11 +325,31 @@ impl HttpFetcher {
     /// global `max_body_size` with a PDF-specific cap. Sends If-None-Match /
     /// If-Modified-Since headers if provided, allowing the server to return
     /// 304 Not Modified when content hasn't changed.
-    #[instrument(skip(self, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
     pub async fn fetch_conditional_with_options(
         &self,
         url: &CrawlUrl,
         conditional_headers: &ConditionalRequestHeaders,
+        options: FetchOptions,
+    ) -> Result<FetchResult> {
+        self.fetch_inner(url, Some(conditional_headers), options)
+            .await
+    }
+
+    /// Shared implementation behind `fetch_with_options` and
+    /// `fetch_conditional_with_options`.
+    ///
+    /// Retries on network errors and on statuses in
+    /// `retry_config.retryable_status_codes` (429/5xx by default), honoring
+    /// a server `Retry-After` hint (seconds or HTTP-date) by sleeping for
+    /// `max(exponential backoff, hint)`, capped at `max_backoff`. A status is
+    /// never turned into an `Err` — after the last attempt the final status
+    /// is returned as `Ok(FetchResult::Fetched(RawPage { status, .. }))`;
+    /// classifying success/failure from `status` is the caller's job.
+    #[instrument(skip(self, conditional_headers, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
+    async fn fetch_inner(
+        &self,
+        url: &CrawlUrl,
+        conditional_headers: Option<&ConditionalRequestHeaders>,
         options: FetchOptions,
     ) -> Result<FetchResult> {
         let parsed_url = Url::parse(&url.url)?;
@@ -375,34 +365,62 @@ impl HttpFetcher {
         }
 
         let mut last_error = None;
-        let mut backoff = self.config.retry_config.initial_backoff;
+        let mut next_sleep = self.config.retry_config.initial_backoff;
 
         for attempt in 0..=self.config.retry_config.max_retries {
             if attempt > 0 {
-                debug!(attempt, "Retrying request after {:?}", backoff);
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
+                debug!(attempt, "Retrying request after {:?}", next_sleep);
+                tokio::time::sleep(next_sleep).await;
+                next_sleep = Duration::from_secs_f64(
+                    (next_sleep.as_secs_f64() * self.config.retry_config.backoff_multiplier)
                         .min(self.config.retry_config.max_backoff.as_secs_f64()),
                 );
             }
 
             let start = Instant::now();
 
-            match self
-                .fetch_once_conditional(&parsed_url, conditional_headers)
-                .await
-            {
+            let fetch_once_result = match conditional_headers {
+                Some(conditional) => self.fetch_once_conditional(&parsed_url, conditional).await,
+                None => self.fetch_once(&parsed_url).await,
+            };
+
+            match fetch_once_result {
                 Ok((response, final_url)) => {
                     let fetch_duration = start.elapsed();
 
-                    // Check for 304 Not Modified
-                    if response.status() == StatusCode::NOT_MODIFIED {
+                    // Check for 304 Not Modified (only meaningful with conditional headers)
+                    if conditional_headers.is_some()
+                        && response.status() == StatusCode::NOT_MODIFIED
+                    {
                         debug!(url = %url.url, "Content not modified (304)");
                         return Ok(FetchResult::NotModified {
                             url: url.url.clone(),
                             fetch_duration_ms: fetch_duration.as_millis() as u64,
                         });
+                    }
+
+                    let status = response.status().as_u16();
+                    let retryable = self
+                        .config
+                        .retry_config
+                        .retryable_status_codes
+                        .contains(&status);
+                    if retryable && attempt < self.config.retry_config.max_retries {
+                        let hinted = response
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| parse_retry_after(v, Utc::now()));
+                        next_sleep = hinted
+                            .map_or(next_sleep, |h| h.max(next_sleep))
+                            .min(self.config.retry_config.max_backoff);
+                        debug!(
+                            status,
+                            attempt,
+                            ?next_sleep,
+                            "Retryable status, backing off"
+                        );
+                        continue;
                     }
 
                     let page = self
@@ -546,28 +564,31 @@ impl HttpFetcher {
                 .as_deref()
                 .is_some_and(|ct| ct.contains("application/pdf"));
 
+        let is_success = (200..=299).contains(&status);
+
         // Check content type — we accept HTML, markdown, and (when opted in) PDF.
-        if let Some(ref ct) = content_type {
-            let accepted = ct.contains("text/html")
-                || ct.contains("application/xhtml")
-                || ct.contains("text/markdown")
-                || is_pdf;
-            if !accepted {
-                return Err(ScrapixError::Crawl(format!(
-                    "Unsupported content type: {}",
-                    ct
-                )));
+        // Non-2xx responses (error pages) skip this check: they are never
+        // indexed and are often served as text/plain regardless of what the
+        // "real" content type would be.
+        if is_success {
+            if let Some(ref ct) = content_type {
+                let accepted = ct.contains("text/html")
+                    || ct.contains("application/xhtml")
+                    || ct.contains("text/markdown")
+                    || is_pdf;
+                if !accepted {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Unsupported content type: {}",
+                        ct
+                    )));
+                }
             }
         }
 
-        // Read body with size limit
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ScrapixError::Network(format!("Failed to read response body: {}", e)))?;
-
         // Effective size cap: PDFs may use a feature-specific cap that supersedes
         // the generic `max_body_size` (since PDFs are often larger than HTML).
+        // Non-2xx bodies are never indexed, so cap them at a small fixed size
+        // regardless of the configured limit.
         let effective_cap = if is_pdf {
             options
                 .pdf_max_size_bytes
@@ -576,13 +597,41 @@ impl HttpFetcher {
         } else {
             self.config.max_body_size
         };
+        let effective_cap = if is_success {
+            effective_cap
+        } else {
+            effective_cap.min(64 * 1024)
+        };
 
-        if bytes.len() > effective_cap {
-            return Err(ScrapixError::Crawl(format!(
-                "Response body too large: {} bytes (max: {})",
-                bytes.len(),
-                effective_cap
-            )));
+        // Reject up front when the server told us the size via Content-Length.
+        if let Some(len) = response.content_length() {
+            if len as usize > effective_cap {
+                return Err(ScrapixError::Crawl(format!(
+                    "Response body too large: {len} bytes (max: {effective_cap})"
+                )));
+            }
+        }
+
+        // Read the body as a stream so we never buffer more than the cap,
+        // even when the server lies about (or omits) Content-Length.
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(effective_cap as u64) as usize,
+        );
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ScrapixError::Network(format!("Failed to read response body: {e}")))?
+        {
+            if bytes.len() + chunk.len() > effective_cap {
+                return Err(ScrapixError::Crawl(format!(
+                    "Response body too large: >{effective_cap} bytes (max: {effective_cap})"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         // Encode body:
@@ -731,6 +780,20 @@ impl HttpFetcherBuilder {
 
     pub fn max_retries(mut self, max: u32) -> Self {
         self.config.retry_config.max_retries = max;
+        self
+    }
+
+    /// Set the initial backoff duration between retries (grows by
+    /// `backoff_multiplier` on each subsequent retry, capped at `max_backoff`).
+    pub fn initial_backoff(mut self, backoff: Duration) -> Self {
+        self.config.retry_config.initial_backoff = backoff;
+        self
+    }
+
+    /// Allow fetching hosts that resolve to private/internal IP ranges.
+    /// Defaults to `false`. Not yet enforced by the fetcher itself.
+    pub fn allow_private_ips(mut self, allow: bool) -> Self {
+        self.config.allow_private_ips = allow;
         self
     }
 
