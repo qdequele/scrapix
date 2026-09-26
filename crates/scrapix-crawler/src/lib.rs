@@ -65,6 +65,7 @@ pub mod extractor;
 pub mod fetcher;
 pub mod proxy;
 pub mod robots;
+pub(crate) mod safe_dns;
 pub mod sitemap;
 
 #[cfg(feature = "browser-cdp")]
@@ -87,6 +88,7 @@ pub use robots::{
     PersistentRobotsCache, PersistentRobotsEntry, RobotsCache, RobotsCacheStats, RobotsConfig,
     RobotsPersistence, RocksDbOps, RocksRobotsPersistence,
 };
+pub use safe_dns::is_public_ip;
 pub use sitemap::{
     ChangeFrequency, SitemapConfig, SitemapContent, SitemapEntry, SitemapParser, SitemapUrl,
 };

@@ -50,6 +50,7 @@ impl FetchOptions {
 
 use crate::dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 use crate::robots::RobotsCache;
+use crate::safe_dns::SafeResolver;
 
 /// Conditional request headers for incremental crawling
 #[derive(Debug, Clone, Default)]
@@ -120,8 +121,9 @@ pub struct FetcherConfig {
     /// Retry configuration
     pub retry_config: RetryConfig,
     /// Whether to allow fetching hosts that resolve to private/internal IP
-    /// ranges. Defaults to `false` (deny) for SSRF safety. Not yet enforced —
-    /// wired up when the fetcher gains DNS-based private-IP checks.
+    /// ranges. Defaults to `false` (deny) for SSRF safety. Applies to
+    /// hostnames whose DNS results are private; raw-IP hosts (seed URLs and
+    /// redirect targets) are always refused regardless of this flag.
     pub allow_private_ips: bool,
 }
 
@@ -226,8 +228,26 @@ impl HttpFetcher {
             }
         }
 
+        let max_redirects = config.max_redirects;
+        let allow_private = config.allow_private_ips;
         let redirect_policy = if config.follow_redirects {
-            Policy::limited(config.max_redirects)
+            Policy::custom(move |attempt| {
+                if attempt.previous().len() >= max_redirects {
+                    return attempt.error("too many redirects");
+                }
+                // Raw-IP redirect targets are always refused, the same as
+                // raw-IP seeds (`reject_ip_host`), regardless of
+                // `allow_private_ips` — that flag only relaxes the
+                // private-IP check on *resolved hostnames* (see
+                // `SafeResolver`). A redirect to a link-local address such as
+                // the cloud metadata endpoint (169.254.169.254) must still be
+                // refused even when `allow_private_ips` is set for tests
+                // that point the fetcher at a local wiremock server.
+                match attempt.url().host() {
+                    Some(url::Host::Domain(_)) => attempt.follow(),
+                    _ => attempt.error("redirect to a raw IP address refused"),
+                }
+            })
         } else {
             Policy::none()
         };
@@ -239,6 +259,10 @@ impl HttpFetcher {
             .redirect(redirect_policy)
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .default_headers(default_headers)
+            .dns_resolver(Arc::new(SafeResolver {
+                cache: dns_resolver.clone(),
+                allow_private,
+            }))
             .gzip(true)
             .brotli(true)
             .deflate(true)
@@ -465,33 +489,47 @@ impl HttpFetcher {
         }))
     }
 
+    /// Classify a `reqwest::Error` from `send().await` into a `ScrapixError`.
+    ///
+    /// Two SSRF-specific cases are checked first:
+    /// - A redirect the custom `Policy` refused (raw-IP or non-public
+    ///   redirect target) surfaces as `reqwest`'s `Kind::Redirect`, whose
+    ///   `Display` text already contains "redirect" — mapped to
+    ///   `ScrapixError::Crawl` so callers can match on "redirect".
+    /// - A `SafeResolver` refusal (hostname resolves only to non-public
+    ///   addresses) is wrapped deep inside the connect error's source chain,
+    ///   where `Display` doesn't reach it but `Debug` does — mapped to
+    ///   `ScrapixError::Connection` so callers can match on "non-public".
+    fn map_send_error(e: &reqwest::Error, url: &Url) -> ScrapixError {
+        if e.is_redirect() {
+            return ScrapixError::Crawl(format!("Redirect refused: {e}"));
+        }
+        let debug = format!("{e:?}");
+        if debug.contains("non-public") {
+            return ScrapixError::Connection(format!("Refused: {debug}"));
+        }
+        if e.is_timeout() {
+            ScrapixError::Timeout(format!("Request timed out: {}", url))
+        } else if e.is_connect() {
+            ScrapixError::Connection(format!("Connection failed: {}", e))
+        } else if let Some(status) = e.status() {
+            ScrapixError::Http {
+                status: status.as_u16(),
+                url: url.to_string(),
+            }
+        } else {
+            ScrapixError::Network(e.to_string())
+        }
+    }
+
     /// Perform a single fetch attempt
     async fn fetch_once(&self, url: &Url) -> Result<(Response, String)> {
-        // Pre-resolve DNS if resolver is configured (warms cache for future requests)
-        if let Some(ref resolver) = self.dns_resolver {
-            if let Some(host) = url.host_str() {
-                // Pre-resolve to warm the cache; we don't fail on DNS errors here
-                // since reqwest will still try to resolve
-                if let Err(e) = resolver.resolve(host).await {
-                    debug!(host, error = %e, "DNS pre-resolution failed, reqwest will resolve");
-                }
-            }
-        }
-
-        let response = self.client.get(url.as_str()).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ScrapixError::Timeout(format!("Request timed out: {}", url))
-            } else if e.is_connect() {
-                ScrapixError::Connection(format!("Connection failed: {}", e))
-            } else if let Some(status) = e.status() {
-                ScrapixError::Http {
-                    status: status.as_u16(),
-                    url: url.to_string(),
-                }
-            } else {
-                ScrapixError::Network(e.to_string())
-            }
-        })?;
+        let response = self
+            .client
+            .get(url.as_str())
+            .send()
+            .await
+            .map_err(|e| Self::map_send_error(&e, url))?;
         let final_url = response.url().to_string();
         Ok((response, final_url))
     }
@@ -502,15 +540,6 @@ impl HttpFetcher {
         url: &Url,
         conditional_headers: &ConditionalRequestHeaders,
     ) -> Result<(Response, String)> {
-        // Pre-resolve DNS if resolver is configured (warms cache for future requests)
-        if let Some(ref resolver) = self.dns_resolver {
-            if let Some(host) = url.host_str() {
-                if let Err(e) = resolver.resolve(host).await {
-                    debug!(host, error = %e, "DNS pre-resolution failed, reqwest will resolve");
-                }
-            }
-        }
-
         let mut request = self.client.get(url.as_str());
 
         // Add conditional headers if present
@@ -525,20 +554,10 @@ impl HttpFetcher {
             }
         }
 
-        let response = request.send().await.map_err(|e| {
-            if e.is_timeout() {
-                ScrapixError::Timeout(format!("Request timed out: {}", url))
-            } else if e.is_connect() {
-                ScrapixError::Connection(format!("Connection failed: {}", e))
-            } else if let Some(status) = e.status() {
-                ScrapixError::Http {
-                    status: status.as_u16(),
-                    url: url.to_string(),
-                }
-            } else {
-                ScrapixError::Network(e.to_string())
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Self::map_send_error(&e, url))?;
         let final_url = response.url().to_string();
         Ok((response, final_url))
     }
