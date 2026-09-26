@@ -262,6 +262,44 @@ impl MessageConsumer for ChannelConsumer {
         F: Fn(T, MessageMetadata) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
+        let handler = Arc::new(handler);
+        self.process_with_ack::<T, _, _>(
+            move |payload, metadata, ack| {
+                let handler = handler.clone();
+                async move {
+                    match handler(payload, metadata.clone()).await {
+                        Ok(()) => ack.ack(),
+                        Err(e) => {
+                            error!(
+                                topic = %metadata.topic,
+                                offset = metadata.offset,
+                                error = %e,
+                                "Handler error, leaving message uncommitted for redelivery"
+                            );
+                            // Drop `ack` without calling it. The channel bus has no
+                            // notion of offset commits, so this only changes logging
+                            // — nothing is actually redelivered.
+                        }
+                    }
+                }
+            },
+            concurrency,
+            shutdown,
+        )
+        .await
+    }
+
+    async fn process_with_ack<T, F, Fut>(
+        &self,
+        handler: F,
+        concurrency: usize,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(T, MessageMetadata, scrapix_core::Ack) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let topics: Vec<String> = self.subscriptions.read().clone();
         if topics.is_empty() {
             return Err(ScrapixError::Queue("No topics subscribed".into()));
@@ -270,7 +308,7 @@ impl MessageConsumer for ChannelConsumer {
         let receiver = self.get_receiver(&topics[0]);
         let topic_name = topics[0].clone();
         let handler = Arc::new(handler);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         let mut offset = 0i64;
 
         loop {
@@ -297,15 +335,12 @@ impl MessageConsumer for ChannelConsumer {
                             };
 
                             let handler = handler.clone();
+                            // The in-process channel bus has no durable offset to
+                            // commit, so `Ack` here is a no-op — it exists only to
+                            // keep the handler signature uniform with Kafka.
+                            let ack = scrapix_core::Ack::noop();
                             tokio::spawn(async move {
-                                if let Err(e) = handler(payload, metadata.clone()).await {
-                                    error!(
-                                        topic = %metadata.topic,
-                                        offset = metadata.offset,
-                                        error = %e,
-                                        "Handler error"
-                                    );
-                                }
+                                handler(payload, metadata, ack).await;
                                 drop(permit);
                             });
                         }
@@ -330,7 +365,7 @@ impl MessageConsumer for ChannelConsumer {
         }
 
         // Wait for all in-flight tasks
-        let _ = semaphore.acquire_many(concurrency as u32).await;
+        let _ = semaphore.acquire_many(concurrency.max(1) as u32).await;
         Ok(())
     }
 

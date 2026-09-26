@@ -133,22 +133,23 @@ impl KafkaConsumer {
                     let metadata = MessageMetadata::from_message(&msg);
 
                     match self.deserialize_message::<T>(&msg) {
-                        Ok(payload) => {
-                            if let Err(e) = handler(payload, metadata.clone()).await {
+                        Ok(payload) => match handler(payload, metadata.clone()).await {
+                            Ok(()) => {
+                                // Commit offset only after the handler acknowledges success.
+                                if let Err(e) = self.commit_message(&msg) {
+                                    warn!(error = %e, "Failed to commit offset");
+                                }
+                            }
+                            Err(e) => {
                                 error!(
                                     topic = %metadata.topic,
                                     partition = metadata.partition,
                                     offset = metadata.offset,
                                     error = %e,
-                                    "Handler error"
+                                    "Handler error, leaving message uncommitted for redelivery"
                                 );
                             }
-
-                            // Commit offset after processing
-                            if let Err(e) = self.commit_message(&msg) {
-                                warn!(error = %e, "Failed to commit offset");
-                            }
-                        }
+                        },
                         Err(e) => {
                             error!(
                                 topic = %metadata.topic,
@@ -157,7 +158,7 @@ impl KafkaConsumer {
                                 error = %e,
                                 "Deserialization error"
                             );
-                            // Still commit to avoid reprocessing bad messages
+                            // Still commit to avoid reprocessing bad (unparseable) messages.
                             let _ = self.commit_message(&msg);
                         }
                     }
@@ -171,8 +172,131 @@ impl KafkaConsumer {
         Ok(())
     }
 
+    /// Process messages concurrently, committing offsets only once the handler acks.
+    ///
+    /// Spawns up to `concurrency` handler tasks and keeps polling (maintaining
+    /// heartbeats) while they run. Offsets are tracked per-partition by an
+    /// [`OffsetTracker`](crate::OffsetTracker) so that only a contiguous prefix of
+    /// acked offsets is ever committed — an un-acked or still in-flight message
+    /// (or one whose `Ack` is dropped without being called) blocks the commit
+    /// point behind it, so it is redelivered after a restart or rebalance.
+    pub async fn process_with_ack<T, F, Fut>(
+        &self,
+        handler: F,
+        concurrency: usize,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(T, MessageMetadata, crate::Ack) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::{mpsc, Semaphore};
+        use tracing::info;
+
+        info!(
+            concurrency = concurrency,
+            "Starting ack-based concurrent message processing"
+        );
+
+        let handler = std::sync::Arc::new(handler);
+        let semaphore = std::sync::Arc::new(Semaphore::new(concurrency.max(1)));
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(String, i32, i64)>();
+        let mut tracker = crate::OffsetTracker::default();
+        let mut stream = self.consumer.stream();
+        let mut commit_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut assigned = self.assigned_partitions();
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("Shutdown requested, exiting consumer loop");
+                break;
+            }
+
+            tokio::select! {
+                _ = commit_tick.tick() => {
+                    while let Ok((t, p, o)) = done_rx.try_recv() {
+                        tracker.complete(&t, p, o);
+                    }
+                    // Drop tracker state for partitions we no longer own (rebalance).
+                    let now = self.assigned_partitions();
+                    for gone in assigned.difference(&now) {
+                        tracker.revoke(&gone.0, gone.1);
+                    }
+                    assigned = now;
+                    self.commit_offsets(tracker.take_commits(), CommitMode::Async);
+                }
+                Some((t, p, o)) = done_rx.recv() => tracker.complete(&t, p, o),
+                next = stream.next() => match next {
+                    Some(Ok(msg)) => {
+                        let metadata = MessageMetadata::from_message(&msg);
+                        tracker.begin(&metadata.topic, metadata.partition, metadata.offset);
+                        let ack = {
+                            let (tx, t, p, o) = (
+                                done_tx.clone(),
+                                metadata.topic.clone(),
+                                metadata.partition,
+                                metadata.offset,
+                            );
+                            crate::Ack::from_fn(move || {
+                                let _ = tx.send((t, p, o));
+                            })
+                        };
+
+                        match self.deserialize_message::<T>(&msg) {
+                            Ok(payload) => {
+                                let permit = match semaphore.clone().acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+                                let handler = handler.clone();
+                                tokio::spawn(async move {
+                                    handler(payload, metadata, ack).await;
+                                    drop(permit);
+                                });
+                            }
+                            Err(e) => {
+                                error!(
+                                    topic = %metadata.topic,
+                                    partition = metadata.partition,
+                                    offset = metadata.offset,
+                                    error = %e,
+                                    "Deserialization error, skipping"
+                                );
+                                // Poison message: ack immediately so we don't block the
+                                // commit point on something we can never process.
+                                ack.ack();
+                            }
+                        }
+                    }
+                    Some(Err(e)) => error!(error = %e, "Kafka error"),
+                    None => break,
+                },
+            }
+        }
+
+        // Drain: wait for in-flight handlers (bounded), then commit whatever finished.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            semaphore.acquire_many(concurrency.max(1) as u32),
+        )
+        .await;
+        while let Ok((t, p, o)) = done_rx.try_recv() {
+            tracker.complete(&t, p, o);
+        }
+        self.commit_offsets(tracker.take_commits(), CommitMode::Sync);
+
+        Ok(())
+    }
+
     /// Process messages concurrently by spawning tasks for each message.
     /// This ensures the consumer keeps polling (maintaining heartbeats) while handlers run.
+    ///
+    /// Built on [`process_with_ack`](Self::process_with_ack): the offset is committed
+    /// only when the handler returns `Ok`. On `Err`, the message is left uncommitted
+    /// for redelivery — the handler is expected to have already handled retry/DLQ
+    /// logic itself before returning.
     pub async fn process_concurrent<T, F, Fut>(
         &self,
         handler: F,
@@ -184,102 +308,62 @@ impl KafkaConsumer {
         F: Fn(T, MessageMetadata) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        use std::sync::atomic::Ordering;
-        use tokio::sync::Semaphore;
-        use tracing::info;
-
-        info!(
-            concurrency = concurrency,
-            "Starting concurrent message processing"
-        );
-
         let handler = std::sync::Arc::new(handler);
-        let semaphore = std::sync::Arc::new(Semaphore::new(concurrency));
-        let mut stream = self.consumer.stream();
-
-        let mut poll_count = 0u64;
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                info!("Shutdown requested, exiting consumer loop");
-                break;
-            }
-
-            poll_count += 1;
-            if poll_count % 100 == 0 {
-                info!(poll_count = poll_count, "Consumer polling...");
-            }
-
-            // Poll with a short timeout to allow checking shutdown flag and maintain heartbeats
-            match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
-                Ok(Some(Ok(msg))) => {
-                    let metadata = MessageMetadata::from_message(&msg);
-                    info!(
-                        topic = %metadata.topic,
-                        partition = metadata.partition,
-                        offset = metadata.offset,
-                        "Received message from Kafka"
-                    );
-
-                    match self.deserialize_message::<T>(&msg) {
-                        Ok(payload) => {
-                            // Commit immediately to avoid reprocessing on restart
-                            // The semaphore ensures we don't get too far ahead
-                            if let Err(e) = self.commit_message(&msg) {
-                                warn!(error = %e, "Failed to commit offset");
-                            }
-
-                            // Acquire permit (wait if at max concurrency)
-                            let permit = match semaphore.clone().acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(_) => break, // Semaphore closed
-                            };
-
-                            let handler = handler.clone();
-
-                            // Spawn handler in background
-                            tokio::spawn(async move {
-                                if let Err(e) = handler(payload, metadata.clone()).await {
-                                    error!(
-                                        topic = %metadata.topic,
-                                        partition = metadata.partition,
-                                        offset = metadata.offset,
-                                        error = %e,
-                                        "Handler error"
-                                    );
-                                }
-                                drop(permit); // Release semaphore
-                            });
-                        }
+        self.process_with_ack::<T, _, _>(
+            move |payload, metadata, ack| {
+                let handler = handler.clone();
+                async move {
+                    match handler(payload, metadata.clone()).await {
+                        Ok(()) => ack.ack(),
                         Err(e) => {
                             error!(
                                 topic = %metadata.topic,
                                 partition = metadata.partition,
                                 offset = metadata.offset,
                                 error = %e,
-                                "Deserialization error"
+                                "Handler error, leaving message uncommitted for redelivery"
                             );
-                            // Commit to skip bad message
-                            let _ = self.commit_message(&msg);
+                            // Drop `ack` without calling it: offset stays uncommitted.
                         }
                     }
                 }
-                Ok(Some(Err(e))) => {
-                    error!(error = %e, "Kafka error");
-                }
-                Ok(None) => {
-                    // Stream ended
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - this is fine, allows us to check shutdown and maintain heartbeat
-                }
+            },
+            concurrency,
+            shutdown,
+        )
+        .await
+    }
+
+    /// Partitions currently assigned to this consumer, as `(topic, partition)` pairs.
+    fn assigned_partitions(&self) -> std::collections::HashSet<(String, i32)> {
+        self.consumer
+            .assignment()
+            .map(|tpl| {
+                tpl.elements()
+                    .iter()
+                    .map(|e| (e.topic().to_string(), e.partition()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Commit a batch of `(topic, partition, next_offset)` tuples produced by an
+    /// [`OffsetTracker`](crate::OffsetTracker).
+    fn commit_offsets(&self, commits: Vec<(String, i32, i64)>, mode: CommitMode) {
+        if commits.is_empty() {
+            return;
+        }
+        let mut tpl = TopicPartitionList::new();
+        for (topic, partition, next) in &commits {
+            if let Err(e) =
+                tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Offset(*next))
+            {
+                warn!(error = %e, "Failed to build commit list");
             }
         }
-
-        // Wait for all in-flight tasks to complete
-        let _ = semaphore.acquire_many(concurrency as u32).await;
-
-        Ok(())
+        if let Err(e) = self.consumer.commit(&tpl, mode) {
+            warn!(error = %e, "Offset commit failed (will retry next tick)");
+        }
     }
 
     /// Receive a batch of messages
@@ -477,6 +561,20 @@ impl crate::traits::MessageConsumer for KafkaConsumer {
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
         KafkaConsumer::process_concurrent(self, handler, concurrency, shutdown).await
+    }
+
+    async fn process_with_ack<T, F, Fut>(
+        &self,
+        handler: F,
+        concurrency: usize,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(T, MessageMetadata, crate::Ack) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        KafkaConsumer::process_with_ack(self, handler, concurrency, shutdown).await
     }
 
     async fn poll_one<T: DeserializeOwned + Send>(&self, timeout: Duration) -> Result<Option<T>> {

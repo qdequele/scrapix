@@ -67,6 +67,9 @@ pub trait MessageConsumer: Send + Sync + 'static {
         Fut: Future<Output = Result<()>> + Send;
 
     /// Process messages concurrently, spawning up to `concurrency` tasks.
+    ///
+    /// The offset is committed only after the handler returns `Ok`; on `Err` the
+    /// message is left uncommitted for redelivery.
     async fn process_concurrent<T, F, Fut>(
         &self,
         handler: F,
@@ -77,6 +80,21 @@ pub trait MessageConsumer: Send + Sync + 'static {
         T: DeserializeOwned + Send + 'static,
         F: Fn(T, MessageMetadata) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static;
+
+    /// Process messages concurrently, handing each handler an explicit [`Ack`]
+    /// (re-exported from `scrapix_core`) instead of inferring commit behavior from
+    /// a `Result`. The offset commits only once `ack.ack()` is called; dropping the
+    /// `Ack` without acking leaves it uncommitted for redelivery.
+    async fn process_with_ack<T, F, Fut>(
+        &self,
+        handler: F,
+        concurrency: usize,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(T, MessageMetadata, scrapix_core::Ack) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static;
 
     /// Poll for a single message with timeout.
     async fn poll_one<T: DeserializeOwned + Send>(&self, timeout: Duration) -> Result<Option<T>>;
@@ -219,6 +237,24 @@ impl AnyConsumer {
         match self {
             Self::Kafka(c) => c.process_concurrent(handler, concurrency, shutdown).await,
             Self::Channel(c) => c.process_concurrent(handler, concurrency, shutdown).await,
+        }
+    }
+
+    /// Process messages concurrently, handing each handler an explicit [`Ack`](scrapix_core::Ack).
+    pub async fn process_with_ack<T, F, Fut>(
+        &self,
+        handler: F,
+        concurrency: usize,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: Fn(T, MessageMetadata, scrapix_core::Ack) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        match self {
+            Self::Kafka(c) => c.process_with_ack(handler, concurrency, shutdown).await,
+            Self::Channel(c) => c.process_with_ack(handler, concurrency, shutdown).await,
         }
     }
 

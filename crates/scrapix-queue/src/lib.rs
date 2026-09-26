@@ -53,13 +53,16 @@
 pub mod bus;
 pub mod channel;
 pub mod consumer;
+pub mod offsets;
 pub mod producer;
 pub mod topics;
 pub mod traits;
 
 // Re-exports
 pub use consumer::{ConsumerBuilder, ConsumerConfig, KafkaConsumer, MessageMetadata};
+pub use offsets::OffsetTracker;
 pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};
+pub use scrapix_core::Ack;
 pub use topics::{
     names as topic_names, CrawlEvent, CrawlHistoryMessage, DlqMessage, DocumentMessage,
     LinksMessage, RawPageMessage, UrlMessage,
