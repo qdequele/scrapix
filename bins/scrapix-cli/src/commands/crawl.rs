@@ -7,7 +7,9 @@ use futures::StreamExt;
 use tabled::Table;
 
 use crate::client::ApiClient;
-use crate::output::{create_spinner, print_error, print_info, print_json, print_success};
+use crate::output::{
+    create_spinner, print_error, print_info, print_json, print_success, print_warning,
+};
 use crate::types::{CreateCrawlResponse, JobRow, JobStatusResponse};
 
 use scrapix_core::CrawlConfig;
@@ -62,6 +64,13 @@ pub async fn handle_crawl(
         eprintln!("  {} {}", "Index:".dimmed(), response.index_uid);
         eprintln!("  {} {}", "URLs:".dimmed(), response.start_urls_count);
         eprintln!();
+
+        for warning in &response.warnings {
+            print_warning(warning);
+        }
+        if !response.warnings.is_empty() {
+            eprintln!();
+        }
 
         if !sync && follow {
             print_info("Following job events (Ctrl+C to stop)...");

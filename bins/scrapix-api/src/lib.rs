@@ -76,7 +76,10 @@ use tower_http::{
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
-use scrapix_core::{CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobState, JobStatus};
+use scrapix_core::{
+    ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
+    JobStatus, PdfConfig,
+};
 use scrapix_crawler::{
     is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, RobotsCache,
     RobotsConfig, SitemapParser, WaitUntil,
@@ -1054,6 +1057,10 @@ struct CreateCrawlResponse {
     index_uid: String,
     start_urls_count: usize,
     message: String,
+    /// Non-fatal warnings about config fields that were accepted but cannot
+    /// be honored per-job (worker-level settings). Empty when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Bulk crawl response
@@ -2203,6 +2210,53 @@ fn fan_out_worker_wakes() {
     }
 }
 
+/// Validate a `CrawlConfig`, mapping `validator` errors to a 4xx `ApiError`.
+///
+/// Extracted from `do_create_crawl` so it can be unit-tested without the
+/// surrounding `AppState` (producer, DB pool, etc.) that job creation needs.
+pub(crate) fn validate_crawl_config(config: &CrawlConfig) -> Result<(), ApiError> {
+    use validator::Validate;
+    config
+        .validate()
+        .map_err(|errors| ApiError::new(errors.to_string(), "validation_error"))
+}
+
+/// Warn about config fields that are accepted but cannot be honored per-job
+/// (worker-level settings): `concurrency.browser_pool_size`,
+/// `concurrency.dns_concurrency`, `features.pdf.extract_links`. A warning is
+/// emitted only when the field differs from its default.
+pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let default_concurrency = ConcurrencyConfig::default();
+
+    if config.concurrency.browser_pool_size != default_concurrency.browser_pool_size {
+        warnings.push(format!(
+            "concurrency.browser_pool_size ({}) is a worker-level setting (set at process \
+             startup) and is ignored per-job",
+            config.concurrency.browser_pool_size
+        ));
+    }
+
+    if config.concurrency.dns_concurrency != default_concurrency.dns_concurrency {
+        warnings.push(format!(
+            "concurrency.dns_concurrency ({}) is a worker-level setting (set at process \
+             startup) and is ignored per-job",
+            config.concurrency.dns_concurrency
+        ));
+    }
+
+    if let Some(pdf) = &config.features.pdf {
+        if pdf.extract_links != PdfConfig::default().extract_links {
+            warnings.push(
+                "features.pdf.extract_links is a reserved no-op flag and currently has no effect"
+                    .to_string(),
+            );
+        }
+    }
+
+    warnings
+}
+
 /// Core crawl creation logic, reusable from handler, trigger, and cron scheduler
 pub(crate) async fn do_create_crawl(
     state: &Arc<AppState>,
@@ -2272,6 +2326,14 @@ pub(crate) async fn do_create_crawl(
     } else {
         config
     };
+
+    // Full validation (start_urls, index_uid length, and any future
+    // #[validate] rules) — after index_uid auto-derivation and Meilisearch
+    // engine resolution so both are populated before the length checks run.
+    validate_crawl_config(&config)?;
+
+    // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
+    let warnings = crawl_config_warnings(&config);
 
     // Pre-flight credit check (1 credit minimum to start a crawl)
     if let (Some(ref pool), Some(ctx)) = (&state.db_pool, account_ctx) {
@@ -2395,6 +2457,9 @@ pub(crate) async fn do_create_crawl(
     // Auto-generate include patterns from start_urls path prefixes when none specified.
     // e.g. start_url "https://example.com/docs" -> include pattern "https://example.com/docs/*"
     // This prevents crawling the entire site when only a subdirectory was intended.
+    // NOTE: these are full-URL glob patterns (`scheme://host/path/*`). Task B4 unifies the
+    // sitemap-discovered-URL filter and this include-pattern filter onto one matcher that
+    // understands full-URL patterns, so no change is needed here beyond this note.
     let include_patterns = if config.url_patterns.include.is_empty() {
         let mut patterns: Vec<String> = config
             .start_urls
@@ -2445,6 +2510,12 @@ pub(crate) async fn do_create_crawl(
     let job_meilisearch_url = Some(config.meilisearch.url.clone());
     let job_meilisearch_key = Some(config.meilisearch.api_key.clone());
 
+    // Job-scoped settings (headers, user agents, proxy, rate limits, sitemap,
+    // index_only, Meilisearch primary_key/batch_size/settings/keep_settings)
+    // that workers need but that aren't per-URL. Attached to every seed
+    // message so it survives the frontier -> crawler -> content pipeline.
+    let job_spec = Some(JobSpec::from_config(&config));
+
     for url in &config.start_urls {
         let crawl_url = CrawlUrl::seed(url);
         // Use pipeline_index_uid (temp index if replace_index, otherwise target)
@@ -2462,7 +2533,8 @@ pub(crate) async fn do_create_crawl(
         .with_meilisearch(job_meilisearch_url.clone(), job_meilisearch_key.clone())
         .with_features(Some(config.features.clone()))
         .with_limits(config.max_depth, config.max_pages)
-        .with_incremental(!replace_index);
+        .with_incremental(!replace_index)
+        .with_job(job_spec.clone());
 
         // Attach account_id to message for billing attribution
         let msg = if let Some(ctx) = account_ctx {
@@ -2568,6 +2640,7 @@ pub(crate) async fn do_create_crawl(
         index_uid: target_index_uid,
         start_urls_count: urls_published,
         message: format!("Crawl job started with {} seed URLs", urls_published),
+        warnings,
     })
 }
 
@@ -5490,5 +5563,92 @@ mod tests {
                 "Blocked headers should be lowercase for case-insensitive comparison"
             );
         }
+    }
+
+    // ========================================================================
+    // crawl_config_warnings / validate_crawl_config tests (Task 5 / R4)
+    // ========================================================================
+
+    #[test]
+    fn warnings_flag_worker_level_fields() {
+        let mut cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "concurrency": {"browser_pool_size": 99}
+        }))
+        .unwrap();
+        let w = crawl_config_warnings(&cfg);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("browser_pool_size"));
+        cfg.concurrency = Default::default();
+        assert!(crawl_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn warnings_flag_dns_concurrency() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "concurrency": {"dns_concurrency": 7}
+        }))
+        .unwrap();
+        let w = crawl_config_warnings(&cfg);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("dns_concurrency"));
+    }
+
+    #[test]
+    fn warnings_flag_pdf_extract_links() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "features": {"pdf": {"enabled": true, "extract_links": true}}
+        }))
+        .unwrap();
+        let w = crawl_config_warnings(&cfg);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("extract_links"));
+    }
+
+    #[test]
+    fn warnings_empty_for_default_config() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a"
+        }))
+        .unwrap();
+        assert!(crawl_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_empty_start_urls_after_defaulting() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": [], "index_uid": "a"
+        }))
+        .unwrap();
+        assert!(validator::Validate::validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_crawl_config_rejects_invalid_config_with_validation_error() {
+        // do_create_crawl needs a full AppState (producer, DB pool, fetcher, ...),
+        // so we test the extracted validation step it calls instead.
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": [], "index_uid": "a"
+        }))
+        .unwrap();
+
+        let err = validate_crawl_config(&cfg).expect_err("empty start_urls must be rejected");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "validation_error");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn validate_crawl_config_accepts_valid_config() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a"
+        }))
+        .unwrap();
+        assert!(validate_crawl_config(&cfg).is_ok());
     }
 }

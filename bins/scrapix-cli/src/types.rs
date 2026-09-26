@@ -46,6 +46,10 @@ pub struct CreateCrawlResponse {
     pub start_urls_count: usize,
     #[allow(dead_code)]
     pub message: String,
+    /// Non-fatal warnings about config fields that were accepted but cannot
+    /// be honored per-job (worker-level settings). Empty when there are none.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

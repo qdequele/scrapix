@@ -18,6 +18,11 @@ pub fn print_info(message: &str) {
     eprintln!("{} {}", "ℹ".blue().bold(), message);
 }
 
+/// Print a warning message to stderr
+pub fn print_warning(message: &str) {
+    eprintln!("{} {}", "⚠".yellow().bold(), message);
+}
+
 /// Create a spinner on stderr
 pub fn create_spinner(message: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();

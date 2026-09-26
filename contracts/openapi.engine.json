@@ -1007,6 +1007,13 @@
           },
           "status": {
             "type": "string"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Non-fatal warnings about config fields that were accepted but cannot\nbe honored per-job (worker-level settings). Empty when there are none."
           }
         }
       },
