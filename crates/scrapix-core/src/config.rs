@@ -264,7 +264,10 @@ pub struct RateLimitConfig {
     #[serde(default = "default_true")]
     pub respect_robots_txt: bool,
 
-    /// Default crawl delay if not specified in robots.txt (ms)
+    /// Per-domain delay (ms) used when the domain's robots.txt was fetched
+    /// and sets no `Crawl-delay`, and the job sets neither
+    /// `per_domain_delay_ms` (> 0) nor `requests_per_second` /
+    /// `requests_per_minute`. 0 (default) = no extra delay.
     #[serde(default = "default_crawl_delay")]
     pub default_crawl_delay_ms: u64,
 }
@@ -276,7 +279,7 @@ fn default_true() -> bool {
     true
 }
 fn default_crawl_delay() -> u64 {
-    1000
+    0
 }
 
 impl Default for RateLimitConfig {

@@ -1042,8 +1042,14 @@ impl FrontierService {
         }
 
         let limits = job_limits(&template);
+        let popped = urls.len();
         let mut bounced = Vec::new();
         let mut dispatched = 0usize;
+        // URLs bounced because their domain (or the job) was not ready.
+        let mut politeness_bounced = 0usize;
+        // Domains found busy/waiting in this batch: their remaining URLs are
+        // parked without asking the politeness store again.
+        let mut not_ready: HashMap<String, Duration> = HashMap::new();
         let mut lease_held = true;
         let mut last_renew = std::time::Instant::now();
         let mut urls = urls.into_iter();
@@ -1066,6 +1072,14 @@ impl FrontierService {
             }
 
             let domain = extract_domain(&url.url);
+            if let Some(wait) = not_ready.get(&domain) {
+                self.metrics.urls_delayed.fetch_add(1, Ordering::Relaxed);
+                politeness_bounced += 1;
+                let mut url = url;
+                url.not_before_ms = Some(now + wait.as_millis() as i64);
+                bounced.push(url);
+                continue;
+            }
             // The slot token becomes the dispatched message's id, which the
             // crawler echoes back in its FetchFeedback.
             let token = uuid::Uuid::new_v4().to_string();
@@ -1079,8 +1093,16 @@ impl FrontierService {
             // be, so the next ticks don't pop and requeue it over and over.
             let wait = match self.politeness.try_acquire(&slot).await {
                 Ok(Acquire::Granted) => None,
-                Ok(Acquire::Wait(wait)) => Some(wait),
-                Ok(Acquire::DomainBusy) => Some(BUSY_RETRY),
+                Ok(Acquire::Wait(wait)) => {
+                    not_ready.insert(domain.clone(), wait);
+                    politeness_bounced += 1;
+                    Some(wait)
+                }
+                Ok(Acquire::DomainBusy) => {
+                    not_ready.insert(domain.clone(), BUSY_RETRY);
+                    politeness_bounced += 1;
+                    Some(BUSY_RETRY)
+                }
                 Ok(Acquire::JobBusy) => {
                     // Every other URL of the job would be refused too.
                     let until = Some(now + BUSY_RETRY.as_millis() as i64);
@@ -1092,6 +1114,7 @@ impl FrontierService {
                     self.metrics
                         .urls_delayed
                         .fetch_add(rest.len() as u64, Ordering::Relaxed);
+                    politeness_bounced += rest.len();
                     bounced.extend(rest);
                     break;
                 }
@@ -1145,8 +1168,13 @@ impl FrontierService {
             }
         }
 
-        let next = (2 * dispatched + 1).clamp(1, self.dispatch_batch_size.max(1));
-        self.pop_sizes.lock().insert(job_id.to_string(), next);
+        // A batch bounced entirely by politeness says nothing about how much
+        // the job can send (the bounced URLs are parked, so the next pop
+        // reaches other domains): keep the pop size instead of shrinking it.
+        if !(dispatched == 0 && politeness_bounced == popped) {
+            let next = (2 * dispatched + 1).clamp(1, self.dispatch_batch_size.max(1));
+            self.pop_sizes.lock().insert(job_id.to_string(), next);
+        }
 
         self.requeue_or_stash(job_id, bounced).await;
         Ok(lease_held)
@@ -1289,9 +1317,17 @@ impl FrontierService {
             token: &fb.message_id,
             signal: feedback_signal(fb),
             crawl_delay_ms: fb.crawl_delay_ms,
-            retry_after: fb
-                .retry_after_ms
-                .map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER)),
+            robots_checked: fb.robots_checked,
+            retry_until_ms: fb.retry_after_ms.map(|ms| {
+                // Measured from when the crawler saw the response (old
+                // feedback without a timestamp: from now).
+                let seen = if fb.timestamp > 0 {
+                    fb.timestamp
+                } else {
+                    now_ms()
+                };
+                seen.saturating_add(ms.min(MAX_RETRY_AFTER.as_millis() as u64) as i64)
+            }),
         };
         debug!(domain = %domain, job_id = %fb.job_id, status = ?fb.status, "Fetch feedback");
         if let Err(e) = self.politeness.report(&report).await {
@@ -2149,7 +2185,7 @@ mod tests {
         let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
         let h = Harness::start_with(args, store).await;
         let spec = JobSpec {
-            requests_per_second: Some(2.0), // 500 ms apart
+            requests_per_second: Some(4.0), // 250 ms apart
             ..JobSpec::default()
         };
         let seed = one_domain_job("job-rps", Some(spec));
@@ -2158,13 +2194,33 @@ mod tests {
             h.publish(&seed.child(CrawlUrl::new(format!("https://one.test/{i}"), 1)))
                 .await;
         }
-        let got = h.collect_dispatched(Duration::from_millis(1_200)).await;
+        // Timestamp each dispatch as it is received.
+        let c = h.consumer(topic_names::URL_PROCESSING);
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+        let mut at = Vec::new();
+        while Instant::now() < deadline {
+            if c.poll_one::<UrlMessage>(Duration::from_millis(5))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                at.push(Instant::now());
+            }
+        }
         h.stop();
         assert!(
-            (2..=3).contains(&got.len()),
-            "2 rps over 1.2 s dispatches 2-3 URLs, got {}",
-            got.len()
+            at.len() >= 3,
+            "4 rps over 1.5 s: at least 3 dispatches, got {}",
+            at.len()
         );
+        for w in at.windows(2) {
+            let gap = w[1] - w[0];
+            // 250 ms minus receive jitter (dispatch tick + poll interval).
+            assert!(
+                gap >= Duration::from_millis(200),
+                "dispatches {gap:?} apart"
+            );
+        }
     }
 
     /// With `REDIS_URL` set, two frontier instances share one domain slot:
@@ -2251,5 +2307,223 @@ mod tests {
             h.abort();
         }
         assert_eq!(second.len(), 1, "feedback frees the shared slot once");
+    }
+
+    /// A job spec built the way the API builds it (default `CrawlConfig`,
+    /// with `rate_limit` overrides from `rate_limit_json`).
+    fn api_job_spec(rate_limit_json: serde_json::Value) -> JobSpec {
+        let config: scrapix_core::CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://example.com/"],
+            "index_uid": "idx",
+            "rate_limit": rate_limit_json,
+        }))
+        .unwrap();
+        JobSpec::from_config(&config)
+    }
+
+    /// The delay the service's politeness store imposes on `domain` for a
+    /// job with `spec`, after the crawler reported the domain's robots.txt
+    /// (`robots_checked`, no Crawl-delay): take one slot, then read the
+    /// wait before the next.
+    async fn delay_after_robots_feedback(
+        service: &FrontierService,
+        domain: &str,
+        spec: JobSpec,
+        robots_checked: bool,
+    ) -> Duration {
+        let template = UrlMessage::new(
+            CrawlUrl::seed(format!("https://{domain}/")),
+            "job-delay",
+            "idx",
+        )
+        .with_job(Some(spec));
+        let limits = job_limits(&template);
+        let slot = |token: &'static str| SlotRequest {
+            domain,
+            job_id: "job-delay",
+            token,
+            limits,
+        };
+        assert_eq!(
+            service.politeness.try_acquire(&slot("t1")).await.unwrap(),
+            Acquire::Granted
+        );
+        service
+            .apply_feedback(&FetchFeedback {
+                status: Some(200),
+                robots_checked,
+                ..FetchFeedback::new(domain, "job-delay", "t1", format!("https://{domain}/"))
+            })
+            .await;
+        match service.politeness.try_acquire(&slot("t2")).await.unwrap() {
+            Acquire::Wait(d) => d,
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    fn assert_near(d: Duration, expected_ms: u64) {
+        let ms = d.as_millis() as u64;
+        assert!(
+            ms <= expected_ms && ms + 100 >= expected_ms,
+            "expected ~{expected_ms} ms, got {ms} ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_crawl_delay_applies_only_when_robots_checked_and_no_explicit_delay() {
+        let bus = ChannelBus::new();
+        let args = test_args(); // DOMAIN_DELAY_MS default: 250
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let service = spawn_service(&bus, &args, store).await;
+
+        // A default API job: only the worker delay.
+        let d = delay_after_robots_feedback(
+            &service,
+            "a.test",
+            api_job_spec(serde_json::json!({})),
+            true,
+        )
+        .await;
+        assert_near(d, 250);
+
+        // Explicit per-domain delay wins over default_crawl_delay_ms.
+        let spec = api_job_spec(serde_json::json!({
+            "per_domain_delay_ms": 400, "default_crawl_delay_ms": 1500
+        }));
+        let d = delay_after_robots_feedback(&service, "b.test", spec, true).await;
+        assert_near(d, 400);
+
+        // No explicit delay, robots checked without Crawl-delay: 1500.
+        let spec = api_job_spec(serde_json::json!({
+            "per_domain_delay_ms": 0, "default_crawl_delay_ms": 1500
+        }));
+        let d = delay_after_robots_feedback(&service, "c.test", spec.clone(), true).await;
+        assert_near(d, 1500);
+
+        // Same job, robots.txt never consulted: worker delay only.
+        let d = delay_after_robots_feedback(&service, "d.test", spec, false).await;
+        assert_near(d, 250);
+
+        // An explicit rate (rpm) also disables default_crawl_delay_ms.
+        let spec = api_job_spec(serde_json::json!({
+            "per_domain_delay_ms": 0, "default_crawl_delay_ms": 1500, "requests_per_minute": 120
+        }));
+        let d = delay_after_robots_feedback(&service, "e.test", spec, true).await;
+        assert_near(d, 500);
+    }
+
+    #[tokio::test]
+    async fn stale_retry_after_is_measured_from_the_feedback_timestamp() {
+        let bus = ChannelBus::new();
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let service = spawn_service(&bus, &args, store).await;
+        let l = JobLimits::default();
+        let slot = |domain: &'static str, token: &'static str| SlotRequest {
+            domain,
+            job_id: "j",
+            token,
+            limits: l,
+        };
+        let now = now_ms();
+
+        // Produced 90 s ago with Retry-After 60 s: already over.
+        assert_eq!(
+            service
+                .politeness
+                .try_acquire(&slot("old.test", "o1"))
+                .await
+                .unwrap(),
+            Acquire::Granted
+        );
+        service
+            .apply_feedback(&FetchFeedback {
+                status: Some(429),
+                retry_after_ms: Some(60_000),
+                timestamp: now - 90_000,
+                ..FetchFeedback::new("old.test", "j", "o1", "https://old.test/")
+            })
+            .await;
+        assert_eq!(
+            service
+                .politeness
+                .try_acquire(&slot("old.test", "o2"))
+                .await
+                .unwrap(),
+            Acquire::Granted
+        );
+
+        // Produced 50 s ago with Retry-After 60 s: ~10 s left.
+        assert_eq!(
+            service
+                .politeness
+                .try_acquire(&slot("new.test", "n1"))
+                .await
+                .unwrap(),
+            Acquire::Granted
+        );
+        service
+            .apply_feedback(&FetchFeedback {
+                status: Some(429),
+                retry_after_ms: Some(60_000),
+                timestamp: now - 50_000,
+                ..FetchFeedback::new("new.test", "j", "n1", "https://new.test/")
+            })
+            .await;
+        match service
+            .politeness
+            .try_acquire(&slot("new.test", "n2"))
+            .await
+            .unwrap()
+        {
+            Acquire::Wait(d) => assert!(
+                d <= Duration::from_secs(10) && d >= Duration::from_secs(9),
+                "{d:?}"
+            ),
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_domain_does_not_starve_other_domains() {
+        let mut args = test_args();
+        args.concurrent_per_domain = 1;
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store).await;
+        // Another job holds busy.test's only slot and never reports back.
+        assert_eq!(
+            h.service
+                .politeness
+                .try_acquire(&SlotRequest {
+                    domain: "busy.test",
+                    job_id: "hog",
+                    token: "hog-1",
+                    limits: JobLimits::default(),
+                })
+                .await
+                .unwrap(),
+            Acquire::Granted
+        );
+        let seed = UrlMessage::new(CrawlUrl::seed("https://busy.test/"), "job-mixed", "idx");
+        h.publish(&seed).await;
+        // Busy-domain URLs first (FIFO), then 20 free domains.
+        for i in 0..300 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://busy.test/{i}"), 1)))
+                .await;
+        }
+        for i in 0..20 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://free{i}.test/"), 1)))
+                .await;
+        }
+        let got = h.collect_dispatched(Duration::from_millis(1_000)).await;
+        h.stop();
+        let free = got.iter().filter(|m| m.url.url.contains("free")).count();
+        assert_eq!(
+            free, 20,
+            "every free domain dispatched despite the busy one"
+        );
+        assert!(got.iter().all(|m| !m.url.url.contains("busy.test")));
     }
 }

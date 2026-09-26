@@ -51,7 +51,7 @@ fn test_defaults_are_polite() {
     // Rate limiting should be on by default
     assert!(config.rate_limit.respect_robots_txt);
     assert!(config.rate_limit.per_domain_delay_ms >= 100);
-    assert_eq!(config.rate_limit.default_crawl_delay_ms, 1000);
+    assert_eq!(config.rate_limit.default_crawl_delay_ms, 0);
 }
 
 #[test]

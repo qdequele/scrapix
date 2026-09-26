@@ -78,7 +78,7 @@ pub use linkgraph::{LinkGraph, LinkGraphBuilder, LinkGraphConfig, LinkGraphStats
 pub use partition::{extract_domain, DomainGrouper, PartitionConfig, Partitioner};
 pub use politeness::{
     Acquire, DomainStats, FetchReport, FetchSignal, JobLimits, PolitenessConfig,
-    PolitenessScheduler, PolitenessStore, SlotRequest,
+    PolitenessScheduler, PolitenessStore, RobotsInfo, SlotRequest,
 };
 #[cfg(feature = "redis-store")]
 pub use politeness_redis::RedisPoliteness;

@@ -784,8 +784,9 @@ impl HttpFetcher {
         self.robots_cache.get_crawl_delay(domain).await
     }
 
-    /// Cached robots.txt `Crawl-delay` for `url`'s origin (never fetches).
-    pub fn cached_crawl_delay(&self, url: &str) -> Option<u64> {
+    /// Cached robots.txt `Crawl-delay` for `url`'s origin (never fetches):
+    /// `None` = not cached, `Some(None)` = fetched, no crawl-delay.
+    pub fn cached_crawl_delay(&self, url: &str) -> Option<Option<u64>> {
         self.robots_cache.cached_crawl_delay(url)
     }
 

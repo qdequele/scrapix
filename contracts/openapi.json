@@ -4805,7 +4805,7 @@
           "default_crawl_delay_ms": {
             "type": "integer",
             "format": "int64",
-            "description": "Default crawl delay if not specified in robots.txt (ms)",
+            "description": "Per-domain delay (ms) used when the domain's robots.txt was fetched\nand sets no `Crawl-delay`, and the job sets neither\n`per_domain_delay_ms` (> 0) nor `requests_per_second` /\n`requests_per_minute`. 0 (default) = no extra delay.",
             "minimum": 0
           },
           "per_domain_delay_ms": {

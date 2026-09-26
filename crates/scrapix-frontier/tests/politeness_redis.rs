@@ -79,7 +79,8 @@ fn report<'a>(
         token,
         signal,
         crawl_delay_ms: None,
-        retry_after: None,
+        robots_checked: false,
+        retry_until_ms: None,
     }
 }
 
@@ -186,7 +187,7 @@ async fn delay_job_cap_retry_after_and_expiry() {
         Acquire::Granted
     );
     b.report(&FetchReport {
-        retry_after: Some(Duration::from_secs(60)),
+        retry_until_ms: Some(chrono::Utc::now().timestamp_millis() + 60_000),
         crawl_delay_ms: Some(5_000),
         ..report("r.test", "j", "r1", FetchSignal::RateLimited)
     })
@@ -223,5 +224,106 @@ async fn delay_job_cap_retry_after_and_expiry() {
         Acquire::Granted
     );
 
+    cleanup(&url, &prefix).await;
+}
+
+#[tokio::test]
+async fn default_crawl_delay_needs_checked_robots_and_accounting_needs_the_slot() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let (a, b) = pair(&url, &prefix, config(10)).await;
+    let l = JobLimits {
+        default_crawl_delay_ms: 1_500,
+        ..JobLimits::default()
+    };
+    let wait = |r: Acquire| match r {
+        Acquire::Wait(d) => d,
+        Acquire::Granted => Duration::ZERO,
+        other => panic!("unexpected {other:?}"),
+    };
+    let free = JobLimits::default();
+
+    // robots.txt never fetched: no default delay.
+    assert_eq!(
+        a.try_acquire(&req("u.test", "j", "u1", l)).await.unwrap(),
+        Acquire::Granted
+    );
+    a.report(&report("u.test", "j", "u1", FetchSignal::Success))
+        .await
+        .unwrap();
+    assert_eq!(
+        b.try_acquire(&req("u.test", "j", "u2", l)).await.unwrap(),
+        Acquire::Granted
+    );
+
+    // Fetched without Crawl-delay: the job's default applies...
+    assert_eq!(
+        a.try_acquire(&req("k.test", "j", "k1", l)).await.unwrap(),
+        Acquire::Granted
+    );
+    a.report(&FetchReport {
+        robots_checked: true,
+        ..report("k.test", "j", "k1", FetchSignal::Success)
+    })
+    .await
+    .unwrap();
+    let d = wait(b.try_acquire(&req("k.test", "j", "k2", l)).await.unwrap());
+    assert!(d > Duration::from_millis(1_400), "{d:?}");
+    // ...unless the job set an explicit delay.
+    let explicit = JobLimits {
+        min_delay_ms: 200,
+        ..l
+    };
+    let d = wait(
+        b.try_acquire(&req("k.test", "j", "k3", explicit))
+            .await
+            .unwrap(),
+    );
+    assert!(d <= Duration::from_millis(200), "{d:?}");
+
+    // Feedback for a slot that is not held (duplicate) does no accounting:
+    // a dozen rate-limited duplicates would otherwise pause the domain.
+    assert_eq!(
+        a.try_acquire(&req("dup.test", "j", "x1", free))
+            .await
+            .unwrap(),
+        Acquire::Granted
+    );
+    a.report(&report("dup.test", "j", "x1", FetchSignal::Success))
+        .await
+        .unwrap();
+    for _ in 0..12 {
+        a.report(&report("dup.test", "j", "x1", FetchSignal::RateLimited))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        a.try_acquire(&req("dup.test", "j", "x2", free))
+            .await
+            .unwrap(),
+        Acquire::Granted
+    );
+
+    // A Retry-After deadline already in the past does not pause.
+    assert_eq!(
+        a.try_acquire(&req("old.test", "j", "o1", free))
+            .await
+            .unwrap(),
+        Acquire::Granted
+    );
+    a.report(&FetchReport {
+        retry_until_ms: Some(chrono::Utc::now().timestamp_millis() - 1_000),
+        ..report("old.test", "j", "o1", FetchSignal::RateLimited)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        a.try_acquire(&req("old.test", "j", "o2", free))
+            .await
+            .unwrap(),
+        Acquire::Granted
+    );
+
+    assert!(a.tracked_domain_count() >= 4);
     cleanup(&url, &prefix).await;
 }

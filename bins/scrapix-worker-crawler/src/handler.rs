@@ -180,7 +180,10 @@ impl CrawlerWorker {
         let mut feedback = fetch_feedback(msg, result, via_proxy);
         let respects_robots = !matches!(msg.job, Some(ref j) if !j.respect_robots_txt);
         if respects_robots && result.is_some() {
-            feedback.crawl_delay_ms = self.fetcher.cached_crawl_delay(&msg.url.url);
+            if let Some(delay) = self.fetcher.cached_crawl_delay(&msg.url.url) {
+                feedback.robots_checked = true;
+                feedback.crawl_delay_ms = delay;
+            }
         }
         let send = self.producer.send(
             topic_names::FETCH_FEEDBACK,
@@ -1113,6 +1116,7 @@ mod tests {
         assert!(!fb.transport_error);
         assert_eq!(fb.retry_after_ms, None);
         assert_eq!(fb.crawl_delay_ms, None, "robots not consulted");
+        assert!(!fb.robots_checked);
     }
 
     #[tokio::test]
@@ -1190,6 +1194,7 @@ mod tests {
         let fb = feedback_for(&bus, &respects).await;
         assert_eq!(fb.status, Some(200));
         assert_eq!(fb.crawl_delay_ms, Some(2_000));
+        assert!(fb.robots_checked);
 
         let ignores = message(
             url(&server, "/page"),
@@ -1201,6 +1206,32 @@ mod tests {
         let (ack, _) = tracked_ack();
         w.handle_message(ignores.clone(), ack).await;
         let fb = feedback_for(&bus, &ignores).await;
+        assert_eq!(fb.crawl_delay_ms, None);
+        assert!(!fb.robots_checked, "job ignores robots.txt");
+    }
+
+    #[tokio::test]
+    async fn robots_without_crawl_delay_is_reported_as_checked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("User-agent: *\nAllow: /\n", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let w = worker_with_robots(&bus, true).await;
+        let msg = message(url(&server, "/page"), Some(JobSpec::default()));
+        let (ack, _) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+        let fb = feedback_for(&bus, &msg).await;
+        assert!(fb.robots_checked);
         assert_eq!(fb.crawl_delay_ms, None);
     }
 }

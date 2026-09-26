@@ -832,6 +832,11 @@ pub struct FetchFeedback {
     /// for jobs that respect robots.txt, and only when already cached)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crawl_delay_ms: Option<u64>,
+    /// The URL's robots.txt was fetched (the crawler's robots cache holds
+    /// its origin) and the job respects robots.txt — so `crawl_delay_ms:
+    /// None` means "robots.txt sets no Crawl-delay", not "unknown"
+    #[serde(default)]
+    pub robots_checked: bool,
     /// When the feedback was produced (ms since epoch)
     #[serde(default)]
     pub timestamp: i64,

@@ -14,10 +14,13 @@
 //!   multiplier)`, clamped to `[min(min_delay_ms, default_delay_ms),
 //!   max_delay_ms]`. The adaptive delay starts at `default_delay_ms` (the
 //!   worker's `DOMAIN_DELAY_MS`), grows on errors and shrinks back on
-//!   success. The robots term is the domain's `Crawl-delay` (or the job's
-//!   `default_crawl_delay_ms` when robots.txt set none), only for jobs that
-//!   respect robots.txt.
-//! - A `Retry-After` (429/503) pauses the domain until it elapses.
+//!   success. The robots term applies only to jobs that respect robots.txt:
+//!   it is the domain's `Crawl-delay` when robots.txt sets one, else the
+//!   job's `default_crawl_delay_ms` — but only when robots.txt was actually
+//!   fetched (and set none) and the job set no explicit delay
+//!   (`per_domain_delay_ms` > 0) or rate (`requests_per_second`/minute).
+//! - A `Retry-After` (429/503) pauses the domain until
+//!   `feedback timestamp + Retry-After` (ignored if already past).
 //! - A job has at most `JobLimits::max_in_flight` requests in flight.
 //!
 //! [`PolitenessScheduler`] keeps this state in memory (one frontier
@@ -79,7 +82,8 @@ pub struct JobLimits {
     /// `rate_limit.respect_robots_txt`: whether the robots term applies
     pub respect_robots: bool,
     /// `rate_limit.default_crawl_delay_ms`: the robots term when the
-    /// domain's robots.txt set no `Crawl-delay`
+    /// domain's robots.txt was fetched and set no `Crawl-delay`, for a job
+    /// with no explicit `min_delay_ms` (> 0) or `max_rps`
     pub default_crawl_delay_ms: u64,
     /// `concurrency.max_concurrent_requests`: per-job in-flight cap
     pub max_in_flight: Option<u32>,
@@ -106,19 +110,39 @@ impl JobLimits {
             _ => 0,
         }
     }
+
+    /// Whether `default_crawl_delay_ms` may stand in for a missing robots
+    /// `Crawl-delay`: only when the job set no explicit delay or rate.
+    pub fn uses_default_crawl_delay(&self) -> bool {
+        self.min_delay_ms == 0 && self.max_rps.is_none()
+    }
+}
+
+/// What the frontier knows about a domain's robots.txt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RobotsInfo {
+    /// `Crawl-delay` (ms), when robots.txt sets one
+    pub crawl_delay_ms: Option<u64>,
+    /// robots.txt was fetched (so `crawl_delay_ms: None` means "none set")
+    pub checked: bool,
 }
 
 /// The effective delay between two requests to one domain (see the module
-/// docs). `adaptive_ms` is the domain's error-adapted delay, `robots_ms` its
-/// robots.txt `Crawl-delay` if one was reported.
+/// docs). `adaptive_ms` is the domain's error-adapted delay.
 pub fn effective_delay(
     config: &PolitenessConfig,
     adaptive_ms: u64,
-    robots_ms: Option<u64>,
+    robots: RobotsInfo,
     limits: &JobLimits,
 ) -> u64 {
     let robots = if config.respect_robots_delay && limits.respect_robots {
-        let raw = robots_ms.unwrap_or(limits.default_crawl_delay_ms);
+        let raw = match robots.crawl_delay_ms {
+            Some(d) => d,
+            None if robots.checked && limits.uses_default_crawl_delay() => {
+                limits.default_crawl_delay_ms
+            }
+            None => 0,
+        };
         (raw as f64 * config.robots_delay_multiplier) as u64
     } else {
         0
@@ -179,8 +203,12 @@ pub struct FetchReport<'a> {
     pub signal: FetchSignal,
     /// robots.txt `Crawl-delay` of the domain, when known
     pub crawl_delay_ms: Option<u64>,
-    /// Server `Retry-After`: pause the domain this long
-    pub retry_after: Option<Duration>,
+    /// robots.txt was fetched (`crawl_delay_ms: None` then means none set)
+    pub robots_checked: bool,
+    /// Server `Retry-After` as an absolute deadline (ms since epoch,
+    /// measured from when the crawler saw the response): pause the domain
+    /// until then; ignored if already past
+    pub retry_until_ms: Option<i64>,
 }
 
 /// Politeness state behind the frontier dispatcher: in memory
@@ -217,8 +245,8 @@ struct DomainState {
     last_request: Option<Instant>,
     /// Error-adapted delay (starts at `default_delay_ms`)
     delay_ms: u64,
-    /// robots.txt `Crawl-delay`, when reported
-    robots_delay_ms: Option<u64>,
+    /// robots.txt `Crawl-delay` / whether robots.txt was fetched
+    robots: RobotsInfo,
     /// Limits used by the token-less API (`set_job_limits`)
     job_limits: JobLimits,
     /// Currently in-flight requests (oldest first)
@@ -236,7 +264,7 @@ impl DomainState {
         Self {
             last_request: None,
             delay_ms,
-            robots_delay_ms: None,
+            robots: RobotsInfo::default(),
             job_limits: JobLimits::default(),
             in_flight: Vec::new(),
             paused: false,
@@ -329,7 +357,7 @@ impl PolitenessScheduler {
     }
 
     fn state_delay(&self, state: &DomainState, limits: &JobLimits) -> u64 {
-        effective_delay(&self.config, state.delay_ms, state.robots_delay_ms, limits)
+        effective_delay(&self.config, state.delay_ms, state.robots, limits)
     }
 
     /// Check if a request to a domain can be made (token-less API; uses the
@@ -362,7 +390,7 @@ impl PolitenessScheduler {
             None => effective_delay(
                 &self.config,
                 self.config.default_delay_ms,
-                None,
+                RobotsInfo::default(),
                 &JobLimits::default(),
             ),
         }
@@ -457,7 +485,12 @@ impl PolitenessScheduler {
     /// Set the robots.txt `Crawl-delay` for a domain (multiplied by
     /// `robots_delay_multiplier` and clamped when computing the delay).
     pub fn set_delay(&self, domain: &str, delay_ms: u64) {
-        self.with_state(domain, |state| state.robots_delay_ms = Some(delay_ms));
+        self.with_state(domain, |state| {
+            state.robots = RobotsInfo {
+                crawl_delay_ms: Some(delay_ms),
+                checked: true,
+            }
+        });
         debug!(domain, delay_ms, "Set domain robots delay");
     }
 
@@ -547,6 +580,9 @@ impl PolitenessScheduler {
             }
             None => 0,
         };
+        if job_held == 0 {
+            jobs.remove(req.job_id);
+        }
         if let Some(cap) = req.limits.max_in_flight.filter(|c| *c > 0) {
             if job_held >= cap as usize {
                 return Acquire::JobBusy;
@@ -593,8 +629,11 @@ impl PolitenessScheduler {
     pub fn apply_report(&self, r: &FetchReport<'_>) {
         let owned = self.free_token(r.domain, r.job_id, r.token);
         self.with_state(r.domain, |state| {
-            if let Some(d) = r.crawl_delay_ms {
-                state.robots_delay_ms = Some(d);
+            if r.crawl_delay_ms.is_some() || r.robots_checked {
+                state.robots = RobotsInfo {
+                    crawl_delay_ms: r.crawl_delay_ms,
+                    checked: true,
+                };
             }
             // Error accounting only for this instance's own dispatches, so a
             // failure seen by every instance is not counted N times.
@@ -606,8 +645,11 @@ impl PolitenessScheduler {
                     FetchSignal::NoRequest => {}
                 }
             }
-            if let Some(d) = r.retry_after {
-                state.pause_for(d);
+            if let Some(until) = r.retry_until_ms {
+                let left = until - chrono::Utc::now().timestamp_millis();
+                if left > 0 {
+                    state.pause_for(Duration::from_millis(left as u64));
+                }
             }
         });
     }
@@ -731,7 +773,8 @@ mod tests {
             token,
             signal,
             crawl_delay_ms: None,
-            retry_after: None,
+            robots_checked: false,
+            retry_until_ms: None,
         }
     }
 
@@ -790,7 +833,7 @@ mod tests {
         let l = JobLimits::default();
         assert_eq!(p.acquire(&req("a.test", "j", "t1", l)), Acquire::Granted);
         p.apply_report(&FetchReport {
-            retry_after: Some(Duration::from_secs(60)),
+            retry_until_ms: Some(chrono::Utc::now().timestamp_millis() + 60_000),
             crawl_delay_ms: Some(3_000),
             ..report("a.test", "j", "t1", FetchSignal::RateLimited)
         });
@@ -821,17 +864,40 @@ mod tests {
             default_crawl_delay_ms: 1_000,
             ..JobLimits::default()
         };
-        assert_eq!(effective_delay(p.config(), 0, None, &l), 1_000);
-        assert_eq!(effective_delay(p.config(), 0, Some(200), &l), 200);
+        let checked = |d: Option<u64>| RobotsInfo {
+            crawl_delay_ms: d,
+            checked: true,
+        };
+        assert_eq!(effective_delay(p.config(), 0, checked(None), &l), 1_000);
+        assert_eq!(effective_delay(p.config(), 0, checked(Some(200)), &l), 200);
+        // robots.txt never fetched: no default.
+        assert_eq!(effective_delay(p.config(), 0, RobotsInfo::default(), &l), 0);
+        // An explicit job delay or rate replaces the default.
+        let explicit = JobLimits {
+            min_delay_ms: 200,
+            ..l
+        };
+        assert_eq!(
+            effective_delay(p.config(), 0, checked(None), &explicit),
+            200
+        );
+        let rate = JobLimits {
+            max_rps: Some(10.0),
+            ..l
+        };
+        assert_eq!(effective_delay(p.config(), 0, checked(None), &rate), 100);
         let mult = PolitenessConfig {
             robots_delay_multiplier: 1.5,
             min_delay_ms: 0,
             default_delay_ms: 0,
             ..Default::default()
         };
-        assert_eq!(effective_delay(&mult, 0, Some(2_000), &l), 3_000);
+        assert_eq!(effective_delay(&mult, 0, checked(Some(2_000)), &l), 3_000);
         // Clamped to max_delay_ms.
-        assert_eq!(effective_delay(&mult, 0, Some(600_000), &l), 30_000);
+        assert_eq!(
+            effective_delay(&mult, 0, checked(Some(600_000)), &l),
+            30_000
+        );
     }
 
     #[test]
