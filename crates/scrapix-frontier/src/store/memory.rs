@@ -230,6 +230,8 @@ impl FrontierStore for MemoryFrontierStore {
         let Some(entry) = jobs.get_mut(job_id) else {
             return Ok(());
         };
+        // Undo the pop: these URLs did not leave the frontier.
+        entry.counters.dispatched = entry.counters.dispatched.saturating_sub(urls.len() as u64);
         for url in urls {
             entry.enqueue(url);
         }

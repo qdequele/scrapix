@@ -148,10 +148,15 @@ return out
 "#;
 
 /// `KEYS`: meta, q, later. `ARGV`: repeated triples
-/// (-(priority), not_before_ms or "", url JSON). Counters untouched; each URL
-/// gets a fresh seq. A no-op for an unknown job.
+/// (-(priority), not_before_ms or "", url JSON). Undoes the pop: `dispatched`
+/// is decremented (floored at 0) by the number of URLs; every other counter is
+/// untouched. Each URL gets a fresh seq. A no-op for an unknown job.
 const REQUEUE_LUA: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local dispatched = tonumber(redis.call('HGET', KEYS[1], 'dispatched') or '0')
+local n = #ARGV / 3
+if dispatched < n then n = dispatched end
+if n > 0 then redis.call('HINCRBY', KEYS[1], 'dispatched', -n) end
 for i = 1, #ARGV, 3 do
   local seq = string.format('%020d', redis.call('HINCRBY', KEYS[1], 'seq', 1))
   if ARGV[i + 1] == '' then
@@ -372,8 +377,9 @@ impl FrontierStore for RedisFrontierStore {
     }
 
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>> {
-        // ZPOPMIN's count must fit a signed 64-bit integer.
-        let n = n.min(i64::MAX as usize);
+        // ZPOPMIN's count must fit a signed 64-bit integer, and DragonflyDB
+        // may parse it as a u32 — clamp to the smaller of the two.
+        let n = n.min(u32::MAX as usize);
         let mut conn = self.conn.clone();
         let members: Vec<String> = self
             .pop_ready

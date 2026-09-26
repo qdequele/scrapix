@@ -146,7 +146,9 @@ pub struct JobCounters {
     /// URLs that passed all admission checks and were enqueued. Incremented
     /// at most once per URL (retries do not increment it again).
     pub admitted: u64,
-    /// URLs popped via `pop_ready`.
+    /// URLs popped via `pop_ready` and not put back via `requeue`, i.e.
+    /// dispatch attempts that actually left the frontier (a retry that is
+    /// re-admitted and popped again counts again).
     pub dispatched: u64,
     /// `admit` calls not admitted for depth, budget, capacity, or run
     /// state (i.e. any `Admission` other than `Admitted`; this includes
@@ -202,8 +204,10 @@ pub trait FrontierStore: Send + Sync {
     /// `Ok(vec![])` for an unknown job. Increments `dispatched`.
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>>;
 
-    /// Put URLs back without touching counters (politeness said "not yet").
-    /// A no-op for an unknown job.
+    /// Put URLs previously returned by `pop_ready` back (politeness said "not
+    /// yet"). Undoes the pop: `dispatched` is decremented by `urls.len()`
+    /// (floored at 0); every other counter — in particular the `admitted`
+    /// budget — is untouched. A no-op for an unknown job.
     async fn requeue(&self, job_id: &str, urls: Vec<CrawlUrl>) -> Result<()>;
 
     /// Total pending URLs (ready + delayed). `0` for an unknown job.

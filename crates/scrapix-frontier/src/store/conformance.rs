@@ -36,9 +36,14 @@ pub async fn max_pages_counts_each_url_once(s: &dyn FrontierStore) {
     }
     let popped = s.pop_ready("j", 10, i64::MAX).await.unwrap();
     assert_eq!(popped.len(), 2);
+    assert_eq!(s.counters("j").await.unwrap().dispatched, 2);
     s.requeue("j", popped).await.unwrap(); // politeness bounce must not consume budget
-    assert_eq!(s.counters("j").await.unwrap().admitted, 2);
+    let c = s.counters("j").await.unwrap();
+    assert_eq!(c.admitted, 2);
+    // requeue undoes the pop: `dispatched` counts URLs that actually left.
+    assert_eq!(c.dispatched, 0);
     assert_eq!(s.pop_ready("j", 10, i64::MAX).await.unwrap().len(), 2);
+    assert_eq!(s.counters("j").await.unwrap().dispatched, 2);
 }
 
 pub async fn full_queue_rejects_before_marking_seen(s: &dyn FrontierStore) {
