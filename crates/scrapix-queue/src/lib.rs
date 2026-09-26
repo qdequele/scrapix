@@ -50,6 +50,7 @@
 //! }
 //! ```
 
+pub mod accounting;
 pub mod bus;
 pub mod channel;
 pub mod consumer;
@@ -59,6 +60,7 @@ pub mod topics;
 pub mod traits;
 
 // Re-exports
+pub use accounting::{FrontierSnapshot, JobAccounting};
 pub use consumer::{ConsumerBuilder, ConsumerConfig, KafkaConsumer, MessageMetadata};
 pub use offsets::OffsetTracker;
 pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};
