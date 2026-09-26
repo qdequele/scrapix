@@ -47,7 +47,9 @@ pub use clickhouse::{
     ClickHouseStorage, DailyStats, DomainStats, HourlyStats, JobEvent, JobEventBatcher,
     JobEventSummaryRow, JobStats, RequestEvent, RequestEventBatcher,
 };
-pub use meilisearch::{MeilisearchConfig, MeilisearchStorage, MeilisearchStorageBuilder};
+pub use meilisearch::{
+    DocAck, MeilisearchConfig, MeilisearchStorage, MeilisearchStorageBuilder, RejectFn,
+};
 pub use object_storage::{
     ObjectInfo, ObjectMetadata, ObjectStorageError, S3Config, S3ConfigBuilder, S3Storage,
     S3StorageBuilder,

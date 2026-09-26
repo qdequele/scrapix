@@ -96,8 +96,9 @@ async fn full_batch_is_sent_and_acked_by_add() {
     assert_eq!(acked.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
-async fn keep_settings_skips_settings_on_existing_index() {
+/// Mocks an existing index `existing` whose filterable attributes are
+/// `filterable`; PATCH /settings must never be called.
+async fn existing_index(filterable: serde_json::Value) -> MockServer {
     let ms = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/indexes/existing$"))
@@ -106,8 +107,36 @@ async fn keep_settings_skips_settings_on_existing_index() {
             "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"})))
         .mount(&ms)
         .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/indexes/existing/settings/filterable-attributes$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(filterable))
+        .mount(&ms)
+        .await;
     Mock::given(method("PATCH"))
         .and(path_regex(r"^/indexes/existing/settings$"))
+        .respond_with(task_accepted())
+        .expect(0)
+        .mount(&ms)
+        .await;
+    ms
+}
+
+fn keep_settings() -> scrapix_core::JobSpec {
+    scrapix_core::JobSpec {
+        keep_settings: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn keep_settings_skips_settings_on_existing_index() {
+    let ms = existing_index(serde_json::json!(["domain", "_crawl_job_id"])).await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/indexes/existing/settings/filterable-attributes$",
+        ))
         .respond_with(task_accepted())
         .expect(0)
         .mount(&ms)
@@ -116,13 +145,125 @@ async fn keep_settings_skips_settings_on_existing_index() {
     let storage = MeilisearchStorageBuilder::new(ms.uri(), "existing")
         .connect()
         .unwrap();
-    let spec = scrapix_core::JobSpec {
-        keep_settings: true,
-        ..Default::default()
-    };
-    storage
-        .configure_index("existing", &Default::default(), Some(&spec))
+    assert!(
+        storage
+            .configure_index("existing", &Default::default(), Some(&keep_settings()))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn keep_settings_still_makes_crawl_job_id_filterable() {
+    let ms = existing_index(serde_json::json!(["domain"])).await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/indexes/existing/settings/filterable-attributes$",
+        ))
+        .respond_with(task_accepted())
+        .expect(1)
+        .mount(&ms)
         .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "existing")
+        .connect()
+        .unwrap();
+    assert!(
+        storage
+            .configure_index("existing", &Default::default(), Some(&keep_settings()))
+            .await
+    );
+
+    let requests = ms.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("filterable attributes updated");
+    let body: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
+    assert_eq!(body, serde_json::json!(["domain", "_crawl_job_id"]));
+}
+
+#[tokio::test]
+async fn permanently_refused_batch_is_rejected_not_retried() {
+    let ms = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "message": "The provided API key is invalid.", "code": "invalid_api_key",
+            "type": "auth", "link": "https://docs.meilisearch.com/errors#invalid_api_key"})))
+        .expect(1)
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(10)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    for n in 0..2 {
+        let r = rejected.clone();
+        let ack = scrapix_storage::DocAck::new(counting_ack(&acked)).on_reject(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        storage
+            .add_document_to_index(doc(n), "i", ack)
+            .await
+            .unwrap();
+    }
+
+    assert!(storage.flush().await.is_err());
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(rejected.load(Ordering::SeqCst), 2);
+    assert_eq!(storage.pending_count(), 0, "refused batch is not kept");
+    // Nothing left to send: the next flush makes no request (expect(1)).
+    assert_eq!(storage.flush().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn backpressure_wait_is_time_boxed() {
+    let ms = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(1)
+        .backpressure_timeout(std::time::Duration::from_millis(300))
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    // 4 * batch_size documents fill the buffer (every flush fails retryably).
+    for n in 0..4 {
+        storage
+            .add_document_to_index(doc(n), "i", counting_ack(&acked))
+            .await
+            .unwrap();
+    }
+    assert_eq!(storage.pending_count(), 4);
+
+    let reason = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let r = reason.clone();
+    let ack = scrapix_storage::DocAck::new(counting_ack(&acked)).on_reject(move |why| {
+        *r.lock() = Some(why);
+    });
+    let started = std::time::Instant::now();
+    assert!(storage
+        .add_document_to_index(doc(9), "i", ack)
+        .await
+        .is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        reason.lock().as_deref(),
+        Some("meilisearch backpressure timeout")
+    );
+    assert_eq!(acked.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        storage.pending_count(),
+        4,
+        "earlier documents stay buffered"
+    );
 }
 
 #[tokio::test]
@@ -187,4 +328,5 @@ async fn job_settings_are_merged_over_feature_defaults() {
     assert!(filterable.contains(&"_crawl_job_id".to_string()));
     assert!(!filterable.contains(&"domain".to_string()));
     assert_eq!(body["stopWords"], serde_json::json!(["the"]));
+    assert_eq!(body["pagination"]["maxTotalHits"], 10000);
 }

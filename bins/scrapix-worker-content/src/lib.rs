@@ -38,7 +38,7 @@ use scrapix_lifecycle::{
     wake_port_from_env,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, AiUsageContext, AiUsageEvent, AI_USAGE_CONTEXT};
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage};
@@ -51,7 +51,7 @@ use scrapix_queue::{
     topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, CrawlHistoryMessage,
     DocumentMessage, ProducerBuilder, RawPageMessage,
 };
-use scrapix_storage::{MeilisearchStorage, MeilisearchStorageBuilder};
+use scrapix_storage::{DocAck, MeilisearchStorage, MeilisearchStorageBuilder};
 
 /// `JobWarning` when a job asks for AI enrichment on a worker without an
 /// AI provider.
@@ -75,9 +75,11 @@ pub struct Args {
     #[arg(short, long, env = "KAFKA_GROUP_ID", default_value = "scrapix-content")]
     pub group_id: String,
 
-    /// Number of raw pages processed concurrently (in-flight messages).
-    /// Each page's offset commits only once its documents are accepted by
-    /// Meilisearch, so this also bounds un-committed work per worker.
+    /// Number of raw pages processed at once (parse, enrich, buffer).
+    /// A page's handler returns once its documents are buffered; the page
+    /// stays un-acked (offset uncommitted) until Meilisearch accepts their
+    /// batch. Un-acked work is therefore bounded by the Meilisearch buffers
+    /// (at most 4 x batch size per index), not by this value.
     #[arg(short, long, env = "CONCURRENCY", default_value = "8")]
     pub concurrency: usize,
 
@@ -304,13 +306,62 @@ enum PageOutcome {
     Failed(String),
 }
 
-/// A page whose documents were all accepted by Meilisearch: publish its
-/// `DocumentIndexed`, then ack its message.
+/// A page whose documents all reached a final Meilisearch outcome: publish
+/// its event (`DocumentIndexed`, or `DocumentFailed` if any document was
+/// refused), then ack its message.
 struct IndexedNotice {
     job_id: String,
     event: CrawlEvent,
+    /// Documents indexed (0 when the page failed)
     docs: u64,
     ack: Ack,
+}
+
+/// Tracks one page's buffered documents until each is accepted or refused.
+struct PageTracker {
+    remaining: std::sync::atomic::AtomicUsize,
+    error: parking_lot::Mutex<Option<String>>,
+    notice: parking_lot::Mutex<Option<IndexedNotice>>,
+    tx: mpsc::UnboundedSender<IndexedNotice>,
+    pending: Arc<AtomicU64>,
+}
+
+impl PageTracker {
+    /// One document finished (`Some(reason)` = refused). The last one sends
+    /// the page's notice.
+    fn done(&self, error: Option<String>) {
+        if let Some(e) = error {
+            self.error.lock().get_or_insert(e);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let Some(mut notice) = self.notice.lock().take() else {
+            return;
+        };
+        if let Some(error) = self.error.lock().take() {
+            if let CrawlEvent::DocumentIndexed {
+                job_id,
+                url,
+                url_message_id,
+                ..
+            } = &notice.event
+            {
+                notice.event = CrawlEvent::DocumentFailed {
+                    job_id: job_id.clone(),
+                    url: url.clone(),
+                    url_message_id: url_message_id.clone(),
+                    error,
+                    timestamp: now_ms(),
+                };
+            }
+            notice.docs = 0;
+        }
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(notice).is_err() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Per-job Meilisearch target: `(url, api key, index uid, primary key,
@@ -335,9 +386,10 @@ struct ContentWorker {
     consumer: Arc<AnyConsumer>,
     producer: Arc<AnyProducer>,
     parser: HtmlParser,
-    /// Default storage (built at startup). `None` = indexing disabled
-    /// (`SKIP_MEILISEARCH`, or Meilisearch unreachable at startup).
-    storage: Option<Arc<MeilisearchStorage>>,
+    /// `false` only with `SKIP_MEILISEARCH`. A Meilisearch that is
+    /// unreachable at startup does not disable indexing: per-job storages
+    /// connect lazily and retry, and nothing is acked until accepted.
+    indexing_enabled: bool,
     /// Default Meilisearch URL (from env/args)
     default_meilisearch_url: String,
     /// Default Meilisearch API key (from env/args)
@@ -392,13 +444,13 @@ impl ContentWorker {
             .compression("lz4")
             .build()?;
 
-        let storage = default_storage(args).await;
+        startup_check(args).await;
         Ok(Self::build(
             args,
             worker_id,
             Arc::new(kafka_consumer.into()),
             Arc::new(kafka_producer.into()),
-            storage,
+            !args.skip_meilisearch,
         ))
     }
 
@@ -414,17 +466,23 @@ impl ContentWorker {
     ) -> anyhow::Result<Self> {
         let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker (pre-built bus)");
-        let storage = default_storage(args).await;
-        Ok(Self::build(args, worker_id, consumer, producer, storage))
+        startup_check(args).await;
+        Ok(Self::build(
+            args,
+            worker_id,
+            consumer,
+            producer,
+            !args.skip_meilisearch,
+        ))
     }
 
-    /// Shared construction once the bus and default storage exist.
+    /// Shared construction once the bus exists.
     fn build(
         args: &Args,
         worker_id: String,
         consumer: Arc<AnyConsumer>,
         producer: Arc<AnyProducer>,
-        storage: Option<Arc<MeilisearchStorage>>,
+        indexing_enabled: bool,
     ) -> Self {
         // Always extract everything; per-job features are applied as a
         // post-parse filter so the parser can be reused.
@@ -523,7 +581,7 @@ impl ContentWorker {
             consumer,
             producer,
             parser,
-            storage,
+            indexing_enabled,
             default_meilisearch_url: args.meilisearch_url.clone(),
             default_meilisearch_key: args.meilisearch_key.clone().unwrap_or_default(),
             storage_cache: tokio::sync::Mutex::new(HashMap::new()),
@@ -581,7 +639,8 @@ impl ContentWorker {
         }
     }
 
-    /// Get (or create and configure) the buffered storage for a message.
+    /// Get (or create) the buffered storage for a message and make sure
+    /// the job's index configuration is applied.
     ///
     /// `Ok(None)` = indexing disabled on this worker. `Err` = the job's
     /// Meilisearch target is unusable (never falls back to another
@@ -591,39 +650,45 @@ impl ContentWorker {
         msg: &RawPageMessage,
         features: &FeaturesConfig,
     ) -> Result<Option<Arc<MeilisearchStorage>>, String> {
-        if self.storage.is_none() {
+        if !self.indexing_enabled {
             return Ok(None);
         }
         let key = self.storage_key(msg);
-        // Held across configuration so concurrent pages of a new index wait
-        // until its settings are submitted (before any of its documents).
-        let mut cache = self.storage_cache.lock().await;
-        if let Some(storage) = cache.get(&key) {
-            return Ok(Some(storage.clone()));
-        }
-
-        let mut builder = MeilisearchStorageBuilder::new(&key.url, &key.index_uid)
-            .primary_key(&key.primary_key)
-            .batch_size(key.batch_size);
-        if !key.api_key.is_empty() {
-            builder = builder.api_key(&key.api_key);
-        }
-        let storage = Arc::new(
-            builder
-                .connect()
-                .map_err(|e| format!("Invalid Meilisearch target: {e}"))?,
-        );
+        // The map lock covers only the lookup and the (network-free)
+        // client construction, never Meilisearch I/O.
+        let storage = {
+            let mut cache = self.storage_cache.lock().await;
+            match cache.get(&key) {
+                Some(storage) => storage.clone(),
+                None => {
+                    let mut builder = MeilisearchStorageBuilder::new(&key.url, &key.index_uid)
+                        .primary_key(&key.primary_key)
+                        .batch_size(key.batch_size);
+                    if !key.api_key.is_empty() {
+                        builder = builder.api_key(&key.api_key);
+                    }
+                    let storage = Arc::new(
+                        builder
+                            .connect()
+                            .map_err(|e| format!("Invalid Meilisearch target: {e}"))?,
+                    );
+                    info!(
+                        url = %key.url,
+                        index = %key.index_uid,
+                        primary_key = %key.primary_key,
+                        batch_size = key.batch_size,
+                        "Created per-job Meilisearch storage"
+                    );
+                    cache.insert(key.clone(), storage.clone());
+                    storage
+                }
+            }
+        };
+        // Once per distinct job configuration; concurrent pages of the same
+        // job wait here so settings go out before their documents.
         storage
-            .configure_index(&key.index_uid, features, msg.job.as_ref())
+            .ensure_configured(&key.index_uid, features, msg.job.as_ref())
             .await;
-        info!(
-            url = %key.url,
-            index = %key.index_uid,
-            primary_key = %key.primary_key,
-            batch_size = key.batch_size,
-            "Created per-job Meilisearch storage"
-        );
-        cache.insert(key, storage.clone());
         Ok(Some(storage))
     }
 
@@ -663,7 +728,11 @@ impl ContentWorker {
             while let Some(notice) = rx.recv().await {
                 if publish_with_retry(&producer, &notice.job_id, &notice.event).await {
                     notice.ack.ack();
-                    metrics.record_indexed(notice.docs);
+                    if notice.docs > 0 {
+                        metrics.record_indexed(notice.docs);
+                    } else {
+                        metrics.record_failure();
+                    }
                 }
                 // Not published: the ack is dropped, the message stays
                 // un-acked and is redelivered.
@@ -686,11 +755,8 @@ impl ContentWorker {
                     CrawlEvent::AiUsage { job_id, .. } => job_id.clone(),
                     _ => String::new(),
                 };
-                if let Err(e) = producer
-                    .send(topic_names::EVENTS, Some(&job_id), &event)
-                    .await
-                {
-                    warn!(job_id = %job_id, error = %e, "Failed to publish AiUsage event");
+                if !publish_with_retry(&producer, &job_id, &event).await {
+                    error!(job_id = %job_id, "Dropped AiUsage event after retries (billing data)");
                 }
             }
         }))
@@ -761,7 +827,7 @@ impl ContentWorker {
 
         // Periodic flush so documents are indexed (and acked) even when a
         // batch never fills up.
-        let flush_handle = if self.storage.is_some() {
+        let flush_handle = if self.indexing_enabled {
             let worker = self.clone();
             let done = consumer_stop.clone();
             Some(tokio::spawn(async move {
@@ -907,7 +973,8 @@ impl ContentWorker {
     }
 
     /// Hand a page's documents to Meilisearch; `DocumentIndexed` + ack
-    /// happen once Meilisearch accepted all of them.
+    /// happen once Meilisearch accepted all of them (`DocumentFailed` + ack
+    /// if any was refused permanently or timed out on backpressure).
     async fn index_page(
         &self,
         msg: &RawPageMessage,
@@ -916,6 +983,26 @@ impl ContentWorker {
         ai_enriched: bool,
         ack: Ack,
     ) {
+        // Resolve the target first: a page that cannot be indexed must not
+        // be published to the documents topic or crawl history.
+        let features = self.resolve_features(msg);
+        let storage = match self.storage_for(msg, &features).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                warn!(url = %msg.url, error = %error, "Cannot index page");
+                self.metrics.record_failure();
+                let failed = CrawlEvent::DocumentFailed {
+                    job_id: msg.job_id.clone(),
+                    url: msg.url.clone(),
+                    url_message_id: msg.url_message_id.clone(),
+                    error,
+                    timestamp: now_ms(),
+                };
+                self.finish(msg, failed, ack).await;
+                return;
+            }
+        };
+
         // Publish documents to Kafka if enabled (a failure leaves the page
         // un-acked; redelivery re-publishes).
         if self.publish_to_kafka {
@@ -934,62 +1021,49 @@ impl ContentWorker {
 
         self.publish_history(msg).await;
 
-        let event = CrawlEvent::DocumentIndexed {
-            job_id: msg.job_id.clone(),
-            account_id: msg.account_id.clone(),
-            url: msg.url.clone(),
-            document_id,
-            timestamp: now_ms(),
-            url_message_id: msg.url_message_id.clone(),
-            ai_enriched,
-        };
-
-        let features = self.resolve_features(msg);
-        let storage = match self.storage_for(msg, &features).await {
-            Ok(Some(storage)) => storage,
-            Ok(None) => {
-                // Indexing disabled on this worker: nothing to wait for.
-                self.finish(msg, event, ack).await;
-                return;
-            }
-            Err(error) => {
-                warn!(url = %msg.url, error = %error, "Cannot index page");
-                let failed = CrawlEvent::DocumentFailed {
-                    job_id: msg.job_id.clone(),
-                    url: msg.url.clone(),
-                    url_message_id: msg.url_message_id.clone(),
-                    error,
-                    timestamp: now_ms(),
-                };
-                self.finish(msg, failed, ack).await;
-                return;
-            }
-        };
-
-        let notice_ack = {
-            let tx = self.indexed_tx.clone();
-            let pending = self.pending_notices.clone();
-            let notice = IndexedNotice {
+        let Some(storage) = storage else {
+            // Indexing explicitly disabled (SKIP_MEILISEARCH): nothing was
+            // indexed, so the page is reported as skipped.
+            let skipped = CrawlEvent::DocumentSkipped {
                 job_id: msg.job_id.clone(),
-                event,
+                url: msg.url.clone(),
+                url_message_id: msg.url_message_id.clone(),
+                reason: "indexing disabled".to_string(),
+                timestamp: now_ms(),
+            };
+            self.finish(msg, skipped, ack).await;
+            return;
+        };
+
+        let tracker = Arc::new(PageTracker {
+            remaining: std::sync::atomic::AtomicUsize::new(docs.len()),
+            error: parking_lot::Mutex::new(None),
+            notice: parking_lot::Mutex::new(Some(IndexedNotice {
+                job_id: msg.job_id.clone(),
+                event: CrawlEvent::DocumentIndexed {
+                    job_id: msg.job_id.clone(),
+                    account_id: msg.account_id.clone(),
+                    url: msg.url.clone(),
+                    document_id,
+                    timestamp: now_ms(),
+                    url_message_id: msg.url_message_id.clone(),
+                    ai_enriched,
+                },
                 docs: docs.len() as u64,
                 ack,
-            };
-            Ack::from_fn(move || {
-                pending.fetch_add(1, Ordering::AcqRel);
-                if tx.send(notice).is_err() {
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                }
-            })
-        };
+            })),
+            tx: self.indexed_tx.clone(),
+            pending: self.pending_notices.clone(),
+        });
 
-        let doc_count = docs.len();
-        for (doc, doc_ack) in docs.into_iter().zip(notice_ack.split(doc_count)) {
+        for doc in docs {
+            let (on_accept, on_reject) = (tracker.clone(), tracker.clone());
+            let doc_ack = DocAck::new(Ack::from_fn(move || on_accept.done(None)))
+                .on_reject(move |reason| on_reject.done(Some(reason)));
             if let Err(e) = storage
                 .add_document_to_index(doc, &msg.index_uid, doc_ack)
                 .await
             {
-                // The doc's ack is dropped: the page stays un-acked.
                 warn!(url = %msg.url, error = %e, "Failed to buffer document for Meilisearch");
             }
         }
@@ -1528,12 +1602,13 @@ fn worker_id(args: &Args) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string())
 }
 
-/// Build the default storage (startup connectivity check + default index).
-/// `None` disables indexing.
-async fn default_storage(args: &Args) -> Option<Arc<MeilisearchStorage>> {
+/// Startup connectivity check: initializes the default index. A failure is
+/// only logged; indexing stays enabled (per-job storages connect lazily and
+/// retry until Meilisearch accepts their documents).
+async fn startup_check(args: &Args) {
     if args.skip_meilisearch {
-        info!("Meilisearch indexing disabled");
-        return None;
+        info!("Meilisearch indexing disabled (SKIP_MEILISEARCH)");
+        return;
     }
     let mut builder = MeilisearchStorageBuilder::new(&args.meilisearch_url, &args.default_index)
         .batch_size(args.batch_size);
@@ -1541,18 +1616,15 @@ async fn default_storage(args: &Args) -> Option<Arc<MeilisearchStorage>> {
         builder = builder.api_key(key);
     }
     match builder.build().await {
-        Ok(storage) => {
-            info!(
-                url = %args.meilisearch_url,
-                index = %args.default_index,
-                "Connected to Meilisearch"
-            );
-            Some(Arc::new(storage))
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to connect to Meilisearch, indexing disabled");
-            None
-        }
+        Ok(_) => info!(
+            url = %args.meilisearch_url,
+            index = %args.default_index,
+            "Connected to Meilisearch"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "Meilisearch not reachable at startup; indexing stays enabled and will retry"
+        ),
     }
 }
 
@@ -1712,49 +1784,60 @@ mod tests {
     /// and settings accepted, document additions answered by `docs`.
     async fn meilisearch(docs: ResponseTemplate) -> MockServer {
         let ms = MockServer::start().await;
+        mount_meilisearch(&ms, docs).await;
+        ms
+    }
+
+    /// Mount the [`meilisearch`] mocks on an existing server (mocks mounted
+    /// earlier take precedence).
+    async fn mount_meilisearch(ms: &MockServer, docs: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path_regex(r"^/indexes/[^/]+$"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
                 "message": "not found", "code": "index_not_found",
                 "type": "invalid_request", "link": "https://docs.meilisearch.com"})))
-            .mount(&ms)
+            .mount(ms)
             .await;
         Mock::given(method("POST"))
             .and(path("/indexes"))
             .respond_with(task_accepted())
-            .mount(&ms)
+            .mount(ms)
             .await;
         Mock::given(method("PATCH"))
             .and(path_regex(r"^/indexes/[^/]+/settings$"))
             .respond_with(task_accepted())
-            .mount(&ms)
+            .mount(ms)
             .await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/indexes/[^/]+/documents$"))
             .respond_with(docs)
-            .mount(&ms)
+            .mount(ms)
             .await;
-        ms
+    }
+
+    /// Worker against `ms` (indexing enabled, no startup check), with
+    /// extra CLI flags.
+    fn build_worker(bus: &ChannelBus, ms: &MockServer, extra: &[&str]) -> ContentWorker {
+        let uri = ms.uri();
+        let mut argv = vec!["scrapix-worker-content", "--meilisearch-url", uri.as_str()];
+        argv.extend_from_slice(extra);
+        ContentWorker::build(
+            &Args::parse_from(argv),
+            "test".into(),
+            Arc::new(AnyConsumer::from(bus.consumer())),
+            Arc::new(AnyProducer::from(bus.producer())),
+            true,
+        )
+    }
+
+    fn started(w: ContentWorker) -> Arc<ContentWorker> {
+        let w = Arc::new(w);
+        w.spawn_indexed_publisher();
+        w
     }
 
     fn worker(bus: &ChannelBus, ms: &MockServer) -> Arc<ContentWorker> {
-        let args = Args::parse_from(["scrapix-worker-content", "--meilisearch-url", &ms.uri()]);
-        let consumer = Arc::new(AnyConsumer::from(bus.consumer()));
-        let producer = Arc::new(AnyProducer::from(bus.producer()));
-        // A connected (not initialized) default storage enables indexing
-        // without mocking the startup index initialization.
-        let storage = MeilisearchStorageBuilder::new(ms.uri(), "documents")
-            .connect()
-            .unwrap();
-        let w = Arc::new(ContentWorker::build(
-            &args,
-            "test".into(),
-            consumer,
-            producer,
-            Some(Arc::new(storage)),
-        ));
-        w.spawn_indexed_publisher();
-        w
+        started(build_worker(bus, ms, &[]))
     }
 
     fn events_reader(bus: &ChannelBus) -> AnyConsumer {
@@ -1937,11 +2020,10 @@ mod tests {
         let ms = meilisearch(task_accepted()).await;
         let bus = ChannelBus::new();
         let events = events_reader(&bus);
-        let w = worker(&bus, &ms);
-        if w.ai_service.is_some() {
-            // An AI provider is configured in this environment.
-            return;
-        }
+        let mut w = build_worker(&bus, &ms, &[]);
+        // No AI provider, whatever this environment's AI_* variables say.
+        w.ai_service = None;
+        let w = started(w);
         let features = FeaturesConfig {
             ai_summary: Some(FeatureToggle {
                 enabled: true,
@@ -1989,22 +2071,7 @@ mod tests {
         let ms = meilisearch(task_accepted()).await;
         let bus = ChannelBus::new();
         let events = events_reader(&bus);
-        let args = Args::parse_from([
-            "scrapix-worker-content",
-            "--meilisearch-url",
-            &ms.uri(),
-            "--enable-dedup",
-        ]);
-        let storage = MeilisearchStorageBuilder::new(ms.uri(), "documents")
-            .connect()
-            .unwrap();
-        let w = ContentWorker::build(
-            &args,
-            "test".into(),
-            Arc::new(AnyConsumer::from(bus.consumer())),
-            Arc::new(AnyProducer::from(bus.producer())),
-            Some(Arc::new(storage)),
-        );
+        let w = build_worker(&bus, &ms, &["--enable-dedup"]);
 
         let a = page("https://a.test/guide", 200, None);
         let recrawl = page("https://a.test/guide", 200, None);
@@ -2068,5 +2135,242 @@ mod tests {
             ..usage
         };
         assert!(ai_usage_event(unattributed).is_none());
+    }
+
+    fn failed_for<'a>(events: &'a [CrawlEvent], id: &str) -> Option<&'a String> {
+        events.iter().find_map(|e| match e {
+            CrawlEvent::DocumentFailed {
+                url_message_id,
+                error,
+                ..
+            } if url_message_id == id => Some(error),
+            _ => None,
+        })
+    }
+
+    fn indexed_count(events: &[CrawlEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, CrawlEvent::DocumentIndexed { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn meilisearch_unreachable_at_startup_keeps_indexing_enabled() {
+        let ms = MockServer::start().await;
+        // Startup index initialization fails...
+        Mock::given(method("POST"))
+            .and(path("/indexes"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&ms)
+            .await;
+        mount_meilisearch(&ms, task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let args = Args::parse_from(["scrapix-worker-content", "--meilisearch-url", &ms.uri()]);
+        let w = ContentWorker::with_bus(
+            &args,
+            Arc::new(AnyConsumer::from(bus.consumer())),
+            Arc::new(AnyProducer::from(bus.producer())),
+        )
+        .await
+        .unwrap();
+        assert!(w.indexing_enabled);
+        let w = started(w);
+        let msg = page("https://a.test/guide", 200, None);
+        let (ack, acked) = tracked_ack();
+
+        // ...but pages are still indexed, and acked only once accepted.
+        w.handle_message(msg.clone(), ack).await;
+        assert!(!acked.load(Ordering::SeqCst));
+        w.flush_all_storages().await;
+        assert!(wait_for(&acked).await);
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(indexed_count(&events), 1, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn skip_meilisearch_reports_indexing_disabled() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let args = Args::parse_from([
+            "scrapix-worker-content",
+            "--meilisearch-url",
+            &ms.uri(),
+            "--skip-meilisearch",
+        ]);
+        let w = ContentWorker::with_bus(
+            &args,
+            Arc::new(AnyConsumer::from(bus.consumer())),
+            Arc::new(AnyProducer::from(bus.producer())),
+        )
+        .await
+        .unwrap();
+        let w = started(w);
+        let msg = page("https://a.test/guide", 200, None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::DocumentSkipped { reason, url_message_id, .. }
+                    if reason == "indexing disabled" && *url_message_id == msg.url_message_id
+            )),
+            "{events:?}"
+        );
+        assert_eq!(indexed_count(&events), 0);
+        assert!(ms.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn jobs_with_different_settings_on_one_index_each_get_them() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let job = |attr: &str| JobSpec {
+            index_settings: Some(scrapix_core::MeilisearchSettings {
+                searchable_attributes: Some(vec![attr.to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (url, spec) in [
+            ("https://a.test/1", job("a")),
+            ("https://a.test/2", job("a")),
+            ("https://a.test/3", job("b")),
+        ] {
+            let (ack, _) = tracked_ack();
+            w.handle_message(page(url, 200, Some(spec)), ack).await;
+        }
+
+        let patches: Vec<serde_json::Value> = ms
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(patches.len(), 2, "once per distinct job configuration");
+        assert_eq!(patches[0]["searchableAttributes"], serde_json::json!(["a"]));
+        assert_eq!(patches[1]["searchableAttributes"], serde_json::json!(["b"]));
+    }
+
+    #[tokio::test]
+    async fn permanently_refused_batch_fails_the_page_and_acks() {
+        let ms = meilisearch(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "message": "The provided API key is invalid.", "code": "invalid_api_key",
+            "type": "auth", "link": "https://docs.meilisearch.com/errors#invalid_api_key"})))
+        .await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let msg = page("https://a.test/guide", 200, None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+        w.flush_all_storages().await;
+
+        assert!(wait_for(&acked).await, "refused page is acked, not stalled");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        let error = failed_for(&events, &msg.url_message_id).expect("DocumentFailed");
+        assert!(error.contains("refused"), "{error}");
+        assert_eq!(indexed_count(&events), 0, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn block_split_page_acks_once_after_all_blocks_are_accepted() {
+        let ms = MockServer::start().await;
+        let docs = |status: u16| {
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/indexes/[^/]+/documents$"))
+                .respond_with(if status == 202 {
+                    task_accepted()
+                } else {
+                    ResponseTemplate::new(status)
+                })
+                .up_to_n_times(1)
+        };
+        // 1st batch accepted, 2nd rejected (retryable), then accepted.
+        docs(202).mount(&ms).await;
+        docs(500).mount(&ms).await;
+        mount_meilisearch(&ms, task_accepted()).await;
+
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        let section = |h: &str| {
+            format!(
+                "<h2 id=\"{h}\">{h}</h2><p>Section {h} has a long enough paragraph to be kept \
+                 as its own block by the splitter, well over fifty characters.</p>"
+            )
+        };
+        let html = format!(
+            "<html><head><title>T</title></head><body><main>{}{}{}</main></body></html>",
+            section("one"),
+            section("two"),
+            section("three")
+        );
+        let mut msg = page(
+            "https://a.test/blocks",
+            200,
+            Some(JobSpec {
+                batch_size: Some(2),
+                ..Default::default()
+            }),
+        );
+        msg.html = html;
+        msg.features = Some(FeaturesConfig {
+            block_split: Some(FeatureToggle {
+                enabled: true,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            ..Default::default()
+        });
+        let (ack, acked) = tracked_ack();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let ack = Ack::from_fn(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            ack.ack();
+        });
+
+        // Blocks 1-2 go out as the first (accepted) batch; block 3 stays
+        // buffered: the page is not acked yet.
+        w.handle_message(msg.clone(), ack).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!acked.load(Ordering::SeqCst));
+
+        // Block 3's first send is rejected: still not acked.
+        w.flush_all_storages().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!acked.load(Ordering::SeqCst));
+
+        // Accepted: acked exactly once, one DocumentIndexed for the page.
+        w.flush_all_storages().await;
+        assert!(wait_for(&acked).await);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let sent: usize = ms
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/documents"))
+            .map(|r| {
+                serde_json::from_slice::<Vec<serde_json::Value>>(&r.body)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(sent, 4, "2 + 1 rejected + 1 accepted");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(indexed_count(&events), 1, "{events:?}");
     }
 }
