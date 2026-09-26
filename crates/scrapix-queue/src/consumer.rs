@@ -118,7 +118,16 @@ impl KafkaConsumer {
     }
 
     /// Process messages with a handler function
+    ///
     /// Note: This processes messages sequentially. For concurrent processing, use process_concurrent.
+    ///
+    /// Even though this is sequential (at most one message in flight at a time per
+    /// partition), a naive "commit the message that was just handled" is still
+    /// wrong: if offset N's handler fails (left uncommitted) and N+1's handler then
+    /// succeeds, committing N+1 directly would commit "next offset to read" = N+2,
+    /// which is *past* N and would never redeliver it. We route through the same
+    /// [`OffsetTracker`](crate::OffsetTracker) used by `process_with_ack` so the
+    /// commit point can never advance past an offset that hasn't completed.
     pub async fn process<T, F, Fut>(&self, mut handler: F) -> Result<()>
     where
         T: DeserializeOwned,
@@ -126,19 +135,22 @@ impl KafkaConsumer {
         Fut: std::future::Future<Output = Result<()>>,
     {
         let mut stream = self.consumer.stream();
+        let mut tracker = crate::OffsetTracker::default();
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(msg) => {
                     let metadata = MessageMetadata::from_message(&msg);
+                    tracker.begin(&metadata.topic, metadata.partition, metadata.offset);
 
                     match self.deserialize_message::<T>(&msg) {
                         Ok(payload) => match handler(payload, metadata.clone()).await {
                             Ok(()) => {
-                                // Commit offset only after the handler acknowledges success.
-                                if let Err(e) = self.commit_message(&msg) {
-                                    warn!(error = %e, "Failed to commit offset");
-                                }
+                                tracker.complete(
+                                    &metadata.topic,
+                                    metadata.partition,
+                                    metadata.offset,
+                                );
                             }
                             Err(e) => {
                                 error!(
@@ -148,6 +160,8 @@ impl KafkaConsumer {
                                     error = %e,
                                     "Handler error, leaving message uncommitted for redelivery"
                                 );
+                                // Do NOT complete: this offset (and anything after it)
+                                // must stay uncommitted until it succeeds.
                             }
                         },
                         Err(e) => {
@@ -156,12 +170,16 @@ impl KafkaConsumer {
                                 partition = metadata.partition,
                                 offset = metadata.offset,
                                 error = %e,
-                                "Deserialization error"
+                                "Deserialization error, skipping poison message"
                             );
-                            // Still commit to avoid reprocessing bad (unparseable) messages.
-                            let _ = self.commit_message(&msg);
+                            // Poison message: complete it immediately so it doesn't
+                            // block the commit point behind it forever.
+                            tracker.complete(&metadata.topic, metadata.partition, metadata.offset);
                         }
                     }
+
+                    self.commit_offsets(tracker.take_commits(), CommitMode::Async);
+                    warn_stuck_partitions(&mut tracker);
                 }
                 Err(e) => {
                     error!(error = %e, "Kafka error");
@@ -226,6 +244,7 @@ impl KafkaConsumer {
                     }
                     assigned = now;
                     self.commit_offsets(tracker.take_commits(), CommitMode::Async);
+                    warn_stuck_partitions(&mut tracker);
                 }
                 Some((t, p, o)) = done_rx.recv() => tracker.complete(&t, p, o),
                 next = stream.next() => match next {
@@ -284,6 +303,12 @@ impl KafkaConsumer {
         .await;
         while let Ok((t, p, o)) = done_rx.try_recv() {
             tracker.complete(&t, p, o);
+        }
+        // Same rebalance handling as the tick branch: don't try to commit offsets
+        // for partitions we no longer own.
+        let final_assigned = self.assigned_partitions();
+        for gone in assigned.difference(&final_assigned) {
+            tracker.revoke(&gone.0, gone.1);
         }
         self.commit_offsets(tracker.take_commits(), CommitMode::Sync);
 
@@ -362,7 +387,17 @@ impl KafkaConsumer {
             }
         }
         if let Err(e) = self.consumer.commit(&tpl, mode) {
-            warn!(error = %e, "Offset commit failed (will retry next tick)");
+            // `tracker.take_commits()` already advanced `last_committed` for these
+            // offsets, so they will NOT be retried on the next tick unless the
+            // partition makes further progress (a later `take_commits()` call
+            // reports a higher offset). A commit failure here is effectively
+            // dropped until then.
+            warn!(
+                error = %e,
+                ?commits,
+                "Offset commit failed; these offsets are dropped and won't be retried \
+                 until the partition advances further"
+            );
         }
     }
 
@@ -503,6 +538,34 @@ impl KafkaConsumer {
             Ok(None) => Ok(None),
             Err(_) => Ok(None), // Timeout
         }
+    }
+}
+
+/// How long a partition may go without committable progress before we consider it
+/// stuck (a handler failing or hung on the same offset) and log a warning.
+const STUCK_PARTITION_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Minimum gap between repeated stuck-partition warnings for the same partition.
+const STUCK_PARTITION_WARN_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Log a warning (at most once per [`STUCK_PARTITION_WARN_COOLDOWN`] per partition)
+/// for every partition the tracker considers stuck. Shared between `process` and
+/// `process_with_ack` so both surface the same signal for an operator: this is a
+/// mitigation (visibility), not a fix — the message itself is still left
+/// uncommitted for redelivery, same as any other un-acked offset.
+fn warn_stuck_partitions(tracker: &mut crate::OffsetTracker) {
+    for (topic, partition, offset) in tracker.stuck_partitions(
+        std::time::Instant::now(),
+        STUCK_PARTITION_THRESHOLD,
+        STUCK_PARTITION_WARN_COOLDOWN,
+    ) {
+        warn!(
+            topic = %topic,
+            partition = partition,
+            offset = offset,
+            "Consumer offset commit stuck: no progress for over 60s — handler \
+             repeatedly failing or hung on this offset?"
+        );
     }
 }
 
