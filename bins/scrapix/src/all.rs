@@ -133,6 +133,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let frontier_args = scrapix_frontier_service::Args {
         brokers: String::new(),
         group_id: "scrapix-frontier".to_string(),
+        // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
+        redis_url: std::env::var("REDIS_URL").ok(),
+        frontier_key_prefix: "scrapix:frontier".to_string(),
+        job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
         domain_delay_ms: 50,
@@ -200,6 +204,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         }
     });
 
+    let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
         if let Err(e) = scrapix_frontier_service::run_with_bus(
             frontier_args,
@@ -207,6 +212,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
             frontier_consumer,
             None, // links consumer
             None, // history consumer
+            frontier_store,
         )
         .await
         {
@@ -378,6 +384,10 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     let frontier_args = scrapix_frontier_service::Args {
         brokers: brokers.to_string(),
         group_id: "scrapix-all-frontier".to_string(),
+        // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
+        redis_url: std::env::var("REDIS_URL").ok(),
+        frontier_key_prefix: "scrapix:frontier".to_string(),
+        job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
         domain_delay_ms: 50,
@@ -444,6 +454,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         }
     });
 
+    let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
         if let Err(e) = scrapix_frontier_service::run_with_bus(
             frontier_args,
@@ -451,6 +462,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
             frontier_consumer,
             None,
             None,
+            frontier_store,
         )
         .await
         {

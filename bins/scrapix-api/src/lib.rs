@@ -4480,6 +4480,7 @@ fn start_event_consumer(
                         CrawlEvent::DocumentFailed { job_id, .. } => job_id.clone(),
                         CrawlEvent::AiUsage { job_id, .. } => job_id.clone(),
                         CrawlEvent::JobWarning { job_id, .. } => job_id.clone(),
+                        CrawlEvent::FrontierProgress { job_id, .. } => job_id.clone(),
                     };
 
                     // Update job state and broadcast

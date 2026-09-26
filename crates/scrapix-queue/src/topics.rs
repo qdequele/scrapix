@@ -491,6 +491,29 @@ pub enum CrawlEvent {
         #[serde(default)]
         timestamp: i64,
     },
+    /// Periodic per-job frontier snapshot (cumulative store counters plus
+    /// the current queue depth), published by the frontier instance that
+    /// holds the job's dispatch lease whenever the counters change.
+    FrontierProgress {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        received: u64,
+        #[serde(default)]
+        admitted: u64,
+        #[serde(default)]
+        dispatched: u64,
+        #[serde(default)]
+        rejected: u64,
+        #[serde(default)]
+        dropped: u64,
+        #[serde(default)]
+        queued: u64,
+        #[serde(default)]
+        timestamp: i64,
+    },
     /// URLs discovered
     UrlsDiscovered {
         job_id: String,

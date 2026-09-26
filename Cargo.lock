@@ -5669,6 +5669,7 @@ dependencies = [
  "scrapix-frontier",
  "scrapix-lifecycle",
  "scrapix-queue",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

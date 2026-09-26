@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 scrapix-core = { path = "../../crates/scrapix-core" }
-scrapix-frontier = { path = "../../crates/scrapix-frontier" }
+scrapix-frontier = { path = "../../crates/scrapix-frontier", features = ["redis-store"] }
 scrapix-queue = { path = "../../crates/scrapix-queue" }
 scrapix-lifecycle = { path = "../../crates/scrapix-lifecycle" }
 
@@ -28,3 +28,4 @@ clap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
+serde_json = { workspace = true }
