@@ -129,7 +129,10 @@ pub async fn insert_job(pool: &PgPool, job: &JobState) {
 }
 
 /// Full update of a single job's mutable fields (lifecycle events: complete, fail, cancel).
-pub async fn update_job_full(pool: &PgPool, job: &JobState) {
+///
+/// Returns `Err` (after logging) so the flush can retry an owed terminal
+/// write before releasing the job's held acks.
+pub async fn update_job_full(pool: &PgPool, job: &JobState) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
         "UPDATE jobs SET
             status = $2,
@@ -155,8 +158,12 @@ pub async fn update_job_full(pool: &PgPool, job: &JobState) {
     .execute(pool)
     .await;
 
-    if let Err(e) = result {
-        warn!(job_id = %job.job_id, error = %e, "Failed to update job in Postgres");
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!(job_id = %job.job_id, error = %e, "Failed to update job in Postgres");
+            Err(e)
+        }
     }
 }
 

@@ -149,6 +149,12 @@ pub struct Args {
     #[arg(long, env = "JOB_COMPLETION_GRACE_MS", default_value = "3000")]
     pub completion_grace_ms: u64,
 
+    /// Maximum event acks held while waiting for the accounting flush; at
+    /// the cap the event consumer blocks (backpressure) until a flush frees
+    /// room.
+    #[arg(long, env = "MAX_PENDING_ACKS", default_value = "50000")]
+    pub max_pending_acks: usize,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -174,7 +180,11 @@ struct CrawlState {
     /// Acks of events that changed a job's accounting, held until the
     /// accounting flush containing them succeeded (R-19): the Kafka offset
     /// only advances past an event once its effect is durable.
-    pending_acks: parking_lot::Mutex<Vec<Ack>>,
+    /// Held acks with the job each event belongs to.
+    pending_acks: parking_lot::Mutex<Vec<(String, Ack)>>,
+    /// Terminal job snapshots whose checked full write is still owed; their
+    /// jobs' held acks are released only once it succeeded.
+    terminal_pending: RwLock<HashMap<String, JobState>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -231,9 +241,12 @@ struct AppState {
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
-    /// Defer event acks until the accounting flush (true when Postgres
-    /// persistence is configured; otherwise events are acked immediately).
-    defer_acks: bool,
+    /// Accounting is persisted and event acks are deferred until the flush
+    /// (true when Postgres is configured; turned off for the process if the
+    /// `accounting` column turns out to be missing, see `finish_flush`).
+    accounting_persisted: std::sync::atomic::AtomicBool,
+    /// Set on shutdown (unblocks a `settle_ack` waiting at the cap).
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +256,8 @@ struct AppConfig {
     job_stall_timeout: Duration,
     /// See [`Args::completion_grace_ms`]
     completion_grace: Duration,
+    /// See [`Args::max_pending_acks`]
+    max_pending_acks: usize,
 }
 
 impl AppConfig {
@@ -251,6 +266,7 @@ impl AppConfig {
             max_jobs: args.max_jobs,
             job_stall_timeout: Duration::from_secs(args.job_stall_timeout_secs),
             completion_grace: Duration::from_millis(args.completion_grace_ms),
+            max_pending_acks: args.max_pending_acks.max(1),
         }
     }
 }
@@ -283,6 +299,7 @@ impl AppState {
                 accounting: RwLock::new(HashMap::new()),
                 balanced_since: RwLock::new(HashMap::new()),
                 pending_acks: parking_lot::Mutex::new(Vec::new()),
+                terminal_pending: RwLock::new(HashMap::new()),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
@@ -301,7 +318,8 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
-            defer_acks: db_pool.is_some(),
+            accounting_persisted: std::sync::atomic::AtomicBool::new(db_pool.is_some()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             db_pool,
             stripe_client,
             analytics_store,
@@ -397,11 +415,34 @@ impl AppState {
     /// Postgres immediately and free its per-job tracking state.
     fn on_terminal(&self, job_id: &str, updated: Option<JobState>) {
         self.forget_job_tracking(job_id);
-        if let (Some(ref pool), Some(snapshot)) = (&self.db_pool, updated) {
-            self.crawl.dirty_jobs.write().remove(job_id);
-            let pool = pool.clone();
-            tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
+        if let Some(snapshot) = updated {
+            self.write_terminal(snapshot);
         }
+    }
+
+    /// Write a terminal job through to Postgres now (best effort, for
+    /// latency) and, while acks are deferred, owe a checked write to the
+    /// next flush: the job's held acks wait for it.
+    fn write_terminal(&self, snapshot: JobState) {
+        let job_id = snapshot.job_id.clone();
+        self.crawl.dirty_jobs.write().remove(&job_id);
+        if self.accounting_persisted() {
+            self.crawl
+                .terminal_pending
+                .write()
+                .insert(job_id, snapshot.clone());
+        }
+        if let Some(ref pool) = self.db_pool {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let _ = jobs_db::update_job_full(&pool, &snapshot).await;
+            });
+        }
+    }
+
+    fn accounting_persisted(&self) -> bool {
+        self.accounting_persisted
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Queue a job notification email (delivered by the Rails app). Called
@@ -503,7 +544,10 @@ impl AppState {
             .unwrap_or_default();
         let still_valid = match decision {
             Finalize::Wait => false,
-            Finalize::Complete | Finalize::FailNoPages => acc.is_balanced(),
+            // Don't fail a job that crawled pages in the meantime (or
+            // complete one that turned out to have none).
+            Finalize::Complete => acc.is_balanced() && acc.pages_crawled_ok > 0,
+            Finalize::FailNoPages => acc.is_balanced() && acc.pages_crawled_ok == 0,
             Finalize::FailStalled => {
                 !acc.is_balanced()
                     && self
@@ -715,18 +759,57 @@ impl AppState {
     /// Hand an event's ack back: acked now, unless the event changed a job's
     /// accounting and accounting is persisted, in which case it is held
     /// until the flush containing it succeeds (R-19).
-    fn settle_ack(&self, ack: Ack, outcome: EventOutcome) {
-        if self.defer_acks && outcome.accounting_touched {
-            self.crawl.pending_acks.lock().push(ack);
-        } else {
+    ///
+    /// At most `max_pending_acks` acks are held: at the cap this waits until
+    /// a flush frees room (the consumer runs at concurrency 1, so this
+    /// backpressures consumption instead of growing memory), or until
+    /// shutdown, where the ack is dropped un-acked (redelivered).
+    async fn settle_ack(&self, job_id: &str, ack: Ack, outcome: EventOutcome) {
+        if !outcome.accounting_touched || !self.accounting_persisted() {
             ack.ack();
+            return;
+        }
+        let mut ack = Some(ack);
+        let mut last_warn: Option<std::time::Instant> = None;
+        loop {
+            {
+                let mut pending = self.crawl.pending_acks.lock();
+                if !self.accounting_persisted() {
+                    drop(pending);
+                    if let Some(a) = ack.take() {
+                        a.ack();
+                    }
+                    return;
+                }
+                if pending.len() < self.config.max_pending_acks {
+                    if let Some(a) = ack.take() {
+                        pending.push((job_id.to_string(), a));
+                    }
+                    return;
+                }
+            }
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return; // dropped un-acked: redelivered after restart
+            }
+            if last_warn.is_none_or_elapsed(Duration::from_secs(60)) {
+                warn!(
+                    held = self.config.max_pending_acks,
+                    "Event consumer blocked: held acks at the cap, waiting for a successful \
+                     accounting flush (Postgres unavailable?)"
+                );
+                last_warn = Some(std::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     /// Start a Postgres flush: take the held acks first, then the dirty jobs
-    /// and their snapshots, so every taken ack's event is in the snapshot
-    /// (an event is applied, and its job marked dirty, before its ack is
-    /// held).
+    /// and their snapshots and the owed terminal writes, so every taken
+    /// ack's event is covered (an event is applied, and its job marked dirty
+    /// or terminal, before its ack is held).
     fn begin_flush(&self) -> FlushBatch {
         let acks = std::mem::take(&mut *self.crawl.pending_acks.lock());
         let dirty_ids: Vec<String> = self.crawl.dirty_jobs.write().drain().collect();
@@ -737,46 +820,119 @@ impl AppState {
                 .filter_map(|id| jobs.get(id).cloned())
                 .collect()
         };
-        let accounting = self.accounting_snapshots(&dirty_ids);
+        let accounting = if self.accounting_persisted() {
+            self.accounting_snapshots(&dirty_ids)
+        } else {
+            Vec::new()
+        };
+        let terminal: Vec<JobState> = self
+            .crawl
+            .terminal_pending
+            .write()
+            .drain()
+            .map(|(_, j)| j)
+            .collect();
         FlushBatch {
             acks,
             dirty_ids,
             snapshots,
             accounting,
+            terminal,
         }
     }
 
-    /// Finish a flush: ack the held events once their accounting is durable;
-    /// otherwise keep them held and the jobs dirty for the next attempt.
+    /// Finish a flush.
+    ///
+    /// - Accounting durable: ack the held events, except those of jobs whose
+    ///   owed terminal write failed (kept held, write retried next flush).
+    /// - Transient accounting failure: keep everything held, the jobs dirty
+    ///   and the terminal writes owed, for the next attempt.
+    /// - Missing `accounting` column (the Rails migration has not run):
+    ///   non-retryable. Accounting persistence and ack deferral are turned
+    ///   off for this process and every held ack is released, degrading to
+    ///   in-memory accounting instead of blocking consumption forever.
+    ///
     /// (Acks may complete in any order: the offset tracker only commits the
     /// contiguous acked prefix of each partition.)
-    fn finish_flush(&self, acks: Vec<Ack>, dirty_ids: Vec<String>, accounting_ok: bool) {
-        if accounting_ok {
-            for ack in acks {
-                ack.ack();
-            }
-        } else {
-            self.crawl.dirty_jobs.write().extend(dirty_ids);
-            self.crawl.pending_acks.lock().extend(acks);
-        }
-    }
-
-    /// Flush dirty job counters and accounting to Postgres, then release the
-    /// acks of the events they cover.
-    async fn flush_to_db(&self, pool: &sqlx::PgPool) {
+    fn finish_flush(
+        &self,
+        batch: FlushBatch,
+        accounting: AccountingFlush,
+        failed_terminal: &HashSet<String>,
+    ) {
         let FlushBatch {
             acks,
             dirty_ids,
-            snapshots,
-            accounting,
-        } = self.begin_flush();
-        if !snapshots.is_empty() {
-            jobs_db::flush_job_counters(pool, &snapshots).await;
+            terminal,
+            ..
+        } = batch;
+        let mut owed = self.crawl.terminal_pending.write();
+        match accounting {
+            AccountingFlush::SchemaMissing => {
+                error!(
+                    "jobs.accounting column is missing (Rails migration \
+                     20260926000001_add_accounting_to_jobs not applied): job accounting is \
+                     kept in memory only and events are acked immediately for this process"
+                );
+                self.accounting_persisted
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                owed.clear();
+                drop(owed);
+                let held = std::mem::take(&mut *self.crawl.pending_acks.lock());
+                for (_, ack) in acks.into_iter().chain(held) {
+                    ack.ack();
+                }
+            }
+            AccountingFlush::Retry => {
+                for j in terminal {
+                    owed.entry(j.job_id.clone()).or_insert(j);
+                }
+                drop(owed);
+                self.crawl.dirty_jobs.write().extend(dirty_ids);
+                self.crawl.pending_acks.lock().extend(acks);
+            }
+            AccountingFlush::Ok => {
+                for j in terminal {
+                    if failed_terminal.contains(&j.job_id) {
+                        owed.entry(j.job_id.clone()).or_insert(j);
+                    }
+                }
+                drop(owed);
+                let mut keep = Vec::new();
+                for (job_id, ack) in acks {
+                    if failed_terminal.contains(&job_id) {
+                        keep.push((job_id, ack));
+                    } else {
+                        ack.ack();
+                    }
+                }
+                if !keep.is_empty() {
+                    self.crawl.pending_acks.lock().extend(keep);
+                }
+            }
         }
-        let ok = jobs_db::flush_job_accounting(pool, &accounting)
-            .await
-            .is_ok();
-        self.finish_flush(acks, dirty_ids, ok);
+    }
+
+    /// Flush dirty job counters, accounting and owed terminal writes to
+    /// Postgres, then release the acks of the events they cover.
+    async fn flush_to_db(&self, pool: &sqlx::PgPool) {
+        let batch = self.begin_flush();
+        if !batch.snapshots.is_empty() {
+            jobs_db::flush_job_counters(pool, &batch.snapshots).await;
+        }
+        let accounting = match jobs_db::flush_job_accounting(pool, &batch.accounting).await {
+            Ok(()) => AccountingFlush::Ok,
+            Err(e) => classify_flush_error(&e),
+        };
+        let mut failed_terminal = HashSet::new();
+        if accounting == AccountingFlush::Ok {
+            for job in &batch.terminal {
+                if jobs_db::update_job_full(pool, job).await.is_err() {
+                    failed_terminal.insert(job.job_id.clone());
+                }
+            }
+        }
+        self.finish_flush(batch, accounting, &failed_terminal);
     }
 
     /// Process an event (not from the events topic) and update job state.
@@ -1186,10 +1342,49 @@ struct EventOutcome {
 
 /// One Postgres flush round (see `AppState::begin_flush`).
 struct FlushBatch {
-    acks: Vec<Ack>,
+    acks: Vec<(String, Ack)>,
     dirty_ids: Vec<String>,
     snapshots: Vec<JobState>,
     accounting: Vec<(String, serde_json::Value)>,
+    /// Owed checked writes of terminal jobs
+    terminal: Vec<JobState>,
+}
+
+/// Outcome of the accounting flush statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountingFlush {
+    Ok,
+    /// Transient failure: retry next flush, keep acks held.
+    Retry,
+    /// The `jobs.accounting` column / `jobs` table does not exist: the
+    /// Rails migration has not run. Not retryable.
+    SchemaMissing,
+}
+
+/// Whether a Postgres SQLSTATE means the schema the accounting flush needs is
+/// missing (42703 undefined_column, 42P01 undefined_table).
+fn is_schema_missing_sqlstate(code: Option<&str>) -> bool {
+    matches!(code, Some("42703") | Some("42P01"))
+}
+
+fn classify_flush_error(e: &sqlx::Error) -> AccountingFlush {
+    match e {
+        sqlx::Error::Database(db) if is_schema_missing_sqlstate(db.code().as_deref()) => {
+            AccountingFlush::SchemaMissing
+        }
+        _ => AccountingFlush::Retry,
+    }
+}
+
+/// `Option<Instant>` helper for rate-limited logging.
+trait ElapsedSince {
+    fn is_none_or_elapsed(&self, every: Duration) -> bool;
+}
+
+impl ElapsedSince for Option<std::time::Instant> {
+    fn is_none_or_elapsed(&self, every: Duration) -> bool {
+        self.map_or(true, |t| t.elapsed() >= every)
+    }
 }
 
 /// Maximum distinct warnings kept per job.
@@ -5035,13 +5230,9 @@ async fn cancel_job(
     // loop never finalizes it.
     state.forget_job_tracking(&job_id);
 
-    // Persist cancellation to Postgres
-    if let Some(ref pool) = state.db_pool {
-        state.crawl.dirty_jobs.write().remove(&job_id);
-        let pool = pool.clone();
-        let snapshot = job.clone();
-        tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
-    }
+    // Persist cancellation to Postgres (checked by the next flush before
+    // the job's held acks are released)
+    state.write_terminal(job.clone());
 
     info!(job_id = %job_id, "Job cancelled");
 
@@ -5151,10 +5342,12 @@ fn start_event_consumer(
     info!("Event consumer subscribed to {} topic", topic_names::EVENTS);
 
     // Bridge the watch-channel shutdown to the AtomicBool the ack-based
-    // consumer polls (it re-checks at least once per second).
+    // consumer polls (it re-checks at least once per second), and to the
+    // state flag that unblocks a `settle_ack` waiting at the cap.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let stop = stop.clone();
+        let state = state.clone();
         let mut shutdown = shutdown;
         tokio::spawn(async move {
             while !*shutdown.borrow() {
@@ -5162,6 +5355,9 @@ fn start_event_consumer(
                     break;
                 }
             }
+            state
+                .shutting_down
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
@@ -5185,7 +5381,7 @@ fn start_event_consumer(
                         });
                         let outcome = state.process_event_at(&job_id, &event, pos);
                         state.broadcast_event(&job_id, event);
-                        state.settle_ack(ack, outcome);
+                        state.settle_ack(&job_id, ack, outcome).await;
                     }
                 },
                 1,
@@ -6317,6 +6513,7 @@ mod lifecycle_tests {
                 max_jobs: 100,
                 job_stall_timeout: Duration::from_secs(1800),
                 completion_grace: Duration::from_secs(3),
+                max_pending_acks: 50_000,
             },
             None,
             None,
@@ -6790,21 +6987,31 @@ mod lifecycle_tests {
         assert!(!after.crawl.accounting.read()["j1"].is_balanced());
     }
 
+    fn persist_on(state: &AppState) {
+        // as with a Postgres pool
+        state.accounting_persisted.store(true, Ordering::Relaxed);
+    }
+
+    fn ok_flush(state: &AppState) {
+        let batch = state.begin_flush();
+        state.finish_flush(batch, AccountingFlush::Ok, &HashSet::new());
+    }
+
     /// R-19(b): an accounting event's ack is held until the accounting flush
     /// containing it succeeds; a failed flush keeps it held (and the job
     /// dirty) for the next round. Other events are acked at once.
     #[tokio::test]
     async fn accounting_event_acks_wait_for_a_successful_flush() {
         let bus = ChannelBus::new();
-        let mut state = test_state(&bus);
-        state.defer_acks = true; // as with a Postgres pool
+        let state = test_state(&bus);
+        persist_on(&state);
         running_job(&state, "j1", 1);
         let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let outcome = state.process_event_at("j1", &progress("j1", 1, 1, 0), at(1));
-        state.settle_ack(counting_ack(&acked), outcome);
+        state.settle_ack("j1", counting_ack(&acked), outcome).await;
         let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(2));
-        state.settle_ack(counting_ack(&acked), outcome);
+        state.settle_ack("j1", counting_ack(&acked), outcome).await;
         assert_eq!(acked.load(Ordering::Relaxed), 0, "held until flushed");
 
         // Non-accounting and replayed events are acked immediately.
@@ -6814,23 +7021,23 @@ mod lifecycle_tests {
             timestamp: 0,
         };
         let outcome = state.process_event_at("j1", &warning, at(3));
-        state.settle_ack(counting_ack(&acked), outcome);
+        state.settle_ack("j1", counting_ack(&acked), outcome).await;
         let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(2));
-        state.settle_ack(counting_ack(&acked), outcome);
+        state.settle_ack("j1", counting_ack(&acked), outcome).await;
         assert_eq!(acked.load(Ordering::Relaxed), 2);
 
         // Failed accounting flush: nothing acked, job still dirty.
         let batch = state.begin_flush();
         assert_eq!(batch.acks.len(), 2);
         assert_eq!(batch.accounting.len(), 1);
-        state.finish_flush(batch.acks, batch.dirty_ids, false);
+        state.finish_flush(batch, AccountingFlush::Retry, &HashSet::new());
         assert_eq!(acked.load(Ordering::Relaxed), 2);
         assert!(state.crawl.dirty_jobs.read().contains("j1"));
 
         // Successful retry: both held acks released.
         let batch = state.begin_flush();
         assert_eq!(batch.accounting.len(), 1, "retried with the job's snapshot");
-        state.finish_flush(batch.acks, batch.dirty_ids, true);
+        state.finish_flush(batch, AccountingFlush::Ok, &HashSet::new());
         assert_eq!(acked.load(Ordering::Relaxed), 4);
         assert!(state.crawl.pending_acks.lock().is_empty());
     }
@@ -6839,13 +7046,183 @@ mod lifecycle_tests {
     async fn without_persistence_acks_are_immediate() {
         let bus = ChannelBus::new();
         let state = test_state(&bus);
-        assert!(!state.defer_acks);
+        assert!(!state.accounting_persisted());
         running_job(&state, "j1", 1);
         let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let outcome = state.process_event_at("j1", &crawled("j1", "m1"), at(1));
         assert!(outcome.accounting_touched);
-        state.settle_ack(counting_ack(&acked), outcome);
+        state.settle_ack("j1", counting_ack(&acked), outcome).await;
         assert_eq!(acked.load(Ordering::Relaxed), 1);
+    }
+
+    /// Round 2 (1a): held acks are capped; at the cap `settle_ack` blocks
+    /// (backpressure) until a successful flush frees room.
+    #[tokio::test]
+    async fn held_ack_cap_blocks_until_a_flush_frees_room() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        state.config.max_pending_acks = 2;
+        persist_on(&state);
+        let state = Arc::new(state);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (i, id) in ["m1", "m2"].iter().enumerate() {
+            let outcome = state.process_event_at("j1", &crawled("j1", id), at(i as i64));
+            state.settle_ack("j1", counting_ack(&acked), outcome).await;
+        }
+        assert_eq!(state.crawl.pending_acks.lock().len(), 2);
+
+        let outcome = state.process_event_at("j1", &crawled("j1", "m3"), at(2));
+        let blocked = {
+            let state = state.clone();
+            let ack = counting_ack(&acked);
+            tokio::spawn(async move { state.settle_ack("j1", ack, outcome).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!blocked.is_finished(), "settle_ack must wait at the cap");
+        assert_eq!(state.crawl.pending_acks.lock().len(), 2);
+
+        ok_flush(&state); // frees room
+        tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("unblocked by the flush")
+            .unwrap();
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            state.crawl.pending_acks.lock().len(),
+            1,
+            "third ack now held"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_ack_cap_releases_on_shutdown_without_acking() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        state.config.max_pending_acks = 1;
+        persist_on(&state);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let o = state.process_event_at("j1", &crawled("j1", "m1"), at(1));
+        state.settle_ack("j1", counting_ack(&acked), o).await;
+        state.shutting_down.store(true, Ordering::Relaxed);
+        let o = state.process_event_at("j1", &crawled("j1", "m2"), at(2));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.settle_ack("j1", counting_ack(&acked), o),
+        )
+        .await
+        .expect("shutdown unblocks");
+        assert_eq!(
+            acked.load(Ordering::Relaxed),
+            0,
+            "dropped un-acked: redelivered"
+        );
+    }
+
+    /// Round 2 (1b): a missing `accounting` column is not retryable: ack
+    /// deferral and accounting persistence are disabled and held acks are
+    /// released.
+    #[tokio::test]
+    async fn schema_missing_flush_disables_deferral_and_releases_acks() {
+        assert!(is_schema_missing_sqlstate(Some("42703")));
+        assert!(is_schema_missing_sqlstate(Some("42P01")));
+        assert!(!is_schema_missing_sqlstate(Some("08006")));
+        assert!(!is_schema_missing_sqlstate(None));
+        assert_eq!(
+            classify_flush_error(&sqlx::Error::PoolTimedOut),
+            AccountingFlush::Retry
+        );
+
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        persist_on(&state);
+        running_job(&state, "j1", 1);
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let o = state.process_event_at("j1", &crawled("j1", "m1"), at(1));
+        state.settle_ack("j1", counting_ack(&acked), o).await;
+        let batch = state.begin_flush();
+        // An ack held after the batch was taken is released too.
+        let o = state.process_event_at("j1", &crawled("j1", "m2"), at(2));
+        state.settle_ack("j1", counting_ack(&acked), o).await;
+        state.finish_flush(batch, AccountingFlush::SchemaMissing, &HashSet::new());
+        assert_eq!(acked.load(Ordering::Relaxed), 2);
+        assert!(!state.accounting_persisted());
+
+        // From then on: immediate acks, no accounting snapshots flushed.
+        let o = state.process_event_at("j1", &crawled("j1", "m3"), at(3));
+        state.settle_ack("j1", counting_ack(&acked), o).await;
+        assert_eq!(acked.load(Ordering::Relaxed), 3);
+        assert!(state.begin_flush().accounting.is_empty());
+    }
+
+    /// Round 2 (2): a job that went terminal keeps its held acks until the
+    /// owed checked terminal write succeeded; a failed write is retried.
+    #[tokio::test]
+    async fn terminal_job_acks_wait_for_its_terminal_write() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        persist_on(&state);
+        running_job(&state, "j1", 1);
+        running_job(&state, "j2", 1);
+        let acked1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acked2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let o = state.process_event_at("j1", &crawled("j1", "m1"), at(1));
+        state.settle_ack("j1", counting_ack(&acked1), o).await;
+        let o = state.process_event_at("j2", &crawled("j2", "m1"), at(2));
+        state.settle_ack("j2", counting_ack(&acked2), o).await;
+
+        state
+            .finalize_job(
+                "j1",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Failed);
+
+        let batch = state.begin_flush();
+        assert_eq!(batch.terminal.len(), 1);
+        assert_eq!(batch.terminal[0].job_id, "j1");
+        let failed: HashSet<String> = ["j1".to_string()].into();
+        state.finish_flush(batch, AccountingFlush::Ok, &failed);
+        assert_eq!(acked1.load(Ordering::Relaxed), 0, "terminal write failed");
+        assert_eq!(acked2.load(Ordering::Relaxed), 1, "other jobs unaffected");
+
+        let batch = state.begin_flush();
+        assert_eq!(batch.terminal.len(), 1, "terminal write retried");
+        state.finish_flush(batch, AccountingFlush::Ok, &HashSet::new());
+        assert_eq!(acked1.load(Ordering::Relaxed), 1);
+        assert!(state.begin_flush().terminal.is_empty());
+    }
+
+    /// Round 2 (3): a NoPages/Complete decision is re-validated against the
+    /// crawled-page count.
+    #[tokio::test]
+    async fn no_pages_decision_is_not_applied_once_a_page_was_crawled() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        state
+            .finalize_job("j1", Finalize::FailNoPages, Instant::now())
+            .await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Running);
+
+        running_job(&state, "j2", 1);
+        for e in [progress("j2", 1, 1, 0), failed("j2", "m1")] {
+            state.process_event("j2", &e);
+        }
+        state
+            .finalize_job("j2", Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(state.get_job("j2").unwrap().status, JobStatus::Running);
     }
 
     /// R-20: a stalled job that crawled pages is billed for them.

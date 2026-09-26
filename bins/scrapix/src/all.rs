@@ -133,6 +133,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
         verbose: args.verbose,
     };
 
@@ -405,6 +406,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
         verbose: args.verbose,
     };
 
