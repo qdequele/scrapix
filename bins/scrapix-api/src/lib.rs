@@ -43,6 +43,7 @@ use std::time::Duration;
 pub mod analytics;
 pub mod auth;
 pub mod billing;
+pub mod completion;
 pub mod configs;
 pub mod email_scheduler;
 pub mod jobs_db;
@@ -93,8 +94,11 @@ use scrapix_parser::{
     html_to_main_content_minihtml, html_to_markdown, html_to_minihtml,
 };
 use scrapix_queue::{
-    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, ProducerBuilder, UrlMessage,
+    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, JobAccounting, JobAction,
+    JobControl, ProducerBuilder, UrlMessage,
 };
+
+use completion::{finalize_decision, Finalize};
 use scrapix_storage::clickhouse::{
     AiUsageBatcher, AiUsageEvent as ClickHouseAiUsageEvent, ClickHouseStorage,
     JobEvent as ClickHouseJobEvent, JobEventBatcher, PageEvent as ClickHousePageEvent,
@@ -134,6 +138,17 @@ pub struct Args {
     #[arg(long, env = "MAX_JOBS", default_value = "10000")]
     pub max_jobs: usize,
 
+    /// Fail a Running job that received no pipeline event for this many
+    /// seconds while its work is not fully accounted for (R5).
+    #[arg(long, env = "JOB_STALL_TIMEOUT_SECS", default_value = "1800")]
+    pub job_stall_timeout_secs: u64,
+
+    /// A job's work accounting must stay balanced for this long before the
+    /// job is finalized (absorbs transient frontier snapshots and late
+    /// sitemap events).
+    #[arg(long, env = "JOB_COMPLETION_GRACE_MS", default_value = "3000")]
+    pub completion_grace_ms: u64,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -145,10 +160,17 @@ struct CrawlState {
     jobs: RwLock<HashMap<String, JobState>>,
     /// Event broadcaster for SSE
     event_tx: broadcast::Sender<(String, CrawlEvent)>,
-    /// Last activity time per job (for idle-based completion detection)
+    /// Time of the last pipeline event applied per job (stall detection)
     job_last_activity: RwLock<HashMap<String, std::time::Instant>>,
     /// Job IDs with pending counter updates awaiting DB flush
     dirty_jobs: RwLock<HashSet<String>>,
+    /// Exact work accounting per non-terminal job (R5). An entry exists from
+    /// job creation (or startup recovery) until the job is terminal; it is
+    /// freed then (and whenever the job itself is evicted).
+    accounting: RwLock<HashMap<String, JobAccounting>>,
+    /// Start of the current uninterrupted balanced streak per Running job
+    /// (completion grace period).
+    balanced_since: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -159,6 +181,9 @@ struct DiagnosticsState {
     domain_counters: RwLock<HashMap<String, DomainCounter>>,
     /// Last time each service type was seen (for health monitoring)
     service_last_seen: RwLock<HashMap<String, std::time::Instant>>,
+    /// Number of job completion/failure emails requested (one per terminal
+    /// job; test hook for the single-email invariant, R5)
+    job_emails_requested: std::sync::atomic::AtomicU64,
 }
 
 /// ClickHouse analytics batchers
@@ -166,7 +191,6 @@ struct AnalyticsState {
     /// Request event batcher (billing atom: 1 row per API call)
     request_batcher: Option<Arc<RequestEventBatcher>>,
     /// AI usage batcher (per-LLM-call tracking)
-    #[allow(dead_code)]
     ai_usage_batcher: Option<Arc<AiUsageBatcher>>,
     /// Job event batcher (lifecycle: JobStarted/Completed/Failed)
     job_event_batcher: Option<Arc<JobEventBatcher>>,
@@ -204,6 +228,20 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct AppConfig {
     max_jobs: usize,
+    /// See [`Args::job_stall_timeout_secs`]
+    job_stall_timeout: Duration,
+    /// See [`Args::completion_grace_ms`]
+    completion_grace: Duration,
+}
+
+impl AppConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            max_jobs: args.max_jobs,
+            job_stall_timeout: Duration::from_secs(args.job_stall_timeout_secs),
+            completion_grace: Duration::from_millis(args.completion_grace_ms),
+        }
+    }
 }
 
 impl AppState {
@@ -231,11 +269,14 @@ impl AppState {
                 event_tx,
                 job_last_activity: RwLock::new(HashMap::new()),
                 dirty_jobs: RwLock::new(HashSet::new()),
+                accounting: RwLock::new(HashMap::new()),
+                balanced_since: RwLock::new(HashMap::new()),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
                 domain_counters: RwLock::new(HashMap::new()),
                 service_last_seen: RwLock::new(HashMap::new()),
+                job_emails_requested: std::sync::atomic::AtomicU64::new(0),
             },
             analytics: AnalyticsState {
                 request_batcher,
@@ -254,31 +295,55 @@ impl AppState {
 
     /// Create a new job
     fn create_job(&self, job_id: &str, index_uid: &str) -> JobState {
-        let mut jobs = self.crawl.jobs.write();
+        self.insert_job(JobState::new(job_id, index_uid))
+    }
 
-        // Evict old jobs if at capacity
-        if jobs.len() >= self.config.max_jobs {
-            // Remove oldest completed jobs first
-            let to_remove: Vec<String> = jobs
-                .iter()
-                .filter(|(_, j)| {
-                    matches!(
-                        j.status,
-                        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
-                    )
-                })
-                .map(|(id, _)| id.clone())
-                .take(self.config.max_jobs / 10)
-                .collect();
-
-            for id in to_remove {
-                jobs.remove(&id);
+    /// Insert a new job into the in-memory map, evicting terminal jobs (and
+    /// their per-job tracking) first when at capacity.
+    fn insert_job(&self, job: JobState) -> JobState {
+        let evicted: Vec<String> = {
+            let mut jobs = self.crawl.jobs.write();
+            let mut evicted = Vec::new();
+            if jobs.len() >= self.config.max_jobs {
+                // Remove oldest completed jobs first
+                evicted = jobs
+                    .iter()
+                    .filter(|(_, j)| is_terminal(&j.status))
+                    .map(|(id, _)| id.clone())
+                    .take(self.config.max_jobs / 10)
+                    .collect();
+                for id in &evicted {
+                    jobs.remove(id);
+                }
             }
+            jobs.insert(job.job_id.clone(), job.clone());
+            evicted
+        };
+        for id in &evicted {
+            self.forget_job_tracking(id);
         }
-
-        let job = JobState::new(job_id, index_uid);
-        jobs.insert(job_id.to_string(), job.clone());
         job
+    }
+
+    /// Serialized accounting of the given jobs (those that still have one),
+    /// for the Postgres flush.
+    fn accounting_snapshots(&self, job_ids: &[String]) -> Vec<(String, serde_json::Value)> {
+        let accs = self.crawl.accounting.read();
+        job_ids
+            .iter()
+            .filter_map(|id| {
+                let v = serde_json::to_value(accs.get(id)?).ok()?;
+                Some((id.clone(), v))
+            })
+            .collect()
+    }
+
+    /// Drop the per-job tracking state (accounting incl. its seen-sets,
+    /// balanced streak, last activity) of a job that is terminal or evicted.
+    fn forget_job_tracking(&self, job_id: &str) {
+        self.crawl.accounting.write().remove(job_id);
+        self.crawl.balanced_since.write().remove(job_id);
+        self.crawl.job_last_activity.write().remove(job_id);
     }
 
     /// Get a job by ID
@@ -313,15 +378,200 @@ impl AppState {
         }
     }
 
+    /// A job just became terminal (completed/failed): write it through to
+    /// Postgres immediately and free its per-job tracking state.
+    fn on_terminal(&self, job_id: &str, updated: Option<JobState>) {
+        self.forget_job_tracking(job_id);
+        if let (Some(ref pool), Some(snapshot)) = (&self.db_pool, updated) {
+            self.crawl.dirty_jobs.write().remove(job_id);
+            let pool = pool.clone();
+            tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
+        }
+    }
+
+    /// Queue a job notification email (delivered by the Rails app). Called
+    /// only from `process_event`'s terminal branches, which run at most once
+    /// per job.
+    fn request_job_email(
+        &self,
+        email_type: &'static str,
+        account_id: Option<String>,
+        payload: serde_json::Value,
+    ) {
+        self.diagnostics
+            .job_emails_requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id) else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
+                if let Some(email_addr) =
+                    email_scheduler::get_account_email_for_job_notification(&pool, uuid).await
+                {
+                    email_scheduler::schedule_email_now(&pool, email_type, &email_addr, payload)
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// One completion-loop tick (R5): refresh each Running job's balanced
+    /// streak and return the jobs that must be finalized now.
+    fn completion_decisions(&self, now: std::time::Instant) -> Vec<(String, Finalize)> {
+        let running: HashSet<String> = self
+            .crawl
+            .jobs
+            .read()
+            .iter()
+            .filter(|(_, j)| matches!(j.status, JobStatus::Running))
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let accs = self.crawl.accounting.read();
+        let mut since = self.crawl.balanced_since.write();
+        let mut activity = self.crawl.job_last_activity.write();
+        since.retain(|id, _| running.contains(id));
+
+        // A Running job without an entry (should not happen: entries are
+        // created with the job and recovered at startup) is treated as having
+        // no accounted work, so it stalls out instead of running forever.
+        let untracked = JobAccounting::default();
+        let mut out = Vec::new();
+        for id in running {
+            let acc = accs.get(&id).unwrap_or(&untracked);
+            if acc.is_balanced() {
+                since.entry(id.clone()).or_insert(now);
+            } else {
+                since.remove(&id);
+            }
+            let last_event = *activity.entry(id.clone()).or_insert(now);
+            let decision = finalize_decision(
+                acc,
+                since.get(&id).copied(),
+                last_event,
+                now,
+                self.config.completion_grace,
+                self.config.job_stall_timeout,
+            );
+            if decision != Finalize::Wait {
+                out.push((id, decision));
+            }
+        }
+        out
+    }
+
+    /// Finalize a Running job per `decision`: run Replace-strategy cleanup
+    /// on true completion, apply the terminal event through `process_event`
+    /// (which alone schedules the email), and tell the pipeline to release
+    /// the job's state.
+    async fn finalize_job(&self, job_id: &str, decision: Finalize) {
+        let Some(job) = self.get_job(job_id) else {
+            return;
+        };
+        if !matches!(job.status, JobStatus::Running) {
+            return;
+        }
+        let acc = self
+            .crawl
+            .accounting
+            .read()
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default();
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let failed = |error: String| CrawlEvent::JobFailed {
+            job_id: job_id.to_string(),
+            account_id: job.account_id.clone(),
+            error,
+            timestamp,
+        };
+
+        let event = match decision {
+            Finalize::Wait => return,
+            Finalize::FailStalled => failed(format!(
+                "Stalled: no progress for {}s",
+                self.config.job_stall_timeout.as_secs()
+            )),
+            Finalize::FailNoPages => failed(format!(
+                "No page could be crawled ({} failures)",
+                acc.pages_failed
+            )),
+            Finalize::Complete => match replace_cleanup(&job, acc.documents_indexed).await {
+                Ok(documents_indexed) => CrawlEvent::JobCompleted {
+                    job_id: job_id.to_string(),
+                    account_id: job.account_id.clone(),
+                    pages_crawled: acc.pages_crawled_ok,
+                    documents_indexed,
+                    errors: acc.pages_failed,
+                    bytes_downloaded: acc.bytes_downloaded,
+                    duration_secs: job.duration_seconds().unwrap_or(0).max(0) as u64,
+                    timestamp,
+                },
+                Err(error) => failed(error),
+            },
+        };
+
+        // The job may have been cancelled while the Replace cleanup ran;
+        // process_event ignores a terminal event for a terminal job.
+        info!(job_id = %job_id, ?decision, "Finalizing job from work accounting");
+        self.process_event(job_id, &event);
+        self.broadcast_event(job_id, event);
+
+        let control = JobControl::new(job_id, JobAction::Finish);
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.producer
+                .send(topic_names::JOB_STATUS, Some(job_id), &control),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(job_id = %job_id, error = %e, "Failed to publish JobControl Finish")
+            }
+            Err(_) => warn!(job_id = %job_id, "Timed out publishing JobControl Finish"),
+        }
+    }
+
     /// Process an event and update job state accordingly
     fn process_event(&self, job_id: &str, event: &CrawlEvent) {
-        // Track last activity for idle-based completion detection
+        // Terminal transitions are applied exactly once: a second
+        // JobCompleted/JobFailed for a job that is already terminal (a
+        // redelivered event, or a finalize racing a cancel) must not re-bill,
+        // re-email or re-record it (R5: exactly one completion email).
+        if matches!(
+            event,
+            CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. }
+        ) {
+            let already_terminal = self
+                .crawl
+                .jobs
+                .read()
+                .get(job_id)
+                .is_some_and(|j| is_terminal(&j.status));
+            if already_terminal {
+                debug!(job_id = %job_id, "Ignoring terminal event for an already terminal job");
+                return;
+            }
+        }
+
+        // Track last activity (stall detection) for live jobs only, so late
+        // events for a finished/unknown job do not leak entries.
         {
             let now = std::time::Instant::now();
-            self.crawl
-                .job_last_activity
-                .write()
-                .insert(job_id.to_string(), now);
+            let live = self
+                .crawl
+                .jobs
+                .read()
+                .get(job_id)
+                .is_some_and(|j| !is_terminal(&j.status));
+            if live {
+                self.crawl
+                    .job_last_activity
+                    .write()
+                    .insert(job_id.to_string(), now);
+            }
 
             // Track which services are alive based on event type
             let service = match event {
@@ -444,12 +694,34 @@ impl AppState {
             }
         }
 
+        // Fold the event into the job's exact work accounting (R5). Only jobs
+        // with an entry (created with the job / recovered at startup, freed
+        // once terminal) are tracked, so late events for a finished job do
+        // not resurrect state. The JobState counters below mirror the
+        // (deduplicated) accounting when it exists.
+        let accounted: Option<AccountedCounters> = {
+            let mut accs = self.crawl.accounting.write();
+            accs.get_mut(job_id).map(|acc| {
+                acc.apply(event);
+                AccountedCounters::from(&*acc)
+            })
+        };
+        if accounted.is_some() && is_accounting_event(event) {
+            self.crawl.dirty_jobs.write().insert(job_id.to_string());
+        }
+
         match event {
             CrawlEvent::PageCrawled {
                 url, duration_ms, ..
             } => {
                 self.update_job(job_id, |j| {
-                    j.pages_crawled += 1;
+                    match accounted {
+                        Some(c) => {
+                            j.pages_crawled = c.pages_crawled_ok;
+                            j.bytes_downloaded = c.bytes_downloaded;
+                        }
+                        None => j.pages_crawled += 1,
+                    }
                     // Update crawl rate based on elapsed time
                     if let Some(started) = j.started_at {
                         let elapsed = chrono::Utc::now()
@@ -478,8 +750,9 @@ impl AppState {
                 status,
                 ..
             } => {
-                self.update_job(job_id, |j| {
-                    j.errors += 1;
+                self.update_job(job_id, |j| match accounted {
+                    Some(c) => j.errors = c.pages_failed,
+                    None => j.errors += 1,
                 });
                 self.crawl.dirty_jobs.write().insert(job_id.to_string());
 
@@ -513,7 +786,10 @@ impl AppState {
             }
             CrawlEvent::DocumentIndexed { .. } => {
                 self.update_job(job_id, |j| {
-                    j.pages_indexed += 1;
+                    match accounted {
+                        Some(c) => j.pages_indexed = c.documents_indexed,
+                        None => j.pages_indexed += 1,
+                    }
                     j.documents_sent += 1;
                 });
                 self.crawl.dirty_jobs.write().insert(job_id.to_string());
@@ -542,45 +818,21 @@ impl AppState {
                         j.crawl_rate = j.pages_crawled as f64 / *duration_secs as f64;
                     }
                 });
-                // Immediate DB write for lifecycle event
-                if let (Some(ref pool), Some(snapshot)) = (&self.db_pool, updated) {
-                    self.crawl.dirty_jobs.write().remove(job_id);
-                    let pool = pool.clone();
-                    tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
-                }
+                self.on_terminal(job_id, updated);
 
-                // Queue job completion email (delivered by the Rails app)
-                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, account_id) {
-                    let pool = pool.clone();
-                    let acct_id = acct_id.clone();
-                    let job_id = job_id.to_string();
-                    let index_uid = index_uid.clone();
-                    let pc = *pages_crawled;
-                    let di = *documents_indexed;
-                    let ds = *duration_secs;
-                    tokio::spawn(async move {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
-                            if let Some(email_addr) =
-                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
-                                    .await
-                            {
-                                email_scheduler::schedule_email_now(
-                                    &pool,
-                                    "job_completed",
-                                    &email_addr,
-                                    serde_json::json!({
-                                        "job_id": job_id,
-                                        "index_uid": index_uid,
-                                        "pages_crawled": pc,
-                                        "documents_indexed": di,
-                                        "duration_secs": ds,
-                                    }),
-                                )
-                                .await;
-                            }
-                        }
-                    });
-                }
+                // Queue job completion email (delivered by the Rails app).
+                // The only place a completion email is scheduled (R5).
+                self.request_job_email(
+                    "job_completed",
+                    account_id.clone(),
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "index_uid": index_uid,
+                        "pages_crawled": pages_crawled,
+                        "documents_indexed": documents_indexed,
+                        "duration_secs": duration_secs,
+                    }),
+                );
 
                 // Deduct credits for crawled pages (fire-and-forget)
                 // Cost per page depends on crawler_type and enabled features
@@ -670,39 +922,46 @@ impl AppState {
                     j.error_message = Some(error.clone());
                     j.completed_at = Some(chrono::Utc::now());
                 });
-                // Immediate DB write for lifecycle event
-                if let (Some(ref pool), Some(snapshot)) = (&self.db_pool, updated) {
-                    self.crawl.dirty_jobs.write().remove(job_id);
-                    let pool = pool.clone();
-                    tokio::spawn(async move { jobs_db::update_job_full(&pool, &snapshot).await });
-                }
+                self.on_terminal(job_id, updated);
 
-                // Queue job failure email (delivered by the Rails app)
-                if let (Some(ref pool), Some(ref acct_id)) = (&self.db_pool, &account_id) {
-                    let pool = pool.clone();
-                    let acct_id = acct_id.clone();
-                    let job_id = job_id.to_string();
-                    let error = error.clone();
-                    tokio::spawn(async move {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
-                            if let Some(email_addr) =
-                                email_scheduler::get_account_email_for_job_notification(&pool, uuid)
-                                    .await
-                            {
-                                email_scheduler::schedule_email_now(
-                                    &pool,
-                                    "job_failed",
-                                    &email_addr,
-                                    serde_json::json!({
-                                        "job_id": job_id,
-                                        "error_message": error,
-                                        "pages_crawled": pages_crawled,
-                                    }),
-                                )
-                                .await;
-                            }
+                // Queue job failure email (delivered by the Rails app).
+                // The only place a failure email is scheduled (R5).
+                self.request_job_email(
+                    "job_failed",
+                    account_id,
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "error_message": error,
+                        "pages_crawled": pages_crawled,
+                    }),
+                );
+            }
+            CrawlEvent::JobWarning { message, .. } => {
+                if !message.is_empty() {
+                    self.update_job(job_id, |j| {
+                        if j.warnings.len() < MAX_JOB_WARNINGS && !j.warnings.contains(message) {
+                            j.warnings.push(message.clone());
                         }
                     });
+                }
+            }
+            CrawlEvent::AiUsage { .. } => {
+                if let Some(ref batcher) = self.analytics.ai_usage_batcher {
+                    let fallback_account = self
+                        .crawl
+                        .jobs
+                        .read()
+                        .get(job_id)
+                        .and_then(|j| j.account_id.clone());
+                    if let Some(ch_event) = crawl_event_to_ai_usage(job_id, event, fallback_account)
+                    {
+                        let batcher = batcher.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = batcher.add(ch_event).await {
+                                debug!(error = %e, "Failed to add AI usage event to ClickHouse");
+                            }
+                        });
+                    }
                 }
             }
             CrawlEvent::UrlsDiscovered { count, .. } => {
@@ -717,6 +976,191 @@ impl AppState {
             _ => {}
         }
     }
+}
+
+/// Maximum distinct warnings kept per job.
+const MAX_JOB_WARNINGS: usize = 100;
+
+fn is_terminal(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
+    )
+}
+
+/// Events that change a job's work accounting (and so mark it dirty for the
+/// Postgres flush).
+fn is_accounting_event(event: &CrawlEvent) -> bool {
+    matches!(
+        event,
+        CrawlEvent::PageCrawled { .. }
+            | CrawlEvent::PageFailed { .. }
+            | CrawlEvent::PageSkipped { .. }
+            | CrawlEvent::PageRetried { .. }
+            | CrawlEvent::DocumentIndexed { .. }
+            | CrawlEvent::DocumentSkipped { .. }
+            | CrawlEvent::DocumentFailed { .. }
+            | CrawlEvent::SitemapPublished { .. }
+            | CrawlEvent::FrontierProgress { .. }
+    )
+}
+
+/// The deduplicated accounting counters mirrored onto `JobState`.
+#[derive(Debug, Clone, Copy)]
+struct AccountedCounters {
+    pages_crawled_ok: u64,
+    pages_failed: u64,
+    documents_indexed: u64,
+    bytes_downloaded: u64,
+}
+
+impl From<&JobAccounting> for AccountedCounters {
+    fn from(acc: &JobAccounting) -> Self {
+        Self {
+            pages_crawled_ok: acc.pages_crawled_ok,
+            pages_failed: acc.pages_failed,
+            documents_indexed: acc.documents_indexed,
+            bytes_downloaded: acc.bytes_downloaded,
+        }
+    }
+}
+
+/// Convert a content-worker `AiUsage` event into a ClickHouse `ai_usage`
+/// row (R9). `fallback_account` is the job's account, used when the event
+/// carries none.
+fn crawl_event_to_ai_usage(
+    job_id: &str,
+    event: &CrawlEvent,
+    fallback_account: Option<String>,
+) -> Option<ClickHouseAiUsageEvent> {
+    let CrawlEvent::AiUsage {
+        account_id,
+        provider,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        duration_ms,
+        feature,
+        url,
+        timestamp,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(ClickHouseAiUsageEvent {
+        provider: provider.clone(),
+        model: model.clone(),
+        operation: feature.clone(),
+        prompt_tokens: *prompt_tokens,
+        completion_tokens: *completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(*completion_tokens),
+        duration_ms: u32::try_from(*duration_ms).unwrap_or(u32::MAX),
+        job_id: job_id.to_string(),
+        account_id: account_id.clone().or(fallback_account).unwrap_or_default(),
+        url: url.clone(),
+        timestamp: if *timestamp > 0 {
+            offset_datetime_from_millis(*timestamp)
+        } else {
+            time::OffsetDateTime::now_utc()
+        },
+    })
+}
+
+/// Replace-strategy post-crawl cleanup, run only on true completion (R5):
+/// delete stale documents from previous crawls and return the verified
+/// Meilisearch document count. Non-Replace jobs return `documents_indexed`
+/// unchanged. `Err` carries the job failure message.
+async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, String> {
+    let Some(ref replace_url) = job.swap_meilisearch_url else {
+        return Ok(documents_indexed);
+    };
+    let ms_key = job.swap_meilisearch_api_key.as_deref();
+    let job_id = &job.job_id;
+    let index_uid = &job.index_uid;
+
+    let key_preview = ms_key
+        .map(|k| {
+            if k.len() > 8 {
+                format!("{}...", &k[..8])
+            } else {
+                k.to_string()
+            }
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    info!(
+        job_id = %job_id,
+        index = %index_uid,
+        meilisearch_url = %replace_url,
+        api_key_prefix = %key_preview,
+        "Deleting stale documents before completing Replace job"
+    );
+
+    // Check for failed indexing tasks before cleanup — these indicate that
+    // fire-and-forget document submissions were rejected by Meilisearch.
+    let failed_tasks = scrapix_storage::meilisearch::MeilisearchStorage::log_failed_tasks(
+        replace_url,
+        ms_key,
+        index_uid,
+    )
+    .await;
+    if failed_tasks > 0 {
+        warn!(
+            job_id = %job_id,
+            index = %index_uid,
+            failed_tasks,
+            "Meilisearch had failed indexing tasks — index may be incomplete"
+        );
+    }
+
+    if let Err(e) = scrapix_storage::meilisearch::MeilisearchStorage::delete_stale_documents(
+        replace_url,
+        ms_key,
+        index_uid,
+        job_id,
+    )
+    .await
+    {
+        error!(
+            job_id = %job_id,
+            error = %e,
+            index = %index_uid,
+            "Stale document cleanup failed, marking job as failed"
+        );
+        return Err(format!("Stale document cleanup failed: {}", e));
+    }
+    info!(
+        job_id = %job_id,
+        index = %index_uid,
+        "Stale document cleanup completed successfully"
+    );
+
+    // Query the actual document count from Meilisearch rather than trusting
+    // the accounted counter (documents submitted to the batch buffer, not
+    // confirmed Meilisearch task results).
+    Ok(
+        match scrapix_storage::meilisearch::MeilisearchStorage::get_actual_document_count(
+            replace_url,
+            ms_key,
+            index_uid,
+        )
+        .await
+        {
+            Some(actual_count) => {
+                if actual_count != documents_indexed {
+                    warn!(
+                        job_id = %job_id,
+                        index = %index_uid,
+                        reported = documents_indexed,
+                        actual = actual_count,
+                        "Document count mismatch: reported count differs from actual Meilisearch count. Meilisearch indexing tasks may have failed silently."
+                    );
+                }
+                actual_count
+            }
+            None => documents_indexed,
+        },
+    )
 }
 
 /// Extract domain from URL
@@ -1111,6 +1555,11 @@ struct JobStatusResponse {
     max_pages: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     config: Option<serde_json::Value>,
+    /// Job-level warnings raised by workers while running the job (e.g. a
+    /// requested feature a worker cannot honor), deduplicated. Omitted when
+    /// there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 impl From<JobState> for JobStatusResponse {
@@ -1133,6 +1582,7 @@ impl From<JobState> for JobStatusResponse {
             start_urls: job.start_urls,
             max_pages: job.max_pages,
             config: job.config,
+            warnings: job.warnings,
         }
     }
 }
@@ -2444,26 +2894,7 @@ pub(crate) async fn do_create_crawl(
     let mut job = if let Some(ctx) = account_ctx {
         let mut j = JobState::with_account(&job_id, &target_index_uid, &ctx.account_id);
         j.api_key_id = ctx.api_key_id.clone();
-        let mut jobs = state.crawl.jobs.write();
-        // Evict old jobs if at capacity
-        if jobs.len() >= state.config.max_jobs {
-            let to_remove: Vec<String> = jobs
-                .iter()
-                .filter(|(_, j)| {
-                    matches!(
-                        j.status,
-                        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled
-                    )
-                })
-                .map(|(id, _)| id.clone())
-                .take(state.config.max_jobs / 10)
-                .collect();
-            for id in to_remove {
-                jobs.remove(&id);
-            }
-        }
-        jobs.insert(job_id.clone(), j.clone());
-        j
+        state.insert_job(j)
     } else {
         state.create_job(&job_id, &target_index_uid)
     };
@@ -2577,6 +3008,16 @@ pub(crate) async fn do_create_crawl(
     // message so it survives the frontier -> crawler -> content pipeline.
     let job_spec = Some(JobSpec::from_config(&config));
 
+    // Exact work accounting (R5). Start from the number of seeds we are about
+    // to publish and decrement on each publish failure, so `seeds_published`
+    // never under-counts (which could balance the job early) while events
+    // for already-published seeds race with this loop.
+    {
+        let mut acc = JobAccounting::default();
+        acc.seeds_published = config.start_urls.len() as u64;
+        state.crawl.accounting.write().insert(job_id.clone(), acc);
+    }
+
     for url in &config.start_urls {
         let crawl_url = CrawlUrl::seed(url);
         // Use pipeline_index_uid (temp index if replace_index, otherwise target)
@@ -2615,6 +3056,9 @@ pub(crate) async fn do_create_crawl(
             }
             Err(e) => {
                 error!(url = %url, job_id = %job_id, error = %e, "Failed to publish seed URL");
+                if let Some(acc) = state.crawl.accounting.write().get_mut(&job_id) {
+                    acc.seeds_published = acc.seeds_published.saturating_sub(1);
+                }
             }
         }
     }
@@ -2622,6 +3066,7 @@ pub(crate) async fn do_create_crawl(
     if urls_published == 0 {
         // Update job as failed
         state.update_job(&job_id, |j| j.fail("Failed to publish any seed URLs"));
+        state.forget_job_tracking(&job_id);
         return Err(ApiError::new(
             "Failed to publish seed URLs to queue",
             "queue_error",
@@ -4372,6 +4817,10 @@ async fn cancel_job(
         })
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
 
+    // A cancelled job is terminal: free its accounting so the completion
+    // loop never finalizes it.
+    state.forget_job_tracking(&job_id);
+
     // Persist cancellation to Postgres
     if let Some(ref pool) = state.db_pool {
         state.crawl.dirty_jobs.write().remove(&job_id);
@@ -4441,6 +4890,42 @@ async fn list_jobs(
 // Event Consumer
 // ============================================================================
 
+/// Rebuild a recovered job's accounting from its persisted snapshot. A job
+/// persisted before the `accounting` column existed (`{}` / missing / not
+/// parseable) falls back to its seed count, so it still finalizes (or stalls
+/// out) instead of staying Running forever.
+fn restore_accounting(job: &JobState, persisted: Option<&serde_json::Value>) -> JobAccounting {
+    let mut acc: JobAccounting = persisted
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    if acc.seeds_published == 0 {
+        acc.seeds_published = job.start_urls.len() as u64;
+    }
+    acc
+}
+
+/// The job an event belongs to.
+fn event_job_id(event: &CrawlEvent) -> &str {
+    match event {
+        CrawlEvent::JobStarted { job_id, .. }
+        | CrawlEvent::PageCrawled { job_id, .. }
+        | CrawlEvent::PageFailed { job_id, .. }
+        | CrawlEvent::DocumentIndexed { job_id, .. }
+        | CrawlEvent::UrlsDiscovered { job_id, .. }
+        | CrawlEvent::JobCompleted { job_id, .. }
+        | CrawlEvent::JobFailed { job_id, .. }
+        | CrawlEvent::PageSkipped { job_id, .. }
+        | CrawlEvent::RateLimited { job_id, .. }
+        | CrawlEvent::PageRetried { job_id, .. }
+        | CrawlEvent::SitemapPublished { job_id, .. }
+        | CrawlEvent::DocumentSkipped { job_id, .. }
+        | CrawlEvent::DocumentFailed { job_id, .. }
+        | CrawlEvent::AiUsage { job_id, .. }
+        | CrawlEvent::JobWarning { job_id, .. }
+        | CrawlEvent::FrontierProgress { job_id, .. } => job_id,
+    }
+}
+
 /// Start consuming events from a message bus to update job state.
 /// Returns a JoinHandle so the caller can await clean shutdown.
 fn start_event_consumer(
@@ -4451,50 +4936,43 @@ fn start_event_consumer(
     consumer.subscribe(&[topic_names::EVENTS])?;
     info!("Event consumer subscribed to {} topic", topic_names::EVENTS);
 
-    // Process events in background
-    let handle = tokio::spawn(async move {
-        loop {
-            if *shutdown.borrow() {
-                info!("Event consumer shutting down");
-                break;
+    // Bridge the watch-channel shutdown to the AtomicBool the ack-based
+    // consumer polls (it re-checks at least once per second).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        let mut shutdown = shutdown;
+        tokio::spawn(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
             }
-            match consumer
-                .poll_one::<CrawlEvent>(Duration::from_millis(100))
-                .await
-            {
-                Ok(Some(event)) => {
-                    // Extract job_id from event
-                    let job_id = match &event {
-                        CrawlEvent::JobStarted { job_id, .. } => job_id.clone(),
-                        CrawlEvent::PageCrawled { job_id, .. } => job_id.clone(),
-                        CrawlEvent::PageFailed { job_id, .. } => job_id.clone(),
-                        CrawlEvent::DocumentIndexed { job_id, .. } => job_id.clone(),
-                        CrawlEvent::UrlsDiscovered { job_id, .. } => job_id.clone(),
-                        CrawlEvent::JobCompleted { job_id, .. } => job_id.clone(),
-                        CrawlEvent::JobFailed { job_id, .. } => job_id.clone(),
-                        CrawlEvent::PageSkipped { job_id, .. } => job_id.clone(),
-                        CrawlEvent::RateLimited { job_id, .. } => job_id.clone(),
-                        CrawlEvent::PageRetried { job_id, .. } => job_id.clone(),
-                        CrawlEvent::SitemapPublished { job_id, .. } => job_id.clone(),
-                        CrawlEvent::DocumentSkipped { job_id, .. } => job_id.clone(),
-                        CrawlEvent::DocumentFailed { job_id, .. } => job_id.clone(),
-                        CrawlEvent::AiUsage { job_id, .. } => job_id.clone(),
-                        CrawlEvent::JobWarning { job_id, .. } => job_id.clone(),
-                        CrawlEvent::FrontierProgress { job_id, .. } => job_id.clone(),
-                    };
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
 
-                    // Update job state and broadcast
-                    state.process_event(&job_id, &event);
-                    state.broadcast_event(&job_id, event);
-                }
-                Ok(None) => {
-                    // No message, continue
-                }
-                Err(e) => {
-                    debug!(error = %e, "Error polling events topic");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
+    // At-least-once (R2): the offset commits only after the event has been
+    // applied. Concurrency 1 keeps events applied in partition order.
+    let handle = tokio::spawn(async move {
+        let result = consumer
+            .process_with_ack::<CrawlEvent, _, _>(
+                move |event, _meta, ack| {
+                    let state = state.clone();
+                    async move {
+                        let job_id = event_job_id(&event).to_string();
+                        state.process_event(&job_id, &event);
+                        state.broadcast_event(&job_id, event);
+                        ack.ack();
+                    }
+                },
+                1,
+                stop,
+            )
+            .await;
+        match result {
+            Ok(()) => info!("Event consumer shut down"),
+            Err(e) => error!(error = %e, "Event consumer stopped with an error"),
         }
     });
 
@@ -4691,9 +5169,7 @@ pub async fn run_with_bus(
     };
 
     // Create application state
-    let config = AppConfig {
-        max_jobs: args.max_jobs,
-    };
+    let config = AppConfig::from_args(&args);
     let db_pool = auth_state.as_ref().map(|a| a.pool.clone());
     let stripe_client = args.stripe_secret_key.as_ref().map(::stripe::Client::new);
     let state = Arc::new(AppState::new(
@@ -4721,13 +5197,39 @@ pub async fn run_with_bus(
             for job in &recovered {
                 jobs.insert(job.job_id.clone(), job.clone());
                 if matches!(job.status, JobStatus::Running) {
-                    // Give idle detector a fresh 30s window for recovered running jobs
+                    // Restart the stall clock for recovered running jobs
                     activity.insert(job.job_id.clone(), now);
                 }
             }
             info!(
                 count = recovered.len(),
                 "Recovered active jobs from Postgres"
+            );
+        }
+
+        // Recover the work accounting of running/paused jobs (R5). The
+        // per-page seen-sets are not persisted, so redelivered events after a
+        // restart are not deduplicated against pre-restart ones.
+        let persisted = jobs_db::load_active_job_accounting(pool).await;
+        let persisted: HashMap<String, serde_json::Value> = persisted.into_iter().collect();
+        let restored = {
+            let jobs = state.crawl.jobs.read();
+            let mut accs = state.crawl.accounting.write();
+            for job in jobs.values() {
+                if !matches!(job.status, JobStatus::Running | JobStatus::Paused) {
+                    continue;
+                }
+                accs.insert(
+                    job.job_id.clone(),
+                    restore_accounting(job, persisted.get(&job.job_id)),
+                );
+            }
+            accs.len()
+        };
+        if restored > 0 {
+            info!(
+                count = restored,
+                "Recovered job work accounting from Postgres"
             );
         }
     }
@@ -4813,6 +5315,8 @@ pub async fn run_with_bus(
                                         .collect()
                                 };
                                 jobs_db::flush_job_counters(pool, &snapshots).await;
+                                let accounting = flush_state.accounting_snapshots(&dirty_ids);
+                                jobs_db::flush_job_accounting(pool, &accounting).await;
                             }
                         }
                     }
@@ -4846,6 +5350,8 @@ pub async fn run_with_bus(
                                         .collect()
                                 };
                                 jobs_db::flush_job_counters(pool, &snapshots).await;
+                                let accounting = flush_state.accounting_snapshots(&dirty_ids);
+                                jobs_db::flush_job_accounting(pool, &accounting).await;
                             }
                         }
                         break;
@@ -4864,232 +5370,35 @@ pub async fn run_with_bus(
         None
     };
 
-    // Start idle-job completion detector (checks every 2s, completes jobs idle for 10s)
-    let idle_state = state.clone();
-    let mut idle_shutdown_rx = shutdown_rx.clone();
-    let idle_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // Job completion loop (R5): every second, finalize Running jobs whose
+    // exact work accounting stayed balanced for the grace period, or that
+    // stalled. Emails are scheduled by process_event only.
+    let completion_state = state.clone();
+    let mut completion_shutdown_rx = shutdown_rx.clone();
+    let completion_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let now = std::time::Instant::now();
-                    let idle_threshold = Duration::from_secs(10);
-
-                    // Find running jobs that have been idle
-                    // (job_id, pages_crawled, pages_indexed, errors, ms_url, ms_key, index_uid, account_id)
-                    type IdleJobInfo = (String, u64, u64, u64, Option<String>, Option<String>, String, Option<String>);
-                    let idle_jobs: Vec<IdleJobInfo> = {
-                        let jobs = idle_state.crawl.jobs.read();
-                        let activity = idle_state.crawl.job_last_activity.read();
-                        jobs.iter()
-                            .filter(|(_, j)| matches!(j.status, JobStatus::Running))
-                            .filter(|(_, j)| j.pages_crawled > 0) // Must have done some work
-                            .filter(|(id, _)| {
-                                activity.get(*id)
-                                    .map(|last| now.duration_since(*last) > idle_threshold)
-                                    .unwrap_or(false)
-                            })
-                            .map(|(id, j)| (
-                                id.clone(),
-                                j.pages_crawled,
-                                j.pages_indexed,
-                                j.errors,
-                                j.swap_meilisearch_url.clone(),
-                                j.swap_meilisearch_api_key.clone(),
-                                j.index_uid.clone(),
-                                j.account_id.clone(),
-                            ))
-                            .collect()
-                    };
-
-                    for (job_id, pages_crawled, documents_indexed, errors, ms_url, ms_key, index_uid, account_id) in idle_jobs {
-                        let duration_secs = {
-                            let jobs = idle_state.crawl.jobs.read();
-                            jobs.get(&job_id)
-                                .and_then(|j| j.duration_seconds())
-                                .unwrap_or(0) as u64
-                        };
-
-                        // For Replace strategy jobs, delete stale documents from previous crawls
-                        if let Some(ref replace_url) = ms_url {
-                            let key_preview = ms_key.as_deref().map(|k| {
-                                if k.len() > 8 { format!("{}...", &k[..8]) } else { k.to_string() }
-                            }).unwrap_or_else(|| "(none)".to_string());
-                            info!(
-                                job_id = %job_id,
-                                index = %index_uid,
-                                meilisearch_url = %replace_url,
-                                api_key_prefix = %key_preview,
-                                "Deleting stale documents before completing Replace job"
-                            );
-
-                            // Check for failed indexing tasks before cleanup — these indicate
-                            // that fire-and-forget document submissions were rejected by Meilisearch.
-                            let failed_tasks = scrapix_storage::meilisearch::MeilisearchStorage::log_failed_tasks(
-                                replace_url,
-                                ms_key.as_deref(),
-                                &index_uid,
-                            ).await;
-                            if failed_tasks > 0 {
-                                warn!(
-                                    job_id = %job_id,
-                                    index = %index_uid,
-                                    failed_tasks,
-                                    "Meilisearch had failed indexing tasks — index may be incomplete"
-                                );
-                            }
-
-                            match scrapix_storage::meilisearch::MeilisearchStorage::delete_stale_documents(
-                                replace_url,
-                                ms_key.as_deref(),
-                                &index_uid,
-                                &job_id,
-                            ).await {
-                                Ok(()) => {
-                                    info!(
-                                        job_id = %job_id,
-                                        index = %index_uid,
-                                        "Stale document cleanup completed successfully"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        job_id = %job_id,
-                                        error = %e,
-                                        index = %index_uid,
-                                        "Stale document cleanup failed, marking job as failed"
-                                    );
-
-                                    let event = CrawlEvent::JobFailed {
-                                        job_id: job_id.clone(),
-                                        account_id: account_id.clone(),
-                                        error: format!(
-                                            "Stale document cleanup failed: {}",
-                                            e,
-                                        ),
-                                        timestamp: chrono::Utc::now().timestamp_millis(),
-                                    };
-                                    let error_msg = format!(
-                                        "Stale document cleanup failed: {}",
-                                        e,
-                                    );
-                                    idle_state.process_event(&job_id, &event);
-                                    idle_state.broadcast_event(&job_id, event);
-
-                                    // Queue job failure email (delivered by the Rails app)
-                                    if let (Some(ref pool), Some(ref acct_id)) =
-                                        (&idle_state.db_pool, &account_id)
-                                    {
-                                        if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
-                                            if let Some(email_addr) =
-                                                email_scheduler::get_account_email_for_job_notification(pool, uuid).await
-                                            {
-                                                email_scheduler::schedule_email_now(
-                                                    pool,
-                                                    "job_failed",
-                                                    &email_addr,
-                                                    serde_json::json!({
-                                                        "job_id": job_id,
-                                                        "error_message": error_msg,
-                                                        "pages_crawled": pages_crawled,
-                                                    }),
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                    }
-
-                                    idle_state.crawl.job_last_activity.write().remove(&job_id);
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // For Replace strategy, query the actual document count from Meilisearch
-                        // rather than trusting the in-memory counter (which reflects documents
-                        // submitted to the batch buffer, not confirmed Meilisearch task results).
-                        let verified_documents_indexed = if let Some(ref replace_url) = ms_url {
-                            match scrapix_storage::meilisearch::MeilisearchStorage::get_actual_document_count(
-                                replace_url,
-                                ms_key.as_deref(),
-                                &index_uid,
-                            ).await {
-                                Some(actual_count) => {
-                                    if actual_count != documents_indexed {
-                                        warn!(
-                                            job_id = %job_id,
-                                            index = %index_uid,
-                                            reported = documents_indexed,
-                                            actual = actual_count,
-                                            "Document count mismatch: reported count differs from actual Meilisearch count. Meilisearch indexing tasks may have failed silently."
-                                        );
-                                    }
-                                    actual_count
-                                }
-                                None => documents_indexed,
-                            }
-                        } else {
-                            documents_indexed
-                        };
-
-                        info!(
-                            job_id = %job_id,
-                            pages_crawled,
-                            documents_indexed = verified_documents_indexed,
-                            "Auto-completing idle job (no activity for 30s)"
-                        );
-
-                        let event = CrawlEvent::JobCompleted {
-                            job_id: job_id.clone(),
-                            account_id: account_id.clone(),
-                            pages_crawled,
-                            documents_indexed: verified_documents_indexed,
-                            errors,
-                            bytes_downloaded: 0,
-                            duration_secs,
-                            timestamp: chrono::Utc::now().timestamp_millis(),
-                        };
-
-                        idle_state.process_event(&job_id, &event);
-                        idle_state.broadcast_event(&job_id, event);
-
-                        // Queue job completion email (delivered by the Rails app)
-                        if let (Some(ref pool), Some(ref acct_id)) =
-                            (&idle_state.db_pool, &account_id)
-                        {
-                            if let Ok(uuid) = uuid::Uuid::parse_str(acct_id) {
-                                if let Some(email_addr) =
-                                    email_scheduler::get_account_email_for_job_notification(pool, uuid).await
-                                {
-                                    email_scheduler::schedule_email_now(
-                                        pool,
-                                        "job_completed",
-                                        &email_addr,
-                                        serde_json::json!({
-                                            "job_id": job_id,
-                                            "index_uid": index_uid,
-                                            "pages_crawled": pages_crawled,
-                                            "documents_indexed": verified_documents_indexed,
-                                            "duration_secs": duration_secs,
-                                        }),
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-
-                        // Clean up activity tracking
-                        idle_state.crawl.job_last_activity.write().remove(&job_id);
+                    let decisions =
+                        completion_state.completion_decisions(std::time::Instant::now());
+                    for (job_id, decision) in decisions {
+                        completion_state.finalize_job(&job_id, decision).await;
                     }
                 }
-                _ = idle_shutdown_rx.changed() => {
-                    info!("Idle job detector shutting down");
+                _ = completion_shutdown_rx.changed() => {
+                    info!("Job completion loop shutting down");
                     break;
                 }
             }
         }
     });
-    info!("Idle job completion detector started (30s threshold)");
+    info!(
+        grace_ms = state.config.completion_grace.as_millis() as u64,
+        stall_timeout_secs = state.config.job_stall_timeout.as_secs(),
+        "Job completion loop started (exact work accounting)"
+    );
 
     // Start cron scheduler if database is configured
     let cron_handle = if let Some(ref pool) = state.db_pool {
@@ -5307,8 +5616,8 @@ pub async fn run_with_bus(
     if let Err(e) = consumer_handle.await {
         warn!("Consumer task failed during shutdown: {}", e);
     }
-    if let Err(e) = idle_handle.await {
-        warn!("Idle detector task failed during shutdown: {}", e);
+    if let Err(e) = completion_handle.await {
+        warn!("Completion loop task failed during shutdown: {}", e);
     }
     if let Some(handle) = cron_handle {
         if let Err(e) = handle.await {
@@ -5768,5 +6077,381 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_crawl_config(&cfg).is_ok());
+    }
+}
+
+/// Job lifecycle (R5/R9) tests on a DB-less `AppState` over the in-process bus.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use scrapix_queue::{ChannelBus, MessageConsumer};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    fn test_state(bus: &ChannelBus) -> AppState {
+        let robots = Arc::new(RobotsCache::new(RobotsConfig::default()).unwrap());
+        let fetcher = Arc::new(HttpFetcherBuilder::new().build(robots).unwrap());
+        AppState::new(
+            AnyProducer::channel(bus.producer()),
+            AppConfig {
+                max_jobs: 100,
+                job_stall_timeout: Duration::from_secs(1800),
+                completion_grace: Duration::from_secs(3),
+            },
+            None,
+            None,
+            None,
+            None,
+            fetcher,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A Running job with a fresh accounting entry for `seeds` seeds.
+    fn running_job(state: &AppState, job_id: &str, seeds: u64) {
+        let mut job = JobState::new(job_id, "idx");
+        job.start();
+        state.insert_job(job);
+        let mut acc = JobAccounting::default();
+        acc.seeds_published = seeds;
+        state
+            .crawl
+            .accounting
+            .write()
+            .insert(job_id.to_string(), acc);
+    }
+
+    fn progress(job_id: &str, received: u64, dispatched: u64, queued: u64) -> CrawlEvent {
+        CrawlEvent::FrontierProgress {
+            job_id: job_id.into(),
+            instance_id: "f1".into(),
+            received,
+            admitted: received,
+            dispatched,
+            rejected: 0,
+            dropped: 0,
+            queued,
+            timestamp: received as i64,
+        }
+    }
+
+    fn crawled(job_id: &str, id: &str) -> CrawlEvent {
+        CrawlEvent::PageCrawled {
+            job_id: job_id.into(),
+            account_id: None,
+            url: "https://a.test/".into(),
+            status: 200,
+            content_length: 100,
+            duration_ms: 5,
+            timestamp: 0,
+            links_published: 0,
+            url_message_id: id.into(),
+            js_rendered: false,
+            sitemap_pending: false,
+        }
+    }
+
+    fn indexed(job_id: &str, id: &str) -> CrawlEvent {
+        CrawlEvent::DocumentIndexed {
+            job_id: job_id.into(),
+            account_id: None,
+            url: "https://a.test/".into(),
+            document_id: "d".into(),
+            timestamp: 0,
+            url_message_id: id.into(),
+            ai_enriched: false,
+        }
+    }
+
+    fn failed(job_id: &str, id: &str) -> CrawlEvent {
+        CrawlEvent::PageFailed {
+            job_id: job_id.into(),
+            account_id: None,
+            url: "https://a.test/x".into(),
+            error: "404 Not Found".into(),
+            retry_count: 0,
+            timestamp: 0,
+            status: Some(404),
+            url_message_id: id.into(),
+        }
+    }
+
+    fn emails(state: &AppState) -> u64 {
+        state
+            .diagnostics
+            .job_emails_requested
+            .load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn balanced_job_completes_once_after_grace_with_one_email() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            crawled("j1", "m1"), // redelivered: not double counted
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.pages_crawled, 1, "PageCrawled is deduplicated");
+        assert_eq!(job.pages_indexed, 1);
+        assert_eq!(job.bytes_downloaded, 100);
+
+        let t0 = Instant::now();
+        assert!(
+            state.completion_decisions(t0).is_empty(),
+            "balanced streak just started: wait for the grace period"
+        );
+        let decisions = state.completion_decisions(t0 + Duration::from_secs(4));
+        assert_eq!(decisions, vec![("j1".to_string(), Finalize::Complete)]);
+
+        state.finalize_job("j1", Finalize::Complete).await;
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.pages_crawled, 1);
+        assert_eq!(emails(&state), 1);
+
+        // Accounting (and its seen-sets) is freed once terminal.
+        assert!(state.crawl.accounting.read().get("j1").is_none());
+        assert!(state.crawl.balanced_since.read().get("j1").is_none());
+
+        // The pipeline is told to release the job.
+        let ctl: JobControl = control
+            .poll_one(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("JobControl published");
+        assert_eq!(ctl.job_id, "j1");
+        assert_eq!(ctl.action, JobAction::Finish);
+
+        // Neither the loop nor a redelivered terminal event emails again.
+        assert!(state
+            .completion_decisions(t0 + Duration::from_secs(10))
+            .is_empty());
+        state.finalize_job("j1", Finalize::Complete).await;
+        state.process_event(
+            "j1",
+            &CrawlEvent::JobCompleted {
+                job_id: "j1".into(),
+                account_id: None,
+                pages_crawled: 1,
+                documents_indexed: 1,
+                errors: 0,
+                bytes_downloaded: 0,
+                duration_secs: 1,
+                timestamp: 0,
+            },
+        );
+        state.process_event(
+            "j1",
+            &CrawlEvent::JobFailed {
+                job_id: "j1".into(),
+                account_id: None,
+                error: "late".into(),
+                timestamp: 0,
+            },
+        );
+        assert_eq!(emails(&state), 1);
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn unbalanced_streak_resets_the_grace_period() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.process_event("j1", &progress("j1", 1, 1, 0));
+        state.process_event("j1", &crawled("j1", "m1"));
+        state.process_event("j1", &indexed("j1", "m1"));
+
+        let t0 = Instant::now();
+        assert!(state.completion_decisions(t0).is_empty());
+        // New work shows up (link discovered and queued): streak broken.
+        state.process_event("j1", &progress("j1", 2, 1, 1));
+        assert!(state
+            .completion_decisions(t0 + Duration::from_secs(2))
+            .is_empty());
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &failed("j1", "m2"));
+        // Balanced again at t0+3s: the grace restarts from there.
+        assert!(state
+            .completion_decisions(t0 + Duration::from_secs(3))
+            .is_empty());
+        assert!(state
+            .completion_decisions(t0 + Duration::from_secs(5))
+            .is_empty());
+        assert_eq!(
+            state.completion_decisions(t0 + Duration::from_secs(6)),
+            vec![("j1".to_string(), Finalize::Complete)]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_pages_failed_job_fails_with_no_pages() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        for e in [
+            progress("j1", 2, 2, 0),
+            failed("j1", "m1"),
+            failed("j1", "m2"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        assert_eq!(state.get_job("j1").unwrap().errors, 2);
+
+        let t0 = Instant::now();
+        assert!(state.completion_decisions(t0).is_empty());
+        let decisions = state.completion_decisions(t0 + Duration::from_secs(4));
+        assert_eq!(decisions, vec![("j1".to_string(), Finalize::FailNoPages)]);
+        state.finalize_job("j1", Finalize::FailNoPages).await;
+
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            job.error_message.as_deref(),
+            Some("No page could be crawled (2 failures)")
+        );
+        assert_eq!(emails(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn silent_unbalanced_job_fails_as_stalled() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.process_event("j1", &progress("j1", 1, 1, 0)); // never finishes
+
+        let now = Instant::now();
+        assert!(state.completion_decisions(now).is_empty());
+        let later = now + Duration::from_secs(1801);
+        assert_eq!(
+            state.completion_decisions(later),
+            vec![("j1".to_string(), Finalize::FailStalled)]
+        );
+        state.finalize_job("j1", Finalize::FailStalled).await;
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            job.error_message.as_deref(),
+            Some("Stalled: no progress for 1800s")
+        );
+        assert_eq!(emails(&state), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_is_never_finalized() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.update_job("j1", |j| j.status = JobStatus::Cancelled);
+        state.forget_job_tracking("j1");
+        assert!(state
+            .completion_decisions(Instant::now() + Duration::from_secs(3600))
+            .is_empty());
+        state.finalize_job("j1", Finalize::FailStalled).await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Cancelled);
+        assert_eq!(emails(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn job_warnings_are_deduplicated_and_exposed_in_status() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        for msg in ["proxy ignored", "proxy ignored", "pdf disabled", ""] {
+            state.process_event(
+                "j1",
+                &CrawlEvent::JobWarning {
+                    job_id: "j1".into(),
+                    message: msg.into(),
+                    timestamp: 0,
+                },
+            );
+        }
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.warnings, vec!["proxy ignored", "pdf disabled"]);
+        let status = serde_json::to_value(JobStatusResponse::from(job)).unwrap();
+        assert_eq!(
+            status["warnings"],
+            serde_json::json!(["proxy ignored", "pdf disabled"])
+        );
+
+        // Omitted when empty.
+        running_job(&state, "j2", 1);
+        let status =
+            serde_json::to_value(JobStatusResponse::from(state.get_job("j2").unwrap())).unwrap();
+        assert!(status.get("warnings").is_none());
+    }
+
+    #[tokio::test]
+    async fn late_events_for_a_finished_job_do_not_resurrect_tracking() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.finalize_job("j1", Finalize::FailStalled).await;
+        state.process_event("j1", &crawled("j1", "m9"));
+        assert!(state.crawl.accounting.read().get("j1").is_none());
+        assert!(state.crawl.job_last_activity.read().get("j1").is_none());
+    }
+
+    #[test]
+    fn ai_usage_event_maps_to_clickhouse_row() {
+        let event = CrawlEvent::AiUsage {
+            job_id: "j1".into(),
+            account_id: None,
+            provider: "openai".into(),
+            model: "gpt".into(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            duration_ms: 42,
+            feature: "ai_summary".into(),
+            url: "https://a.test/".into(),
+            timestamp: 1_700_000_000_000,
+        };
+        let row = crawl_event_to_ai_usage("j1", &event, Some("acct".into())).unwrap();
+        assert_eq!(row.provider, "openai");
+        assert_eq!(row.operation, "ai_summary");
+        assert_eq!(row.total_tokens, 15);
+        assert_eq!(row.duration_ms, 42);
+        assert_eq!(row.job_id, "j1");
+        assert_eq!(row.account_id, "acct", "falls back to the job's account");
+        assert_eq!(row.url, "https://a.test/");
+        assert_eq!(row.timestamp.unix_timestamp(), 1_700_000_000);
+        assert!(crawl_event_to_ai_usage("j1", &crawled("j1", "m"), None).is_none());
+    }
+
+    #[test]
+    fn restored_accounting_falls_back_to_seed_count() {
+        let mut job = JobState::new("j1", "idx");
+        job.start_urls = vec!["https://a.test".into(), "https://b.test".into()];
+        let acc = restore_accounting(&job, Some(&serde_json::json!({})));
+        assert_eq!(acc.seeds_published, 2);
+        let acc = restore_accounting(&job, None);
+        assert_eq!(acc.seeds_published, 2);
+
+        let mut persisted = JobAccounting::default();
+        persisted.seeds_published = 5;
+        persisted.pages_crawled_ok = 3;
+        let acc = restore_accounting(&job, Some(&serde_json::to_value(&persisted).unwrap()));
+        assert_eq!(acc.seeds_published, 5);
+        assert_eq!(acc.pages_crawled_ok, 3);
+    }
+
+    #[test]
+    fn every_event_variant_maps_to_its_job() {
+        assert_eq!(event_job_id(&crawled("jx", "m")), "jx");
+        assert_eq!(event_job_id(&progress("jy", 1, 1, 0)), "jy");
     }
 }

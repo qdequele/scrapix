@@ -4402,6 +4402,13 @@
           },
           "status": {
             "type": "string"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Job-level warnings raised by workers while running the job (e.g. a\nrequested feature a worker cannot honor), deduplicated. Omitted when\nthere are none."
           }
         }
       },

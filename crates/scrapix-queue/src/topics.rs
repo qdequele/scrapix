@@ -18,7 +18,8 @@ pub mod names {
     pub const DLQ_URLS: &str = "scrapix.dlq.urls";
     /// Crawl events for monitoring
     pub const EVENTS: &str = "scrapix.events";
-    /// Job status updates
+    /// Job control messages ([`JobControl`](super::JobControl)): API →
+    /// frontier/workers (finish, cancel, pause, resume)
     pub const JOB_STATUS: &str = "scrapix.jobs.status";
     /// Link graph updates (discovered links)
     pub const LINKS: &str = "scrapix.links";
@@ -872,9 +873,61 @@ impl FetchFeedback {
     }
 }
 
+/// Action carried by a [`JobControl`] message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    /// Stop dispatching and drop the job's queued work.
+    Cancel,
+    /// Stop dispatching but keep the job's queued work.
+    Pause,
+    /// Resume dispatching a paused job.
+    Resume,
+    /// The job is terminal (completed or failed): release its state.
+    #[default]
+    Finish,
+}
+
+/// API → pipeline job control, published to [`names::JOB_STATUS`] keyed by
+/// `job_id`. Every field is `#[serde(default)]` so old and new services
+/// interoperate during a rolling deploy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobControl {
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub action: JobAction,
+    /// When the control message was produced (ms since epoch)
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+impl JobControl {
+    pub fn new(job_id: impl Into<String>, action: JobAction) -> Self {
+        Self {
+            job_id: job_id.into(),
+            action,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_control_round_trips_and_tolerates_missing_fields() {
+        let json = serde_json::to_string(&JobControl::new("j1", JobAction::Finish)).unwrap();
+        assert!(json.contains(r#""action":"finish""#), "{json}");
+        let back: JobControl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.job_id, "j1");
+        assert_eq!(back.action, JobAction::Finish);
+        let partial: JobControl =
+            serde_json::from_str(r#"{"job_id":"j2","action":"pause"}"#).unwrap();
+        assert_eq!(partial.action, JobAction::Pause);
+        assert_eq!(partial.timestamp, 0);
+    }
 
     #[test]
     fn fetch_feedback_tolerates_missing_fields_and_skips_nones() {

@@ -121,6 +121,7 @@ use crate::topics::CrawlEvent;
 /// global to the job, not local to the publishing instance, so only one
 /// snapshot is ever kept per job).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct FrontierSnapshot {
     /// Instance that published this snapshot. Kept for observability only —
     /// not used by `is_balanced`.
@@ -135,7 +136,11 @@ pub struct FrontierSnapshot {
 }
 
 /// Exact, pure work-accounting state for a single crawl job.
+///
+/// `#[serde(default)]` so a persisted snapshot (the `jobs.accounting` jsonb
+/// column, `{}` for rows written before it existed) always deserializes.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct JobAccounting {
     /// Number of seed URLs the job was started with.
     pub seeds_published: u64,
@@ -694,5 +699,28 @@ mod tests {
         );
         a.apply(&sitemap_published("b", 0));
         assert!(a.is_balanced());
+    }
+    /// Persistence (Task 14): `{}` (rows written before the column existed)
+    /// deserializes to the default, and a JSON round trip keeps every
+    /// persisted counter/set (the per-page seen-sets are skipped).
+    #[test]
+    fn persisted_snapshot_round_trips_and_empty_object_is_default() {
+        let empty: JobAccounting = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, JobAccounting::default());
+
+        let mut a = JobAccounting {
+            seeds_published: 1,
+            ..Default::default()
+        };
+        a.apply(&progress("f1", 1, 1, 0));
+        a.apply(&crawled_with("m1", 0, true));
+        a.apply(&indexed("m1"));
+        let back: JobAccounting =
+            serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!(back.seeds_published, 1);
+        assert_eq!(back.crawl_outcomes, 1);
+        assert_eq!(back.content_outcomes, 1);
+        assert!(back.pending_sitemaps.contains("m1"));
+        assert_eq!(back.is_balanced(), a.is_balanced());
     }
 }

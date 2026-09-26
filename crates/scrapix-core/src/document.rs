@@ -416,6 +416,11 @@ pub struct JobState {
     /// Meilisearch API key for performing the swap
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_meilisearch_api_key: Option<String>,
+
+    /// Job-level warnings raised by workers (`JobWarning` events), deduped,
+    /// in arrival order. In-memory only (not persisted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl JobState {
@@ -442,6 +447,7 @@ impl JobState {
             swap_temp_index: None,
             swap_meilisearch_url: None,
             swap_meilisearch_api_key: None,
+            warnings: Vec::new(),
         }
     }
 

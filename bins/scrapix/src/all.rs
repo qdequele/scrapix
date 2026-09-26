@@ -131,6 +131,8 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
         verbose: args.verbose,
     };
 
@@ -401,6 +403,8 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
         verbose: args.verbose,
     };
 
@@ -532,4 +536,12 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     info!("All services stopped.");
     Ok(())
+}
+
+/// Parse an optional numeric env var, falling back to `default`.
+fn env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
