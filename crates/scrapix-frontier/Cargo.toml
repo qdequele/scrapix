@@ -11,6 +11,7 @@ scrapix-core = { path = "../scrapix-core" }
 
 serde = { workspace = true }
 url = { workspace = true }
+async-trait = { workspace = true }
 
 # Bloom filter for deduplication
 bloomfilter = { workspace = true }
@@ -38,10 +39,14 @@ default = []
 distributed = ["rdkafka", "redis"]
 persistent = ["rocksdb"]
 full = ["distributed", "persistent"]
+# Exposes the FrontierStore conformance suite (crates/scrapix-frontier/src/store/conformance.rs)
+# for reuse by other FrontierStore implementations (e.g. a future Redis-backed store).
+conformance = []
 
 [dev-dependencies]
 criterion = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "frontier_benchmarks"

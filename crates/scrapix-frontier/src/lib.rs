@@ -64,6 +64,7 @@ pub mod politeness;
 pub mod priority;
 pub mod recrawl;
 pub mod simhash;
+pub mod store;
 
 // Re-exports
 pub use dedup::{DedupConfig, DedupStats, PartitionedUrlDedup, UrlDedup};
@@ -83,3 +84,4 @@ pub use simhash::{
     DuplicateCluster, DuplicateClusterer, MinHash, NearDuplicateConfig, NearDuplicateDetector,
     NearDuplicateStats, SimHash,
 };
+pub use store::{Admission, FrontierStore, JobCounters, JobRunState, MemoryFrontierStore};

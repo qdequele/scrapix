@@ -5637,6 +5637,7 @@ dependencies = [
 name = "scrapix-frontier"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bloomfilter",
  "chrono",
  "criterion",
@@ -5649,6 +5650,7 @@ dependencies = [
  "serde",
  "sha2",
  "siphasher",
+ "tokio",
  "tracing",
  "url",
 ]
