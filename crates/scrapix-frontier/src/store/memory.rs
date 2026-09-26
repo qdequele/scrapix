@@ -14,9 +14,9 @@ use super::{Admission, FrontierStore, JobCounters, JobRunState};
 /// Stable 64-bit hash of a URL, used only for the seen-set. `siphasher` with
 /// fixed keys (the default `SipHasher13::new()`) is deterministic across
 /// processes, unlike `std::collections::hash_map::DefaultHasher` whose seed
-/// is randomized per process — a future Redis-backed store needs the same
-/// hash on both sides.
-fn hash_url(url: &str) -> u64 {
+/// is randomized per process — the Redis-backed store (`redis.rs`) reuses
+/// this exact hash so both stores agree on the seen-set contents.
+pub(super) fn hash_url(url: &str) -> u64 {
     let mut hasher = siphasher::sip::SipHasher13::new();
     hasher.write(url.as_bytes());
     hasher.finish()
@@ -138,7 +138,7 @@ pub struct MemoryFrontierStore {
     leases: Mutex<HashMap<String, (String, Instant)>>,
 }
 
-fn not_found(job_id: &str) -> ScrapixError {
+pub(super) fn not_found(job_id: &str) -> ScrapixError {
     ScrapixError::NotFound(format!("frontier job `{job_id}` (ensure_job not called)"))
 }
 

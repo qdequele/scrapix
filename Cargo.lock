@@ -5648,11 +5648,13 @@ dependencies = [
  "rocksdb",
  "scrapix-core",
  "serde",
+ "serde_json",
  "sha2",
  "siphasher",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

@@ -24,6 +24,8 @@ rocksdb = { workspace = true, optional = true }
 
 # Rate limiting (distributed) - optional
 redis = { workspace = true, optional = true }
+# CrawlUrl (de)serialization for the Redis-backed FrontierStore - optional
+serde_json = { workspace = true, optional = true }
 
 # Utilities
 chrono = { workspace = true }
@@ -42,11 +44,14 @@ full = ["distributed", "persistent"]
 # Exposes the FrontierStore conformance suite (crates/scrapix-frontier/src/store/conformance.rs)
 # for reuse by other FrontierStore implementations (e.g. a future Redis-backed store).
 conformance = []
+# Redis/DragonflyDB-backed FrontierStore (crates/scrapix-frontier/src/store/redis.rs).
+redis-store = ["redis", "serde_json"]
 
 [dev-dependencies]
 criterion = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
 
 [[bench]]
 name = "frontier_benchmarks"

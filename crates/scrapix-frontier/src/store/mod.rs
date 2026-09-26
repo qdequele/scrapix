@@ -4,9 +4,10 @@
 //! run state, counters, a priority queue of ready-to-dispatch URLs, and a
 //! dedup set. This module provides [`MemoryFrontierStore`], an in-process
 //! reference implementation, validated by the conformance suite in
-//! [`conformance`]. A future Redis-backed implementation must behave
-//! identically to it — that suite is written generically over
-//! `Arc<dyn FrontierStore>` so it can be reused unchanged.
+//! [`conformance`], and (behind the `redis-store` feature)
+//! `RedisFrontierStore`, which must behave identically to it — that suite is
+//! written generically over `Arc<dyn FrontierStore>` so both run it
+//! unchanged.
 //!
 //! ## Admission order
 //!
@@ -114,10 +115,14 @@
 //! evicted.
 
 mod memory;
+#[cfg(feature = "redis-store")]
+mod redis;
 
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
 
+#[cfg(feature = "redis-store")]
+pub use self::redis::RedisFrontierStore;
 pub use memory::MemoryFrontierStore;
 
 use async_trait::async_trait;
