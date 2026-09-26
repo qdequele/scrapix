@@ -78,7 +78,8 @@ pub mod renderer_webdriver;
 // Re-exports for convenience
 pub use dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 pub use extractor::{
-    is_non_page_url, is_non_page_url_with_pdf, ExtractorConfig, UrlExtractor, UrlExtractorBuilder,
+    is_non_page_url, is_non_page_url_with_pdf, url_allowed, ExtractorConfig, UrlExtractor,
+    UrlExtractorBuilder,
 };
 pub use fetcher::{
     parse_retry_after, ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig,

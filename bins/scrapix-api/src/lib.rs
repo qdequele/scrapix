@@ -4475,6 +4475,7 @@ fn start_event_consumer(
                         CrawlEvent::PageSkipped { job_id, .. } => job_id.clone(),
                         CrawlEvent::RateLimited { job_id, .. } => job_id.clone(),
                         CrawlEvent::PageRetried { job_id, .. } => job_id.clone(),
+                        CrawlEvent::SitemapPublished { job_id, .. } => job_id.clone(),
                     };
 
                     // Update job state and broadcast

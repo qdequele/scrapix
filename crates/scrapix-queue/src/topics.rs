@@ -446,6 +446,25 @@ pub enum CrawlEvent {
         #[serde(default)]
         url_message_id: String,
     },
+    /// Sitemap URLs published to the frontier for a job's domain.
+    ///
+    /// Distinct from `UrlsDiscovered` (which is also published alongside
+    /// this event) so job completion accounting can attribute
+    /// sitemap-seeded URLs to the `UrlMessage` that triggered discovery.
+    /// All fields default so old and new workers interoperate during a
+    /// rolling deploy.
+    SitemapPublished {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        count: usize,
+        /// `message_id` of the `UrlMessage` whose successful fetch
+        /// triggered this sitemap discovery.
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
 }
 
 impl CrawlEvent {

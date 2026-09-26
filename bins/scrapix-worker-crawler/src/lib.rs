@@ -35,13 +35,13 @@ use scrapix_lifecycle::{
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-use scrapix_core::CrawlUrl;
+use scrapix_core::{CrawlUrl, UrlPatterns};
+use scrapix_crawler::{
+    is_non_page_url_with_pdf, url_allowed, ExtractorConfig, HttpFetcher, HttpFetcherBuilder,
+    RobotsCache, RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
+};
 #[cfg(feature = "browser")]
 use scrapix_crawler::{CdpRenderer, CdpRendererBuilder};
-use scrapix_crawler::{
-    ExtractorConfig, HttpFetcher, HttpFetcherBuilder, RobotsCache, RobotsConfig, SitemapConfig,
-    SitemapParser, UrlExtractor,
-};
 use scrapix_frontier::LinkGraph;
 use scrapix_queue::{
     topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, ProducerBuilder, UrlMessage,
@@ -327,8 +327,63 @@ struct CrawlerWorker {
     shaper: JobFetchShaper,
     /// Redis-backed crawl history for cross-session incremental crawling
     crawl_history: Option<Arc<RedisCrawlHistory>>,
-    /// Tracks domains we've already discovered sitemaps for
-    discovered_sitemap_domains: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
+    /// Tracks which (job_id, domain) pairs have already had sitemap
+    /// discovery run, so a second job on the same domain still gets its own
+    /// sitemap seeds (Task 7: discovery used to be keyed by worker+domain
+    /// only, so a second job on an already-seen domain got nothing).
+    sitemap_seen: Arc<SitemapSeen>,
+}
+
+/// Maximum number of `(job_id, domain)` pairs [`SitemapSeen`] remembers
+/// before evicting the oldest. Bounds worker memory across long-lived
+/// workers that see many jobs and domains.
+const SITEMAP_SEEN_CAPACITY: usize = 10_000;
+
+/// Bounded (LRU-ish) set of `(job_id, domain)` pairs sitemap discovery has
+/// already run for. `first_time` is the single entry point: it reports
+/// whether this is the first time the pair is seen *and* records it,
+/// atomically under one lock, so concurrent callers can't both observe
+/// "not seen yet" for the same pair.
+struct SitemapSeen {
+    inner: parking_lot::Mutex<SitemapSeenInner>,
+}
+
+struct SitemapSeenInner {
+    set: HashSet<(String, String)>,
+    order: std::collections::VecDeque<(String, String)>,
+    capacity: usize,
+}
+
+impl SitemapSeen {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(SitemapSeenInner {
+                set: HashSet::new(),
+                order: std::collections::VecDeque::new(),
+                capacity,
+            }),
+        }
+    }
+
+    /// Returns `true` the first time this `(job_id, domain)` pair is seen,
+    /// `false` on every later call. Evicts the oldest pair once `capacity`
+    /// is reached (a bounded ring, not a strict LRU: eviction is by
+    /// insertion order, not last access).
+    fn first_time(&self, job_id: &str, domain: &str) -> bool {
+        let key = (job_id.to_string(), domain.to_string());
+        let mut inner = self.inner.lock();
+        if inner.set.contains(&key) {
+            return false;
+        }
+        if inner.capacity > 0 && inner.order.len() >= inner.capacity {
+            if let Some(oldest) = inner.order.pop_front() {
+                inner.set.remove(&oldest);
+            }
+        }
+        inner.set.insert(key.clone());
+        inner.order.push_back(key);
+        true
+    }
 }
 
 impl CrawlerWorker {
@@ -589,7 +644,7 @@ impl CrawlerWorker {
             max_retries: args.max_retries,
             shaper: JobFetchShaper::default(),
             crawl_history,
-            discovered_sitemap_domains: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            sitemap_seen: Arc::new(SitemapSeen::new(SITEMAP_SEEN_CAPACITY)),
         })
     }
 
@@ -687,31 +742,51 @@ impl CrawlerWorker {
         Ok(())
     }
 
-    /// Discover and publish sitemap URLs for a domain (if not already done).
+    /// Discover and publish sitemap URLs for a job's domain (if not already
+    /// done for this `(job_id, domain)` pair).
     ///
     /// Sitemap URLs are derived from `parent` via `UrlMessage::child`, so
     /// they carry every job-scoped field (job spec, limits, features, ...).
-    /// Runs in a background task spawned after a successful fetch; Task 7
-    /// replaces this with per-job discovery.
+    /// Runs in a background task spawned after a successful fetch, off the
+    /// hot path (R9). Discovery is keyed per `(job_id, domain)` via
+    /// `sitemap_seen`, so a second job crawling an already-seen domain still
+    /// gets its own sitemap seeds.
+    ///
+    /// `parent.job.sitemap` (when the message carries a job spec) decides
+    /// whether discovery runs at all and where seeds come from:
+    /// - `enabled == false` skips discovery entirely, even if this worker's
+    ///   `SITEMAP_DISCOVERY` default is on.
+    /// - non-empty `urls` are fetched directly instead of running robots.txt
+    ///   discovery.
+    /// - no job spec at all (legacy/test messages) falls back to this
+    ///   worker's `SITEMAP_DISCOVERY` default.
+    ///
+    /// Entries are filtered by [`url_allowed`], the same URL-pattern matcher
+    /// link extraction uses, and by [`is_non_page_url_with_pdf`] honoring the
+    /// job's PDF opt-in, so a PDF sitemap entry is kept when the job enables
+    /// PDF scraping.
     async fn maybe_discover_sitemaps(
         &self,
         domain: &str,
         parent: &UrlMessage,
     ) -> scrapix_core::Result<usize> {
         let job_id = parent.job_id.as_str();
-        let url_patterns = parent.url_patterns.clone();
-        // Check if we've already discovered sitemaps for this domain
-        {
-            let domains = self.discovered_sitemap_domains.read();
-            if domains.contains(domain) {
-                return Ok(0);
-            }
+
+        let (enabled, explicit_urls): (bool, &[String]) = match parent.job.as_ref() {
+            Some(job) => (job.sitemap.enabled, job.sitemap.urls.as_slice()),
+            // No job spec travels with this message: fall back to the
+            // worker-level default (SITEMAP_DISCOVERY env, reflected in
+            // whether a sitemap parser was built at all).
+            None => (self.sitemap_parser.is_some(), &[]),
+        };
+        if !enabled {
+            return Ok(0);
         }
 
-        // Mark as discovered (even before we try, to avoid duplicate work)
-        {
-            let mut domains = self.discovered_sitemap_domains.write();
-            domains.insert(domain.to_string());
+        // Dedupe per (job_id, domain): a second job on an already-seen
+        // domain still gets its own sitemap seeds.
+        if !self.sitemap_seen.first_time(job_id, domain) {
+            return Ok(0);
         }
 
         let sitemap_parser = match &self.sitemap_parser {
@@ -719,13 +794,26 @@ impl CrawlerWorker {
             None => return Ok(0),
         };
 
-        // Use the same full discovery as /map: fetch robots.txt, follow all sub-sitemaps
-        let base_url = format!("https://{domain}");
-        let sitemap_entries = match sitemap_parser.discover_all_urls(&base_url).await {
-            Ok(urls) => urls,
-            Err(e) => {
-                debug!(domain, error = %e, "Sitemap discovery failed");
-                return Ok(0);
+        let sitemap_entries = if !explicit_urls.is_empty() {
+            let mut all_urls = Vec::new();
+            for url in explicit_urls {
+                match sitemap_parser.fetch_and_parse(url).await {
+                    Ok(urls) => all_urls.extend(urls),
+                    Err(e) => {
+                        debug!(domain, sitemap_url = %url, error = %e, "Failed to fetch job-specified sitemap");
+                    }
+                }
+            }
+            all_urls
+        } else {
+            // Use the same full discovery as /map: fetch robots.txt, follow all sub-sitemaps
+            let base_url = format!("https://{domain}");
+            match sitemap_parser.discover_all_urls(&base_url).await {
+                Ok(urls) => urls,
+                Err(e) => {
+                    debug!(domain, error = %e, "Sitemap discovery failed");
+                    return Ok(0);
+                }
             }
         };
 
@@ -735,56 +823,16 @@ impl CrawlerWorker {
             "Discovered URLs from sitemaps"
         );
 
+        let pdf_enabled = parent.features.as_ref().is_some_and(|f| f.is_pdf_enabled());
+
         let mut discovered_count = 0;
         for sitemap_entry in sitemap_entries {
-            // Filter non-page URLs (images, PDFs, CSS, JS, fonts, etc.)
-            if scrapix_crawler::is_non_page_url(&sitemap_entry.loc) {
+            if !sitemap_entry_allowed(
+                &sitemap_entry.loc,
+                parent.url_patterns.as_ref(),
+                pdf_enabled,
+            ) {
                 continue;
-            }
-
-            // Filter by allowed_domains whitelist
-            if let Some(ref patterns) = url_patterns {
-                if !patterns.allowed_domains.is_empty() {
-                    if let Ok(parsed_url) = url::Url::parse(&sitemap_entry.loc) {
-                        if let Some(url_domain) = parsed_url.host_str() {
-                            if !patterns
-                                .allowed_domains
-                                .iter()
-                                .any(|d| d.eq_ignore_ascii_case(url_domain))
-                            {
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Filter by include/exclude glob patterns
-            if let Some(ref patterns) = url_patterns {
-                let matches_include = patterns.include.is_empty()
-                    || patterns.include.iter().any(|p| {
-                        if p.contains("**") {
-                            let parts: Vec<&str> = p.split("**").collect();
-                            parts.len() == 2
-                                && sitemap_entry.loc.starts_with(parts[0])
-                                && (parts[1].is_empty() || sitemap_entry.loc.ends_with(parts[1]))
-                        } else {
-                            sitemap_entry.loc == *p
-                        }
-                    });
-                let matches_exclude = patterns.exclude.iter().any(|p| {
-                    if p.contains("**") {
-                        let parts: Vec<&str> = p.split("**").collect();
-                        parts.len() == 2
-                            && sitemap_entry.loc.starts_with(parts[0])
-                            && (parts[1].is_empty() || sitemap_entry.loc.ends_with(parts[1]))
-                    } else {
-                        sitemap_entry.loc == *p
-                    }
-                });
-                if !matches_include || matches_exclude {
-                    continue;
-                }
             }
 
             let mut crawl_url = CrawlUrl::seed(&sitemap_entry.loc);
@@ -819,14 +867,28 @@ impl CrawlerWorker {
                 discovered_count, "Published sitemap URLs to frontier"
             );
 
+            let timestamp = chrono::Utc::now().timestamp_millis();
             let event = CrawlEvent::UrlsDiscovered {
                 job_id: job_id.to_string(),
                 source_url: format!("https://{domain}/sitemap.xml"),
                 count: discovered_count,
-                timestamp: chrono::Utc::now().timestamp_millis(),
+                timestamp,
             };
             if let Err(e) = self.publish_event(job_id, &event).await {
                 debug!(domain, error = %e, "Failed to publish sitemap discovery event");
+            }
+
+            // Counted separately from `UrlsDiscovered` so job completion
+            // accounting (links_published) can attribute sitemap-seeded
+            // URLs to the message that triggered discovery (D1).
+            let sitemap_published = CrawlEvent::SitemapPublished {
+                job_id: job_id.to_string(),
+                count: discovered_count,
+                url_message_id: parent.message_id.clone(),
+                timestamp,
+            };
+            if let Err(e) = self.publish_event(job_id, &sitemap_published).await {
+                debug!(domain, error = %e, "Failed to publish SitemapPublished event");
             }
         }
 
@@ -839,6 +901,24 @@ impl CrawlerWorker {
             .send(topic_names::EVENTS, Some(job_id), event)
             .await?;
         Ok(())
+    }
+}
+
+/// Whether a sitemap entry should be published to the frontier: not a
+/// non-page resource (respecting the job's PDF opt-in) and allowed by the
+/// job's URL patterns — the same [`url_allowed`] matcher link extraction
+/// uses, so a sitemap entry and a discovered link are judged identically.
+///
+/// `patterns` is `None` when the job set no `url_patterns` at all, in which
+/// case every non-filtered-extension URL is allowed (matching link
+/// extraction's behavior for a job without patterns).
+fn sitemap_entry_allowed(loc: &str, patterns: Option<&UrlPatterns>, pdf_enabled: bool) -> bool {
+    if is_non_page_url_with_pdf(loc, pdf_enabled) {
+        return false;
+    }
+    match patterns {
+        Some(patterns) => url_allowed(patterns, loc),
+        None => true,
     }
 }
 
@@ -943,4 +1023,58 @@ pub async fn run_with_bus(
     );
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sitemap_discovery_is_keyed_by_job_and_domain() {
+        let seen = SitemapSeen::new(10);
+        assert!(seen.first_time("job1", "a.test"));
+        assert!(!seen.first_time("job1", "a.test"));
+        assert!(seen.first_time("job2", "a.test"));
+    }
+
+    #[test]
+    fn sitemap_seen_evicts_oldest_pair_once_capacity_is_reached() {
+        let seen = SitemapSeen::new(2);
+        assert!(seen.first_time("job1", "a.test"));
+        assert!(seen.first_time("job2", "a.test"));
+        // Third distinct pair evicts the first (job1, a.test).
+        assert!(seen.first_time("job3", "a.test"));
+        assert!(seen.first_time("job1", "a.test"));
+    }
+
+    #[test]
+    fn sitemap_entry_matches_auto_generated_include_pattern() {
+        // Same matcher link extraction uses (extractor::url_allowed):
+        // an auto-generated `https://host/path/*` include pattern must
+        // accept the equivalent sitemap entry.
+        let patterns = UrlPatterns {
+            include: vec!["https://docs.a.test/guide/*".into()],
+            ..Default::default()
+        };
+        assert!(sitemap_entry_allowed(
+            "https://docs.a.test/guide/intro",
+            Some(&patterns),
+            false
+        ));
+        assert!(!sitemap_entry_allowed(
+            "https://docs.a.test/blog/post",
+            Some(&patterns),
+            false
+        ));
+    }
+
+    #[test]
+    fn sitemap_entry_pdf_survives_filter_when_job_enables_pdf() {
+        assert!(!sitemap_entry_allowed(
+            "https://a.test/doc.pdf",
+            None,
+            false
+        ));
+        assert!(sitemap_entry_allowed("https://a.test/doc.pdf", None, true));
+    }
 }
