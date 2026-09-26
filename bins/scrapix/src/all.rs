@@ -122,6 +122,17 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let content_consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
     content_consumer.subscribe(&[topic_names::PAGES_RAW])?;
 
+    // Job control (JOB_STATUS): one named group per service, so the
+    // frontier and both workers each receive every cancel/pause/resume.
+    let control_consumer = |group: &str| -> anyhow::Result<AnyConsumer> {
+        let c = AnyConsumer::channel(bus.consumer_in_group(group));
+        c.subscribe(&[topic_names::JOB_STATUS])?;
+        Ok(c)
+    };
+    let frontier_control = Arc::new(control_consumer("frontier-control")?);
+    let crawler_control = control_consumer("crawler-control")?;
+    let content_control = Arc::new(control_consumer("content-control")?);
+
     // Build service-specific args
     let api_args = scrapix_api::Args {
         host: args.host.clone(),
@@ -222,6 +233,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
             None, // links consumer
             None, // history consumer
             Some(frontier_feedback),
+            Some(frontier_control),
             frontier_store,
         )
         .await
@@ -231,18 +243,26 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     });
 
     let crawler_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_crawler::run_with_bus(crawler_args, crawler_producer, crawler_consumer)
-                .await
+        if let Err(e) = scrapix_worker_crawler::run_with_bus(
+            crawler_args,
+            crawler_producer,
+            crawler_consumer,
+            Some(crawler_control),
+        )
+        .await
         {
             error!(error = %e, "Crawler worker failed");
         }
     });
 
     let content_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_content::run_with_bus(content_args, content_consumer, content_producer)
-                .await
+        if let Err(e) = scrapix_worker_content::run_with_bus(
+            content_args,
+            content_consumer,
+            content_producer,
+            Some(content_control),
+        )
+        .await
         {
             error!(error = %e, "Content worker failed");
         }
@@ -395,6 +415,21 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         AnyConsumer::from(c)
     });
 
+    // Job control (JOB_STATUS): one group per service (each sees every
+    // control), `latest` so a new group does not replay the history.
+    let control_consumer = |service: &str| -> anyhow::Result<AnyConsumer> {
+        let group = scrapix_queue::control_group_id(service, "all-in-one");
+        let c = ConsumerBuilder::new(brokers, &group)
+            .client_id(format!("{service}-control"))
+            .auto_offset_reset("latest")
+            .build()?;
+        c.subscribe(&[topic_names::JOB_STATUS])?;
+        Ok(AnyConsumer::from(c))
+    };
+    let frontier_control = Arc::new(control_consumer("scrapix-all-frontier")?);
+    let crawler_control = control_consumer("scrapix-all-crawlers")?;
+    let content_control = Arc::new(control_consumer("scrapix-all-content")?);
+
     // Build the same args as channel mode
     let api_args = scrapix_api::Args {
         host: args.host.clone(),
@@ -494,6 +529,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
             None,
             None,
             Some(frontier_feedback),
+            Some(frontier_control),
             frontier_store,
         )
         .await
@@ -503,18 +539,26 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     });
 
     let crawler_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_crawler::run_with_bus(crawler_args, crawler_producer, crawler_consumer)
-                .await
+        if let Err(e) = scrapix_worker_crawler::run_with_bus(
+            crawler_args,
+            crawler_producer,
+            crawler_consumer,
+            Some(crawler_control),
+        )
+        .await
         {
             error!(error = %e, "Crawler worker failed");
         }
     });
 
     let content_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_content::run_with_bus(content_args, content_consumer, content_producer)
-                .await
+        if let Err(e) = scrapix_worker_content::run_with_bus(
+            content_args,
+            content_consumer,
+            content_producer,
+            Some(content_control),
+        )
+        .await
         {
             error!(error = %e, "Content worker failed");
         }

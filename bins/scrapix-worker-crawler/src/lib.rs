@@ -44,7 +44,8 @@ use scrapix_crawler::{
 use scrapix_crawler::{CdpRenderer, CdpRendererBuilder};
 use scrapix_frontier::LinkGraph;
 use scrapix_queue::{
-    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, ProducerBuilder, UrlMessage,
+    control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
+    CrawlEvent, ProducerBuilder, UrlMessage,
 };
 use scrapix_storage::{RedisCrawlHistory, RedisStorage};
 
@@ -332,6 +333,11 @@ struct CrawlerWorker {
     /// sitemap seeds (Task 7: discovery used to be keyed by worker+domain
     /// only, so a second job on an already-seen domain got nothing).
     sitemap_seen: Arc<SitemapSeen>,
+    /// Jobs cancelled or finished (from `JOB_STATUS`): their messages are
+    /// acked without work (spec R5).
+    cancelled: Arc<CancelledJobs>,
+    /// `JOB_STATUS` consumer feeding `cancelled` (per-worker group).
+    control_consumer: Option<Arc<AnyConsumer>>,
 }
 
 /// Maximum number of `(job_id, domain)` pairs [`SitemapSeen`] remembers
@@ -415,17 +421,31 @@ impl CrawlerWorker {
             .compression("lz4")
             .build()?;
 
+        // Job control: a per-worker group, so every worker sees every
+        // cancel; `latest` so a new group does not replay the history.
+        let control_group = control_group_id(&args.group_id, &worker_id);
+        let control = ConsumerBuilder::new(&args.brokers, &control_group)
+            .client_id(format!("scrapix-crawler-{}-control", worker_id))
+            .auto_offset_reset("latest")
+            .build()?;
+        control.subscribe(&[topic_names::JOB_STATUS])?;
+        info!(topic = topic_names::JOB_STATUS, group = %control_group, "Subscribed to job control topic");
+
         let consumer = AnyConsumer::from(kafka_consumer);
         let producer = AnyProducer::from(kafka_producer);
 
-        Self::build(args, worker_id, consumer, producer).await
+        let mut worker = Self::build(args, worker_id, consumer, producer).await?;
+        worker.control_consumer = Some(Arc::new(AnyConsumer::from(control)));
+        Ok(worker)
     }
 
     /// Create a new crawler worker using pre-built `AnyProducer`/`AnyConsumer` (for `scrapix all`).
+    /// `control`, when given, must already be subscribed to `JOB_STATUS`.
     pub async fn with_bus(
         args: &Args,
         producer: AnyProducer,
         consumer: AnyConsumer,
+        control: Option<AnyConsumer>,
     ) -> anyhow::Result<Self> {
         let worker_id = args
             .worker_id
@@ -440,7 +460,9 @@ impl CrawlerWorker {
             "Subscribed to processing topic"
         );
 
-        Self::build(args, worker_id, consumer, producer).await
+        let mut worker = Self::build(args, worker_id, consumer, producer).await?;
+        worker.control_consumer = control.map(Arc::new);
+        Ok(worker)
     }
 
     /// Shared construction logic (everything except bus creation and subscription).
@@ -645,6 +667,8 @@ impl CrawlerWorker {
             shaper: JobFetchShaper::default(),
             crawl_history,
             sitemap_seen: Arc::new(SitemapSeen::new(SITEMAP_SEEN_CAPACITY)),
+            cancelled: Arc::new(CancelledJobs::default()),
+            control_consumer: None,
         })
     }
 
@@ -692,12 +716,27 @@ impl CrawlerWorker {
             }
         });
 
+        let control_handle = match self.control_consumer {
+            Some(ref c) => Some(scrapix_queue::control::spawn_listener(
+                c.clone(),
+                self.cancelled.clone(),
+                self.shutdown.clone(),
+            )),
+            None => {
+                warn!("No job control consumer: cancelled jobs are not skipped");
+                None
+            }
+        };
+
         // Process messages using concurrent processing to maintain heartbeats
         let result = self.clone().process_messages().await;
 
         // Cleanup
         self.shutdown.store(true, Ordering::Relaxed);
         metrics_handle.abort();
+        if let Some(h) = control_handle {
+            h.abort();
+        }
 
         result
     }
@@ -1045,13 +1084,14 @@ pub async fn run_with_bus(
     args: Args,
     producer: AnyProducer,
     consumer: AnyConsumer,
+    control: Option<AnyConsumer>,
 ) -> anyhow::Result<()> {
     info!(
         concurrency = args.concurrency,
         "Starting Scrapix crawler worker (in-process bus)"
     );
 
-    let worker = Arc::new(CrawlerWorker::with_bus(&args, producer, consumer).await?);
+    let worker = Arc::new(CrawlerWorker::with_bus(&args, producer, consumer, control).await?);
     let worker_for_metrics = worker.clone();
 
     let result = worker.run().await;

@@ -103,7 +103,15 @@ impl CrawlerWorker {
     /// publish for the message succeeded; on a publish error the ack is
     /// dropped (message left for redelivery).
     pub(crate) async fn handle_message(self: &Arc<Self>, msg: UrlMessage, ack: Ack) {
-        // Task 15: ack messages of cancelled jobs here without doing any work.
+        // R5: a cancelled/finished job's message is acked without any work,
+        // but its dispatch still holds a politeness slot in the frontier:
+        // free it (status None, no request made) before acking.
+        if self.cancelled.contains(&msg.job_id) {
+            debug!(url = %msg.url.url, job_id = %msg.job_id, "Skipping message of a cancelled job");
+            self.publish_feedback(&msg, None).await;
+            ack.ack();
+            return;
+        }
 
         let start = Instant::now();
         self.metrics.fetch_started();
@@ -1365,5 +1373,36 @@ mod tests {
         let fb = feedback_for(&bus, &msg).await;
         assert!(fb.robots_checked);
         assert_eq!(fb.crawl_delay_ms, None);
+    }
+
+    /// R5: a message of a cancelled (or finished) job is acked without any
+    /// fetch or publish, except the FetchFeedback that frees the frontier's
+    /// politeness slot for this dispatch.
+    #[tokio::test]
+    async fn cancelled_job_message_is_acked_without_fetching_and_frees_its_slot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html></html>", "text/html"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+        w.cancelled.insert("job-1");
+        let msg = message(url(&server, "/"), None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst), "acked");
+        let fb = feedback_for(&bus, &msg).await;
+        assert_eq!(fb.status, None, "no request was made");
+        assert!(!fb.transport_error);
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        assert!(drain::<UrlMessage>(&t.frontier).await.is_empty());
+        assert!(drain::<CrawlEvent>(&t.events).await.is_empty());
+        assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

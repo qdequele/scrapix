@@ -630,12 +630,20 @@ impl AppState {
             self.bill_job(job_id, job.account_id.as_ref(), acc.pages_crawled_ok);
         }
 
-        // Tell the pipeline to release the job's state. Spawned so a slow or
-        // blocked publish never delays the next finalize.
+        // Tell the pipeline to release the job's state.
+        self.publish_control(job_id, JobAction::Finish);
+    }
+
+    /// Publish a `JobControl` to the pipeline (frontier + workers). Spawned
+    /// so a slow or blocked publish never delays the caller (a finalize
+    /// batch, an HTTP request). Best effort: a lost Cancel/Finish leaves
+    /// the frontier's copy of the job to its own retention, a lost Pause
+    /// means the frontier keeps dispatching.
+    fn publish_control(&self, job_id: &str, action: JobAction) {
         let producer = self.producer.clone();
         let job_id = job_id.to_string();
         tokio::spawn(async move {
-            let control = JobControl::new(&job_id, JobAction::Finish);
+            let control = JobControl::new(&job_id, action);
             match tokio::time::timeout(
                 Duration::from_secs(5),
                 producer.send(topic_names::JOB_STATUS, Some(&job_id), &control),
@@ -644,11 +652,89 @@ impl AppState {
             {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    warn!(job_id = %job_id, error = %e, "Failed to publish JobControl Finish")
+                    warn!(job_id = %job_id, ?action, error = %e, "Failed to publish JobControl")
                 }
-                Err(_) => warn!(job_id = %job_id, "Timed out publishing JobControl Finish"),
+                Err(_) => warn!(job_id = %job_id, ?action, "Timed out publishing JobControl"),
             }
         });
+    }
+
+    /// Cancel a job (R5): `Cancelled` is terminal, so the check-and-set runs
+    /// under the same single `jobs.write()` as `transition_terminal` — a
+    /// cancel and a completion can never both apply, and a cancel never
+    /// overwrites a terminal status (`Conflict`). Only the caller that
+    /// applied the transition bills the pages crawled so far, persists the
+    /// terminal state and tells the pipeline to stop the job.
+    fn cancel(&self, job_id: &str) -> Result<JobState, ControlError> {
+        let snapshot = {
+            let mut jobs = self.crawl.jobs.write();
+            let j = jobs.get_mut(job_id).ok_or(ControlError::NotFound)?;
+            if is_terminal(&j.status) {
+                return Err(ControlError::Conflict(j.status.clone()));
+            }
+            j.status = JobStatus::Cancelled;
+            j.completed_at = Some(chrono::Utc::now());
+            j.clone()
+        };
+        let pages = self
+            .crawl
+            .accounting
+            .read()
+            .get(job_id)
+            .map_or(snapshot.pages_crawled, |acc| acc.pages_crawled_ok);
+        self.bill_job(job_id, snapshot.account_id.as_ref(), pages);
+        // Terminal: free the accounting so the completion loop never
+        // finalizes it, and persist it (checked by the next flush before
+        // the job's held acks are released).
+        self.forget_job_tracking(job_id);
+        self.write_terminal(snapshot.clone());
+        self.publish_control(job_id, JobAction::Cancel);
+        info!(job_id = %job_id, pages_billed = pages, "Job cancelled");
+        Ok(snapshot)
+    }
+
+    /// Pause a Running job: the frontier stops dispatching it (in-flight
+    /// pages still finish and report), and the completion loop neither
+    /// finalizes nor stall-fails it while paused.
+    fn pause(&self, job_id: &str) -> Result<JobState, ControlError> {
+        let snapshot = self.transition_status(job_id, JobStatus::Running, JobStatus::Paused)?;
+        self.crawl.balanced_since.write().remove(job_id);
+        self.crawl.dirty_jobs.write().insert(job_id.to_string());
+        self.publish_control(job_id, JobAction::Pause);
+        info!(job_id = %job_id, "Job paused");
+        Ok(snapshot)
+    }
+
+    /// Resume a Paused job, restarting its stall clock (the time spent
+    /// paused is not a stall).
+    fn resume(&self, job_id: &str) -> Result<JobState, ControlError> {
+        let snapshot = self.transition_status(job_id, JobStatus::Paused, JobStatus::Running)?;
+        self.crawl
+            .job_last_activity
+            .write()
+            .insert(job_id.to_string(), std::time::Instant::now());
+        self.crawl.balanced_since.write().remove(job_id);
+        self.crawl.dirty_jobs.write().insert(job_id.to_string());
+        self.publish_control(job_id, JobAction::Resume);
+        info!(job_id = %job_id, "Job resumed");
+        Ok(snapshot)
+    }
+
+    /// Atomic `from` → `to` status change (`Conflict` with the current
+    /// status otherwise).
+    fn transition_status(
+        &self,
+        job_id: &str,
+        from: JobStatus,
+        to: JobStatus,
+    ) -> Result<JobState, ControlError> {
+        let mut jobs = self.crawl.jobs.write();
+        let j = jobs.get_mut(job_id).ok_or(ControlError::NotFound)?;
+        if j.status != from {
+            return Err(ControlError::Conflict(j.status.clone()));
+        }
+        j.status = to;
+        Ok(j.clone())
     }
 
     /// Deduct crawl credits for `pages` pages of a finished job
@@ -1368,6 +1454,30 @@ impl AppState {
     }
 }
 
+/// Why a cancel / pause / resume request was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlError {
+    /// No such job (in memory).
+    NotFound,
+    /// The job's current status does not allow the transition (409).
+    Conflict(JobStatus),
+}
+
+impl From<ControlError> for ApiError {
+    fn from(e: ControlError) -> Self {
+        match e {
+            ControlError::NotFound => ApiError::new("Job not found", "not_found"),
+            ControlError::Conflict(status) => ApiError::new(
+                format!(
+                    "Job is {}: transition not allowed",
+                    format!("{status:?}").to_lowercase()
+                ),
+                "conflict",
+            ),
+        }
+    }
+}
+
 /// Result of the atomic terminal check-and-set.
 #[derive(Debug)]
 enum TerminalTransition {
@@ -1993,6 +2103,9 @@ struct BulkCrawlError {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct JobStatusResponse {
     job_id: String,
+    /// One of `pending`, `running`, `paused`, `completed`, `failed`,
+    /// `cancelled`
+    #[schema(value_type = JobStatus)]
     status: String,
     index_uid: String,
     pages_crawled: u64,
@@ -5255,40 +5368,64 @@ async fn handle_job_ws_connection(socket: WebSocket, state: Arc<AppState>, job_i
 }
 
 /// Cancel a job
-#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200), (status = 404, body = ApiError)), security(("api_key" = [])))]
+///
+/// Stops the job everywhere (frontier and workers) and bills the pages
+/// crawled so far. Only a pending, running or paused job can be cancelled:
+/// a job that already completed, failed or was cancelled returns 409 and
+/// keeps its status.
+#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is already terminal", body = ApiError)), security(("api_key" = [])))]
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    Ok(Json(state.cancel(&job_id)?.into()))
+}
 
-    // Check ownership before cancelling
+/// Pause a running job
+///
+/// The frontier stops dispatching the job's URLs (pages already in flight
+/// finish). Only a running job can be paused; any other status returns 409.
+#[utoipa::path(post, path = "/job/{id}/pause", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is not running", body = ApiError)), security(("api_key" = [])))]
+async fn pause_job(
+    State(state): State<Arc<AppState>>,
+    account_ext: Option<Extension<AuthenticatedAccount>>,
+    user_ext: Option<Extension<AuthenticatedUser>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobStatusResponse>, ApiError> {
+    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    Ok(Json(state.pause(&job_id)?.into()))
+}
+
+/// Resume a paused job
+///
+/// Only a paused job can be resumed; any other status returns 409.
+#[utoipa::path(post, path = "/job/{id}/resume", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is not paused", body = ApiError)), security(("api_key" = [])))]
+async fn resume_job(
+    State(state): State<Arc<AppState>>,
+    account_ext: Option<Extension<AuthenticatedAccount>>,
+    user_ext: Option<Extension<AuthenticatedUser>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobStatusResponse>, ApiError> {
+    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    Ok(Json(state.resume(&job_id)?.into()))
+}
+
+/// The in-memory job `job_id`, if it exists and the caller owns it.
+async fn owned_job(
+    state: &AppState,
+    account_ext: &Option<Extension<AuthenticatedAccount>>,
+    user_ext: &Option<Extension<AuthenticatedUser>>,
+    job_id: &str,
+) -> Result<JobState, ApiError> {
+    let account_ctx = extract_account_context(state.db_pool.as_ref(), account_ext, user_ext).await;
     let existing = state
-        .get_job(&job_id)
+        .get_job(job_id)
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
     check_job_ownership(&existing, &account_ctx)?;
-
-    let job = state
-        .update_job(&job_id, |j| {
-            j.status = JobStatus::Cancelled;
-            j.completed_at = Some(chrono::Utc::now());
-        })
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
-
-    // A cancelled job is terminal: free its accounting so the completion
-    // loop never finalizes it.
-    state.forget_job_tracking(&job_id);
-
-    // Persist cancellation to Postgres (checked by the next flush before
-    // the job's held acks are released)
-    state.write_terminal(job.clone());
-
-    info!(job_id = %job_id, "Job cancelled");
-
-    Ok(Json(job.into()))
+    Ok(existing)
 }
 
 /// List all jobs
@@ -5321,7 +5458,10 @@ async fn list_jobs(
         let in_memory = state.crawl.jobs.read();
         for job in &mut db_jobs {
             if let Some(mem_job) = in_memory.get(&job.job_id) {
-                if matches!(mem_job.status, JobStatus::Running | JobStatus::Pending) {
+                if matches!(
+                    mem_job.status,
+                    JobStatus::Running | JobStatus::Pending | JobStatus::Paused
+                ) {
                     *job = mem_job.clone();
                 }
             }
@@ -5904,7 +6044,9 @@ pub async fn run_with_bus(
         .route("/job/{id}/status", get(job_status))
         .route("/job/{id}/events", get(job_events))
         .route("/job/{id}/events/history", get(get_job_events_history))
-        .route("/job/{id}", delete(cancel_job));
+        .route("/job/{id}", delete(cancel_job))
+        .route("/job/{id}/pause", post(pause_job))
+        .route("/job/{id}/resume", post(resume_job));
 
     // Protected routes (API key auth required when enabled).
     // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
@@ -7505,6 +7647,158 @@ mod lifecycle_tests {
             got.is_none(),
             "no JobControl for a job that did not transition"
         );
+    }
+
+    fn bills(state: &AppState) -> (u64, u64) {
+        let d = &state.diagnostics;
+        (
+            d.job_bills_requested.load(Ordering::Relaxed),
+            d.pages_billed.load(Ordering::Relaxed),
+        )
+    }
+
+    async fn next_control(c: &scrapix_queue::ChannelConsumer) -> Option<JobControl> {
+        c.poll_one(Duration::from_secs(1)).await.unwrap()
+    }
+
+    /// R5: cancelling a running job bills the pages it crawled, exactly
+    /// once, and tells the pipeline to stop it.
+    #[tokio::test]
+    async fn cancel_bills_crawled_pages_once_and_stops_the_pipeline() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 5);
+        state.process_event("j1", &progress("j1", 5, 5, 0));
+        for id in ["m1", "m2", "m3"] {
+            state.process_event("j1", &crawled("j1", id));
+        }
+        state.process_event("j1", &crawled("j1", "m3")); // redelivered
+
+        let job = state.cancel("j1").expect("running job cancels");
+        assert_eq!(job.status, JobStatus::Cancelled);
+        assert!(job.completed_at.is_some());
+        assert_eq!(bills(&state), (1, 3), "one billing call for 3 pages");
+        assert!(state.crawl.accounting.read().get("j1").is_none());
+        let ctl = next_control(&control).await.expect("JobControl published");
+        assert_eq!((ctl.job_id.as_str(), ctl.action), ("j1", JobAction::Cancel));
+
+        // A second cancel is rejected and bills nothing more.
+        assert_eq!(
+            state.cancel("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Cancelled)
+        );
+        assert_eq!(bills(&state), (1, 3));
+        assert!(next_control(&control).await.is_none());
+        // Nor does the completion loop touch it.
+        assert!(state
+            .completion_decisions(Instant::now() + Duration::from_secs(3600))
+            .is_empty());
+        assert_eq!(emails(&state), 0);
+
+        assert_eq!(state.cancel("nope").unwrap_err(), ControlError::NotFound);
+    }
+
+    /// Cancel after the job completed is rejected: the terminal status is
+    /// not overwritten and the job is not billed a second time.
+    #[tokio::test]
+    async fn cancel_after_complete_is_rejected_and_not_rebilled() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Completed);
+        assert_eq!(bills(&state), (1, 1));
+
+        assert_eq!(
+            state.cancel("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Completed)
+        );
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Completed);
+        assert_eq!(bills(&state), (1, 1), "not billed again");
+    }
+
+    /// Pause/resume: Running <-> Paused only (409 otherwise); a paused job
+    /// is neither finalized nor stall-failed, and resuming restarts its
+    /// stall clock.
+    #[tokio::test]
+    async fn pause_and_resume_transitions_and_conflicts() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &crawled("j1", "m1")); // m2 still in flight
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("process older than 1h is not required: use a smaller offset");
+        state
+            .crawl
+            .job_last_activity
+            .write()
+            .insert("j1".into(), long_ago);
+
+        assert_eq!(
+            state.resume("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Running)
+        );
+        let job = state.pause("j1").unwrap();
+        assert_eq!(job.status, JobStatus::Paused);
+        let ctl = next_control(&control).await.expect("Pause published");
+        assert_eq!(ctl.action, JobAction::Pause);
+        assert_eq!(
+            state.pause("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Paused)
+        );
+        assert!(
+            state.completion_decisions(Instant::now()).is_empty(),
+            "a paused job is not stall-failed"
+        );
+
+        let job = state.resume("j1").unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        let ctl = next_control(&control).await.expect("Resume published");
+        assert_eq!(ctl.action, JobAction::Resume);
+        assert!(
+            state.completion_decisions(Instant::now()).is_empty(),
+            "resume restarts the stall clock"
+        );
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Running);
+
+        // A paused job can still be cancelled (and is billed).
+        state.pause("j1").unwrap();
+        assert_eq!(state.cancel("j1").unwrap().status, JobStatus::Cancelled);
+        assert_eq!(bills(&state), (1, 1));
+        assert_eq!(
+            state.pause("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Cancelled)
+        );
+        assert_eq!(
+            state.resume("j1").unwrap_err(),
+            ControlError::Conflict(JobStatus::Cancelled)
+        );
+        assert_eq!(state.pause("nope").unwrap_err(), ControlError::NotFound);
+    }
+
+    #[test]
+    fn control_errors_map_to_404_and_409() {
+        let not_found: ApiError = ControlError::NotFound.into();
+        assert_eq!(not_found.into_response().status(), StatusCode::NOT_FOUND);
+        let conflict: ApiError = ControlError::Conflict(JobStatus::Completed).into();
+        assert_eq!(conflict.code, "conflict");
+        assert!(conflict.error.contains("completed"), "{}", conflict.error);
+        assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
     }
 
     #[test]

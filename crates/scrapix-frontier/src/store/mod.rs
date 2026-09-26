@@ -13,8 +13,10 @@
 //!
 //! `admit` evaluates, for a single [`CrawlUrl`], in this exact order:
 //!
-//! 1. **state** — the job must be [`JobRunState::Running`]; otherwise
-//!    [`Admission::JobNotRunning`].
+//! 1. **state** — the job must be [`JobRunState::Running`] or
+//!    [`JobRunState::Paused`] (a paused job keeps queuing the links its
+//!    in-flight pages discover; it only stops dispatching); otherwise
+//!    (`Cancelled` / `Finished`) [`Admission::JobNotRunning`].
 //! 2. **depth** — if the job has a `max_depth` and the URL exceeds it,
 //!    [`Admission::OverDepth`].
 //! 3. **retry bypass** — a URL with `retry_count > 0` is a redispatch of a
@@ -218,7 +220,9 @@ pub trait FrontierStore: Send + Sync {
     /// Put URLs previously returned by `pop_ready` back (politeness said "not
     /// yet"). Undoes the pop: `dispatched` is decremented by `urls.len()`
     /// (floored at 0); every other counter — in particular the `admitted`
-    /// budget — is untouched. A no-op for an unknown job.
+    /// budget — is untouched. A no-op for an unknown job. For a job
+    /// `release`d since the pop (e.g. cancelled mid-batch) the URLs are not
+    /// queued again but counted in `dropped`.
     async fn requeue(&self, job_id: &str, urls: Vec<CrawlUrl>) -> Result<()>;
 
     /// Total pending URLs (ready + delayed). `0` for an unknown job.

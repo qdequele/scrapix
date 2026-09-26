@@ -66,18 +66,23 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 ### Job Status Lifecycle
 
 ```
-Pending ─── Running ─── Completed
-                │
-                ├── Failed
-                │
-                └── Cancelled (via DELETE /job/{id})
+Pending ─── Running ──┬── Completed
+             ▲    │   └── Failed
+      resume │    │ pause
+             │    ▼
+             Paused
+
+Pending | Running | Paused ── DELETE /job/{id} ──▶ Cancelled
 ```
 
 - **Pending**: Job created, waiting for first event
 - **Running**: Actively crawling and indexing pages
-- **Completed**: All pages crawled, idle for 30 seconds (auto-detected)
-- **Failed**: Unrecoverable error occurred
+- **Paused**: No new pages are dispatched (via `POST /job/{id}/pause`); pages already in flight finish
+- **Completed**: All work derived from the job is accounted for
+- **Failed**: Unrecoverable error, no page could be crawled, or no progress for `JOB_STALL_TIMEOUT_SECS`
 - **Cancelled**: Manually cancelled by user
+
+`Completed`, `Failed` and `Cancelled` are terminal. A request for a transition the job's current status does not allow returns `409` with code `conflict`, and the status is unchanged.
 
 ### Example
 
@@ -200,7 +205,7 @@ curl "http://localhost:8080/jobs?limit=20&offset=20"
 
 ## DELETE /job/{id}
 
-Cancel a running crawl job. Sets the job status to `cancelled` and stops further processing.
+Cancel a pending, running or paused crawl job. Sets the job status to `cancelled`, stops the frontier and every worker for this job, and bills the pages crawled so far. Cancelling a job that is already `completed`, `failed` or `cancelled` returns `409` (`conflict`) and does not change it.
 
 ### Path Parameters
 
@@ -230,11 +235,31 @@ Returns the final job status after cancellation:
 ```
 
 <Note>
-  Cancellation is not instant — pages already in the processing pipeline will still be indexed. The job status is updated immediately, but some events may arrive after cancellation.
+  The job status is updated immediately. The frontier drops the job's queued URLs and workers skip its remaining messages; documents already buffered for indexing may still be written, and some events may arrive after cancellation.
 </Note>
 
 ### Example
 
 ```bash
 curl -X DELETE http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000
+```
+
+---
+
+## POST /job/{id}/pause
+
+Pause a running job. The frontier stops dispatching its URLs and keeps its queue; pages already being fetched finish and links they discover are queued. A paused job is never auto-completed or failed as stalled. Returns the job status (`"status": "paused"`). Any status other than `running` returns `409`.
+
+```bash
+curl -X POST http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/pause
+```
+
+---
+
+## POST /job/{id}/resume
+
+Resume a paused job: dispatch restarts where it stopped, and the stall timer restarts from zero. Returns the job status (`"status": "running"`). Any status other than `paused` returns `409`.
+
+```bash
+curl -X POST http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/resume
 ```

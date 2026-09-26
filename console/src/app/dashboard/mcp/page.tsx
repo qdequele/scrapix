@@ -134,6 +134,8 @@ const toolGroups = [
       { name: "job_status", description: "Get current status of a crawl job" },
       { name: "list_jobs", description: "List all jobs with pagination" },
       { name: "cancel_job", description: "Cancel a running or queued job" },
+      { name: "pause_job", description: "Pause a running job" },
+      { name: "resume_job", description: "Resume a paused job" },
     ],
   },
   {

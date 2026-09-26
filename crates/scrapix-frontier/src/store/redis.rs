@@ -91,7 +91,7 @@ redis.call('HINCRBY', KEYS[1], 'received', 1)
 local m = redis.call('HMGET', KEYS[1], 'state', 'max_depth', 'max_pages', 'admitted')
 local is_retry = ARGV[3] == '1'
 local outcome = 0
-if m[1] ~= 'Running' then
+if m[1] ~= 'Running' and m[1] ~= 'Paused' then
   outcome = 5
 elseif m[2] and m[2] ~= '' and tonumber(ARGV[2]) > tonumber(m[2]) then
   outcome = 2
@@ -147,16 +147,22 @@ end
 return out
 "#;
 
-/// `KEYS`: meta, q, later. `ARGV`: repeated triples
+/// `KEYS`: meta, q, later, tpl. `ARGV`: repeated triples
 /// (-(priority), not_before_ms or "", url JSON). Undoes the pop: `dispatched`
 /// is decremented (floored at 0) by the number of URLs; every other counter is
-/// untouched. Each URL gets a fresh seq. A no-op for an unknown job.
+/// untouched. Each URL gets a fresh seq. A no-op for an unknown job; for a
+/// released job (no `tpl`) the URLs are counted in `dropped` instead.
 const REQUEUE_LUA: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 local dispatched = tonumber(redis.call('HGET', KEYS[1], 'dispatched') or '0')
 local n = #ARGV / 3
 if dispatched < n then n = dispatched end
 if n > 0 then redis.call('HINCRBY', KEYS[1], 'dispatched', -n) end
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  -- Released job: the URLs are dropped, never queued again.
+  redis.call('HINCRBY', KEYS[1], 'dropped', #ARGV / 3)
+  return 1
+end
 for i = 1, #ARGV, 3 do
   local seq = string.format('%020d', redis.call('HINCRBY', KEYS[1], 'seq', 1))
   if ARGV[i + 1] == '' then
@@ -405,7 +411,8 @@ impl FrontierStore for RedisFrontierStore {
         invocation
             .key(self.job_key(job_id, "meta"))
             .key(self.job_key(job_id, "q"))
-            .key(self.job_key(job_id, "later"));
+            .key(self.job_key(job_id, "later"))
+            .key(self.job_key(job_id, "tpl"));
         for url in &urls {
             let (neg_priority, not_before, json) = enqueue_args(url)?;
             invocation.arg(neg_priority).arg(not_before).arg(json);

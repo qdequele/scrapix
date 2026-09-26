@@ -48,8 +48,8 @@ use scrapix_extractor::{
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
 use scrapix_parser::{HtmlParser, HtmlParserConfig};
 use scrapix_queue::{
-    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, CrawlHistoryMessage,
-    DocumentMessage, ProducerBuilder, RawPageMessage,
+    control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
+    CrawlEvent, CrawlHistoryMessage, DocumentMessage, ProducerBuilder, RawPageMessage,
 };
 use scrapix_storage::{DocAck, MeilisearchStorage, MeilisearchStorageBuilder};
 
@@ -421,6 +421,11 @@ struct ContentWorker {
     default_batch_size: usize,
     /// Default feature config built from CLI args, used when message has no features
     default_features: FeaturesConfig,
+    /// Jobs cancelled or finished (from `JOB_STATUS`): their pages are
+    /// acked without indexing (spec R5).
+    cancelled: Arc<CancelledJobs>,
+    /// `JOB_STATUS` consumer feeding `cancelled` (per-worker group).
+    control_consumer: Option<Arc<AnyConsumer>>,
 }
 
 impl ContentWorker {
@@ -444,36 +449,45 @@ impl ContentWorker {
             .compression("lz4")
             .build()?;
 
+        // Job control: a per-worker group, so every worker sees every
+        // cancel; `latest` so a new group does not replay the history.
+        let control_group = control_group_id(&args.group_id, &worker_id);
+        let control = ConsumerBuilder::new(&args.brokers, &control_group)
+            .client_id(format!("scrapix-content-{}-control", worker_id))
+            .auto_offset_reset("latest")
+            .build()?;
+        control.subscribe(&[topic_names::JOB_STATUS])?;
+        info!(topic = topic_names::JOB_STATUS, group = %control_group, "Subscribed to job control topic");
+
         startup_check(args).await;
-        Ok(Self::build(
+        let mut worker = Self::build(
             args,
             worker_id,
             Arc::new(kafka_consumer.into()),
             Arc::new(kafka_producer.into()),
             !args.skip_meilisearch,
-        ))
+        );
+        worker.control_consumer = Some(Arc::new(control.into()));
+        Ok(worker)
     }
 
     /// Create a content worker with pre-built message bus objects.
     ///
     /// Used by `scrapix all` to inject in-process channel producer/consumer instead of Kafka.
     /// The caller is responsible for subscribing the consumer to the appropriate topic before
-    /// calling this function.
+    /// calling this function (and `control`, when given, to `JOB_STATUS`).
     async fn with_bus(
         args: &Args,
         consumer: Arc<AnyConsumer>,
         producer: Arc<AnyProducer>,
+        control: Option<Arc<AnyConsumer>>,
     ) -> anyhow::Result<Self> {
         let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker (pre-built bus)");
         startup_check(args).await;
-        Ok(Self::build(
-            args,
-            worker_id,
-            consumer,
-            producer,
-            !args.skip_meilisearch,
-        ))
+        let mut worker = Self::build(args, worker_id, consumer, producer, !args.skip_meilisearch);
+        worker.control_consumer = control;
+        Ok(worker)
     }
 
     /// Shared construction once the bus exists.
@@ -603,6 +617,8 @@ impl ContentWorker {
             publish_history: args.publish_history,
             default_batch_size: args.batch_size.max(1),
             default_features,
+            cancelled: Arc::new(CancelledJobs::default()),
+            control_consumer: None,
         }
     }
 
@@ -819,6 +835,17 @@ impl ContentWorker {
 
         let publisher_handle = self.spawn_indexed_publisher();
         let ai_usage_handle = self.spawn_ai_usage_forwarder();
+        let control_handle = match self.control_consumer {
+            Some(ref c) => Some(scrapix_queue::control::spawn_listener(
+                c.clone(),
+                self.cancelled.clone(),
+                self.shutdown.clone(),
+            )),
+            None => {
+                warn!("No job control consumer: cancelled jobs are not skipped");
+                None
+            }
+        };
 
         // The consumer is stopped only after the final flush, so acks from
         // documents buffered at shutdown still reach its last commit.
@@ -886,6 +913,9 @@ impl ContentWorker {
         if let Some(handle) = ai_usage_handle {
             handle.abort();
         }
+        if let Some(handle) = control_handle {
+            handle.abort();
+        }
 
         result
     }
@@ -920,6 +950,13 @@ impl ContentWorker {
     async fn handle_message(&self, msg: RawPageMessage, ack: Ack) {
         if self.shutdown.load(Ordering::Relaxed) {
             // Not processed: left un-acked for redelivery.
+            return;
+        }
+        if self.cancelled.contains(&msg.job_id) {
+            // R5: a cancelled/finished job is not indexed. (Documents
+            // already buffered for it still flush with their batch.)
+            debug!(url = %msg.url, job_id = %msg.job_id, "Skipping page of a cancelled job");
+            ack.ack();
             return;
         }
         self.metrics
@@ -1745,13 +1782,14 @@ pub async fn run_with_bus(
     args: Args,
     consumer: Arc<AnyConsumer>,
     producer: Arc<AnyProducer>,
+    control: Option<Arc<AnyConsumer>>,
 ) -> anyhow::Result<()> {
     info!(
         concurrency = args.concurrency,
         "Starting Scrapix content worker (in-process bus)"
     );
 
-    let worker = Arc::new(ContentWorker::with_bus(&args, consumer, producer).await?);
+    let worker = Arc::new(ContentWorker::with_bus(&args, consumer, producer, control).await?);
 
     let result = worker.run().await;
 
@@ -2180,6 +2218,7 @@ mod tests {
             &args,
             Arc::new(AnyConsumer::from(bus.consumer())),
             Arc::new(AnyProducer::from(bus.producer())),
+            None,
         )
         .await
         .unwrap();
@@ -2212,6 +2251,7 @@ mod tests {
             &args,
             Arc::new(AnyConsumer::from(bus.consumer())),
             Arc::new(AnyProducer::from(bus.producer())),
+            None,
         )
         .await
         .unwrap();
@@ -2379,5 +2419,35 @@ mod tests {
         assert_eq!(sent, 4, "2 + 1 rejected + 1 accepted");
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert_eq!(indexed_count(&events), 1, "{events:?}");
+    }
+
+    /// R5: a page of a cancelled (or finished) job is acked and never
+    /// indexed, with no outcome event.
+    #[tokio::test]
+    async fn cancelled_job_page_is_acked_and_not_indexed() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms);
+        w.cancelled.insert("job-1");
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(page("https://a.test/guide", 200, None), ack)
+            .await;
+        w.flush_all_storages().await;
+
+        assert!(acked.load(Ordering::SeqCst), "acked without work");
+        let requests = ms.received_requests().await.unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.url.path().ends_with("/documents")),
+            "nothing sent to Meilisearch: {:?}",
+            requests
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(drain::<CrawlEvent>(&events).await.is_empty());
     }
 }

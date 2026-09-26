@@ -93,7 +93,7 @@ impl JobEntry {
 /// state -> depth -> retry bypass (skips budget + dedup) -> budget ->
 /// capacity -> dedup -> enqueue.
 fn decide_admission(entry: &JobEntry, url: &CrawlUrl, queue_cap: usize, hash: u64) -> Admission {
-    if entry.state != JobRunState::Running {
+    if !matches!(entry.state, JobRunState::Running | JobRunState::Paused) {
         return Admission::JobNotRunning;
     }
     if let Some(max_depth) = entry.max_depth {
@@ -232,6 +232,11 @@ impl FrontierStore for MemoryFrontierStore {
         };
         // Undo the pop: these URLs did not leave the frontier.
         entry.counters.dispatched = entry.counters.dispatched.saturating_sub(urls.len() as u64);
+        if entry.release_deadline.is_some() {
+            // Released job: the URLs are dropped, never queued again.
+            entry.counters.dropped += urls.len() as u64;
+            return Ok(());
+        }
         for url in urls {
             entry.enqueue(url);
         }

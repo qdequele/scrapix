@@ -23,6 +23,12 @@ export const ACCOUNT_BASE_URL =
 /** Backend serving the OAuth provider (/oauth, /.well-known) and /mcp. */
 export const OAUTH_BASE_URL =
   process.env.CONTRACT_OAUTH_BASE_URL ?? AUTH_BASE_URL;
+/**
+ * The Rust crawl engine, serving the job routes (/crawl, /jobs, /job/*). It
+ * validates the Rails session cookie itself.
+ */
+export const ENGINE_BASE_URL =
+  process.env.CONTRACT_ENGINE_BASE_URL ?? "http://localhost:8080";
 
 function baseFor(path: string): string {
   if (path.startsWith("/auth")) return AUTH_BASE_URL;
@@ -35,6 +41,15 @@ function baseFor(path: string): string {
     path.startsWith("/mcp")
   ) {
     return OAUTH_BASE_URL;
+  }
+  if (
+    path === "/crawl" ||
+    path.startsWith("/crawl?") ||
+    path === "/jobs" ||
+    path.startsWith("/jobs?") ||
+    path.startsWith("/job/")
+  ) {
+    return ENGINE_BASE_URL;
   }
   return BASE_URL;
 }

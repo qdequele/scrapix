@@ -1734,6 +1734,7 @@
           "jobs"
         ],
         "summary": "Cancel a job",
+        "description": "Stops the job everywhere (frontier and workers) and bills the pages\ncrawled so far. Only a pending, running or paused job can be cancelled:\na job that already completed, failed or was cancelled returns 409 and\nkeeps its status.",
         "operationId": "cancel_job",
         "parameters": [
           {
@@ -1748,10 +1749,143 @@
         ],
         "responses": {
           "200": {
-            "description": ""
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is already terminal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/job/{id}/pause": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Pause a running job",
+        "description": "The frontier stops dispatching the job's URLs (pages already in flight\nfinish). Only a running job can be paused; any other status returns 409.",
+        "operationId": "pause_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/job/{id}/resume": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Resume a paused job",
+        "description": "Only a paused job can be resumed; any other status returns 409.",
+        "operationId": "resume_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is not paused",
             "content": {
               "application/json": {
                 "schema": {
@@ -4308,6 +4442,18 @@
           "replace"
         ]
       },
+      "JobStatus": {
+        "type": "string",
+        "description": "Crawl job status",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "paused"
+        ]
+      },
       "JobStatusResponse": {
         "type": "object",
         "description": "Job status response",
@@ -4401,7 +4547,8 @@
             ]
           },
           "status": {
-            "type": "string"
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "One of `pending`, `running`, `paused`, `completed`, `failed`,\n`cancelled`"
           },
           "warnings": {
             "type": "array",

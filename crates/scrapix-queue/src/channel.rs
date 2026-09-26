@@ -2,6 +2,14 @@
 //!
 //! This replaces Kafka when running all services in a single process (`scrapix all`).
 //! Uses `async-channel` (mpmc, bounded) to simulate topics.
+//!
+//! Consumers from [`ChannelBus::consumer`] share one queue per topic (like
+//! one Kafka consumer group). Consumers from [`ChannelBus::consumer_in_group`]
+//! each get their own copy of every message sent after they subscribed
+//! (like a Kafka group with `auto.offset.reset=latest`), which is how
+//! broadcast topics such as job control reach every service. Delivery to
+//! a topic with named groups never blocks the producer: a full group queue
+//! drops the message (logged).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -12,7 +20,7 @@ use async_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use scrapix_core::{Result, ScrapixError};
 
@@ -35,6 +43,67 @@ struct TopicChannel {
     sender: Sender<Vec<u8>>,
     receiver: Receiver<Vec<u8>>,
     offset: AtomicI64,
+    /// Named consumer groups: each receives its own copy of every message.
+    groups: Vec<GroupChannel>,
+}
+
+struct GroupChannel {
+    name: String,
+    sender: Sender<Vec<u8>>,
+    receiver: Receiver<Vec<u8>>,
+}
+
+impl TopicChannel {
+    fn new(capacity: usize) -> Self {
+        let (sender, receiver) = async_channel::bounded(capacity);
+        Self {
+            sender,
+            receiver,
+            offset: AtomicI64::new(0),
+            groups: Vec::new(),
+        }
+    }
+
+    /// The receiver of consumer group `name`, created on first use.
+    fn group_receiver(&mut self, name: &str, capacity: usize) -> Receiver<Vec<u8>> {
+        if let Some(g) = self.groups.iter().find(|g| g.name == name) {
+            return g.receiver.clone();
+        }
+        let (sender, receiver) = async_channel::bounded(capacity);
+        self.groups.push(GroupChannel {
+            name: name.to_string(),
+            sender,
+            receiver: receiver.clone(),
+        });
+        receiver
+    }
+}
+
+/// Where one produced message goes.
+struct Route {
+    default: Sender<Vec<u8>>,
+    groups: Vec<(String, Sender<Vec<u8>>)>,
+    offset: i64,
+}
+
+impl Route {
+    async fn deliver(self, topic: &str, bytes: Vec<u8>) -> Result<()> {
+        if self.groups.is_empty() {
+            return self
+                .default
+                .send(bytes)
+                .await
+                .map_err(|e| ScrapixError::Queue(format!("Channel send failed: {}", e)));
+        }
+        for (name, sender) in &self.groups {
+            if let Err(e) = sender.try_send(bytes.clone()) {
+                warn!(topic, group = %name, error = %e, "Channel group queue full or closed, message dropped");
+            }
+        }
+        // The shared queue of a broadcast topic may have no reader at all.
+        let _ = self.default.try_send(bytes);
+        Ok(())
+    }
 }
 
 impl ChannelBus {
@@ -68,6 +137,16 @@ impl ChannelBus {
             bus: self.topics.clone(),
             capacity: self.capacity,
             subscriptions: Arc::new(RwLock::new(Vec::new())),
+            group: None,
+        }
+    }
+
+    /// Create a consumer in the named group `group`: it receives its own
+    /// copy of every message sent to its topics after `subscribe`.
+    pub fn consumer_in_group(&self, group: impl Into<String>) -> ChannelConsumer {
+        ChannelConsumer {
+            group: Some(group.into()),
+            ..self.consumer()
         }
     }
 }
@@ -85,29 +164,34 @@ pub struct ChannelProducer {
 }
 
 impl ChannelProducer {
-    fn get_or_create_topic(&self, topic: &str) -> (Sender<Vec<u8>>, i64) {
+    fn route(&self, topic: &str) -> Route {
         // Fast path
         {
             let topics = self.bus.read();
             if let Some(tc) = topics.get(topic) {
-                let offset = tc.offset.fetch_add(1, Ordering::Relaxed);
-                return (tc.sender.clone(), offset);
+                return route_of(tc);
             }
         }
 
         // Slow path
         let mut topics = self.bus.write();
         let tc = topics.entry(topic.to_string()).or_insert_with(|| {
-            let (sender, receiver) = async_channel::bounded(self.capacity);
             debug!(topic = topic, "Created topic channel (from producer)");
-            TopicChannel {
-                sender,
-                receiver,
-                offset: AtomicI64::new(0),
-            }
+            TopicChannel::new(self.capacity)
         });
-        let offset = tc.offset.fetch_add(1, Ordering::Relaxed);
-        (tc.sender.clone(), offset)
+        route_of(tc)
+    }
+}
+
+fn route_of(tc: &TopicChannel) -> Route {
+    Route {
+        default: tc.sender.clone(),
+        groups: tc
+            .groups
+            .iter()
+            .map(|g| (g.name.clone(), g.sender.clone()))
+            .collect(),
+        offset: tc.offset.fetch_add(1, Ordering::Relaxed),
     }
 }
 
@@ -122,11 +206,9 @@ impl MessageProducer for ChannelProducer {
         let bytes = serde_json::to_vec(payload)
             .map_err(|e| ScrapixError::Queue(format!("Serialization failed: {}", e)))?;
 
-        let (sender, offset) = self.get_or_create_topic(topic);
-        sender
-            .send(bytes)
-            .await
-            .map_err(|e| ScrapixError::Queue(format!("Channel send failed: {}", e)))?;
+        let route = self.route(topic);
+        let offset = route.offset;
+        route.deliver(topic, bytes).await?;
 
         debug!(topic = topic, offset = offset, "Channel message sent");
         Ok((0, offset)) // partition=0 for channels
@@ -138,12 +220,9 @@ impl MessageProducer for ChannelProducer {
         _key: Option<&str>,
         payload: &[u8],
     ) -> Result<(i32, i64)> {
-        let (sender, offset) = self.get_or_create_topic(topic);
-        sender
-            .send(payload.to_vec())
-            .await
-            .map_err(|e| ScrapixError::Queue(format!("Channel send failed: {}", e)))?;
-
+        let route = self.route(topic);
+        let offset = route.offset;
+        route.deliver(topic, payload.to_vec()).await?;
         Ok((0, offset))
     }
 
@@ -161,30 +240,30 @@ pub struct ChannelConsumer {
     bus: Arc<RwLock<HashMap<String, TopicChannel>>>,
     capacity: usize,
     subscriptions: Arc<RwLock<Vec<String>>>,
+    /// Named consumer group (`None`: the topic's shared queue).
+    group: Option<String>,
 }
 
 impl ChannelConsumer {
     fn get_receiver(&self, topic: &str) -> Receiver<Vec<u8>> {
         // Fast path
-        {
+        if self.group.is_none() {
             let topics = self.bus.read();
             if let Some(tc) = topics.get(topic) {
                 return tc.receiver.clone();
             }
         }
 
-        // Create topic if it doesn't exist yet
+        // Create topic (and group) if it doesn't exist yet
         let mut topics = self.bus.write();
         let tc = topics.entry(topic.to_string()).or_insert_with(|| {
-            let (sender, receiver) = async_channel::bounded(self.capacity);
             debug!(topic = topic, "Created topic channel (from consumer)");
-            TopicChannel {
-                sender,
-                receiver,
-                offset: AtomicI64::new(0),
-            }
+            TopicChannel::new(self.capacity)
         });
-        tc.receiver.clone()
+        match self.group {
+            Some(ref group) => tc.group_receiver(group, self.capacity),
+            None => tc.receiver.clone(),
+        }
     }
 }
 
@@ -195,6 +274,10 @@ impl MessageConsumer for ChannelConsumer {
         for topic in topics {
             if !subs.contains(&topic.to_string()) {
                 subs.push(topic.to_string());
+            }
+            if self.group.is_some() {
+                // Register the group now: it receives what is sent from here on.
+                self.get_receiver(topic);
             }
         }
         debug!(topics = ?topics, "Channel consumer subscribed");
@@ -386,5 +469,66 @@ impl MessageConsumer for ChannelConsumer {
             Ok(Err(_)) => Ok(None), // Channel closed
             Err(_) => Ok(None),     // Timeout
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn poll(c: &ChannelConsumer) -> Option<String> {
+        c.poll_one::<String>(Duration::from_millis(100))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn named_groups_each_receive_every_message() {
+        let bus = ChannelBus::new();
+        let a = bus.consumer_in_group("a");
+        a.subscribe(&["t"]).unwrap();
+        let b = bus.consumer_in_group("b");
+        b.subscribe(&["t"]).unwrap();
+        let p = bus.producer();
+        p.send("t", None, &"m1".to_string()).await.unwrap();
+        p.send("t", None, &"m2".to_string()).await.unwrap();
+        for c in [&a, &b] {
+            assert_eq!(poll(c).await.as_deref(), Some("m1"));
+            assert_eq!(poll(c).await.as_deref(), Some("m2"));
+            assert_eq!(poll(c).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_consumers_still_share_one_queue() {
+        let bus = ChannelBus::new();
+        let p = bus.producer();
+        p.send("t", None, &"m1".to_string()).await.unwrap();
+        let a = bus.consumer();
+        a.subscribe(&["t"]).unwrap();
+        let b = bus.consumer();
+        b.subscribe(&["t"]).unwrap();
+        // Buffered before any consumer existed, delivered once.
+        let got = [poll(&a).await, poll(&b).await];
+        assert_eq!(got.iter().flatten().count(), 1, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn group_topic_never_blocks_the_producer_when_nobody_reads() {
+        let bus = ChannelBus::with_capacity(2);
+        let g = bus.consumer_in_group("g");
+        g.subscribe(&["t"]).unwrap();
+        let p = bus.producer();
+        for i in 0..10 {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                p.send("t", None, &format!("m{i}")),
+            )
+            .await
+            .expect("send must not block")
+            .unwrap();
+        }
+        // The group kept the oldest messages it had room for.
+        assert_eq!(poll(&g).await.as_deref(), Some("m0"));
     }
 }

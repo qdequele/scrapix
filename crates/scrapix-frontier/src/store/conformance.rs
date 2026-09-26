@@ -237,9 +237,18 @@ pub async fn rejected_counts_non_admitted_outcomes(s: &dyn FrontierStore) {
     );
     assert_eq!(s.counters("j").await.unwrap().rejected, 2);
 
+    // A paused job keeps admitting (it only stops dispatching)...
     s.set_state("j", JobRunState::Paused).await.unwrap();
     assert_eq!(
         s.admit("j", &CrawlUrl::seed("https://a.test/paused"), 100)
+            .await
+            .unwrap(),
+        Admission::Admitted
+    );
+    // ...a finished one does not.
+    s.set_state("j", JobRunState::Finished).await.unwrap();
+    assert_eq!(
+        s.admit("j", &CrawlUrl::seed("https://a.test/finished"), 100)
             .await
             .unwrap(),
         Admission::JobNotRunning
@@ -299,6 +308,27 @@ pub async fn cancelled_job_admits_nothing_and_release_frees(s: &dyn FrontierStor
     assert_eq!(s.queued("j").await.unwrap(), 0);
 }
 
+/// URLs popped before a `release` (a dispatcher mid-batch when the job was
+/// cancelled) and requeued after it are dropped, not queued again.
+pub async fn requeue_after_release_drops_the_urls(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+    s.admit("j", &CrawlUrl::seed("https://a.test/1"), 100)
+        .await
+        .unwrap();
+    let popped = s.pop_ready("j", 10, i64::MAX).await.unwrap();
+    assert_eq!(popped.len(), 1);
+    s.set_state("j", JobRunState::Cancelled).await.unwrap();
+    s.release("j", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    s.requeue("j", popped).await.unwrap();
+    assert_eq!(s.queued("j").await.unwrap(), 0);
+    let c = s.counters("j").await.unwrap();
+    assert_eq!(c.dispatched, 0, "the pop is undone");
+    assert_eq!(c.dropped, 1, "and the URL counted as dropped");
+}
+
 pub async fn lease_is_exclusive(s: &dyn FrontierStore) {
     let ttl = std::time::Duration::from_secs(5);
     assert!(s.try_lease("j", "a", ttl).await.unwrap());
@@ -328,6 +358,7 @@ where
     dropped_counts_release_of_queued_urls(&*make().await).await;
     retries_bypass_dedup_and_budget(&*make().await).await;
     cancelled_job_admits_nothing_and_release_frees(&*make().await).await;
+    requeue_after_release_drops_the_urls(&*make().await).await;
     lease_is_exclusive(&*make().await).await;
 }
 

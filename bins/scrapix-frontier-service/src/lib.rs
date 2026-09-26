@@ -22,6 +22,13 @@
 //!    and `Retry-After` from the feedback feed the domain's delay/pause.
 //! 5. Publish `CrawlEvent::FrontierProgress` snapshots of the store
 //!    counters.
+//! 6. Consume the API's `JobControl` (spec R5), in a per-instance group so
+//!    every instance applies every control: Cancel/Finish mark the job
+//!    `Cancelled`/`Finished` and `release` it (queue and seen set dropped,
+//!    state kept as a tombstone for `JOB_RETENTION_HOURS`, so late URLs are
+//!    refused instead of resurrecting it); Pause/Resume flip
+//!    `Running` ↔ `Paused` (a paused job keeps admitting, it only stops
+//!    dispatching).
 //!
 //! Politeness state is in Redis when `REDIS_URL` is set (shared by every
 //! instance; one consumer group for feedback), otherwise in memory (one
@@ -58,7 +65,7 @@ use scrapix_frontier::{
 };
 use scrapix_queue::{
     topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, CrawlHistoryMessage,
-    FetchFeedback, LinksMessage, ProducerBuilder, UrlMessage,
+    FetchFeedback, JobAction, JobControl, LinksMessage, ProducerBuilder, UrlMessage,
 };
 
 /// How many input messages are admitted concurrently.
@@ -85,6 +92,8 @@ const BUSY_RETRY: Duration = Duration::from_millis(200);
 const ERROR_RETRY: Duration = Duration::from_secs(1);
 /// Upper bound on a `Retry-After` pause (same cap as the crawler's re-queue delay).
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// Capped backoff for a job control message the store failed to apply.
+const CONTROL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Scrapix Frontier Service
 #[derive(Parser, Debug)]
@@ -395,6 +404,8 @@ struct FrontierService {
     history_consumer: Option<Arc<AnyConsumer>>,
     /// `FETCH_FEEDBACK` consumer (politeness slot release)
     feedback_consumer: Option<Arc<AnyConsumer>>,
+    /// `JOB_STATUS` consumer (cancel / pause / resume / finish)
+    control_consumer: Option<Arc<AnyConsumer>>,
     producer: Arc<AnyProducer>,
     store: Arc<dyn FrontierStore>,
     /// Parsed job templates (from `store.job_template`), used on dispatch.
@@ -415,6 +426,8 @@ struct FrontierService {
     shutdown: Arc<AtomicBool>,
     instance_id: String,
     queue_cap: usize,
+    /// How long a released job's state stays as a tombstone.
+    job_retention: Duration,
     dispatch_batch_size: usize,
     dispatch_interval: Duration,
     linkgraph_compute_interval: Duration,
@@ -427,6 +440,13 @@ struct Buses {
     links: Option<Arc<AnyConsumer>>,
     history: Option<Arc<AnyConsumer>>,
     feedback: Option<Arc<AnyConsumer>>,
+    control: Option<Arc<AnyConsumer>>,
+}
+
+/// Consumer group for `JOB_STATUS`: one per instance, so every frontier
+/// instance applies every control message.
+pub fn control_group_id(group_id: &str, instance_id: &str) -> String {
+    format!("{group_id}-control-{instance_id}")
 }
 
 /// Link graph and recrawl components built from `Args`.
@@ -559,6 +579,22 @@ impl FrontierService {
             Some(Arc::new(AnyConsumer::from(c)))
         };
 
+        let control_group = control_group_id(&args.group_id, &instance_id);
+        let control_consumer = {
+            let c = ConsumerBuilder::new(&args.brokers, &control_group)
+                .client_id(format!("scrapix-frontier-{}-control", instance_id))
+                // A new group must not replay the whole control history.
+                .auto_offset_reset("latest")
+                .build()?;
+            c.subscribe(&[topic_names::JOB_STATUS])?;
+            info!(
+                topic = topic_names::JOB_STATUS,
+                group = %control_group,
+                "Subscribed to job control topic"
+            );
+            Some(Arc::new(AnyConsumer::from(c)))
+        };
+
         let store = build_store(args).await?;
         Ok(Self::build(
             args,
@@ -569,6 +605,7 @@ impl FrontierService {
                 links: links_consumer,
                 history: history_consumer,
                 feedback: feedback_consumer,
+                control: control_consumer,
             },
             store,
             politeness,
@@ -580,6 +617,7 @@ impl FrontierService {
     ///
     /// Used by `scrapix all` (shared in-process bus) and by tests (with a
     /// `MemoryFrontierStore`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_bus(
         args: &Args,
         producer: Arc<AnyProducer>,
@@ -587,6 +625,7 @@ impl FrontierService {
         links_consumer: Option<Arc<AnyConsumer>>,
         history_consumer: Option<Arc<AnyConsumer>>,
         feedback_consumer: Option<Arc<AnyConsumer>>,
+        control_consumer: Option<Arc<AnyConsumer>>,
         store: Arc<dyn FrontierStore>,
     ) -> anyhow::Result<Self> {
         let instance_id = args
@@ -600,6 +639,9 @@ impl FrontierService {
         if feedback_consumer.is_none() {
             warn!("No fetch feedback consumer: politeness slots only free on expiry");
         }
+        if control_consumer.is_none() {
+            warn!("No job control consumer: cancel/pause/resume do not reach this frontier");
+        }
         Ok(Self::build(
             args,
             instance_id,
@@ -609,6 +651,7 @@ impl FrontierService {
                 links: links_consumer,
                 history: history_consumer,
                 feedback: feedback_consumer,
+                control: control_consumer,
             },
             store,
             politeness,
@@ -629,6 +672,7 @@ impl FrontierService {
             links_consumer: buses.links,
             history_consumer: buses.history,
             feedback_consumer: buses.feedback,
+            control_consumer: buses.control,
             producer: buses.producer,
             store,
             templates: BoundedCache::new(JOB_CACHE_CAP),
@@ -644,6 +688,7 @@ impl FrontierService {
             shutdown: Arc::new(AtomicBool::new(false)),
             instance_id,
             queue_cap: args.max_pending_per_job,
+            job_retention: Duration::from_secs(args.job_retention_hours.saturating_mul(3600)),
             dispatch_batch_size: args.dispatch_batch_size,
             dispatch_interval: Duration::from_millis(args.dispatch_interval_ms),
             linkgraph_compute_interval: Duration::from_secs(args.linkgraph_compute_interval),
@@ -660,6 +705,7 @@ impl FrontierService {
         let history_handle = self.start_history_consumer();
         let pagerank_handle = self.start_pagerank_computer();
         let feedback_handle = self.clone().start_feedback_consumer();
+        let control_handle = self.clone().start_control_consumer();
 
         let result = self.clone().process_messages().await;
 
@@ -672,6 +718,7 @@ impl FrontierService {
             history_handle,
             pagerank_handle,
             feedback_handle,
+            control_handle,
         ]
         .into_iter()
         .flatten()
@@ -1335,6 +1382,103 @@ impl FrontierService {
         }
     }
 
+    /// Consume `JOB_STATUS` and apply each control to the store, in order
+    /// (concurrency 1: a Pause and its Resume must not be reordered). A
+    /// control the store fails to apply is retried with backoff until it
+    /// succeeds or the service shuts down.
+    fn start_control_consumer(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let consumer = self.control_consumer.clone()?;
+        Some(tokio::spawn(async move {
+            let shutdown = self.shutdown.clone();
+            let service = self.clone();
+            let result = consumer
+                .process_with_ack::<JobControl, _, _>(
+                    move |control, _metadata, ack| {
+                        let service = service.clone();
+                        async move {
+                            let mut backoff = ADMIT_BACKOFF_MIN;
+                            loop {
+                                match service.apply_control(&control).await {
+                                    Ok(()) => {
+                                        ack.ack();
+                                        return;
+                                    }
+                                    Err(e) => warn!(
+                                        job_id = %control.job_id,
+                                        action = ?control.action,
+                                        error = %e,
+                                        "Failed to apply job control; retrying"
+                                    ),
+                                }
+                                if service.sleep_unless_shutdown(backoff).await {
+                                    return; // un-acked: redelivered
+                                }
+                                backoff = (backoff * 2).min(CONTROL_BACKOFF_MAX);
+                            }
+                        }
+                    },
+                    1,
+                    shutdown,
+                )
+                .await;
+            if let Err(e) = result {
+                error!(error = %e, "Job control consumer stopped");
+            }
+        }))
+    }
+
+    /// Apply one control message to the store.
+    ///
+    /// - Cancel / Finish: the job becomes `Cancelled` / `Finished` and is
+    ///   released. A job the store does not know yet (the control beat its
+    ///   first URL) gets a tombstone entry first, so that URL is refused
+    ///   too. A job already stopped keeps its state (a Finish never turns a
+    ///   cancelled job into a finished one).
+    /// - Pause: `Running` → `Paused`. Resume: `Paused` → `Running`. Anything
+    ///   else (unknown, stopped) is left alone, so a late Resume never
+    ///   revives a cancelled or finished job.
+    async fn apply_control(&self, control: &JobControl) -> scrapix_core::Result<()> {
+        let job_id = control.job_id.as_str();
+        if job_id.is_empty() {
+            return Ok(());
+        }
+        let current = self.store.state(job_id).await?;
+        match control.action {
+            JobAction::Cancel | JobAction::Finish => {
+                let target = if control.action == JobAction::Cancel {
+                    JobRunState::Cancelled
+                } else {
+                    JobRunState::Finished
+                };
+                match current {
+                    Some(JobRunState::Cancelled | JobRunState::Finished) => {}
+                    Some(_) => self.store.set_state(job_id, target).await?,
+                    None => {
+                        self.store.ensure_job(job_id, "", None, None).await?;
+                        self.store.set_state(job_id, target).await?;
+                    }
+                }
+                self.store.release(job_id, self.job_retention).await?;
+                self.templates.remove(job_id);
+                self.pop_sizes.lock().remove(job_id);
+                info!(job_id = %job_id, action = ?control.action, "Frontier job stopped and released");
+            }
+            JobAction::Pause => {
+                if current == Some(JobRunState::Running) {
+                    self.store.set_state(job_id, JobRunState::Paused).await?;
+                    info!(job_id = %job_id, "Frontier job paused");
+                }
+            }
+            JobAction::Resume => {
+                if current == Some(JobRunState::Paused) {
+                    self.store.set_state(job_id, JobRunState::Running).await?;
+                    info!(job_id = %job_id, "Frontier job resumed");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn start_links_consumer(&self) -> Option<tokio::task::JoinHandle<()>> {
         let consumer = self.links_consumer.clone()?;
         let link_graph = self.link_graph.clone()?;
@@ -1511,6 +1655,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 ///
 /// Used by `scrapix all` to run the frontier in-process alongside other services,
 /// sharing an in-process channel bus instead of Kafka.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_bus(
     args: Args,
     producer: Arc<AnyProducer>,
@@ -1518,6 +1663,7 @@ pub async fn run_with_bus(
     links_consumer: Option<Arc<AnyConsumer>>,
     history_consumer: Option<Arc<AnyConsumer>>,
     feedback_consumer: Option<Arc<AnyConsumer>>,
+    control_consumer: Option<Arc<AnyConsumer>>,
     store: Arc<dyn FrontierStore>,
 ) -> anyhow::Result<()> {
     info!(
@@ -1533,6 +1679,7 @@ pub async fn run_with_bus(
             links_consumer,
             history_consumer,
             feedback_consumer,
+            control_consumer,
             store,
         )
         .await?,
@@ -1581,10 +1728,23 @@ mod tests {
         consumer.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
         let feedback = Arc::new(AnyConsumer::channel(bus.consumer()));
         feedback.subscribe(&[topic_names::FETCH_FEEDBACK]).unwrap();
+        let control = Arc::new(AnyConsumer::channel(
+            bus.consumer_in_group(format!("frontier-control-{}", uuid::Uuid::new_v4())),
+        ));
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
         Arc::new(
-            FrontierService::with_bus(args, producer, consumer, None, None, Some(feedback), store)
-                .await
-                .unwrap(),
+            FrontierService::with_bus(
+                args,
+                producer,
+                consumer,
+                None,
+                None,
+                Some(feedback),
+                Some(control),
+                store,
+            )
+            .await
+            .unwrap(),
         )
     }
 
@@ -1745,6 +1905,33 @@ mod tests {
                 .send(topic_names::FETCH_FEEDBACK, Some(&fb.domain), &fb)
                 .await
                 .unwrap();
+        }
+
+        /// Publish a `JobControl` as the API does.
+        async fn control(&self, job_id: &str, action: JobAction) {
+            AnyProducer::channel(self.bus.producer())
+                .send(
+                    topic_names::JOB_STATUS,
+                    Some(job_id),
+                    &JobControl::new(job_id, action),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Wait (bounded) until the store reports `state` for `job_id`.
+        async fn wait_state(&self, job_id: &str, state: JobRunState) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if self.service.store.state(job_id).await.unwrap() == Some(state) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "{job_id} never reached {state:?}: {:?}",
+                self.service.store.state(job_id).await
+            );
         }
 
         fn consumer(&self, topic: &str) -> AnyConsumer {
@@ -2525,5 +2712,131 @@ mod tests {
             "every free domain dispatched despite the busy one"
         );
         assert!(got.iter().all(|m| !m.url.url.contains("busy.test")));
+    }
+
+    /// R5: Cancel stops the job for good: queued work is dropped, later
+    /// URLs are refused (and acked), and a late URL never resurrects it.
+    #[tokio::test]
+    async fn cancel_drops_queued_work_and_late_urls_never_resurrect_the_job() {
+        let mut args = test_args();
+        args.concurrent_per_domain = 1;
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store.clone()).await;
+        let seed = one_domain_job("job-cancel", None);
+        h.publish(&seed).await;
+        for i in 0..3 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://one.test/{i}"), 1)))
+                .await;
+        }
+        // One slot and no feedback: one URL in flight, the rest queued.
+        let first = h.collect_dispatched(Duration::from_millis(600)).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(store.queued("job-cancel").await.unwrap(), 3);
+
+        h.control("job-cancel", JobAction::Cancel).await;
+        h.wait_state("job-cancel", JobRunState::Cancelled).await;
+        assert_eq!(store.queued("job-cancel").await.unwrap(), 0);
+        assert!(!store
+            .active_jobs()
+            .await
+            .unwrap()
+            .contains(&"job-cancel".to_string()));
+
+        // The slot frees, more URLs arrive: nothing is dispatched.
+        h.feedback(&first[0], Some(200), None).await;
+        for i in 10..13 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://one.test/{i}"), 1)))
+                .await;
+        }
+        assert!(h
+            .collect_dispatched(Duration::from_millis(600))
+            .await
+            .is_empty());
+        assert_eq!(store.queued("job-cancel").await.unwrap(), 0);
+        assert_eq!(
+            store.state("job-cancel").await.unwrap(),
+            Some(JobRunState::Cancelled),
+            "a late URL must not resurrect a cancelled job"
+        );
+        let c = store.counters("job-cancel").await.unwrap();
+        assert_eq!(c.received, 7, "late URLs were consumed (acked), not stuck");
+
+        // A Cancel that beats the job's first URL leaves a tombstone.
+        h.control("job-ghost", JobAction::Cancel).await;
+        h.wait_state("job-ghost", JobRunState::Cancelled).await;
+        h.publish(&one_domain_job("job-ghost", None)).await;
+        assert!(h
+            .collect_dispatched(Duration::from_millis(500))
+            .await
+            .is_empty());
+        assert_eq!(
+            store.state("job-ghost").await.unwrap(),
+            Some(JobRunState::Cancelled)
+        );
+        h.stop();
+    }
+
+    /// Finish releases a completed job the same way, and it stays dead.
+    #[tokio::test]
+    async fn finish_releases_the_job_and_keeps_it_finished() {
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(test_args(), store.clone()).await;
+        let seed = seed_message("job-fin", None);
+        h.publish(&seed).await;
+        assert_eq!(
+            h.collect_dispatched(Duration::from_millis(500)).await.len(),
+            1
+        );
+        h.control("job-fin", JobAction::Finish).await;
+        h.wait_state("job-fin", JobRunState::Finished).await;
+        // A Resume after Finish must not revive it.
+        h.control("job-fin", JobAction::Resume).await;
+        h.publish(&seed.child(CrawlUrl::new("https://example.com/late", 1)))
+            .await;
+        assert!(h
+            .collect_dispatched(Duration::from_millis(500))
+            .await
+            .is_empty());
+        assert_eq!(
+            store.state("job-fin").await.unwrap(),
+            Some(JobRunState::Finished)
+        );
+        h.stop();
+    }
+
+    /// Pause stops dispatch but keeps the queue; Resume restarts it.
+    #[tokio::test]
+    async fn pause_stops_dispatch_and_resume_restarts_it() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store.clone()).await;
+        let seed = seed_message("job-pause", None);
+        h.publish(&seed).await;
+        assert_eq!(
+            h.collect_dispatched(Duration::from_millis(500)).await.len(),
+            1
+        );
+
+        h.control("job-pause", JobAction::Pause).await;
+        h.wait_state("job-pause", JobRunState::Paused).await;
+        // Links found by pages still in flight keep arriving while paused:
+        // they are queued, not dispatched, and not lost.
+        for i in 0..3 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://d{i}.test/"), 1)))
+                .await;
+        }
+        assert!(h
+            .collect_dispatched(Duration::from_millis(600))
+            .await
+            .is_empty());
+        assert_eq!(store.queued("job-pause").await.unwrap(), 3);
+
+        h.control("job-pause", JobAction::Resume).await;
+        h.wait_state("job-pause", JobRunState::Running).await;
+        let resumed = h.collect_dispatched(Duration::from_millis(800)).await;
+        h.stop();
+        assert_eq!(resumed.len(), 3, "dispatch restarts after Resume");
     }
 }
