@@ -182,10 +182,13 @@ impl RobotsCache {
         // seed URLs in `HttpFetcher::fetch_inner`.
         crate::safe_client::reject_ip_host(url)?;
 
+        // Keep a non-default port: robots.txt lives on the same authority as
+        // the page (RFC 9309 §2.3).
         let robots_url = format!(
-            "{}://{}/robots.txt",
+            "{}://{}{}/robots.txt",
             url.scheme(),
-            url.host_str().unwrap_or("")
+            url.host_str().unwrap_or(""),
+            url.port().map(|p| format!(":{p}")).unwrap_or_default()
         );
 
         debug!(robots_url, "Fetching robots.txt");
@@ -679,9 +682,10 @@ impl PersistentRobotsCache {
         crate::safe_client::reject_ip_host(url)?;
 
         let robots_url = format!(
-            "{}://{}/robots.txt",
+            "{}://{}{}/robots.txt",
             url.scheme(),
-            url.host_str().unwrap_or("")
+            url.host_str().unwrap_or(""),
+            url.port().map(|p| format!(":{p}")).unwrap_or_default()
         );
 
         debug!(robots_url, "Fetching robots.txt");

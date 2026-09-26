@@ -373,8 +373,17 @@ pub enum CrawlEvent {
         content_length: u64,
         duration_ms: u64,
         timestamp: i64,
+        /// Number of discovered links published back to the frontier
+        #[serde(default)]
+        links_published: u64,
+        /// `message_id` of the `UrlMessage` this page was fetched for
+        #[serde(default)]
+        url_message_id: String,
+        /// Whether the page was rendered by a browser (browser billing)
+        #[serde(default)]
+        js_rendered: bool,
     },
-    /// Page crawl failed
+    /// Page crawl failed (terminal for this URL)
     PageFailed {
         job_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,6 +391,25 @@ pub enum CrawlEvent {
         url: String,
         error: String,
         retry_count: u32,
+        timestamp: i64,
+        /// Final HTTP status, when the failure came from a response
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// `message_id` of the `UrlMessage` that failed
+        #[serde(default)]
+        url_message_id: String,
+    },
+    /// A URL failed transiently and was re-queued with `retry_count + 1`
+    PageRetried {
+        job_id: String,
+        url: String,
+        /// `message_id` of the `UrlMessage` that was retried (the re-queued
+        /// message gets a fresh id)
+        #[serde(default)]
+        url_message_id: String,
+        /// Retry count of the re-queued message
+        retry_count: u32,
+        error: String,
         timestamp: i64,
     },
     /// Document indexed
@@ -413,6 +441,10 @@ pub enum CrawlEvent {
         url: String,
         reason: String,
         timestamp: i64,
+        /// `message_id` of the `UrlMessage` that was skipped (empty when the
+        /// skip is not tied to a frontier message)
+        #[serde(default)]
+        url_message_id: String,
     },
 }
 
@@ -461,6 +493,9 @@ impl CrawlEvent {
             content_length: 0,
             duration_ms,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            links_published: 0,
+            url_message_id: String::new(),
+            js_rendered: false,
         }
     }
 
@@ -481,6 +516,9 @@ impl CrawlEvent {
             content_length,
             duration_ms,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            links_published: 0,
+            url_message_id: String::new(),
+            js_rendered: false,
         }
     }
 
@@ -497,6 +535,8 @@ impl CrawlEvent {
             error: error.into(),
             retry_count,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            status: None,
+            url_message_id: String::new(),
         }
     }
 }
@@ -818,6 +858,68 @@ mod tests {
                 assert_eq!(retry_count, 3);
             }
             _ => panic!("Expected PageFailed"),
+        }
+    }
+
+    #[test]
+    fn page_events_without_new_fields_still_deserialize() {
+        // Events written by a pre-upgrade worker (rolling deploy).
+        let failed: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_failed","job_id":"j","url":"u","error":"e","retry_count":0,"timestamp":1}"#,
+        )
+        .unwrap();
+        match failed {
+            CrawlEvent::PageFailed {
+                status,
+                url_message_id,
+                ..
+            } => {
+                assert_eq!(status, None);
+                assert!(url_message_id.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        let crawled: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_crawled","job_id":"j","url":"u","status":200,"duration_ms":1,"timestamp":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            crawled,
+            CrawlEvent::PageCrawled {
+                links_published: 0,
+                js_rendered: false,
+                ..
+            }
+        ));
+        let skipped: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_skipped","job_id":"j","url":"u","reason":"r","timestamp":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(skipped, CrawlEvent::PageSkipped { .. }));
+    }
+
+    #[test]
+    fn page_retried_round_trips() {
+        let ev = CrawlEvent::PageRetried {
+            job_id: "j".into(),
+            url: "https://a.test/".into(),
+            url_message_id: "m1".into(),
+            retry_count: 2,
+            error: "HTTP 503".into(),
+            timestamp: 5,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"page_retried""#));
+        match serde_json::from_str::<CrawlEvent>(&json).unwrap() {
+            CrawlEvent::PageRetried {
+                retry_count,
+                url_message_id,
+                ..
+            } => {
+                assert_eq!(retry_count, 2);
+                assert_eq!(url_message_id, "m1");
+            }
+            other => panic!("{other:?}"),
         }
     }
 

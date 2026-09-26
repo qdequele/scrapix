@@ -5597,6 +5597,7 @@ dependencies = [
  "base64 0.22.1",
  "chromiumoxide",
  "chrono",
+ "dashmap",
  "fantoccini",
  "flate2",
  "futures",
@@ -5819,12 +5820,14 @@ dependencies = [
  "scrapix-lifecycle",
  "scrapix-queue",
  "scrapix-storage",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

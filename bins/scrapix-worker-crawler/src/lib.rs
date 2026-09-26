@@ -5,11 +5,13 @@
 //! ## Responsibilities
 //!
 //! 1. Consume URLs from the frontier topic
-//! 2. Fetch pages (respecting robots.txt and rate limits)
-//! 3. Extract links from fetched pages
-//! 4. Track link graph for priority boosting
-//! 5. Publish raw pages to the content processing topic
-//! 6. Publish discovered URLs back to the frontier
+//! 2. Fetch pages (respecting robots.txt and rate limits, per-job headers,
+//!    user agents, proxy and browser rendering)
+//! 3. Classify the HTTP status: only 2xx pages go to the content worker;
+//!    429/5xx and transport errors are re-queued with backoff, then
+//!    dead-lettered; other statuses fail with a `PageFailed` event
+//! 4. Extract links from fetched pages and publish them back to the frontier
+//! 5. Ack the message only after all of the above was published
 //!
 //! ## Features
 //!
@@ -17,9 +19,13 @@
 //! - Link graph analysis for priority boosting
 //! - Incremental crawling with conditional HTTP headers
 
+mod handler;
+pub mod job_fetch;
+pub mod outcome;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use scrapix_lifecycle::{
@@ -29,23 +35,22 @@ use scrapix_lifecycle::{
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "browser")]
-use scrapix_core::ScrapixError;
-use scrapix_core::{CrawlUrl, FeaturesConfig, UrlPatterns};
+use scrapix_core::CrawlUrl;
 #[cfg(feature = "browser")]
 use scrapix_crawler::{CdpRenderer, CdpRendererBuilder};
 use scrapix_crawler::{
-    ConditionalRequestHeaders, ExtractorConfig, HttpFetcher, HttpFetcherBuilder, RobotsCache,
-    RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
+    ExtractorConfig, HttpFetcher, HttpFetcherBuilder, RobotsCache, RobotsConfig, SitemapConfig,
+    SitemapParser, UrlExtractor,
 };
 use scrapix_frontier::LinkGraph;
 use scrapix_queue::{
-    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, LinksMessage,
-    ProducerBuilder, RawPageMessage, UrlMessage,
+    topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, ProducerBuilder, UrlMessage,
 };
 use scrapix_storage::{RedisCrawlHistory, RedisStorage};
 
 use std::collections::HashSet;
+
+use crate::job_fetch::JobFetchShaper;
 
 /// Crawler worker for fetching web pages from the URL frontier
 #[derive(Parser, Debug)]
@@ -81,7 +86,9 @@ pub struct Args {
     #[arg(long, env = "REQUEST_TIMEOUT", default_value = "30")]
     pub timeout: u64,
 
-    /// Maximum retries per URL
+    /// Maximum re-queues per URL for transient failures (429/5xx, network
+    /// errors) before it is dead-lettered. The fetcher itself retries once
+    /// in-process on top of this.
     #[arg(long, env = "MAX_RETRIES", default_value = "3")]
     pub max_retries: u32,
 
@@ -113,8 +120,9 @@ pub struct Args {
     #[arg(long, env = "DNS_CACHE_TTL", default_value = "300")]
     pub dns_cache_ttl: u64,
 
-    /// Enable link graph tracking for priority boosting
-    #[arg(long, env = "LINK_GRAPH", default_value = "true")]
+    /// Enable crawler-local link graph tracking for priority boosting (off by
+    /// default: the per-worker graph only sees a fraction of the links)
+    #[arg(long, env = "LINK_GRAPH", default_value = "false")]
     pub link_graph: bool,
 
     /// Link graph score computation interval (in URLs processed)
@@ -169,6 +177,12 @@ pub struct Args {
     /// Maximum sitemap URLs to discover per domain
     #[arg(long, env = "MAX_SITEMAP_URLS", default_value = "10000")]
     pub max_sitemap_urls: usize,
+
+    /// Allow fetching hosts that resolve to private/internal addresses
+    /// (SSRF opt-out). Tests and self-hosted private-network crawls only;
+    /// never enable in production. Raw-IP URLs stay refused.
+    #[arg(long, env = "ALLOW_PRIVATE_IPS")]
+    pub allow_private_ips: bool,
 }
 
 /// Worker metrics for monitoring
@@ -179,6 +193,7 @@ struct WorkerMetrics {
     urls_failed: AtomicU64,
     urls_discovered: AtomicU64,
     urls_not_modified: AtomicU64,
+    urls_retried: AtomicU64,
     bytes_downloaded: AtomicU64,
     active_fetches: AtomicU64,
     dns_cache_hits: AtomicU64,
@@ -210,6 +225,11 @@ impl WorkerMetrics {
         self.urls_not_modified.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_retry(&self) {
+        self.urls_processed.fetch_add(1, Ordering::Relaxed);
+        self.urls_retried.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_discovered(&self, count: u64) {
         self.urls_discovered.fetch_add(count, Ordering::Relaxed);
     }
@@ -224,7 +244,6 @@ impl WorkerMetrics {
         self.browser_renders.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     fn record_http_fetch(&self) {
         self.http_fetches.fetch_add(1, Ordering::Relaxed);
     }
@@ -250,6 +269,7 @@ impl WorkerMetrics {
             urls_failed: self.urls_failed.load(Ordering::Relaxed),
             urls_discovered: self.urls_discovered.load(Ordering::Relaxed),
             urls_not_modified: self.urls_not_modified.load(Ordering::Relaxed),
+            urls_retried: self.urls_retried.load(Ordering::Relaxed),
             bytes_downloaded: self.bytes_downloaded.load(Ordering::Relaxed),
             active_fetches: self.active_fetches.load(Ordering::Relaxed),
             dns_cache_hits: self.dns_cache_hits.load(Ordering::Relaxed),
@@ -269,6 +289,7 @@ struct MetricsSnapshot {
     urls_failed: u64,
     urls_discovered: u64,
     urls_not_modified: u64,
+    urls_retried: u64,
     bytes_downloaded: u64,
     active_fetches: u64,
     dns_cache_hits: u64,
@@ -300,6 +321,10 @@ struct CrawlerWorker {
     link_graph_interval: u64,
     incremental_crawl: bool,
     publish_links: bool,
+    /// Re-queue budget for transient failures (`MAX_RETRIES`)
+    max_retries: u32,
+    /// Per-job request shaping (user agents, headers, proxies, robots opt-out)
+    shaper: JobFetchShaper,
     /// Redis-backed crawl history for cross-session incremental crawling
     crawl_history: Option<Arc<RedisCrawlHistory>>,
     /// Tracks domains we've already discovered sitemaps for
@@ -377,9 +402,8 @@ impl CrawlerWorker {
             fetch_timeout: Duration::from_secs(10),
             respect_robots: args.respect_robots,
             default_crawl_delay_ms: None,
-            // Matches the fetcher's own SSRF default (also unset here) —
-            // production crawls never opt into private-IP targets.
-            allow_private_ips: false,
+            // Same SSRF policy as the fetcher (ALLOW_PRIVATE_IPS, default off).
+            allow_private_ips: args.allow_private_ips,
         };
 
         // Create simple in-memory robots cache for the HTTP fetcher
@@ -390,18 +414,31 @@ impl CrawlerWorker {
             info!("Sitemap discovery enabled");
             Some(SitemapParser::new(SitemapConfig {
                 max_urls: args.max_sitemap_urls,
+                allow_private_ips: args.allow_private_ips,
                 ..SitemapConfig::default()
             }))
         } else {
             None
         };
 
-        // Create HTTP fetcher with optional DNS caching
+        // Create HTTP fetcher with optional DNS caching.
+        //
+        // The fetcher retries 429/5xx and transport errors once in-process;
+        // `MAX_RETRIES` is the *re-queue* budget handled by the worker
+        // (outcome::classify), so the two do not multiply into
+        // (MAX_RETRIES + 1)^2 attempts. The in-process wait is capped at 5s
+        // so a long `Retry-After` does not pin a fetch slot: the re-queue
+        // delay honors the full hint instead.
         let mut fetcher_builder = HttpFetcherBuilder::new()
             .user_agent(&args.user_agent)
             .timeout(Duration::from_secs(args.timeout))
-            .max_retries(args.max_retries)
-            .max_body_size(args.max_body_size_mb * 1024 * 1024);
+            .max_retries(1)
+            .max_backoff(Duration::from_secs(5))
+            .max_body_size(args.max_body_size_mb * 1024 * 1024)
+            .allow_private_ips(args.allow_private_ips);
+        if args.allow_private_ips {
+            warn!("ALLOW_PRIVATE_IPS is set: SSRF protection for private addresses is off");
+        }
 
         if args.dns_cache {
             fetcher_builder =
@@ -409,7 +446,7 @@ impl CrawlerWorker {
             info!(ttl_secs = args.dns_cache_ttl, "DNS caching enabled");
         }
 
-        let fetcher = fetcher_builder.build(fetcher_robots_cache)?;
+        let fetcher = fetcher_builder.build(fetcher_robots_cache.clone())?;
 
         // Create URL extractor
         let extractor_config = ExtractorConfig {
@@ -466,7 +503,11 @@ impl CrawlerWorker {
             );
 
             // Create CDP renderer
+            // The renderer checks robots.txt (same cache as the HTTP
+            // fetcher) and the SSRF rules before every navigation.
             let mut cdp_builder = CdpRendererBuilder::new()
+                .robots_cache(fetcher_robots_cache.clone())
+                .allow_private_ips(args.allow_private_ips)
                 .timeout(Duration::from_secs(args.browser_timeout))
                 .max_concurrent_pages(args.browser_concurrency)
                 .headless(args.browser_headless);
@@ -488,7 +529,7 @@ impl CrawlerWorker {
                 Err(e) => {
                     warn!(
                         error = %e,
-                        "Failed to initialize browser renderer, falling back to HTTP only"
+                        "Failed to initialize browser renderer; jobs requiring a browser will fail on this worker"
                     );
                     (None, Vec::new())
                 }
@@ -545,6 +586,8 @@ impl CrawlerWorker {
             link_graph_interval: args.link_graph_interval,
             incremental_crawl: args.incremental_crawl,
             publish_links: args.publish_links,
+            max_retries: args.max_retries,
+            shaper: JobFetchShaper::default(),
             crawl_history,
             discovered_sitemap_domains: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         })
@@ -577,6 +620,7 @@ impl CrawlerWorker {
                     succeeded = snapshot.urls_succeeded,
                     failed = snapshot.urls_failed,
                     not_modified = snapshot.urls_not_modified,
+                    retried = snapshot.urls_retried,
                     discovered = snapshot.urls_discovered,
                     sitemap_urls = snapshot.sitemap_urls_discovered,
                     sitemap_domains = snapshot.domains_with_sitemaps,
@@ -603,8 +647,11 @@ impl CrawlerWorker {
         result
     }
 
-    /// Process messages from the frontier queue
-    /// Uses concurrent processing to keep the consumer polling and maintain heartbeats
+    /// Process messages from the frontier queue.
+    ///
+    /// Uses ack-based concurrent processing: each message's offset is
+    /// committed only after [`CrawlerWorker::handle_message`] acked it, i.e.
+    /// after every publish for it succeeded.
     async fn process_messages(self: Arc<Self>) -> anyhow::Result<()> {
         let concurrency = self.concurrency;
         let shutdown = self.shutdown.clone();
@@ -616,34 +663,20 @@ impl CrawlerWorker {
             "Starting message processing loop"
         );
 
-        // Use concurrent processing to maintain heartbeats while handlers run
         self.consumer
-            .process_concurrent::<UrlMessage, _, _>(
-                move |msg, metadata| {
+            .process_with_ack::<UrlMessage, _, _>(
+                move |msg, metadata, ack| {
                     let worker = worker.clone();
                     async move {
-                        info!(
+                        debug!(
                             url = %msg.url.url,
                             job_id = %msg.job_id,
                             partition = metadata.partition,
                             offset = metadata.offset,
+                            retry_count = msg.url.retry_count,
                             "Received URL from frontier"
                         );
-
-                        worker.metrics.fetch_started();
-                        let result = worker.process_url(&msg).await;
-                        worker.metrics.fetch_completed();
-
-                        if let Err(ref e) = result {
-                            warn!(
-                                url = %msg.url.url,
-                                job_id = %msg.job_id,
-                                error = %e,
-                                "Failed to process URL"
-                            );
-                        }
-
-                        result
+                        worker.handle_message(msg, ack).await;
                     }
                 },
                 concurrency,
@@ -654,57 +687,19 @@ impl CrawlerWorker {
         Ok(())
     }
 
-    /// Check if a URL should be rendered with a browser
-    #[cfg(feature = "browser")]
-    fn should_use_browser(&self, url: &scrapix_core::CrawlUrl) -> bool {
-        // Check if browser renderer is available
-        if self.browser_renderer.is_none() {
-            return false;
-        }
-
-        // Check if URL explicitly requires JS
-        if url.requires_js {
-            return true;
-        }
-
-        // Check against configured patterns
-        for pattern in &self.browser_patterns {
-            if pattern.is_match(&url.url) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Fetch a page using the browser renderer
-    #[cfg(feature = "browser")]
-    async fn fetch_with_browser(
-        &self,
-        url: &scrapix_core::CrawlUrl,
-    ) -> scrapix_core::Result<scrapix_core::RawPage> {
-        let renderer = self
-            .browser_renderer
-            .as_ref()
-            .ok_or_else(|| ScrapixError::Crawl("Browser renderer not available".into()))?;
-
-        renderer.fetch(url).await
-    }
-
-    /// Discover and publish sitemap URLs for a domain (if not already done)
-    #[allow(clippy::too_many_arguments)]
+    /// Discover and publish sitemap URLs for a domain (if not already done).
+    ///
+    /// Sitemap URLs are derived from `parent` via `UrlMessage::child`, so
+    /// they carry every job-scoped field (job spec, limits, features, ...).
+    /// Runs in a background task spawned after a successful fetch; Task 7
+    /// replaces this with per-job discovery.
     async fn maybe_discover_sitemaps(
         &self,
         domain: &str,
-        job_id: &str,
-        index_uid: &str,
-        source: Option<String>,
-        url_patterns: Option<UrlPatterns>,
-        meilisearch_url: Option<String>,
-        meilisearch_api_key: Option<String>,
-        features: Option<FeaturesConfig>,
-        incremental: bool,
+        parent: &UrlMessage,
     ) -> scrapix_core::Result<usize> {
+        let job_id = parent.job_id.as_str();
+        let url_patterns = parent.url_patterns.clone();
         // Check if we've already discovered sitemaps for this domain
         {
             let domains = self.discovered_sitemap_domains.read();
@@ -799,16 +794,7 @@ impl CrawlerWorker {
                 crawl_url.priority = (priority * 100.0) as i32;
             }
 
-            let url_msg = match &url_patterns {
-                Some(patterns) => {
-                    UrlMessage::with_patterns(crawl_url, job_id, index_uid, patterns.clone())
-                }
-                None => UrlMessage::new(crawl_url, job_id, index_uid),
-            }
-            .with_source(source.clone())
-            .with_meilisearch(meilisearch_url.clone(), meilisearch_api_key.clone())
-            .with_features(features.clone())
-            .with_incremental(incremental);
+            let url_msg = parent.child(crawl_url);
 
             if let Err(e) = self
                 .producer
@@ -845,386 +831,6 @@ impl CrawlerWorker {
         }
 
         Ok(discovered_count)
-    }
-
-    /// Process a single URL
-    async fn process_url(&self, msg: &UrlMessage) -> scrapix_core::Result<()> {
-        let start = Instant::now();
-        let url = &msg.url;
-
-        // Try to discover sitemaps for this domain (only runs once per domain)
-        if let Ok(parsed_url) = url::Url::parse(&url.url) {
-            if let Some(domain) = parsed_url.host_str() {
-                if let Err(e) = self
-                    .maybe_discover_sitemaps(
-                        domain,
-                        &msg.job_id,
-                        &msg.index_uid,
-                        msg.source.clone(),
-                        msg.url_patterns.clone(),
-                        msg.meilisearch_url.clone(),
-                        msg.meilisearch_api_key.clone(),
-                        msg.features.clone(),
-                        msg.incremental,
-                    )
-                    .await
-                {
-                    debug!(domain, error = %e, "Sitemap discovery failed");
-                }
-            }
-        }
-
-        // Determine if we should use browser rendering
-        #[cfg(feature = "browser")]
-        let use_browser = self.should_use_browser(url);
-        #[cfg(not(feature = "browser"))]
-        let use_browser = false;
-
-        // Fetch the page (either with HTTP or browser)
-        let page = if use_browser {
-            #[cfg(feature = "browser")]
-            {
-                debug!(url = %url.url, "Using browser rendering");
-                self.metrics.record_browser_render();
-                match self.fetch_with_browser(url).await {
-                    Ok(page) => page,
-                    Err(e) => {
-                        self.metrics.record_failure();
-                        let event = CrawlEvent::page_failed(
-                            &msg.job_id,
-                            &url.url,
-                            e.to_string(),
-                            url.retry_count,
-                        );
-                        self.publish_event(&msg.job_id, &event).await?;
-                        return Err(e);
-                    }
-                }
-            }
-            #[cfg(not(feature = "browser"))]
-            {
-                unreachable!("Browser feature not enabled")
-            }
-        } else {
-            // Build conditional headers for incremental crawling.
-            // Only when both the global flag and per-job incremental flag are enabled.
-            // Replace index strategy sets msg.incremental = false to force full re-crawl.
-            let conditional_headers = if self.incremental_crawl && msg.incremental {
-                let mut headers = ConditionalRequestHeaders::new();
-                if let Some(ref etag) = url.etag {
-                    headers = headers.with_etag(etag);
-                }
-                if let Some(ref last_modified) = url.last_modified {
-                    headers = headers.with_last_modified(last_modified);
-                }
-                // If no in-message headers, look up Redis crawl history
-                if !headers.has_headers() {
-                    if let Some(ref history) = self.crawl_history {
-                        match history.get(&msg.index_uid, &url.url).await {
-                            Ok(Some(record)) => {
-                                if let Some(ref etag) = record.etag {
-                                    headers = headers.with_etag(etag);
-                                }
-                                if let Some(ref lm) = record.last_modified {
-                                    headers = headers.with_last_modified(lm);
-                                }
-                                if headers.has_headers() {
-                                    debug!(
-                                        url = %url.url,
-                                        "Loaded conditional headers from Redis crawl history"
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                debug!(url = %url.url, error = %e, "Failed to look up crawl history");
-                            }
-                        }
-                    }
-                }
-                headers
-            } else {
-                ConditionalRequestHeaders::new()
-            };
-
-            self.metrics.record_http_fetch();
-
-            // Derive per-crawl fetch options from the job's feature config.
-            // PDF support travels with the UrlMessage so the fetcher can remain
-            // a long-lived, per-worker singleton while still honoring per-job
-            // opt-ins.
-            let fetch_options = if let Some(ref features) = msg.features {
-                if features.is_pdf_enabled() {
-                    scrapix_crawler::FetchOptions::with_pdf(features.pdf_max_size_bytes())
-                } else {
-                    scrapix_crawler::FetchOptions::default()
-                }
-            } else {
-                scrapix_crawler::FetchOptions::default()
-            };
-
-            // Fetch the page with conditional headers (+ per-job options).
-            match self
-                .fetcher
-                .fetch_conditional_with_options(url, &conditional_headers, fetch_options)
-                .await
-            {
-                Ok(result) => match result {
-                    scrapix_crawler::FetchResult::Fetched(page) => page,
-                    scrapix_crawler::FetchResult::NotModified {
-                        url: not_modified_url,
-                        fetch_duration_ms: _,
-                    } => {
-                        // Page hasn't changed since last crawl
-                        self.metrics.record_not_modified();
-                        debug!(
-                            url = %url.url,
-                            "Page not modified (304), skipping processing"
-                        );
-
-                        // Publish skip event so the API can track job progress
-                        let event = CrawlEvent::PageSkipped {
-                            job_id: msg.job_id.clone(),
-                            url: not_modified_url,
-                            reason: "304 Not Modified".to_string(),
-                            timestamp: chrono::Utc::now().timestamp_millis(),
-                        };
-                        self.publish_event(&msg.job_id, &event).await?;
-
-                        return Ok(());
-                    }
-                },
-                Err(e) => {
-                    self.metrics.record_failure();
-
-                    // Send failure event
-                    let event = CrawlEvent::page_failed(
-                        &msg.job_id,
-                        &url.url,
-                        e.to_string(),
-                        url.retry_count,
-                    );
-                    self.publish_event(&msg.job_id, &event).await?;
-
-                    return Err(e);
-                }
-            }
-        };
-
-        let fetch_duration = start.elapsed();
-        let page_size = page.html.len() as u64;
-
-        // Update DNS cache stats
-        if let Some(dns_stats) = self.fetcher.dns_cache_stats() {
-            self.metrics
-                .record_dns_stats(dns_stats.hits, dns_stats.misses);
-        }
-
-        self.metrics.record_success(page_size);
-
-        info!(
-            url = %url.url,
-            status = page.status,
-            size_kb = page_size / 1024,
-            duration_ms = fetch_duration.as_millis(),
-            js_rendered = page.js_rendered,
-            "Page fetched successfully"
-        );
-
-        // Extract URLs from the page using patterns from the message if available
-        // Use per-job max_depth from message if available, otherwise fall back to global CLI arg
-        let effective_max_depth = msg.max_depth.unwrap_or(self.extractor.config().max_depth);
-        let discovered_urls = if let Some(ref patterns) = msg.url_patterns {
-            // Create extractor with patterns from job config
-            // If allowed_domains is set, use strict domain filtering
-            let extractor_config = ExtractorConfig {
-                patterns: Some(patterns.clone()),
-                max_depth: effective_max_depth,
-                follow_external: false,
-                follow_subdomains: patterns.allowed_domains.is_empty(), // Disable if whitelist is set
-                extract_from_data_attrs: false,
-                allowed_domains: patterns.allowed_domains.clone(),
-            };
-            let extractor = UrlExtractor::new(extractor_config);
-            extractor.extract(&page, url.depth)
-        } else {
-            // If message has per-job max_depth, create a temporary extractor with it
-            if msg.max_depth.is_some() {
-                let mut config = self.extractor.config().clone();
-                config.max_depth = effective_max_depth;
-                let extractor = UrlExtractor::new(config);
-                extractor.extract(&page, url.depth)
-            } else {
-                // Use default extractor without patterns
-                self.extractor.extract(&page, url.depth)
-            }
-        };
-        let discovered_count = discovered_urls.len();
-
-        self.metrics.record_discovered(discovered_count as u64);
-
-        // Track links in link graph if enabled
-        let target_urls: Vec<String> = discovered_urls.iter().map(|u| u.url.clone()).collect();
-        if let Some(ref graph) = self.link_graph {
-            let target_refs: Vec<&str> = target_urls.iter().map(|s| s.as_str()).collect();
-            graph.record_links(&url.url, target_refs);
-
-            // Periodically compute scores
-            let processed = self.metrics.urls_processed.load(Ordering::Relaxed);
-            if processed > 0 && processed % self.link_graph_interval == 0 {
-                graph.compute_scores_if_dirty();
-                debug!(processed = processed, "Recomputed link graph scores");
-            }
-        }
-
-        // Publish links to frontier service for centralized PageRank if enabled
-        if self.publish_links && !target_urls.is_empty() {
-            let links_msg = LinksMessage::new(&url.url, target_urls.clone(), &msg.job_id);
-            if let Err(e) = self
-                .producer
-                .send(topic_names::LINKS, Some(&msg.job_id), &links_msg)
-                .await
-            {
-                debug!(error = %e, "Failed to publish links to frontier");
-            }
-        }
-
-        debug!(
-            url = %url.url,
-            count = discovered_count,
-            "Extracted URLs from page"
-        );
-
-        // Extract ETag and Last-Modified from response headers for incremental crawling
-        let etag = page.headers.get("etag").cloned();
-        let last_modified = page.headers.get("last-modified").cloned();
-
-        // Save crawl history to Redis for future incremental crawls (only for Update strategy)
-        if msg.incremental {
-            if let Some(ref history) = self.crawl_history {
-                if etag.is_some() || last_modified.is_some() {
-                    if let Err(e) = history
-                        .save(
-                            &msg.index_uid,
-                            &url.url,
-                            etag.clone(),
-                            last_modified.clone(),
-                        )
-                        .await
-                    {
-                        debug!(url = %url.url, error = %e, "Failed to save crawl history to Redis");
-                    }
-                }
-            }
-        }
-
-        // Publish raw page to content processing topic
-        let raw_page_msg = RawPageMessage {
-            url: page.url.clone(),
-            final_url: page.final_url.clone(),
-            status: page.status,
-            html: page.html,
-            content_type: page.content_type,
-            content_length: page_size,
-            js_rendered: page.js_rendered,
-            fetched_at: page.fetched_at.timestamp_millis(),
-            fetch_duration_ms: page.fetch_duration_ms,
-            job_id: msg.job_id.clone(),
-            index_uid: msg.index_uid.clone(),
-            source: msg.source.clone(),
-            account_id: msg.account_id.clone(),
-            message_id: uuid::Uuid::new_v4().to_string(),
-            etag,
-            last_modified,
-            meilisearch_url: msg.meilisearch_url.clone(),
-            meilisearch_api_key: msg.meilisearch_api_key.clone(),
-            features: msg.features.clone(),
-            job: msg.job.clone(),
-            url_message_id: msg.message_id.clone(),
-        };
-
-        self.producer
-            .send(topic_names::PAGES_RAW, Some(&msg.job_id), &raw_page_msg)
-            .await?;
-
-        debug!(
-            url = %page.url,
-            topic = topic_names::PAGES_RAW,
-            "Published raw page to content topic"
-        );
-
-        // Publish discovered URLs back to frontier with link graph boost
-        for mut discovered_url in discovered_urls {
-            // Apply link graph priority boost if enabled
-            if let Some(ref graph) = self.link_graph {
-                let boost = graph.get_priority_boost(&discovered_url.url);
-                discovered_url.priority += boost;
-            }
-
-            // Propagate URL patterns and account_id from parent message so child URLs are filtered correctly
-            let mut url_msg = if let Some(ref patterns) = msg.url_patterns {
-                UrlMessage::with_patterns(
-                    discovered_url,
-                    &msg.job_id,
-                    &msg.index_uid,
-                    patterns.clone(),
-                )
-            } else {
-                UrlMessage::new(discovered_url, &msg.job_id, &msg.index_uid)
-            };
-            // Propagate source for multi-tenant indexing
-            url_msg.source = msg.source.clone();
-            // Propagate account_id for billing attribution
-            url_msg.account_id = msg.account_id.clone();
-            // Propagate per-job Meilisearch config
-            url_msg.meilisearch_url = msg.meilisearch_url.clone();
-            url_msg.meilisearch_api_key = msg.meilisearch_api_key.clone();
-            // Propagate per-job feature config
-            url_msg.features = msg.features.clone();
-            // Propagate per-job crawl limits
-            url_msg.max_depth = msg.max_depth;
-            url_msg.max_pages = msg.max_pages;
-            url_msg.incremental = msg.incremental;
-
-            self.producer
-                .send(
-                    topic_names::URL_FRONTIER,
-                    Some(&url_msg.partition_key()),
-                    &url_msg,
-                )
-                .await?;
-        }
-
-        if discovered_count > 0 {
-            debug!(
-                source_url = %url.url,
-                count = discovered_count,
-                topic = topic_names::URL_FRONTIER,
-                "Published discovered URLs to frontier"
-            );
-
-            // Send URLs discovered event
-            let event = CrawlEvent::UrlsDiscovered {
-                job_id: msg.job_id.clone(),
-                source_url: url.url.clone(),
-                count: discovered_count,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            self.publish_event(&msg.job_id, &event).await?;
-        }
-
-        // Send success event with billing data
-        let event = CrawlEvent::page_crawled_with_billing(
-            &msg.job_id,
-            msg.account_id.clone(),
-            &url.url,
-            page.status,
-            page_size,
-            fetch_duration.as_millis() as u64,
-        );
-        self.publish_event(&msg.job_id, &event).await?;
-
-        Ok(())
     }
 
     /// Publish a crawl event

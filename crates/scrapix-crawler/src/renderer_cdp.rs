@@ -41,6 +41,50 @@ use tracing::{debug, instrument, warn};
 use scrapix_core::{CrawlUrl, RawPage, Result, ScrapixError};
 
 use crate::robots::RobotsCache;
+use crate::safe_client::reject_ip_host;
+use crate::safe_dns::is_public_ip;
+
+/// Check a URL before handing it to the browser: the same SSRF rules as the
+/// HTTP fetcher (raw-IP hosts refused; hostnames must resolve only to public
+/// addresses unless `allow_private_ips`) and, when `robots` is given,
+/// robots.txt.
+///
+/// The browser does its own DNS resolution, so unlike `SafeResolver` we
+/// cannot pin the checked addresses: any non-public address in the answer
+/// refuses the URL outright.
+pub(crate) async fn check_render_target(
+    url: &str,
+    allow_private_ips: bool,
+    robots: Option<&RobotsCache>,
+) -> Result<()> {
+    let parsed = url::Url::parse(url)?;
+    reject_ip_host(&parsed)?;
+
+    if !allow_private_ips {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| ScrapixError::Crawl(format!("URL has no host: {url}")))?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| ScrapixError::Connection(format!("DNS lookup failed for {host}: {e}")))?
+            .collect();
+        if addrs.is_empty() || addrs.iter().any(|a| !is_public_ip(a.ip())) {
+            return Err(ScrapixError::Refused(format!(
+                "{host} resolves to a non-public address"
+            )));
+        }
+    }
+
+    if let Some(cache) = robots {
+        if !cache.is_allowed(url).await? {
+            return Err(ScrapixError::RobotsDisallowed {
+                url: url.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Errors specific to CDP rendering
 #[derive(Debug, Error)]
@@ -158,6 +202,11 @@ pub struct CdpConfig {
     /// Additional Chrome arguments
     #[serde(default)]
     pub extra_args: Vec<String>,
+
+    /// Allow rendering hosts that resolve to private/internal addresses.
+    /// Defaults to `false` (SSRF protection); tests/self-hosting only.
+    #[serde(default)]
+    pub allow_private_ips: bool,
 }
 
 fn default_true() -> bool {
@@ -196,6 +245,7 @@ impl Default for CdpConfig {
             inject_script: None,
             proxy: None,
             extra_args: Vec::new(),
+            allow_private_ips: false,
         }
     }
 }
@@ -333,14 +383,18 @@ impl CdpRenderer {
     /// Render a page and return the result
     #[instrument(skip(self), fields(url = %url))]
     pub async fn render(&self, url: &str) -> Result<RenderResult> {
-        // Check robots.txt
-        if let Some(ref cache) = self.robots_cache {
-            if !cache.is_allowed(url).await? {
-                return Err(ScrapixError::RobotsDisallowed {
-                    url: url.to_string(),
-                });
-            }
-        }
+        self.render_checked(url, true).await
+    }
+
+    /// Render a page after the SSRF check and (when `check_robots`) the
+    /// robots.txt check.
+    async fn render_checked(&self, url: &str, check_robots: bool) -> Result<RenderResult> {
+        let robots = if check_robots {
+            self.robots_cache.as_deref()
+        } else {
+            None
+        };
+        check_render_target(url, self.config.allow_private_ips, robots).await?;
 
         // Acquire semaphore
         let _permit = self
@@ -553,7 +607,13 @@ impl CdpRenderer {
     /// Fetch a CrawlUrl and return a RawPage
     #[instrument(skip(self), fields(url = %url.url))]
     pub async fn fetch(&self, url: &CrawlUrl) -> Result<RawPage> {
-        let result = self.render(&url.url).await?;
+        self.fetch_with_robots(url, true).await
+    }
+
+    /// Fetch a CrawlUrl, checking robots.txt only when `respect_robots`
+    /// (per-job `respect_robots_txt`). The SSRF check always runs.
+    pub async fn fetch_with_robots(&self, url: &CrawlUrl, respect_robots: bool) -> Result<RawPage> {
+        let result = self.render_checked(&url.url, respect_robots).await?;
 
         Ok(RawPage {
             url: url.url.clone(),
@@ -683,6 +743,12 @@ impl CdpRendererBuilder {
         self
     }
 
+    /// Allow rendering hosts that resolve to private addresses (tests only).
+    pub fn allow_private_ips(mut self, allow: bool) -> Self {
+        self.config.allow_private_ips = allow;
+        self
+    }
+
     pub fn robots_cache(mut self, cache: Arc<RobotsCache>) -> Self {
         self.robots_cache = Some(cache);
         self
@@ -702,6 +768,22 @@ impl Default for CdpRendererBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn render_target_refuses_raw_ips_and_private_hosts() {
+        let raw = check_render_target("http://169.254.169.254/latest", false, None).await;
+        assert!(matches!(raw, Err(ScrapixError::Refused(_))), "{raw:?}");
+        // Raw IPs stay refused even with the private-IP opt-out.
+        let raw = check_render_target("http://127.0.0.1/", true, None).await;
+        assert!(matches!(raw, Err(ScrapixError::Refused(_))), "{raw:?}");
+        // localhost resolves to loopback.
+        let local = check_render_target("http://localhost/", false, None).await;
+        assert!(matches!(local, Err(ScrapixError::Refused(_))), "{local:?}");
+        // Opt-out lets a hostname resolving to loopback through.
+        assert!(check_render_target("http://localhost/", true, None)
+            .await
+            .is_ok());
+    }
 
     #[test]
     fn test_config_defaults() {

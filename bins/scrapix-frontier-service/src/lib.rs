@@ -191,6 +191,15 @@ impl JobFrontier {
     fn try_add(&self, url: CrawlUrl) -> bool {
         self.urls_received.fetch_add(1, Ordering::Relaxed);
 
+        // A crawler re-queue (retry_count > 0) is a URL this job already
+        // admitted and dispatched: skip dedup and the limits, otherwise the
+        // retry would be dropped as a duplicate. (Interim until the
+        // FrontierStore rewrite, which also honors `not_before_ms`.)
+        if url.retry_count > 0 {
+            self.queue.push(url);
+            return true;
+        }
+
         // Enforce max_depth: reject URLs deeper than the limit
         if let Some(max_depth) = self.max_depth {
             if url.depth > max_depth {

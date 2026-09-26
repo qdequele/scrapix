@@ -272,6 +272,12 @@ pub struct CrawlUrl {
     /// Last-Modified timestamp from previous crawl (for conditional requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
+
+    /// Earliest time (Unix millis) this URL may be dispatched again. Set by
+    /// the crawler when it re-queues a URL for a retry with backoff; the
+    /// frontier holds the URL back until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<i64>,
 }
 
 impl CrawlUrl {
@@ -287,6 +293,7 @@ impl CrawlUrl {
             requires_js: false,
             etag: None,
             last_modified: None,
+            not_before_ms: None,
         }
     }
 

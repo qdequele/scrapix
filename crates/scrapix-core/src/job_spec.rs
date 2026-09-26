@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Travels on every `UrlMessage`/`RawPageMessage` (a few hundred bytes) so
 /// that job configuration is not lost as messages flow through the
 /// distributed pipeline (frontier, crawler, content workers).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSpec {
     #[serde(default)]
     pub crawler_type: CrawlerType,
@@ -45,6 +45,31 @@ pub struct JobSpec {
 
 fn default_true() -> bool {
     true
+}
+
+/// Matches the serde defaults (an empty `{}` deserializes to this), so a
+/// `JobSpec { ..Default::default() }` respects robots.txt like a job that
+/// never set `rate_limit.respect_robots_txt`.
+impl Default for JobSpec {
+    fn default() -> Self {
+        Self {
+            crawler_type: CrawlerType::default(),
+            headers: HashMap::new(),
+            user_agents: Vec::new(),
+            proxy: None,
+            respect_robots_txt: true,
+            per_domain_delay_ms: 0,
+            default_crawl_delay_ms: 0,
+            requests_per_second: None,
+            max_concurrent_requests: None,
+            sitemap: SitemapConfig::default(),
+            index_only: Vec::new(),
+            primary_key: None,
+            batch_size: None,
+            index_settings: None,
+            keep_settings: false,
+        }
+    }
 }
 
 impl JobSpec {
@@ -98,6 +123,13 @@ mod tests {
         assert_eq!(spec.user_agents, vec!["MyBot/1.0".to_string()]);
         assert_eq!(spec.requests_per_second, Some(2.0));
         assert_eq!(spec.primary_key, Some("uid".to_string()));
+    }
+
+    #[test]
+    fn default_matches_empty_json_and_respects_robots() {
+        let from_json: JobSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(JobSpec::default(), from_json);
+        assert!(JobSpec::default().respect_robots_txt);
     }
 
     #[test]

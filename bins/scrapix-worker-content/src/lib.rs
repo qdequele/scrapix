@@ -952,6 +952,8 @@ impl ContentWorker {
                     error: format!("Parse error: {}", e),
                     retry_count: 0,
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    status: None,
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
 
@@ -1023,6 +1025,7 @@ impl ContentWorker {
                     url: msg.url.clone(),
                     reason: format!("Near-duplicate of {}", duplicate_url),
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
 
@@ -1209,6 +1212,8 @@ impl ContentWorker {
                     error: format!("Markdown parse error: {}", e),
                     retry_count: 0,
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    status: None,
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
                 return Err(e);
@@ -1244,6 +1249,7 @@ impl ContentWorker {
                     url: msg.url.clone(),
                     reason: format!("Near-duplicate of {}", duplicate_url),
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
                 return Ok(());
@@ -1331,6 +1337,8 @@ impl ContentWorker {
                     error: format!("PDF parse error: {}", e),
                     retry_count: 0,
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    status: None,
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
                 return Err(e);
@@ -1356,6 +1364,8 @@ impl ContentWorker {
                     error: format!("PDF document build error: {}", e),
                     retry_count: 0,
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    status: None,
+                    url_message_id: msg.url_message_id.clone(),
                 };
                 self.publish_event(&msg.job_id, &event).await?;
                 return Err(e);

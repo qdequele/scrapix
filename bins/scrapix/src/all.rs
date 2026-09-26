@@ -182,6 +182,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,
+        // Same opt-out env var as the standalone worker (off by default).
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     };
 
     let content_args = build_content_args(args, String::new());
@@ -423,6 +427,10 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,
+        // Same opt-out env var as the standalone worker (off by default).
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     };
 
     let content_args = build_content_args(args, brokers.to_string());

@@ -325,7 +325,9 @@ impl AppState {
 
             // Track which services are alive based on event type
             let service = match event {
-                CrawlEvent::PageCrawled { .. } | CrawlEvent::PageFailed { .. } => Some("crawler"),
+                CrawlEvent::PageCrawled { .. }
+                | CrawlEvent::PageFailed { .. }
+                | CrawlEvent::PageRetried { .. } => Some("crawler"),
                 CrawlEvent::DocumentIndexed { .. } => Some("content"),
                 CrawlEvent::UrlsDiscovered { .. } => Some("frontier"),
                 _ => None,
@@ -473,6 +475,7 @@ impl AppState {
                 url,
                 error,
                 retry_count,
+                status,
                 ..
             } => {
                 self.update_job(job_id, |j| {
@@ -486,7 +489,7 @@ impl AppState {
                     url: url.clone(),
                     domain: domain.clone(),
                     error: error.clone(),
-                    status_code: extract_status_code(error),
+                    status_code: status.or_else(|| extract_status_code(error)),
                     job_id: job_id.to_string(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     retry_count: *retry_count,
@@ -4413,6 +4416,7 @@ fn start_event_consumer(
                         CrawlEvent::JobFailed { job_id, .. } => job_id.clone(),
                         CrawlEvent::PageSkipped { job_id, .. } => job_id.clone(),
                         CrawlEvent::RateLimited { job_id, .. } => job_id.clone(),
+                        CrawlEvent::PageRetried { job_id, .. } => job_id.clone(),
                     };
 
                     // Update job state and broadcast

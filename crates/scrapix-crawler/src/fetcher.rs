@@ -10,10 +10,10 @@ use chrono::Utc;
 use reqwest::{
     header::{
         HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
-        IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER,
+        IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER, USER_AGENT,
     },
     redirect::Policy,
-    Client, Response, StatusCode,
+    Client, Proxy, Response, StatusCode,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -35,6 +35,25 @@ pub struct FetchOptions {
     /// Maximum PDF size in bytes. When `None`, the fetcher's generic
     /// `max_body_size` applies. Only consulted when `allow_pdf` is `true`.
     pub pdf_max_size_bytes: Option<u64>,
+
+    /// Extra request headers for this fetch (per-job `headers`). Applied on
+    /// top of the fetcher's default headers, replacing any with the same
+    /// name.
+    pub extra_headers: Vec<(String, String)>,
+
+    /// User-Agent for this fetch (per-job `user_agents` rotation). `None`
+    /// keeps the fetcher's configured user agent.
+    pub user_agent: Option<String>,
+
+    /// Proxy URL for this fetch (per-job `proxy`). Requests go through a
+    /// per-proxy client that keeps every SSRF protection of the default
+    /// client. `None` connects directly.
+    pub proxy: Option<String>,
+
+    /// Per-job robots.txt override. `Some(false)` skips the robots.txt
+    /// check for this fetch; `None`/`Some(true)` keep the fetcher's robots
+    /// cache behavior.
+    pub respect_robots: Option<bool>,
 }
 
 impl FetchOptions {
@@ -44,6 +63,7 @@ impl FetchOptions {
         Self {
             allow_pdf: true,
             pdf_max_size_bytes: max_size_bytes,
+            ..Default::default()
         }
     }
 }
@@ -192,7 +212,14 @@ pub struct HttpFetcher {
     config: FetcherConfig,
     robots_cache: Arc<RobotsCache>,
     dns_resolver: Option<Arc<CachingDnsResolver>>,
+    /// Per-proxy clients (keyed by proxy URL), built lazily with the same
+    /// settings as `client` plus `.proxy(..)`.
+    proxy_clients: dashmap::DashMap<String, Client>,
 }
+
+/// Upper bound on cached per-proxy clients. Past it the cache is cleared
+/// (clients are cheap to rebuild; this only bounds memory).
+const MAX_PROXY_CLIENTS: usize = 1024;
 
 impl HttpFetcher {
     /// Create a new HTTP fetcher with the given configuration
@@ -206,6 +233,26 @@ impl HttpFetcher {
         robots_cache: Arc<RobotsCache>,
         dns_resolver: Option<Arc<CachingDnsResolver>>,
     ) -> Result<Self> {
+        let client = Self::build_client(&config, dns_resolver.clone(), None)?;
+
+        Ok(Self {
+            client,
+            config,
+            robots_cache,
+            dns_resolver,
+            proxy_clients: dashmap::DashMap::new(),
+        })
+    }
+
+    /// Build a `reqwest::Client` from `config`. Always starts from
+    /// [`safe_client_builder`] (SSRF resolver, raw-IP-refusing redirect
+    /// policy, `.no_proxy()`); when `proxy` is given, the explicit job proxy
+    /// is added on top.
+    fn build_client(
+        config: &FetcherConfig,
+        dns_resolver: Option<Arc<CachingDnsResolver>>,
+        proxy: Option<&str>,
+    ) -> Result<Client> {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             ACCEPT,
@@ -242,7 +289,13 @@ impl HttpFetcher {
             Policy::none()
         };
 
-        let client = safe_client_builder(dns_resolver.clone(), config.allow_private_ips)
+        let mut builder = safe_client_builder(dns_resolver, config.allow_private_ips);
+        if let Some(proxy) = proxy {
+            let proxy = Proxy::all(proxy)
+                .map_err(|e| ScrapixError::Config(format!("Invalid proxy URL: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+        builder
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout)
@@ -257,14 +310,24 @@ impl HttpFetcher {
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
             .build()
-            .map_err(|e| ScrapixError::Crawl(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| ScrapixError::Crawl(format!("Failed to build HTTP client: {}", e)))
+    }
 
-        Ok(Self {
-            client,
-            config,
-            robots_cache,
-            dns_resolver,
-        })
+    /// The client to use for one fetch: the default client, or the cached
+    /// per-proxy client for `options.proxy`.
+    fn client_for(&self, options: &FetchOptions) -> Result<Client> {
+        let Some(proxy) = options.proxy.as_deref() else {
+            return Ok(self.client.clone());
+        };
+        if let Some(client) = self.proxy_clients.get(proxy) {
+            return Ok(client.clone());
+        }
+        let client = Self::build_client(&self.config, self.dns_resolver.clone(), Some(proxy))?;
+        if self.proxy_clients.len() >= MAX_PROXY_CLIENTS {
+            self.proxy_clients.clear();
+        }
+        self.proxy_clients.insert(proxy.to_string(), client.clone());
+        Ok(client)
     }
 
     /// Create a new HTTP fetcher with default configuration
@@ -352,12 +415,14 @@ impl HttpFetcher {
         // Block raw IP addresses to prevent SSRF
         reject_ip_host(&parsed_url)?;
 
-        // Check robots.txt
-        if !self.robots_cache.is_allowed(&url.url).await? {
+        // Check robots.txt (unless the job opted out)
+        if options.respect_robots != Some(false) && !self.robots_cache.is_allowed(&url.url).await? {
             return Err(ScrapixError::RobotsDisallowed {
                 url: url.url.clone(),
             });
         }
+
+        let client = self.client_for(&options)?;
 
         let mut last_error = None;
         // `backoff` is the pure exponential series (grows every attempt,
@@ -377,10 +442,9 @@ impl HttpFetcher {
 
             let start = Instant::now();
 
-            let fetch_once_result = match conditional_headers {
-                Some(conditional) => self.fetch_once_conditional(&parsed_url, conditional).await,
-                None => self.fetch_once(&parsed_url).await,
-            };
+            let fetch_once_result = self
+                .fetch_once(&client, &parsed_url, conditional_headers, &options)
+                .await;
 
             match fetch_once_result {
                 Ok((response, final_url)) => {
@@ -508,35 +572,42 @@ impl HttpFetcher {
         }
     }
 
-    /// Perform a single fetch attempt
-    async fn fetch_once(&self, url: &Url) -> Result<(Response, String)> {
-        let response = self
-            .client
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(|e| Self::map_send_error(&e, url))?;
-        let final_url = response.url().to_string();
-        Ok((response, final_url))
-    }
-
-    /// Perform a single fetch attempt with conditional headers
-    async fn fetch_once_conditional(
+    /// Perform a single fetch attempt, applying conditional headers (when
+    /// given) and the per-fetch user agent / extra headers.
+    async fn fetch_once(
         &self,
+        client: &Client,
         url: &Url,
-        conditional_headers: &ConditionalRequestHeaders,
+        conditional_headers: Option<&ConditionalRequestHeaders>,
+        options: &FetchOptions,
     ) -> Result<(Response, String)> {
-        let mut request = self.client.get(url.as_str());
+        let mut request = client.get(url.as_str());
 
-        // Add conditional headers if present
-        if let Some(ref etag) = conditional_headers.etag {
-            if let Ok(value) = HeaderValue::from_str(etag) {
-                request = request.header(IF_NONE_MATCH, value);
+        for (name, value) in &options.extra_headers {
+            match (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => request = request.header(name, value),
+                _ => debug!(header = %name, "Skipping invalid per-job header"),
             }
         }
-        if let Some(ref last_modified) = conditional_headers.last_modified {
-            if let Ok(value) = HeaderValue::from_str(last_modified) {
-                request = request.header(IF_MODIFIED_SINCE, value);
+        if let Some(ref ua) = options.user_agent {
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                request = request.header(USER_AGENT, value);
+            }
+        }
+
+        if let Some(conditional) = conditional_headers {
+            if let Some(ref etag) = conditional.etag {
+                if let Ok(value) = HeaderValue::from_str(etag) {
+                    request = request.header(IF_NONE_MATCH, value);
+                }
+            }
+            if let Some(ref last_modified) = conditional.last_modified {
+                if let Ok(value) = HeaderValue::from_str(last_modified) {
+                    request = request.header(IF_MODIFIED_SINCE, value);
+                }
             }
         }
 
@@ -825,8 +896,15 @@ impl HttpFetcherBuilder {
         self
     }
 
+    /// Cap on a single in-process retry wait (exponential backoff or a
+    /// server `Retry-After` hint).
+    pub fn max_backoff(mut self, max: Duration) -> Self {
+        self.config.retry_config.max_backoff = max;
+        self
+    }
+
     /// Allow fetching hosts that resolve to private/internal IP ranges.
-    /// Defaults to `false`. Not yet enforced by the fetcher itself.
+    /// Defaults to `false`.
     pub fn allow_private_ips(mut self, allow: bool) -> Self {
         self.config.allow_private_ips = allow;
         self

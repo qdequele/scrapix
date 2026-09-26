@@ -236,3 +236,95 @@ fn parse_retry_after_forms() {
     );
     assert_eq!(parse_retry_after("soon", now), None);
 }
+
+#[tokio::test]
+async fn per_request_user_agent_and_headers_are_sent() {
+    use wiremock::matchers::header;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/h"))
+        .and(header("user-agent", "JobUA/1"))
+        .and(header("x-test", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("ok", "text/html"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let opts = scrapix_crawler::FetchOptions {
+        user_agent: Some("JobUA/1".into()),
+        extra_headers: vec![("x-test".into(), "1".into())],
+        ..Default::default()
+    };
+    let page = fetcher()
+        .fetch_with_options(&CrawlUrl::seed(url(&server, "/h")), opts)
+        .await
+        .unwrap();
+    assert_eq!(page.status, 200);
+}
+
+#[tokio::test]
+async fn per_request_proxy_routes_through_proxy() {
+    // The wiremock server acts as a plain HTTP proxy: the origin host does
+    // not exist, so the only way to get a 200 is through the proxy.
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/via-proxy"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("proxied", "text/html"))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    let opts = scrapix_crawler::FetchOptions {
+        proxy: Some(proxy.uri().replace("127.0.0.1", "localhost")),
+        ..Default::default()
+    };
+    let page = fetcher()
+        .fetch_with_options(&CrawlUrl::seed("http://origin.invalid/via-proxy"), opts)
+        .await
+        .unwrap();
+    assert_eq!(page.status, 200);
+    assert_eq!(page.html, "proxied");
+}
+
+#[tokio::test]
+async fn respect_robots_false_skips_robots_check() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("User-agent: *\nDisallow: /"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/private"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("ok", "text/html"))
+        .mount(&server)
+        .await;
+    let robots = Arc::new(
+        RobotsCache::new(RobotsConfig {
+            respect_robots: true,
+            allow_private_ips: true,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let fetcher = HttpFetcherBuilder::new()
+        .allow_private_ips(true)
+        .max_retries(0)
+        .build(robots)
+        .unwrap();
+    let target = CrawlUrl::seed(url(&server, "/private"));
+
+    let denied = fetcher.fetch(&target).await;
+    assert!(
+        matches!(
+            denied,
+            Err(scrapix_core::ScrapixError::RobotsDisallowed { .. })
+        ),
+        "{denied:?}"
+    );
+
+    let opts = scrapix_crawler::FetchOptions {
+        respect_robots: Some(false),
+        ..Default::default()
+    };
+    let page = fetcher.fetch_with_options(&target, opts).await.unwrap();
+    assert_eq!(page.status, 200);
+}
