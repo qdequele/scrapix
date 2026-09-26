@@ -1139,6 +1139,8 @@ impl CrawlerWorker {
             meilisearch_url: msg.meilisearch_url.clone(),
             meilisearch_api_key: msg.meilisearch_api_key.clone(),
             features: msg.features.clone(),
+            job: msg.job.clone(),
+            url_message_id: msg.message_id.clone(),
         };
 
         self.producer

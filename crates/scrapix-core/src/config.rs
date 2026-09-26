@@ -183,7 +183,7 @@ pub struct UrlPatterns {
 }
 
 /// Sitemap discovery settings
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SitemapConfig {
     /// Whether to discover and use sitemaps
     #[serde(default)]
@@ -277,7 +277,7 @@ impl Default for RateLimitConfig {
 }
 
 /// Proxy configuration
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct ProxyConfig {
     /// List of proxy URLs
     pub urls: Vec<String>,
@@ -618,7 +618,7 @@ fn default_batch_size() -> u32 {
 }
 
 /// Meilisearch index settings
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MeilisearchSettings {
     #[serde(default)]
     pub searchable_attributes: Option<Vec<String>>,

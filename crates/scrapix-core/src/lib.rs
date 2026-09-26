@@ -14,6 +14,7 @@ pub mod billing;
 pub mod config;
 pub mod document;
 pub mod error;
+pub mod job_spec;
 pub mod telemetry;
 pub mod traits;
 
@@ -22,3 +23,4 @@ pub use billing::*;
 pub use config::*;
 pub use document::*;
 pub use error::*;
+pub use job_spec::JobSpec;

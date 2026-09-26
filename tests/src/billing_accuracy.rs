@@ -36,6 +36,8 @@ fn test_content_length_propagates_in_raw_page_message() {
         meilisearch_url: None,
         meilisearch_api_key: None,
         features: None,
+        job: None,
+        url_message_id: "url-msg-1".to_string(),
     };
 
     let json = serde_json::to_string(&msg).unwrap();

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scrapix_core::{CrawlUrl, Document, FeaturesConfig, UrlPatterns};
+use scrapix_core::{CrawlUrl, Document, FeaturesConfig, JobSpec, RawPage, UrlPatterns};
 
 /// Predefined topic names
 pub mod names {
@@ -67,6 +67,10 @@ pub struct UrlMessage {
     /// Defaults to true. Set to false for Replace index strategy (full re-crawl).
     #[serde(default = "default_true")]
     pub incremental: bool,
+    /// Job-scoped crawl settings (rate limits, proxy, meilisearch settings, etc.)
+    /// that workers need but that are not per-URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobSpec>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +94,7 @@ impl UrlMessage {
             max_depth: None,
             max_pages: None,
             incremental: true,
+            job: None,
         }
     }
 
@@ -101,20 +106,8 @@ impl UrlMessage {
         account_id: impl Into<String>,
     ) -> Self {
         Self {
-            url,
-            job_id: job_id.into(),
-            index_uid: index_uid.into(),
-            source: None,
             account_id: Some(account_id.into()),
-            message_id: uuid::Uuid::new_v4().to_string(),
-            created_at: chrono::Utc::now().timestamp_millis(),
-            url_patterns: None,
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            features: None,
-            max_depth: None,
-            max_pages: None,
-            incremental: true,
+            ..Self::new(url, job_id, index_uid)
         }
     }
 
@@ -126,20 +119,8 @@ impl UrlMessage {
         patterns: UrlPatterns,
     ) -> Self {
         Self {
-            url,
-            job_id: job_id.into(),
-            index_uid: index_uid.into(),
-            source: None,
-            account_id: None,
-            message_id: uuid::Uuid::new_v4().to_string(),
-            created_at: chrono::Utc::now().timestamp_millis(),
             url_patterns: Some(patterns),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            features: None,
-            max_depth: None,
-            max_pages: None,
-            incremental: true,
+            ..Self::new(url, job_id, index_uid)
         }
     }
 
@@ -180,6 +161,35 @@ impl UrlMessage {
     pub fn with_incremental(mut self, incremental: bool) -> Self {
         self.incremental = incremental;
         self
+    }
+
+    /// Set the job-scoped crawl settings (builder pattern)
+    pub fn with_job(mut self, job: Option<JobSpec>) -> Self {
+        self.job = job;
+        self
+    }
+
+    /// Derive a new `UrlMessage` for a discovered/child URL, copying every
+    /// job-scoped field from `self` except `url`, `message_id` (fresh uuid)
+    /// and `created_at` (now).
+    pub fn child(&self, url: CrawlUrl) -> Self {
+        Self {
+            url,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+            job_id: self.job_id.clone(),
+            index_uid: self.index_uid.clone(),
+            source: self.source.clone(),
+            account_id: self.account_id.clone(),
+            url_patterns: self.url_patterns.clone(),
+            meilisearch_url: self.meilisearch_url.clone(),
+            meilisearch_api_key: self.meilisearch_api_key.clone(),
+            features: self.features.clone(),
+            max_depth: self.max_depth,
+            max_pages: self.max_pages,
+            incremental: self.incremental,
+            job: self.job.clone(),
+        }
     }
 
     /// Get the partition key (domain for locality)
@@ -241,6 +251,51 @@ pub struct RawPageMessage {
     /// Per-job feature configuration (overrides worker defaults)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<FeaturesConfig>,
+    /// Job-scoped crawl settings (rate limits, proxy, meilisearch settings, etc.)
+    /// that workers need but that are not per-URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobSpec>,
+    /// The `message_id` of the `UrlMessage` this page was fetched for.
+    /// Used by accounting to tie billing events back to the originating
+    /// frontier message.
+    #[serde(default)]
+    pub url_message_id: String,
+}
+
+impl RawPageMessage {
+    /// Build a `RawPageMessage` from the `UrlMessage` it was fetched for and
+    /// the resulting `RawPage`, copying every job-scoped field from `msg`.
+    pub fn from_url_message(
+        msg: &UrlMessage,
+        page: RawPage,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
+        let content_length = page.html.len() as u64;
+        Self {
+            url: page.url,
+            final_url: page.final_url,
+            status: page.status,
+            html: page.html,
+            content_type: page.content_type,
+            content_length,
+            js_rendered: page.js_rendered,
+            fetched_at: page.fetched_at.timestamp_millis(),
+            fetch_duration_ms: page.fetch_duration_ms,
+            job_id: msg.job_id.clone(),
+            index_uid: msg.index_uid.clone(),
+            source: msg.source.clone(),
+            account_id: msg.account_id.clone(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+            etag,
+            last_modified,
+            meilisearch_url: msg.meilisearch_url.clone(),
+            meilisearch_api_key: msg.meilisearch_api_key.clone(),
+            features: msg.features.clone(),
+            job: msg.job.clone(),
+            url_message_id: msg.message_id.clone(),
+        }
+    }
 }
 
 /// Message for processed documents
@@ -764,5 +819,90 @@ mod tests {
             }
             _ => panic!("Expected PageFailed"),
         }
+    }
+
+    #[test]
+    fn child_copies_every_job_scoped_field() {
+        let parent = UrlMessage::new(CrawlUrl::seed("https://a.test/"), "job", "idx")
+            .with_source(Some("src".into()))
+            .account("acct")
+            .with_meilisearch(Some("http://ms".into()), Some("key".into()))
+            .with_features(Some(FeaturesConfig::default()))
+            .with_limits(Some(3), Some(50))
+            .with_incremental(false)
+            .with_job(Some(scrapix_core::JobSpec {
+                user_agents: vec!["UA".into()],
+                ..Default::default()
+            }));
+        let child = parent.child(CrawlUrl::new("https://a.test/x", 1));
+
+        let strip = |m: &UrlMessage| {
+            let mut v = serde_json::to_value(m).unwrap();
+            let o = v.as_object_mut().unwrap();
+            o.remove("url");
+            o.remove("message_id");
+            o.remove("created_at");
+            v
+        };
+        assert_eq!(strip(&parent), strip(&child));
+        assert_ne!(parent.message_id, child.message_id);
+        assert_eq!(child.url.url, "https://a.test/x");
+    }
+
+    #[test]
+    fn old_url_message_without_job_still_deserializes() {
+        let json = r#"{"url":{"url":"https://a.test/","depth":0,"priority":0,"discovered_at":"2024-01-01T00:00:00Z","retry_count":0,"requires_js":false},
+                       "job_id":"j","index_uid":"i","message_id":"m","created_at":0}"#;
+        let m: UrlMessage = serde_json::from_str(json).unwrap();
+        assert!(m.job.is_none());
+        assert!(m.incremental);
+    }
+
+    #[test]
+    fn raw_page_message_from_url_message_copies_job_scoped_fields() {
+        let parent = UrlMessage::new(CrawlUrl::seed("https://a.test/"), "job", "idx")
+            .with_source(Some("src".into()))
+            .account("acct")
+            .with_meilisearch(Some("http://ms".into()), Some("key".into()))
+            .with_features(Some(FeaturesConfig::default()))
+            .with_job(Some(scrapix_core::JobSpec {
+                user_agents: vec!["UA".into()],
+                ..Default::default()
+            }));
+
+        let page = scrapix_core::RawPage {
+            url: "https://a.test/".to_string(),
+            final_url: "https://a.test/".to_string(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            html: "<html></html>".to_string(),
+            content_type: Some("text/html".to_string()),
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 10,
+        };
+
+        let raw = RawPageMessage::from_url_message(
+            &parent,
+            page.clone(),
+            Some("etag-1".to_string()),
+            Some("Wed, 21 Oct 2023 07:28:00 GMT".to_string()),
+        );
+
+        assert_eq!(raw.job_id, parent.job_id);
+        assert_eq!(raw.index_uid, parent.index_uid);
+        assert_eq!(raw.source, parent.source);
+        assert_eq!(raw.account_id, parent.account_id);
+        assert_eq!(raw.meilisearch_url, parent.meilisearch_url);
+        assert_eq!(raw.meilisearch_api_key, parent.meilisearch_api_key);
+        assert_eq!(
+            serde_json::to_value(&raw.features).unwrap(),
+            serde_json::to_value(&parent.features).unwrap()
+        );
+        assert_eq!(raw.job, parent.job);
+        assert_eq!(raw.url_message_id, parent.message_id);
+        assert_eq!(raw.content_length, page.html.len() as u64);
+        assert_eq!(raw.etag, Some("etag-1".to_string()));
+        assert_ne!(raw.message_id, parent.message_id);
     }
 }
