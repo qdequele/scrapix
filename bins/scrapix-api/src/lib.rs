@@ -195,6 +195,10 @@ struct CrawlState {
     /// When the "consumer blocked at the ack cap" warning last fired
     /// (shared, so it fires at most once a minute across `settle_ack` calls).
     ack_cap_warned_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// When each currently Paused job was paused (R-22 self-heal grace).
+    paused_since: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// Last self-heal re-publish of a `JobControl`, per job (rate limit).
+    control_republished: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -312,6 +316,8 @@ impl AppState {
                 terminal_pending: RwLock::new(HashMap::new()),
                 in_flight_acks: std::sync::atomic::AtomicUsize::new(0),
                 ack_cap_warned_at: parking_lot::Mutex::new(None),
+                paused_since: parking_lot::Mutex::new(HashMap::new()),
+                control_republished: parking_lot::Mutex::new(HashMap::new()),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
@@ -366,6 +372,7 @@ impl AppState {
         };
         for id in &evicted {
             self.forget_job_tracking(id);
+            self.crawl.control_republished.lock().remove(id);
         }
         job
     }
@@ -386,6 +393,7 @@ impl AppState {
     /// Drop the per-job tracking state (accounting incl. its seen-sets,
     /// balanced streak, last activity) of a job that is terminal or evicted.
     fn forget_job_tracking(&self, job_id: &str) {
+        self.crawl.paused_since.lock().remove(job_id);
         self.crawl.accounting.write().remove(job_id);
         self.crawl.balanced_since.write().remove(job_id);
         self.crawl.job_last_activity.write().remove(job_id);
@@ -634,6 +642,55 @@ impl AppState {
         self.publish_control(job_id, JobAction::Finish);
     }
 
+    /// Self-heal (R-22): a pipeline event for a job whose API status is
+    /// Cancelled, Completed/Failed, or Paused for longer than
+    /// `PAUSE_HEAL_GRACE` means some service missed (or never got) the
+    /// matching control — a lost fire-and-forget publish, a Pause that
+    /// overtook the seed, a service restarting with a `latest` group.
+    /// Re-publish it, at most once per `CONTROL_REPUBLISH_EVERY` per job.
+    /// Lifecycle events the API produces itself are ignored.
+    fn heal_control(&self, job_id: &str, event: &CrawlEvent, now: std::time::Instant) {
+        if matches!(
+            event,
+            CrawlEvent::JobStarted { .. }
+                | CrawlEvent::JobCompleted { .. }
+                | CrawlEvent::JobFailed { .. }
+        ) {
+            return;
+        }
+        let Some(status) = self.crawl.jobs.read().get(job_id).map(|j| j.status.clone()) else {
+            return;
+        };
+        let action = match status {
+            JobStatus::Cancelled => JobAction::Cancel,
+            JobStatus::Completed | JobStatus::Failed => JobAction::Finish,
+            JobStatus::Paused => {
+                // Unknown pause time (recovered at startup): heal now.
+                let since = self.crawl.paused_since.lock().get(job_id).copied();
+                if since.is_some_and(|t| now.saturating_duration_since(t) < PAUSE_HEAL_GRACE) {
+                    return;
+                }
+                JobAction::Pause
+            }
+            JobStatus::Pending | JobStatus::Running => return,
+        };
+        {
+            let mut last = self.crawl.control_republished.lock();
+            if last
+                .get(job_id)
+                .is_some_and(|t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY)
+            {
+                return;
+            }
+            if last.len() >= MAX_CONTROL_REPUBLISH_ENTRIES {
+                last.retain(|_, t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY);
+            }
+            last.insert(job_id.to_string(), now);
+        }
+        info!(job_id = %job_id, ?action, "Pipeline event for a stopped/paused job: re-publishing its control");
+        self.publish_control(job_id, action);
+    }
+
     /// Publish a `JobControl` to the pipeline (frontier + workers). Spawned
     /// so a slow or blocked publish never delays the caller (a finalize
     /// batch, an HTTP request). Best effort: a lost Cancel/Finish leaves
@@ -687,6 +744,7 @@ impl AppState {
         // finalizes it, and persist it (checked by the next flush before
         // the job's held acks are released).
         self.forget_job_tracking(job_id);
+        self.crawl.paused_since.lock().remove(job_id);
         self.write_terminal(snapshot.clone());
         self.publish_control(job_id, JobAction::Cancel);
         info!(job_id = %job_id, pages_billed = pages, "Job cancelled");
@@ -698,6 +756,10 @@ impl AppState {
     /// finalizes nor stall-fails it while paused.
     fn pause(&self, job_id: &str) -> Result<JobState, ControlError> {
         let snapshot = self.transition_status(job_id, JobStatus::Running, JobStatus::Paused)?;
+        self.crawl
+            .paused_since
+            .lock()
+            .insert(job_id.to_string(), std::time::Instant::now());
         self.crawl.balanced_since.write().remove(job_id);
         self.crawl.dirty_jobs.write().insert(job_id.to_string());
         self.publish_control(job_id, JobAction::Pause);
@@ -709,6 +771,7 @@ impl AppState {
     /// paused is not a stall).
     fn resume(&self, job_id: &str) -> Result<JobState, ControlError> {
         let snapshot = self.transition_status(job_id, JobStatus::Paused, JobStatus::Running)?;
+        self.crawl.paused_since.lock().remove(job_id);
         self.crawl
             .job_last_activity
             .write()
@@ -1100,16 +1163,24 @@ impl AppState {
             TerminalTransition::NotTerminal | TerminalTransition::UnknownJob => None,
         };
 
+        // A pipeline event for a job the API has stopped (or paused a while
+        // ago) means the pipeline missed that control: re-publish it (R-22).
+        self.heal_control(job_id, event, std::time::Instant::now());
+
+        let live = self
+            .crawl
+            .jobs
+            .read()
+            .get(job_id)
+            .is_some_and(|j| !is_terminal(&j.status));
+        // Late events for a job that was already terminal before this event
+        // no longer change its counters: they stay what was billed.
+        let frozen = terminal_snapshot.is_none() && !live;
+
         // Track last activity (stall detection) for live jobs only, so late
         // events for a finished/unknown job do not leak entries.
         {
             let now = std::time::Instant::now();
-            let live = self
-                .crawl
-                .jobs
-                .read()
-                .get(job_id)
-                .is_some_and(|j| !is_terminal(&j.status));
             if live {
                 self.crawl
                     .job_last_activity
@@ -1276,25 +1347,27 @@ impl AppState {
             CrawlEvent::PageCrawled {
                 url, duration_ms, ..
             } => {
-                self.update_job(job_id, |j| {
-                    match accounted {
-                        Some(c) => {
-                            j.pages_crawled = c.pages_crawled_ok;
-                            j.bytes_downloaded = c.bytes_downloaded;
+                if !frozen {
+                    self.update_job(job_id, |j| {
+                        match accounted {
+                            Some(c) => {
+                                j.pages_crawled = c.pages_crawled_ok;
+                                j.bytes_downloaded = c.bytes_downloaded;
+                            }
+                            None => j.pages_crawled += 1,
                         }
-                        None => j.pages_crawled += 1,
-                    }
-                    // Update crawl rate based on elapsed time
-                    if let Some(started) = j.started_at {
-                        let elapsed = chrono::Utc::now()
-                            .signed_duration_since(started)
-                            .num_seconds();
-                        if elapsed > 0 {
-                            j.crawl_rate = j.pages_crawled as f64 / elapsed as f64;
+                        // Update crawl rate based on elapsed time
+                        if let Some(started) = j.started_at {
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(started)
+                                .num_seconds();
+                            if elapsed > 0 {
+                                j.crawl_rate = j.pages_crawled as f64 / elapsed as f64;
+                            }
                         }
-                    }
-                });
-                self.crawl.dirty_jobs.write().insert(job_id.to_string());
+                    });
+                    self.crawl.dirty_jobs.write().insert(job_id.to_string());
+                }
 
                 // Track domain stats
                 if let Some(domain) = extract_domain(url) {
@@ -1312,11 +1385,13 @@ impl AppState {
                 status,
                 ..
             } => {
-                self.update_job(job_id, |j| match accounted {
-                    Some(c) => j.errors = c.pages_failed,
-                    None => j.errors += 1,
-                });
-                self.crawl.dirty_jobs.write().insert(job_id.to_string());
+                if !frozen {
+                    self.update_job(job_id, |j| match accounted {
+                        Some(c) => j.errors = c.pages_failed,
+                        None => j.errors += 1,
+                    });
+                    self.crawl.dirty_jobs.write().insert(job_id.to_string());
+                }
 
                 // Track error
                 let domain = extract_domain(url).unwrap_or_else(|| "unknown".to_string());
@@ -1346,7 +1421,7 @@ impl AppState {
                     counter.failures += 1;
                 }
             }
-            CrawlEvent::DocumentIndexed { .. } => {
+            CrawlEvent::DocumentIndexed { .. } if !frozen => {
                 self.update_job(job_id, |j| {
                     match accounted {
                         Some(c) => j.pages_indexed = c.documents_indexed,
@@ -1409,7 +1484,7 @@ impl AppState {
                 );
             }
             CrawlEvent::JobWarning { message, .. } => {
-                if !message.is_empty() {
+                if !message.is_empty() && !frozen {
                     self.update_job(job_id, |j| {
                         if j.warnings.len() < MAX_JOB_WARNINGS && !j.warnings.contains(message) {
                             j.warnings.push(message.clone());
@@ -1436,7 +1511,7 @@ impl AppState {
                     }
                 }
             }
-            CrawlEvent::UrlsDiscovered { count, .. } => {
+            CrawlEvent::UrlsDiscovered { count, .. } if !frozen => {
                 self.update_job(job_id, |j| {
                     // Track discovered URLs for progress estimation
                     if j.crawl_rate > 0.0 {
@@ -1551,6 +1626,13 @@ impl ElapsedSince for Option<std::time::Instant> {
 
 /// Maximum distinct warnings kept per job.
 const MAX_JOB_WARNINGS: usize = 100;
+/// A paused job's in-flight pages may still report for this long before
+/// its events mean the frontier missed the Pause (R-22).
+const PAUSE_HEAL_GRACE: Duration = Duration::from_secs(5);
+/// At most one self-heal `JobControl` re-publish per job per this window.
+const CONTROL_REPUBLISH_EVERY: Duration = Duration::from_secs(10);
+/// Bound on the per-job re-publish timestamps kept for rate limiting.
+const MAX_CONTROL_REPUBLISH_ENTRIES: usize = 10_000;
 
 fn is_terminal(status: &JobStatus) -> bool {
     matches!(
@@ -7789,6 +7871,103 @@ mod lifecycle_tests {
             ControlError::Conflict(JobStatus::Cancelled)
         );
         assert_eq!(state.pause("nope").unwrap_err(), ControlError::NotFound);
+    }
+
+    /// R-22: a pipeline event for a job the API has stopped means the
+    /// pipeline missed the control: re-publish it (rate-limited per job).
+    #[tokio::test]
+    async fn events_for_a_cancelled_job_republish_cancel_rate_limited() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &crawled("j1", "m1"));
+        state.cancel("j1").unwrap();
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Cancel
+        );
+
+        // The pipeline keeps crawling: re-publish Cancel, once per window.
+        state.process_event("j1", &crawled("j1", "m2"));
+        let ctl = next_control(&control).await.expect("Cancel re-published");
+        assert_eq!((ctl.job_id.as_str(), ctl.action), ("j1", JobAction::Cancel));
+        state.process_event("j1", &crawled("j1", "m3"));
+        assert!(next_control(&control).await.is_none(), "rate-limited");
+        let later = Instant::now() + Duration::from_secs(11);
+        state.heal_control("j1", &crawled("j1", "m4"), later);
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Cancel
+        );
+
+        // Late pages are neither counted nor billed.
+        let job = state.get_job("j1").unwrap();
+        assert_eq!(job.pages_crawled, 1, "counters frozen at cancel");
+        assert_eq!(bills(&state), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn events_for_a_finished_job_republish_finish() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Finish
+        );
+        state.process_event("j1", &crawled("j1", "m9"));
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Finish
+        );
+        assert_eq!(state.get_job("j1").unwrap().pages_crawled, 1);
+    }
+
+    /// A paused job's in-flight pages report for a while: only events
+    /// after a 5 s grace re-publish Pause.
+    #[tokio::test]
+    async fn events_for_a_paused_job_republish_pause_after_grace() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        state.pause("j1").unwrap();
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Pause
+        );
+        state.process_event("j1", &crawled("j1", "m1"));
+        assert!(next_control(&control).await.is_none(), "within the grace");
+        let later = Instant::now() + Duration::from_secs(6);
+        state.heal_control("j1", &crawled("j1", "m2"), later);
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Pause
+        );
+        // A running job never triggers anything.
+        state.resume("j1").unwrap();
+        assert_eq!(
+            next_control(&control).await.unwrap().action,
+            JobAction::Resume
+        );
+        state.heal_control("j1", &crawled("j1", "m3"), later + Duration::from_secs(60));
+        assert!(next_control(&control).await.is_none());
     }
 
     #[test]

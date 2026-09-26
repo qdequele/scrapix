@@ -28,7 +28,8 @@
 //!    state kept as a tombstone for `JOB_RETENTION_HOURS`, so late URLs are
 //!    refused instead of resurrecting it); Pause/Resume flip
 //!    `Running` ↔ `Paused` (a paused job keeps admitting, it only stops
-//!    dispatching).
+//!    dispatching). A Pause that arrives before the job's first URL is
+//!    remembered (bounded, 10 min) and the job starts `Paused`.
 //!
 //! Politeness state is in Redis when `REDIS_URL` is set (shared by every
 //! instance; one consumer group for feedback), otherwise in memory (one
@@ -92,6 +93,11 @@ const BUSY_RETRY: Duration = Duration::from_millis(200);
 const ERROR_RETRY: Duration = Duration::from_secs(1);
 /// Upper bound on a `Retry-After` pause (same cap as the crawler's re-queue delay).
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// How long a Pause for a job this frontier does not know yet is kept,
+/// waiting for the job's first URL (R-22).
+const EARLY_CONTROL_TTL: Duration = Duration::from_secs(600);
+/// Bound on remembered early controls.
+const EARLY_CONTROL_CAP: usize = 10_000;
 /// Capped backoff for a job control message the store failed to apply.
 const CONTROL_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -418,6 +424,9 @@ struct FrontierService {
     pop_sizes: Mutex<HashMap<String, usize>>,
     /// Popped URLs whose `requeue` failed, retried first on the next tick.
     unrequeued: Mutex<HashMap<String, Vec<CrawlUrl>>>,
+    /// Pauses received before the job's first URL (the control overtook
+    /// the seed): `init_job` starts such a job `Paused` (R-22).
+    early_controls: Mutex<HashMap<String, (JobAction, std::time::Instant)>>,
     politeness: Arc<dyn PolitenessStore>,
     link_graph: Option<Arc<LinkGraph>>,
     recrawl_scheduler: Option<Arc<RecrawlScheduler>>,
@@ -680,6 +689,7 @@ impl FrontierService {
             held_leases: Mutex::new(HashSet::new()),
             pop_sizes: Mutex::new(HashMap::new()),
             unrequeued: Mutex::new(HashMap::new()),
+            early_controls: Mutex::new(HashMap::new()),
             politeness,
             link_graph: extras.link_graph,
             recrawl_scheduler: extras.recrawl_scheduler,
@@ -962,6 +972,11 @@ impl FrontierService {
             .ensure_job(job_id, &template, msg.max_pages, msg.max_depth)
             .await?;
         if fresh {
+            if self.pending_intent(job_id) == Some(JobAction::Pause) {
+                self.store.set_state(job_id, JobRunState::Paused).await?;
+                info!(job_id = %job_id, "New frontier job starts paused (Pause arrived first)");
+                return Ok(());
+            }
             self.store.set_state(job_id, JobRunState::Running).await?;
             info!(
                 job_id = %job_id,
@@ -972,6 +987,37 @@ impl FrontierService {
             );
         }
         Ok(())
+    }
+
+    /// The early control recorded for `job_id`, if not expired.
+    fn pending_intent(&self, job_id: &str) -> Option<JobAction> {
+        let mut early = self.early_controls.lock();
+        match early.get(job_id) {
+            Some((action, at)) if at.elapsed() < EARLY_CONTROL_TTL => Some(*action),
+            Some(_) => {
+                early.remove(job_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn record_intent(&self, job_id: &str, action: JobAction) {
+        let mut early = self.early_controls.lock();
+        if early.len() >= EARLY_CONTROL_CAP {
+            early.retain(|_, (_, at)| at.elapsed() < EARLY_CONTROL_TTL);
+            if early.len() >= EARLY_CONTROL_CAP {
+                // Still full of live entries: drop the oldest.
+                if let Some(oldest) = early
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(id, _)| id.clone())
+                {
+                    early.remove(&oldest);
+                }
+            }
+        }
+        early.insert(job_id.to_string(), (action, std::time::Instant::now()));
     }
 
     /// The parsed template of `job_id`, from the cache or the store. `None`
@@ -1434,8 +1480,10 @@ impl FrontierService {
     ///   first URL) gets a tombstone entry first, so that URL is refused
     ///   too. A job already stopped keeps its state (a Finish never turns a
     ///   cancelled job into a finished one).
-    /// - Pause: `Running` → `Paused`. Resume: `Paused` → `Running`. Anything
-    ///   else (unknown, stopped) is left alone, so a late Resume never
+    /// - Pause: `Running` → `Paused`; for a job not known yet, remembered
+    ///   (bounded, `EARLY_CONTROL_TTL`) so `init_job` starts it `Paused`.
+    ///   Resume: `Paused` → `Running` (and forgets such an early Pause).
+    ///   Anything else (stopped) is left alone, so a late Resume never
     ///   revives a cancelled or finished job.
     async fn apply_control(&self, control: &JobControl) -> scrapix_core::Result<()> {
         let job_id = control.job_id.as_str();
@@ -1459,17 +1507,24 @@ impl FrontierService {
                     }
                 }
                 self.store.release(job_id, self.job_retention).await?;
+                self.early_controls.lock().remove(job_id);
                 self.templates.remove(job_id);
                 self.pop_sizes.lock().remove(job_id);
                 info!(job_id = %job_id, action = ?control.action, "Frontier job stopped and released");
             }
-            JobAction::Pause => {
-                if current == Some(JobRunState::Running) {
+            JobAction::Pause => match current {
+                Some(JobRunState::Running) => {
                     self.store.set_state(job_id, JobRunState::Paused).await?;
                     info!(job_id = %job_id, "Frontier job paused");
                 }
-            }
+                None => {
+                    info!(job_id = %job_id, "Pause for a job not started yet: it will start paused");
+                    self.record_intent(job_id, JobAction::Pause);
+                }
+                Some(_) => {}
+            },
             JobAction::Resume => {
+                self.early_controls.lock().remove(job_id);
                 if current == Some(JobRunState::Paused) {
                     self.store.set_state(job_id, JobRunState::Running).await?;
                     info!(job_id = %job_id, "Frontier job resumed");
@@ -2838,5 +2893,47 @@ mod tests {
         let resumed = h.collect_dispatched(Duration::from_millis(800)).await;
         h.stop();
         assert_eq!(resumed.len(), 3, "dispatch restarts after Resume");
+    }
+
+    /// R-22: a Pause that overtakes the job's seed (different topic) is
+    /// remembered and applied when the job starts: nothing dispatches until
+    /// Resume.
+    #[tokio::test]
+    async fn pause_before_the_seed_is_applied_when_the_job_starts() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let h = Harness::start_with(args, store.clone()).await;
+        h.control("job-early", JobAction::Pause).await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while h.service.pending_intent("job-early").is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            h.service.pending_intent("job-early"),
+            Some(JobAction::Pause)
+        );
+
+        let seed = seed_message("job-early", None);
+        h.publish(&seed).await;
+        for i in 0..2 {
+            h.publish(&seed.child(CrawlUrl::new(format!("https://d{i}.test/"), 1)))
+                .await;
+        }
+        assert!(h
+            .collect_dispatched(Duration::from_millis(600))
+            .await
+            .is_empty());
+        assert_eq!(
+            store.state("job-early").await.unwrap(),
+            Some(JobRunState::Paused)
+        );
+        assert_eq!(store.queued("job-early").await.unwrap(), 3);
+
+        h.control("job-early", JobAction::Resume).await;
+        h.wait_state("job-early", JobRunState::Running).await;
+        let resumed = h.collect_dispatched(Duration::from_millis(800)).await;
+        h.stop();
+        assert_eq!(resumed.len(), 3);
     }
 }
