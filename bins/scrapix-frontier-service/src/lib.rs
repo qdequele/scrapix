@@ -50,9 +50,14 @@ use scrapix_queue::{
 
 /// How many input messages are admitted concurrently.
 const ADMIT_CONCURRENCY: usize = 64;
-/// How many times a failing `admit` is retried before the message is left
-/// un-acked (and so redelivered after a restart/rebalance).
-const ADMIT_ATTEMPTS: u32 = 3;
+/// Capped exponential backoff for a failing `admit` (retried until it
+/// succeeds or the service shuts down).
+const ADMIT_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const ADMIT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Initial per-job pop size (see [`FrontierService::pop_sizes`]).
+const INITIAL_POP_SIZE: usize = 64;
+/// Renew the dispatch lease at least this often while sending a batch.
+const LEASE_RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Per-job dispatch lease TTL; renewed on every dispatcher tick.
 const LEASE_TTL: Duration = Duration::from_secs(5);
 /// How often `FrontierProgress` is published (for jobs whose counters changed).
@@ -295,6 +300,10 @@ struct FrontierService {
     initialized: BoundedCache<()>,
     /// Jobs whose dispatch lease this instance held on the last tick.
     held_leases: Mutex<HashSet<String>>,
+    /// Per-job adaptive pop size (see `dispatch_job`).
+    pop_sizes: Mutex<HashMap<String, usize>>,
+    /// Popped URLs whose `requeue` failed, retried first on the next tick.
+    unrequeued: Mutex<HashMap<String, Vec<CrawlUrl>>>,
     politeness: Arc<PolitenessScheduler>,
     link_graph: Option<Arc<LinkGraph>>,
     recrawl_scheduler: Option<Arc<RecrawlScheduler>>,
@@ -492,6 +501,8 @@ impl FrontierService {
             templates: BoundedCache::new(JOB_CACHE_CAP),
             initialized: BoundedCache::new(JOB_CACHE_CAP),
             held_leases: Mutex::new(HashSet::new()),
+            pop_sizes: Mutex::new(HashMap::new()),
+            unrequeued: Mutex::new(HashMap::new()),
             politeness: Arc::new(politeness),
             link_graph: extras.link_graph,
             recrawl_scheduler: extras.recrawl_scheduler,
@@ -623,7 +634,10 @@ impl FrontierService {
             return;
         };
 
-        for attempt in 1..=ADMIT_ATTEMPTS {
+        let mut backoff = ADMIT_BACKOFF_MIN;
+        let mut attempt: u64 = 0;
+        loop {
+            attempt += 1;
             match self.admit(&msg, &url).await {
                 Ok(admission) => {
                     if admission == Admission::Admitted {
@@ -647,24 +661,45 @@ impl FrontierService {
                         url = %url.url,
                         job_id = %msg.job_id,
                         attempt,
+                        retry_in_ms = backoff.as_millis() as u64,
                         error = %e,
-                        "Frontier store admit failed"
+                        "Frontier store admit failed; retrying"
                     );
                     // Re-run job initialization on the next attempt: the
                     // error may be a job the store no longer knows about.
                     self.initialized.remove(&msg.job_id);
-                    if attempt < ADMIT_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
-                    }
                 }
             }
+            // Keep holding the handler permit while the store is down: that
+            // is the backpressure. Only shutdown stops retrying (the message
+            // then stays un-acked and is redelivered).
+            if self.sleep_unless_shutdown(backoff).await {
+                warn!(
+                    url = %url.url,
+                    job_id = %msg.job_id,
+                    attempt,
+                    "Shutting down with admit still failing; leaving the message un-acked"
+                );
+                drop(ack);
+                return;
+            }
+            backoff = (backoff * 2).min(ADMIT_BACKOFF_MAX);
         }
-        error!(
-            url = %url.url,
-            job_id = %msg.job_id,
-            "Giving up on admit; leaving the message un-acked for redelivery"
-        );
-        drop(ack);
+    }
+
+    /// Sleep for `d`, waking early on shutdown. Returns true if shutting down.
+    async fn sleep_unless_shutdown(&self, d: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + d;
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
+        }
     }
 
     /// Apply the recrawl scheduler and link-graph boosts to an incoming URL.
@@ -802,24 +837,22 @@ impl FrontierService {
             .active_jobs
             .store(jobs.len() as u64, Ordering::Relaxed);
 
+        // URLs a previous tick popped but could not put back come first.
+        self.flush_unrequeued().await;
+
+        {
+            let active: HashSet<&String> = jobs.iter().collect();
+            self.pop_sizes.lock().retain(|job, _| active.contains(job));
+        }
+
         let mut held = HashSet::new();
         for job_id in jobs {
-            match self
-                .store
-                .try_lease(&job_id, &self.instance_id, LEASE_TTL)
-                .await
-            {
+            match self.dispatch_job(&job_id).await {
                 Ok(true) => {
-                    held.insert(job_id.clone());
+                    held.insert(job_id);
                 }
-                Ok(false) => continue,
-                Err(e) => {
-                    warn!(job_id = %job_id, error = %e, "Failed to acquire dispatch lease");
-                    continue;
-                }
-            }
-            if let Err(e) = self.dispatch_job(&job_id).await {
-                warn!(job_id = %job_id, error = %e, "Dispatch failed");
+                Ok(false) => {}
+                Err(e) => warn!(job_id = %job_id, error = %e, "Dispatch failed"),
             }
         }
         *self.held_leases.lock() = held;
@@ -831,26 +864,66 @@ impl FrontierService {
     }
 
     /// Pop a batch of ready URLs for `job_id` and dispatch those politeness
-    /// allows; the rest go back to the store via `requeue` (counters
-    /// untouched, so they are never counted twice against `max_pages`).
-    async fn dispatch_job(&self, job_id: &str) -> scrapix_core::Result<()> {
-        if self.store.state(job_id).await? != Some(JobRunState::Running) {
-            return Ok(());
+    /// allows; the rest go back to the store via `requeue` (which undoes the
+    /// pop in the counters, so nothing is counted twice). Returns whether
+    /// this instance holds the job's dispatch lease.
+    ///
+    /// The pop size adapts per job (`2 × dispatched last time + 1`, capped
+    /// at `dispatch_batch_size`), so a job throttled by politeness pops only
+    /// a little more than it can send instead of churning a full batch
+    /// through `requeue` on every tick.
+    async fn dispatch_job(&self, job_id: &str) -> scrapix_core::Result<bool> {
+        if self.unrequeued.lock().contains_key(job_id) {
+            // Popped URLs still waiting to go back: don't pop more on top.
+            return Ok(false);
         }
-        let Some(template) = self.template(job_id).await else {
-            return Ok(());
+        let template = if self.store.state(job_id).await? == Some(JobRunState::Running) {
+            self.template(job_id).await
+        } else {
+            None
         };
-        let now = now_ms();
-        let urls = self
+        // Renew the lease right before popping; only the holder pops.
+        if !self
             .store
-            .pop_ready(job_id, self.dispatch_batch_size, now)
-            .await?;
+            .try_lease(job_id, &self.instance_id, LEASE_TTL)
+            .await?
+        {
+            return Ok(false);
+        }
+        let Some(template) = template else {
+            return Ok(true);
+        };
+
+        let pop_size = self.pop_size(job_id);
+        let now = now_ms();
+        let urls = self.store.pop_ready(job_id, pop_size, now).await?;
         if urls.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let mut bounced = Vec::new();
-        for mut url in urls {
+        let mut dispatched = 0usize;
+        let mut lease_held = true;
+        let mut last_renew = std::time::Instant::now();
+        let mut urls = urls.into_iter();
+        while let Some(mut url) = urls.next() {
+            if last_renew.elapsed() >= LEASE_RENEW_EVERY {
+                match self
+                    .store
+                    .try_lease(job_id, &self.instance_id, LEASE_TTL)
+                    .await
+                {
+                    Ok(true) => last_renew = std::time::Instant::now(),
+                    held => {
+                        warn!(job_id = %job_id, result = ?held.map(|_| ()), "Lost dispatch lease mid-batch; requeuing the rest");
+                        bounced.push(url);
+                        bounced.extend(urls.by_ref());
+                        lease_held = false;
+                        break;
+                    }
+                }
+            }
+
             let domain = extract_domain(&url.url);
             if !self.politeness.can_fetch(&domain) {
                 self.metrics.urls_delayed.fetch_add(1, Ordering::Relaxed);
@@ -874,6 +947,7 @@ impl FrontierService {
                 .await
             {
                 Ok(_) => {
+                    dispatched += 1;
                     self.metrics.urls_dispatched.fetch_add(1, Ordering::Relaxed);
                     debug!(url = %msg.url.url, job_id = %job_id, "Dispatched URL for crawling");
                     // R-3: the politeness slot is released at dispatch
@@ -882,7 +956,9 @@ impl FrontierService {
                 }
                 Err(e) => {
                     error!(url = %msg.url.url, job_id = %job_id, error = %e, "Failed to dispatch URL");
-                    self.politeness.failed_request(&domain, false);
+                    // A bus outage is not the domain's fault: free the slot
+                    // without error accounting (no backoff, no pause).
+                    self.politeness.release_slot(&domain);
                     let mut url = msg.url;
                     url.not_before_ms = Some(now + 1_000);
                     bounced.push(url);
@@ -890,10 +966,48 @@ impl FrontierService {
             }
         }
 
-        if !bounced.is_empty() {
-            self.store.requeue(job_id, bounced).await?;
+        let next = (2 * dispatched + 1).clamp(1, self.dispatch_batch_size.max(1));
+        self.pop_sizes.lock().insert(job_id.to_string(), next);
+
+        self.requeue_or_stash(job_id, bounced).await;
+        Ok(lease_held)
+    }
+
+    fn pop_size(&self, job_id: &str) -> usize {
+        self.pop_sizes
+            .lock()
+            .get(job_id)
+            .copied()
+            .unwrap_or_else(|| self.dispatch_batch_size.clamp(1, INITIAL_POP_SIZE))
+    }
+
+    /// Put popped URLs back. They were already popped, so they must never
+    /// be dropped: if the store refuses them, keep them in memory and retry
+    /// on the next tick (before that job pops anything else).
+    async fn requeue_or_stash(&self, job_id: &str, urls: Vec<CrawlUrl>) {
+        if urls.is_empty() {
+            return;
         }
-        Ok(())
+        if let Err(e) = self.store.requeue(job_id, urls.clone()).await {
+            warn!(
+                job_id = %job_id,
+                count = urls.len(),
+                error = %e,
+                "Failed to requeue popped URLs; keeping them for the next tick"
+            );
+            self.unrequeued
+                .lock()
+                .entry(job_id.to_string())
+                .or_default()
+                .extend(urls);
+        }
+    }
+
+    async fn flush_unrequeued(&self) {
+        let pending = std::mem::take(&mut *self.unrequeued.lock());
+        for (job_id, urls) in pending {
+            self.requeue_or_stash(&job_id, urls).await;
+        }
     }
 
     fn start_progress_publisher(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -1187,6 +1301,132 @@ mod tests {
             .with_limits(None, max_pages)
     }
 
+    async fn spawn_service(
+        bus: &ChannelBus,
+        args: &Args,
+        store: Arc<dyn FrontierStore>,
+    ) -> Arc<FrontierService> {
+        let producer = Arc::new(AnyProducer::channel(bus.producer()));
+        let consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
+        consumer.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
+        Arc::new(
+            FrontierService::with_bus(args, producer, consumer, None, None, store)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Wraps a `MemoryFrontierStore`, counting calls and failing `admit` /
+    /// `requeue` a configurable number of times.
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: MemoryFrontierStore,
+        admit_failures: AtomicU64,
+        requeue_failures: AtomicU64,
+        admit_calls: AtomicU64,
+        requeued_urls: AtomicU64,
+    }
+
+    fn flaky(msg: &str) -> scrapix_core::ScrapixError {
+        scrapix_core::ScrapixError::Storage(msg.to_string())
+    }
+
+    /// Decrement `n` if positive; true if a failure should be injected.
+    fn take_failure(n: &AtomicU64) -> bool {
+        n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .is_ok()
+    }
+
+    #[async_trait::async_trait]
+    impl FrontierStore for FlakyStore {
+        async fn ensure_job(
+            &self,
+            job_id: &str,
+            template_json: &str,
+            max_pages: Option<u64>,
+            max_depth: Option<u32>,
+        ) -> scrapix_core::Result<()> {
+            self.inner
+                .ensure_job(job_id, template_json, max_pages, max_depth)
+                .await
+        }
+        async fn job_template(&self, job_id: &str) -> scrapix_core::Result<Option<String>> {
+            self.inner.job_template(job_id).await
+        }
+        async fn admit(
+            &self,
+            job_id: &str,
+            url: &CrawlUrl,
+            queue_cap: usize,
+        ) -> scrapix_core::Result<Admission> {
+            self.admit_calls.fetch_add(1, Ordering::SeqCst);
+            if take_failure(&self.admit_failures) {
+                return Err(flaky("admit down"));
+            }
+            self.inner.admit(job_id, url, queue_cap).await
+        }
+        async fn pop_ready(
+            &self,
+            job_id: &str,
+            n: usize,
+            now_ms: i64,
+        ) -> scrapix_core::Result<Vec<CrawlUrl>> {
+            self.inner.pop_ready(job_id, n, now_ms).await
+        }
+        async fn requeue(&self, job_id: &str, urls: Vec<CrawlUrl>) -> scrapix_core::Result<()> {
+            if take_failure(&self.requeue_failures) {
+                return Err(flaky("requeue down"));
+            }
+            self.requeued_urls
+                .fetch_add(urls.len() as u64, Ordering::SeqCst);
+            self.inner.requeue(job_id, urls).await
+        }
+        async fn queued(&self, job_id: &str) -> scrapix_core::Result<u64> {
+            self.inner.queued(job_id).await
+        }
+        async fn counters(&self, job_id: &str) -> scrapix_core::Result<JobCounters> {
+            self.inner.counters(job_id).await
+        }
+        async fn set_state(&self, job_id: &str, state: JobRunState) -> scrapix_core::Result<()> {
+            self.inner.set_state(job_id, state).await
+        }
+        async fn state(&self, job_id: &str) -> scrapix_core::Result<Option<JobRunState>> {
+            self.inner.state(job_id).await
+        }
+        async fn active_jobs(&self) -> scrapix_core::Result<Vec<String>> {
+            self.inner.active_jobs().await
+        }
+        async fn release(&self, job_id: &str, retention: Duration) -> scrapix_core::Result<()> {
+            self.inner.release(job_id, retention).await
+        }
+        async fn try_lease(
+            &self,
+            job_id: &str,
+            owner: &str,
+            ttl: Duration,
+        ) -> scrapix_core::Result<bool> {
+            self.inner.try_lease(job_id, owner, ttl).await
+        }
+    }
+
+    /// Create a running job with `n` queued URLs on one domain.
+    async fn seed_store(store: &dyn FrontierStore, job_id: &str, n: usize) -> UrlMessage {
+        let seed = seed_message(job_id, None);
+        store
+            .ensure_job(job_id, &serde_json::to_string(&seed).unwrap(), None, None)
+            .await
+            .unwrap();
+        store.set_state(job_id, JobRunState::Running).await.unwrap();
+        for i in 0..n {
+            let url = CrawlUrl::new(format!("https://one.test/{i}"), 1);
+            assert_eq!(
+                store.admit(job_id, &url, 1_000_000).await.unwrap(),
+                Admission::Admitted
+            );
+        }
+        seed
+    }
+
     struct Harness {
         bus: ChannelBus,
         service: Arc<FrontierService>,
@@ -1195,16 +1435,13 @@ mod tests {
 
     impl Harness {
         async fn start() -> Self {
-            let bus = ChannelBus::new();
-            let producer = Arc::new(AnyProducer::channel(bus.producer()));
-            let consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
-            consumer.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
             let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
-            let service = Arc::new(
-                FrontierService::with_bus(&test_args(), producer, consumer, None, None, store)
-                    .await
-                    .unwrap(),
-            );
+            Self::start_with(test_args(), store).await
+        }
+
+        async fn start_with(args: Args, store: Arc<dyn FrontierStore>) -> Self {
+            let bus = ChannelBus::new();
+            let service = spawn_service(&bus, &args, store).await;
             let handle = tokio::spawn(service.clone().run());
             Self {
                 bus,
@@ -1354,5 +1591,205 @@ mod tests {
         }
         h.stop();
         assert_eq!(last, Some((4, 3, 3, 1, 0, 0)));
+    }
+
+    #[tokio::test]
+    async fn admit_errors_are_retried_and_acked_once_after_success() {
+        let store = Arc::new(FlakyStore::default());
+        store.admit_failures.store(3, Ordering::SeqCst);
+        let bus = ChannelBus::new();
+        let service = spawn_service(&bus, &test_args(), store.clone()).await;
+
+        let acks = Arc::new(AtomicU64::new(0));
+        let calls_at_ack = Arc::new(AtomicU64::new(0));
+        let ack = {
+            let (acks, calls_at_ack, store) = (acks.clone(), calls_at_ack.clone(), store.clone());
+            Ack::from_fn(move || {
+                acks.fetch_add(1, Ordering::SeqCst);
+                calls_at_ack.store(store.admit_calls.load(Ordering::SeqCst), Ordering::SeqCst);
+            })
+        };
+        service
+            .handle_input(seed_message("job-flaky", None), ack)
+            .await;
+
+        assert_eq!(acks.load(Ordering::SeqCst), 1, "acked exactly once");
+        assert_eq!(
+            calls_at_ack.load(Ordering::SeqCst),
+            4,
+            "acked only after the 4th (first successful) admit"
+        );
+        assert_eq!(store.counters("job-flaky").await.unwrap().admitted, 1);
+    }
+
+    #[tokio::test]
+    async fn admit_failing_until_shutdown_is_never_acked() {
+        let store = Arc::new(FlakyStore::default());
+        store.admit_failures.store(u64::MAX, Ordering::SeqCst);
+        let bus = ChannelBus::new();
+        let service = spawn_service(&bus, &test_args(), store.clone()).await;
+
+        let acks = Arc::new(AtomicU64::new(0));
+        let ack = {
+            let acks = acks.clone();
+            Ack::from_fn(move || {
+                acks.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let task = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .handle_input(seed_message("job-down", None), ack)
+                    .await
+            }
+        });
+        // Well past the old 3-attempt give-up point.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert!(
+            !task.is_finished(),
+            "keeps retrying while the store is down"
+        );
+        assert!(store.admit_calls.load(Ordering::SeqCst) >= 4);
+        service.shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("stops on shutdown")
+            .unwrap();
+        assert_eq!(acks.load(Ordering::SeqCst), 0, "never acked");
+    }
+
+    #[tokio::test]
+    async fn politeness_throttled_job_does_not_churn_requeues() {
+        let store = Arc::new(FlakyStore::default());
+        seed_store(&*store, "job-churn", 500).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 50;
+        let h = Harness::start_with(args, store.clone()).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let dispatched = h.service.metrics.urls_dispatched.load(Ordering::Relaxed);
+        h.stop();
+
+        let requeued = store.requeued_urls.load(Ordering::SeqCst);
+        assert!(
+            dispatched >= 5,
+            "a 50ms domain should get ~20 dispatches/s, got {dispatched}"
+        );
+        assert!(
+            requeued <= 10 * dispatched + 64,
+            "requeued {requeued} URLs for {dispatched} dispatched"
+        );
+        assert_eq!(
+            store.counters("job-churn").await.unwrap().dispatched,
+            dispatched,
+            "store `dispatched` equals URLs actually sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounced_urls_are_eventually_dispatched_once() {
+        let store = Arc::new(FlakyStore::default());
+        seed_store(&*store, "job-bounce", 5).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 50;
+        let h = Harness::start_with(args, store.clone()).await;
+        let dispatched = h.collect_dispatched(Duration::from_millis(1_500)).await;
+        h.stop();
+
+        let urls: std::collections::HashSet<_> =
+            dispatched.iter().map(|m| m.url.url.clone()).collect();
+        assert_eq!(dispatched.len(), 5, "each URL dispatched exactly once");
+        assert_eq!(urls.len(), 5);
+        assert!(
+            store.requeued_urls.load(Ordering::SeqCst) > 0,
+            "politeness must have bounced some URLs"
+        );
+        let c = store.counters("job-bounce").await.unwrap();
+        assert_eq!((c.admitted, c.dispatched), (5, 5));
+    }
+
+    #[tokio::test]
+    async fn failed_requeue_keeps_popped_urls_and_retries() {
+        let store = Arc::new(FlakyStore::default());
+        store.requeue_failures.store(2, Ordering::SeqCst);
+        seed_store(&*store, "job-requeue", 5).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 50;
+        let h = Harness::start_with(args, store.clone()).await;
+        let dispatched = h.collect_dispatched(Duration::from_millis(1_500)).await;
+        h.stop();
+
+        assert_eq!(
+            store.requeue_failures.load(Ordering::SeqCst),
+            0,
+            "failures injected"
+        );
+        let urls: std::collections::HashSet<_> =
+            dispatched.iter().map(|m| m.url.url.clone()).collect();
+        assert_eq!(dispatched.len(), 5, "no popped URL is lost");
+        assert_eq!(urls.len(), 5);
+        assert_eq!(store.queued("job-requeue").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_lease_holder_dispatches_a_job() {
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        let bus = ChannelBus::new();
+        let mut args_a = test_args();
+        args_a.instance_id = Some("frontier-a".to_string());
+        let mut args_b = test_args();
+        args_b.instance_id = Some("frontier-b".to_string());
+        let a = spawn_service(&bus, &args_a, store.clone()).await;
+        let b = spawn_service(&bus, &args_b, store.clone()).await;
+        let ha = tokio::spawn(a.clone().run());
+        let hb = tokio::spawn(b.clone().run());
+
+        let processing = AnyConsumer::channel(bus.consumer());
+        processing
+            .subscribe(&[topic_names::URL_PROCESSING])
+            .unwrap();
+        let producer = AnyProducer::channel(bus.producer());
+        let seed = seed_message("job-lease", None);
+        producer
+            .send(topic_names::URL_FRONTIER, None, &seed)
+            .await
+            .unwrap();
+        for i in 0..9 {
+            // Different domains so politeness doesn't slow the test down.
+            let child = seed.child(CrawlUrl::new(format!("https://d{i}.test/"), 1));
+            producer
+                .send(topic_names::URL_FRONTIER, None, &child)
+                .await
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+        let mut got = Vec::new();
+        while Instant::now() < deadline {
+            if let Some(m) = processing
+                .poll_one::<UrlMessage>(Duration::from_millis(50))
+                .await
+                .unwrap()
+            {
+                got.push(m.url.url);
+            }
+        }
+        for s in [&a, &b] {
+            s.shutdown.store(true, Ordering::Relaxed);
+        }
+        ha.abort();
+        hb.abort();
+
+        let unique: std::collections::HashSet<_> = got.iter().cloned().collect();
+        assert_eq!(got.len(), 10, "each URL dispatched once: {got:?}");
+        assert_eq!(unique.len(), 10);
+        let (da, db) = (
+            a.metrics.urls_dispatched.load(Ordering::Relaxed),
+            b.metrics.urls_dispatched.load(Ordering::Relaxed),
+        );
+        assert!(
+            (da, db) == (10, 0) || (da, db) == (0, 10),
+            "one instance dispatched everything: a={da} b={db}"
+        );
     }
 }

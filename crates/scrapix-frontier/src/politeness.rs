@@ -179,6 +179,15 @@ impl PolitenessScheduler {
         }
     }
 
+    /// Release an in-flight slot without any success/error accounting: no
+    /// delay change, no error streak, no pause. For requests that never
+    /// reached the domain (e.g. the message bus refused the dispatch).
+    pub fn release_slot(&self, domain: &str) {
+        if let Some(state) = self.domains.write().get_mut(domain) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+
     /// Record that a request failed
     pub fn failed_request(&self, domain: &str, is_rate_limited: bool) {
         let mut domains = self.domains.write();
@@ -305,6 +314,38 @@ pub struct DomainStats {
 mod tests {
     use super::*;
     use std::thread::sleep;
+
+    #[test]
+    fn release_slot_frees_in_flight_without_error_accounting() {
+        let config = PolitenessConfig {
+            default_delay_ms: 0,
+            concurrent_per_domain: 1,
+            ..Default::default()
+        };
+        let scheduler = PolitenessScheduler::new(config);
+        let before = scheduler.domain_stats("example.com");
+        assert!(before.is_none());
+
+        // Many more releases than `failed_request` would tolerate before
+        // pausing the domain.
+        for _ in 0..25 {
+            scheduler.start_request("example.com");
+            assert!(!scheduler.can_fetch("example.com"), "slot is taken");
+            scheduler.release_slot("example.com");
+        }
+        let stats = scheduler.domain_stats("example.com").unwrap();
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.consecutive_errors, 0);
+        assert!(!stats.paused);
+        assert_eq!(stats.delay_ms, 0);
+        assert!(scheduler.can_fetch("example.com"));
+
+        // Saturates at zero and ignores unknown domains.
+        scheduler.release_slot("example.com");
+        scheduler.release_slot("unknown.test");
+        assert_eq!(scheduler.domain_stats("example.com").unwrap().in_flight, 0);
+        assert!(scheduler.domain_stats("unknown.test").is_none());
+    }
 
     #[test]
     fn test_first_request_allowed() {

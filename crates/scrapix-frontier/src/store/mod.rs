@@ -90,6 +90,17 @@
 //! `not_before_ms`), promoting due members from `later` into `q` the same
 //! way before popping.
 //!
+//! ## Known caveat: no claim/ack step between pop and send
+//!
+//! `pop_ready` removes URLs from the store immediately. The caller then
+//! either sends each URL downstream or puts it back with `requeue`. If the
+//! caller crashes between `pop_ready` and that send/`requeue`, the URLs of
+//! that in-flight batch are lost: they are marked seen, already counted in
+//! `admitted`/`dispatched`, and no longer pending. There is no
+//! claim-with-visibility-timeout step that would let another instance
+//! recover them. Callers keep the window small by popping adaptively sized
+//! batches.
+//!
 //! ## Behavior for an unknown or released job
 //!
 //! Every implementation must agree on this, since it's the contract a
