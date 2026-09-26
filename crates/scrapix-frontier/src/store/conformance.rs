@@ -9,10 +9,11 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scrapix_core::CrawlUrl;
 
-use super::{Admission, FrontierStore, JobRunState};
+use super::{Admission, FrontierStore, JobCounters, JobRunState};
 
 pub async fn admits_then_dedups(s: &dyn FrontierStore) {
     s.ensure_job("j", "{}", None, None).await.unwrap();
@@ -124,6 +125,142 @@ pub async fn delayed_high_priority_does_not_block_due_low_priority(s: &dyn Front
     assert_eq!(popped2[0].url, "https://a.test/hi");
 }
 
+/// Regression guard for the two-queue design: 1000 delayed URLs that would
+/// otherwise sort ahead of a single due URL (by outranking it on priority)
+/// must not stop `pop_ready` from finding and returning the due one. This is
+/// a behavioral check, not a timing benchmark — it proves `later` entries
+/// never enter `queue`'s scan path until they're promoted.
+pub async fn many_delayed_urls_do_not_block_pop_ready(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+
+    for i in 0..1000 {
+        let mut delayed = CrawlUrl::seed(format!("https://a.test/delayed{i}"));
+        delayed.priority = 100; // outranks the due URL below
+        delayed.not_before_ms = Some(i64::MAX);
+        s.admit("j", &delayed, 2_000).await.unwrap();
+    }
+    let due = CrawlUrl::seed("https://a.test/due");
+    assert_eq!(
+        s.admit("j", &due, 2_000).await.unwrap(),
+        Admission::Admitted
+    );
+
+    let popped = s.pop_ready("j", 1, 1_000).await.unwrap();
+    assert_eq!(popped.len(), 1);
+    assert_eq!(popped[0].url, "https://a.test/due");
+}
+
+/// Pins the missing-job contract documented on the trait: `admit` and
+/// `set_state` error for a job that was never `ensure_job`-ed, every other
+/// method is a lenient no-op/default. A future Redis-backed store must
+/// match this exactly.
+pub async fn unknown_job_is_handled_uniformly(s: &dyn FrontierStore) {
+    assert!(s
+        .admit("ghost", &CrawlUrl::seed("https://a.test/"), 100)
+        .await
+        .is_err());
+    assert!(s.set_state("ghost", JobRunState::Running).await.is_err());
+
+    assert!(s.pop_ready("ghost", 10, i64::MAX).await.unwrap().is_empty());
+    assert!(s
+        .requeue("ghost", vec![CrawlUrl::seed("https://a.test/")])
+        .await
+        .is_ok());
+    assert_eq!(s.queued("ghost").await.unwrap(), 0);
+    assert_eq!(s.counters("ghost").await.unwrap(), JobCounters::default());
+    assert_eq!(s.state("ghost").await.unwrap(), None);
+    assert_eq!(s.job_template("ghost").await.unwrap(), None);
+    assert!(s.release("ghost", Duration::from_secs(1)).await.is_ok());
+    assert!(!s
+        .active_jobs()
+        .await
+        .unwrap()
+        .contains(&"ghost".to_string()));
+}
+
+/// `ensure_job` is first-writer-wins for the template; `release` clears it
+/// even though the job entry itself sticks around for `counters`/`state`.
+pub async fn job_template_first_writer_wins_and_release_clears(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{\"v\":1}", None, None).await.unwrap();
+    assert_eq!(
+        s.job_template("j").await.unwrap(),
+        Some("{\"v\":1}".to_string())
+    );
+
+    // A second ensure_job with a different template is a no-op.
+    s.ensure_job("j", "{\"v\":2}", None, None).await.unwrap();
+    assert_eq!(
+        s.job_template("j").await.unwrap(),
+        Some("{\"v\":1}".to_string())
+    );
+
+    s.set_state("j", JobRunState::Running).await.unwrap();
+    s.release("j", Duration::from_secs(60)).await.unwrap();
+    assert_eq!(s.job_template("j").await.unwrap(), None);
+}
+
+/// `active_jobs` includes a running job and stops including it the moment
+/// it is `release`d (not only once its retention window elapses).
+pub async fn active_jobs_tracks_running_and_release_removes(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+    assert!(s.active_jobs().await.unwrap().contains(&"j".to_string()));
+
+    s.release("j", Duration::from_secs(60)).await.unwrap();
+    assert!(!s.active_jobs().await.unwrap().contains(&"j".to_string()));
+}
+
+/// `rejected` increments for every non-`Admitted` outcome, whatever the
+/// reason: depth, capacity, or run state.
+pub async fn rejected_counts_non_admitted_outcomes(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, Some(0)).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+
+    let mut deep = CrawlUrl::seed("https://a.test/deep");
+    deep.depth = 1;
+    assert_eq!(
+        s.admit("j", &deep, 100).await.unwrap(),
+        Admission::OverDepth
+    );
+    assert_eq!(s.counters("j").await.unwrap().rejected, 1);
+
+    let shallow = CrawlUrl::seed("https://a.test/shallow");
+    assert_eq!(
+        s.admit("j", &shallow, 0).await.unwrap(),
+        Admission::QueueFull
+    );
+    assert_eq!(s.counters("j").await.unwrap().rejected, 2);
+
+    s.set_state("j", JobRunState::Paused).await.unwrap();
+    assert_eq!(
+        s.admit("j", &CrawlUrl::seed("https://a.test/paused"), 100)
+            .await
+            .unwrap(),
+        Admission::JobNotRunning
+    );
+    assert_eq!(s.counters("j").await.unwrap().rejected, 3);
+}
+
+/// `dropped` counts URLs still pending (ready or delayed) when `release`
+/// discards them.
+pub async fn dropped_counts_release_of_queued_urls(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+
+    s.admit("j", &CrawlUrl::seed("https://a.test/1"), 100)
+        .await
+        .unwrap();
+    let mut delayed = CrawlUrl::seed("https://a.test/2");
+    delayed.not_before_ms = Some(i64::MAX);
+    s.admit("j", &delayed, 100).await.unwrap();
+    assert_eq!(s.queued("j").await.unwrap(), 2);
+
+    s.release("j", Duration::from_secs(60)).await.unwrap();
+    assert_eq!(s.counters("j").await.unwrap().dropped, 2);
+    assert_eq!(s.queued("j").await.unwrap(), 0);
+}
+
 pub async fn retries_bypass_dedup_and_budget(s: &dyn FrontierStore) {
     s.ensure_job("j", "{}", Some(1), None).await.unwrap();
     s.set_state("j", JobRunState::Running).await.unwrap();
@@ -178,6 +315,12 @@ where
     priority_then_fifo(&*make().await).await;
     not_before_is_respected(&*make().await).await;
     delayed_high_priority_does_not_block_due_low_priority(&*make().await).await;
+    many_delayed_urls_do_not_block_pop_ready(&*make().await).await;
+    unknown_job_is_handled_uniformly(&*make().await).await;
+    job_template_first_writer_wins_and_release_clears(&*make().await).await;
+    active_jobs_tracks_running_and_release_removes(&*make().await).await;
+    rejected_counts_non_admitted_outcomes(&*make().await).await;
+    dropped_counts_release_of_queued_urls(&*make().await).await;
     retries_bypass_dedup_and_budget(&*make().await).await;
     cancelled_job_admits_nothing_and_release_frees(&*make().await).await;
     lease_is_exclusive(&*make().await).await;

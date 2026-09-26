@@ -23,13 +23,22 @@ fn hash_url(url: &str) -> u64 {
 }
 
 struct JobEntry {
-    template: String,
+    /// `None` once `release` has run (see the trait docs on missing-job /
+    /// released-job semantics), even though the entry itself sticks around
+    /// for `counters`/`state` until its retention window elapses.
+    template: Option<String>,
     max_pages: Option<u64>,
     max_depth: Option<u32>,
     state: JobRunState,
     counters: JobCounters,
     seen: HashSet<u64>,
+    /// URLs ready to dispatch right now, ordered by descending priority
+    /// then FIFO sequence. See the module docs for why `pop_ready` never
+    /// needs to scan past a not-yet-due URL.
     queue: BTreeMap<(Reverse<i32>, u64), CrawlUrl>,
+    /// URLs admitted with a `not_before_ms`, ordered by `(not_before_ms,
+    /// seq)`. `pop_ready` promotes due entries from here into `queue`.
+    later: BTreeMap<(i64, u64), CrawlUrl>,
     seq: u64,
     /// Set by `release`; once passed, the whole entry is evicted lazily on
     /// the next access, since "keep counters/state for `retention`" implies
@@ -40,13 +49,14 @@ struct JobEntry {
 impl JobEntry {
     fn new(template: &str, max_pages: Option<u64>, max_depth: Option<u32>) -> Self {
         Self {
-            template: template.to_string(),
+            template: Some(template.to_string()),
             max_pages,
             max_depth,
             state: JobRunState::Paused,
             counters: JobCounters::default(),
             seen: HashSet::new(),
             queue: BTreeMap::new(),
+            later: BTreeMap::new(),
             seq: 0,
             release_deadline: None,
         }
@@ -55,6 +65,24 @@ impl JobEntry {
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    fn pending_len(&self) -> usize {
+        self.queue.len() + self.later.len()
+    }
+
+    /// Enqueue an already-admitted/requeued URL into whichever of
+    /// `queue`/`later` it belongs in, per the module docs: any URL carrying
+    /// a `not_before_ms` goes to `later` unconditionally (no clock check
+    /// here — only `pop_ready` is clock-aware), everything else goes
+    /// straight into the ready `queue`.
+    fn enqueue(&mut self, url: CrawlUrl) {
+        let seq = self.next_seq();
+        if let Some(not_before_ms) = url.not_before_ms {
+            self.later.insert((not_before_ms, seq), url);
+        } else {
+            self.queue.insert((Reverse(url.priority), seq), url);
+        }
     }
 }
 
@@ -81,7 +109,7 @@ fn decide_admission(entry: &JobEntry, url: &CrawlUrl, queue_cap: usize, hash: u6
             }
         }
     }
-    if entry.queue.len() >= queue_cap {
+    if entry.pending_len() >= queue_cap {
         return Admission::QueueFull;
     }
     if !is_retry && entry.seen.contains(&hash) {
@@ -93,7 +121,11 @@ fn decide_admission(entry: &JobEntry, url: &CrawlUrl, queue_cap: usize, hash: u6
 /// Remove job entries whose `release` retention window has elapsed.
 fn evict_expired(jobs: &mut HashMap<String, JobEntry>) {
     let now = Instant::now();
-    jobs.retain(|_, entry| entry.release_deadline.map_or(true, |deadline| now < deadline));
+    jobs.retain(|_, entry| {
+        entry
+            .release_deadline
+            .map_or(true, |deadline| now < deadline)
+    });
 }
 
 /// In-memory [`FrontierStore`]. State lives entirely in process memory
@@ -129,7 +161,7 @@ impl FrontierStore for MemoryFrontierStore {
     async fn job_template(&self, job_id: &str) -> Result<Option<String>> {
         let mut jobs = self.jobs.lock();
         evict_expired(&mut jobs);
-        Ok(jobs.get(job_id).map(|e| e.template.clone()))
+        Ok(jobs.get(job_id).and_then(|e| e.template.clone()))
     }
 
     async fn admit(&self, job_id: &str, url: &CrawlUrl, queue_cap: usize) -> Result<Admission> {
@@ -147,10 +179,7 @@ impl FrontierStore for MemoryFrontierStore {
                 entry.seen.insert(hash);
                 entry.counters.admitted += 1;
             }
-            let seq = entry.next_seq();
-            entry
-                .queue
-                .insert((Reverse(url.priority), seq), url.clone());
+            entry.enqueue(url.clone());
         } else {
             entry.counters.rejected += 1;
         }
@@ -165,20 +194,26 @@ impl FrontierStore for MemoryFrontierStore {
             return Ok(Vec::new());
         };
 
-        // Collect the keys of the first `n` *ready* URLs in priority/FIFO
-        // order, skipping (not removing) any URL whose `not_before_ms` is
-        // still in the future so it doesn't block due URLs behind it.
-        let mut keys = Vec::with_capacity(n.min(entry.queue.len()));
-        for (key, candidate) in entry.queue.iter() {
-            if keys.len() >= n {
-                break;
-            }
-            let ready = candidate.not_before_ms.map_or(true, |t| t <= now_ms);
-            if ready {
-                keys.push(*key);
+        // Phase 1 — promote: move every `later` entry whose `not_before_ms`
+        // has passed into `queue`, with a fresh sequence number. `later` is
+        // ordered by `(not_before_ms, seq)`, so the due entries are exactly
+        // the ones at or before `(now_ms, u64::MAX)` — an O(k log n) range
+        // operation, never a scan of the whole map.
+        let due_keys: Vec<(i64, u64)> = entry
+            .later
+            .range(..=(now_ms, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in due_keys {
+            if let Some(url) = entry.later.remove(&key) {
+                let seq = entry.next_seq();
+                entry.queue.insert((Reverse(url.priority), seq), url);
             }
         }
 
+        // Phase 2 — pop: `queue` now holds only ready URLs, so popping the
+        // first `n` never needs to skip anything.
+        let keys: Vec<_> = entry.queue.keys().take(n).copied().collect();
         let mut popped = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(url) = entry.queue.remove(&key) {
@@ -196,8 +231,7 @@ impl FrontierStore for MemoryFrontierStore {
             return Ok(());
         };
         for url in urls {
-            let seq = entry.next_seq();
-            entry.queue.insert((Reverse(url.priority), seq), url);
+            entry.enqueue(url);
         }
         Ok(())
     }
@@ -205,7 +239,10 @@ impl FrontierStore for MemoryFrontierStore {
     async fn queued(&self, job_id: &str) -> Result<u64> {
         let mut jobs = self.jobs.lock();
         evict_expired(&mut jobs);
-        Ok(jobs.get(job_id).map(|e| e.queue.len() as u64).unwrap_or(0))
+        Ok(jobs
+            .get(job_id)
+            .map(|e| e.pending_len() as u64)
+            .unwrap_or(0))
     }
 
     async fn counters(&self, job_id: &str) -> Result<JobCounters> {
@@ -234,16 +271,22 @@ impl FrontierStore for MemoryFrontierStore {
     async fn active_jobs(&self) -> Result<Vec<String>> {
         let mut jobs = self.jobs.lock();
         evict_expired(&mut jobs);
-        Ok(jobs.keys().cloned().collect())
+        Ok(jobs
+            .iter()
+            .filter(|(_, e)| e.release_deadline.is_none())
+            .map(|(job_id, _)| job_id.clone())
+            .collect())
     }
 
     async fn release(&self, job_id: &str, retention: Duration) -> Result<()> {
         let mut jobs = self.jobs.lock();
         evict_expired(&mut jobs);
         if let Some(entry) = jobs.get_mut(job_id) {
-            entry.counters.dropped += entry.queue.len() as u64;
+            entry.counters.dropped += entry.pending_len() as u64;
             entry.queue.clear();
+            entry.later.clear();
             entry.seen.clear();
+            entry.template = None;
             entry.release_deadline = Some(Instant::now() + retention);
         }
         Ok(())

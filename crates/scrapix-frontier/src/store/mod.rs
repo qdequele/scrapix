@@ -45,9 +45,73 @@
 //! *fresh* sequence number, so requeued URLs sort behind existing URLs of
 //! the same priority rather than jumping the line.
 //!
-//! `pop_ready` skips (without removing) any URL whose `not_before_ms` is in
-//! the future, so a delayed high-priority URL never blocks a due
-//! lower-priority one behind it in the queue.
+//! ## Storage layout: two structures, not one (contract for Task 10's Redis store)
+//!
+//! A naive single ready-queue design would make `pop_ready` scan past every
+//! not-yet-due URL to find a due one behind it — `O(queue)` in the worst
+//! case (e.g. many delayed URLs sorted ahead of a due one by priority).
+//! Every implementation must instead split a job's pending URLs into two
+//! structures:
+//!
+//! - **`queue`** — URLs that are ready to dispatch *right now*, ordered by
+//!   descending priority then FIFO sequence. `pop_ready` only ever pops
+//!   from here.
+//! - **`later`** — URLs admitted with a `not_before_ms`, ordered by
+//!   `(not_before_ms, seq)`.
+//!
+//! At `admit`/`requeue` time, a URL carrying `not_before_ms: Some(_)` goes
+//! into `later` *unconditionally* — regardless of whether that timestamp
+//! has already passed — rather than checked against a clock. Only
+//! `pop_ready`, which already receives `now_ms` from its caller, needs to
+//! be clock-aware; this keeps `admit`/`requeue` deterministic and
+//! clock-free, which is also what keeps the conformance suite's `now_ms`
+//! parameterization sufficient to exercise this path.
+//!
+//! `pop_ready(n, now_ms)` runs in two phases:
+//!
+//! 1. **Promote** — move every `later` entry whose `not_before_ms <=
+//!    now_ms` into `queue`, each with a *fresh* sequence number (so
+//!    promotion order among ties follows promotion time, not original
+//!    admission time). This is `O(k log n)`, where `k` is the number
+//!    promoted in this call — never a scan of the whole map, and `k` is
+//!    bounded by how many delayed URLs are actually due, not by how many
+//!    are still waiting.
+//! 2. **Pop** — take up to `n` entries off the front of `queue`. This never
+//!    needs to skip anything, because `queue` holds only ready URLs:
+//!    `O(n log n)`.
+//!
+//! `admit`'s capacity check and `queued()` both use `queue.len() +
+//! later.len()` — a full queue is full regardless of which structure a
+//! pending URL happens to sit in.
+//!
+//! A Redis-backed implementation should mirror this with two keys (e.g. a
+//! sorted set `q` for the ready queue and a sorted set `later` keyed by
+//! `not_before_ms`), promoting due members from `later` into `q` the same
+//! way before popping.
+//!
+//! ## Behavior for an unknown or released job
+//!
+//! Every implementation must agree on this, since it's the contract a
+//! Redis-backed store must mirror bit-for-bit:
+//!
+//! - `admit` and `set_state` return `Err` — the job must exist. A caller
+//!   that forgot `ensure_job`, or that raced past a job's `release`
+//!   retention window, has a bug; these two methods are where mutating a
+//!   job that doesn't exist would silently do nothing useful, so they
+//!   surface it instead.
+//! - `pop_ready` returns `Ok(vec![])`.
+//! - `requeue` is a silent no-op: `Ok(())`.
+//! - `queued` returns `Ok(0)`.
+//! - `counters` returns `Ok(JobCounters::default())`.
+//! - `state` and `job_template` return `Ok(None)`.
+//! - `release` is itself a no-op: `Ok(())`.
+//! - `active_jobs` simply omits it.
+//!
+//! `release` (while the job still exists, during its retention window)
+//! also makes `job_template` return `None` and removes the job from
+//! `active_jobs` immediately, even though `counters`/`state` remain
+//! queryable until the retention window elapses and the whole entry is
+//! evicted.
 
 mod memory;
 
@@ -115,32 +179,46 @@ pub trait FrontierStore: Send + Sync {
         max_depth: Option<u32>,
     ) -> Result<()>;
 
+    /// `Ok(None)` for an unknown job, and also once the job has been
+    /// `release`d (even though `counters`/`state` remain queryable).
     async fn job_template(&self, job_id: &str) -> Result<Option<String>>;
 
     /// Atomically: check run state, depth, max_pages (admitted, not
-    /// dispatched, is the budget), queue capacity, and dedup (retries with
+    /// dispatched, is the budget), queue capacity (ready + delayed URLs
+    /// combined — see the module docs), and dedup (retries with
     /// `retry_count > 0` bypass dedup and budget); only then mark seen and
-    /// enqueue. Increments `received` always.
+    /// enqueue. Increments `received` always. `Err` for an unknown job —
+    /// see the module docs' missing-job section.
     async fn admit(&self, job_id: &str, url: &CrawlUrl, queue_cap: usize) -> Result<Admission>;
 
-    /// Pop up to `n` highest-priority URLs whose `not_before_ms` has passed.
-    /// Increments `dispatched`.
+    /// Pop up to `n` highest-priority URLs whose `not_before_ms` has passed,
+    /// promoting due delayed URLs first (see the module docs' storage
+    /// layout section — this never scans past a not-yet-due URL). Returns
+    /// `Ok(vec![])` for an unknown job. Increments `dispatched`.
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>>;
 
     /// Put URLs back without touching counters (politeness said "not yet").
+    /// A no-op for an unknown job.
     async fn requeue(&self, job_id: &str, urls: Vec<CrawlUrl>) -> Result<()>;
 
+    /// Total pending URLs (ready + delayed). `0` for an unknown job.
     async fn queued(&self, job_id: &str) -> Result<u64>;
 
+    /// `JobCounters::default()` for an unknown job.
     async fn counters(&self, job_id: &str) -> Result<JobCounters>;
 
+    /// `Err` for an unknown job — see the module docs' missing-job section.
     async fn set_state(&self, job_id: &str, state: JobRunState) -> Result<()>;
 
+    /// `Ok(None)` for an unknown job.
     async fn state(&self, job_id: &str) -> Result<Option<JobRunState>>;
 
+    /// Jobs that exist and have not been `release`d. A released job is
+    /// omitted immediately, even before its retention window elapses.
     async fn active_jobs(&self) -> Result<Vec<String>>;
 
-    /// Drop queue + seen set; keep counters/state for `retention`.
+    /// Drop queue + seen set + template; keep counters/state queryable for
+    /// `retention`. A no-op for an unknown job.
     async fn release(&self, job_id: &str, retention: std::time::Duration) -> Result<()>;
 
     /// Per-job dispatch lease for multi-instance safety. Returns true if
