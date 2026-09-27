@@ -45,6 +45,7 @@ Scrape a single URL and return extracted content in the requested formats.
 | `ai` | object | `null` | AI enrichment options (see below) |
 | `render_js` | boolean | `false` | Render the page in a headless browser before extracting content |
 | `screenshot` | object | `null` | Screenshot options: `{ "full_page": true }` (default) captures the whole page, `false` only the viewport. Used when `formats` includes `screenshot` |
+| `actions` | object[] | `[]` | Browser actions run after the page loads (see [Page actions](#page-actions)) |
 
 ### Output Formats
 
@@ -86,6 +87,78 @@ base64-encoded PNG in the `screenshot` field:
 
 The screenshot format costs +1 credit, like the other feature formats (see
 [Billing](/guides/billing#scrape)).
+
+### Page actions
+
+`actions` is a list of browser interactions run, in order, after the page
+loads and before content (and any screenshot) is captured — for pages that
+need a click, a scroll or a search before the content you want is there.
+Sending actions enables the browser automatically.
+
+```json
+{
+  "url": "https://example.com/search",
+  "formats": ["markdown", "screenshot"],
+  "actions": [
+    { "type": "write", "selector": "input[name=q]", "text": "meilisearch" },
+    { "type": "press", "key": "Enter" },
+    { "type": "wait", "selector": ".results" },
+    { "type": "scroll", "direction": "down", "amount": 2 },
+    { "type": "click", "selector": "button.load-more" },
+    { "type": "wait", "ms": 500 },
+    { "type": "execute_javascript", "script": "document.querySelectorAll('.result').length" }
+  ]
+}
+```
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `wait` | `ms` **or** `selector` | Sleep `ms` milliseconds (max 30000), or wait until an element matches `selector` |
+| `click` | `selector` | Click the first matching element (waits for it to exist) |
+| `scroll` | `direction` (`up`/`down`, default `down`), `amount` (screens, default `1`) | Scroll the page by `amount` viewport heights |
+| `write` | `selector`, `text` | Focus the first matching element and type `text` into it |
+| `press` | `key` | Press a key on the focused element: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Backspace`, a single character, ... |
+| `execute_javascript` | `script` | Run JavaScript in the page and return its value |
+
+`execute_javascript` returns the value of the script — an expression
+(`document.title`), a promise (awaited), a script using top-level `await`, or
+a function body with `return` (`return {count: 3}`). Values are
+JSON-serialized, in order, in `actions.javascript_returns`; `undefined` and
+non-serializable values (DOM nodes) come back as `null` / `{}`:
+
+```json
+{
+  "success": true,
+  "markdown": "...",
+  "actions": { "javascript_returns": [12] }
+}
+```
+
+**Limits.** At most 50 actions per request. Each action has a 10 second
+timeout (a `wait` with `ms` gets its own duration), and all actions together
+must finish within 30 seconds. A click, key press or script that navigates
+waits (up to 5s) for the new page to load.
+
+**Errors.** The first failing action stops the request with a `422`
+`action_error` naming the action — its content is not returned and the
+request is not billed:
+
+```json
+{
+  "error": "actions[2] (wait) failed: no element matches `.results` within 10.0s",
+  "code": "action_error",
+  "details": { "action_index": 2, "action_type": "wait", "message": "no element matches `.results` within 10.0s" }
+}
+```
+
+Invalid actions (unknown `type`, a `wait` with neither or both of `ms` and
+`selector`, more than 50 actions) are rejected up front with
+`validation_error`.
+
+**Network safety.** Pages driven by actions stay under the same SSRF rules as
+the page itself: every request the page makes — navigations triggered by a
+click or a script, redirects, `fetch`/XHR, subresources — is blocked when it
+targets a private or internal address.
 
 ### Custom CSS Extraction
 

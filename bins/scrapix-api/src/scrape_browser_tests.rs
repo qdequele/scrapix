@@ -174,3 +174,138 @@ async fn screenshot_without_browser_is_render_js_unavailable() {
     assert_eq!(err.code, "render_js_unavailable");
     assert!(err.error.contains("screenshot"), "{}", err.error);
 }
+
+const ACTIONS_PAGE: &str = r#"<!doctype html><html><head><title>Actions</title></head>
+<body><button id="more" onclick="document.body.insertAdjacentHTML('beforeend','<p id=added>Added by click</p>')">More</button></body></html>"#;
+
+/// SCR-75: actions force the browser, run before extraction, and their
+/// script values come back in `actions.javascript_returns`.
+#[tokio::test]
+async fn actions_run_before_extraction() {
+    let Some(state) = browser_state().await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let url = serve(&server, "/actions", ACTIONS_PAGE).await;
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": url,
+            "formats": ["markdown"],
+            "actions": [
+                {"type": "click", "selector": "#more"},
+                {"type": "wait", "selector": "#added"},
+                {"type": "execute_javascript", "script": "document.querySelectorAll('#added').length"},
+                {"type": "execute_javascript", "script": "return {title: document.title}"}
+            ]
+        })),
+    )
+    .await
+    .expect("scrape succeeds");
+    assert!(resp.markdown.unwrap().contains("Added by click"));
+    let actions = resp.actions.expect("actions result");
+    assert_eq!(
+        actions.javascript_returns,
+        vec![
+            serde_json::json!(1),
+            serde_json::json!({"title": "Actions"})
+        ]
+    );
+    let json = serde_json::to_value(ScrapeActionsResult {
+        javascript_returns: vec![serde_json::json!(1)],
+    })
+    .unwrap();
+    assert_eq!(json, serde_json::json!({"javascript_returns": [1]}));
+}
+
+/// A failing action is a structured `action_error` (422) naming the action,
+/// not a generic fetch error or a whole-request timeout.
+#[tokio::test]
+async fn failing_action_is_action_error() {
+    let Some(state) = browser_state().await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let url = serve(&server, "/actions", ACTIONS_PAGE).await;
+
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": url,
+            "actions": [
+                {"type": "wait", "ms": 10},
+                {"type": "execute_javascript", "script": "throw new Error('kaboom')"}
+            ]
+        })),
+    )
+    .await
+    .expect_err("action fails");
+    assert_eq!(err.code, "action_error");
+    assert!(
+        err.error.starts_with("actions[1] (execute_javascript)"),
+        "{}",
+        err.error
+    );
+    let details = err.details.clone().expect("details");
+    assert_eq!(details["action_index"], 1);
+    assert_eq!(details["action_type"], "execute_javascript");
+    assert!(details["message"].as_str().unwrap().contains("kaboom"));
+    assert_eq!(
+        err.into_response().status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+/// Invalid or too many actions are rejected before anything is fetched
+/// (no browser needed), and actions without a browser are refused.
+#[tokio::test]
+async fn actions_are_validated() {
+    let state = Arc::new(state_with(None));
+    let too_many: Vec<_> = (0..51)
+        .map(|_| serde_json::json!({"type": "wait", "ms": 1}))
+        .collect();
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({"url": "https://example.com/", "actions": too_many})),
+    )
+    .await
+    .expect_err("too many actions");
+    assert_eq!(err.code, "validation_error");
+    assert!(err.error.contains("too many actions"), "{}", err.error);
+
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": "https://example.com/",
+            "actions": [{"type": "wait"}]
+        })),
+    )
+    .await
+    .expect_err("wait needs ms or selector");
+    assert_eq!(err.code, "validation_error");
+    assert!(err.error.starts_with("actions[0] (wait)"), "{}", err.error);
+
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": "https://example.com/",
+            "actions": [{"type": "scroll"}]
+        })),
+    )
+    .await
+    .expect_err("no browser");
+    assert_eq!(err.code, "render_js_unavailable");
+
+    // Unknown action types are rejected at deserialization.
+    assert!(serde_json::from_value::<ScrapeRequest>(serde_json::json!({
+        "url": "https://example.com/",
+        "actions": [{"type": "hover", "selector": "a"}]
+    }))
+    .is_err());
+}

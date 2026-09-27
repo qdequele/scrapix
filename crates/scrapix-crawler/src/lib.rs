@@ -70,6 +70,8 @@ pub(crate) mod safe_dns;
 pub mod sitemap;
 
 #[cfg(feature = "browser-cdp")]
+pub mod cdp_actions;
+#[cfg(feature = "browser-cdp")]
 pub mod renderer_cdp;
 
 #[cfg(feature = "browser-webdriver")]
@@ -97,6 +99,8 @@ pub use sitemap::{
 };
 
 // CDP renderer re-exports
+#[cfg(feature = "browser-cdp")]
+pub use cdp_actions::{ACTIONS_BUDGET, ACTION_TIMEOUT};
 #[cfg(feature = "browser-cdp")]
 pub use renderer_cdp::{
     CdpConfig, CdpError, CdpRenderer, CdpRendererBuilder, PageOptions, RenderResult,

@@ -82,6 +82,7 @@ use tower_http::{
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
+use scrapix_core::browser::Action;
 use scrapix_core::{
     ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
     JobStatus, PdfConfig,
@@ -2251,7 +2252,6 @@ impl ApiError {
         }
     }
 
-    #[allow(dead_code)]
     fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self
@@ -2266,6 +2266,7 @@ impl IntoResponse for ApiError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "conflict" => StatusCode::CONFLICT,
             "insufficient_credits" => StatusCode::PAYMENT_REQUIRED,
+            "action_error" => StatusCode::UNPROCESSABLE_ENTITY,
             "spend_limit_exceeded" => StatusCode::FORBIDDEN,
             "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2550,6 +2551,13 @@ struct ScrapeRequest {
     /// Screenshot options, used when `formats` includes `"screenshot"`
     #[serde(default)]
     screenshot: Option<ScreenshotRequestOptions>,
+
+    /// Browser actions run after the page loads and before content (and
+    /// any screenshot) is captured: wait, click, scroll, write, press,
+    /// execute_javascript. Forces browser rendering. At most 50; all
+    /// actions together must finish within 30s.
+    #[serde(default)]
+    actions: Vec<Action>,
 }
 
 impl Default for ScrapeRequest {
@@ -2570,6 +2578,7 @@ impl Default for ScrapeRequest {
             extract: HashMap::new(),
             ai: None,
             screenshot: None,
+            actions: Vec::new(),
         }
     }
 }
@@ -2702,6 +2711,10 @@ struct ScrapeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     screenshot: Option<String>,
 
+    /// Results of the request's `actions` (present when actions were sent)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actions: Option<ScrapeActionsResult>,
+
     /// Warning message (e.g. "AI requires OPENAI_API_KEY")
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
@@ -2711,6 +2724,14 @@ struct ScrapeResponse {
 
     /// Time taken to scrape in milliseconds
     scrape_duration_ms: u64,
+}
+
+/// Results of the /scrape `actions`
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct ScrapeActionsResult {
+    /// Values of the `execute_javascript` actions, in order (JSON
+    /// round-tripped; `undefined` is `null`)
+    javascript_returns: Vec<serde_json::Value>,
 }
 
 /// AI enrichment results
@@ -3058,7 +3079,7 @@ fn preprocess_html(
 
 /// Scrape a single URL and return content immediately
 /// This bypasses the job queue for instant results
-#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError), (status = 422, description = "A browser action failed (`action_error`; `details` names the action)", body = ApiError)), security(("api_key" = [])))]
 async fn scrape_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
@@ -3124,6 +3145,9 @@ pub(crate) async fn perform_scrape(
         ));
     }
 
+    scrapix_core::browser::validate_actions(&request.actions)
+        .map_err(|e| ApiError::new(e, "validation_error"))?;
+
     // Features that only the browser can provide force the browser path.
     let screenshot_opts = request
         .formats
@@ -3131,12 +3155,14 @@ pub(crate) async fn perform_scrape(
         .then(|| ScreenshotOptions {
             full_page: request.screenshot.as_ref().map_or(true, |s| s.full_page),
         });
-    let use_browser = request.render_js || screenshot_opts.is_some();
+    let use_browser = request.render_js || screenshot_opts.is_some() || !request.actions.is_empty();
     if use_browser && state.browser_renderer.is_none() {
         let reason = if request.render_js {
             "JS rendering"
-        } else {
+        } else if screenshot_opts.is_some() {
             "The screenshot format"
+        } else {
+            "Page actions"
         };
         return Err(ApiError::new(
             format!(
@@ -3152,21 +3178,44 @@ pub(crate) async fn perform_scrape(
     let crawl_url = CrawlUrl::seed(&request.url);
 
     let mut screenshot_png: Option<Vec<u8>> = None;
+    let mut actions_result: Option<ScrapeActionsResult> = None;
     let raw_page = if let Some(renderer) = state.browser_renderer.as_ref().filter(|_| use_browser) {
         let page_options = PageOptions {
             screenshot: screenshot_opts,
+            actions: request.actions.clone(),
+            // Caller-supplied actions and scripts must not be able to reach
+            // internal addresses: every request the page makes is checked.
+            guard_requests: true,
             ..Default::default()
         };
         let mut rendered = renderer
             .render_page(&request.url, &page_options)
             .await
-            .map_err(|e| {
-                ApiError::new(
-                    format!("Failed to render URL with browser: {}", e),
-                    "fetch_error",
+            .map_err(|e| match e {
+                scrapix_core::ScrapixError::Action {
+                    index,
+                    action,
+                    message,
+                } => ApiError::new(
+                    format!("actions[{index}] ({action}) failed: {message}"),
+                    "action_error",
                 )
+                .with_details(serde_json::json!({
+                    "action_index": index,
+                    "action_type": action,
+                    "message": message,
+                })),
+                other => ApiError::new(
+                    format!("Failed to render URL with browser: {}", other),
+                    "fetch_error",
+                ),
             })?;
         screenshot_png = rendered.screenshot.take();
+        if !request.actions.is_empty() {
+            actions_result = Some(ScrapeActionsResult {
+                javascript_returns: std::mem::take(&mut rendered.javascript_returns),
+            });
+        }
         CdpRenderer::raw_page(&crawl_url, rendered)
     } else if request.headers.is_empty() {
         // Use the shared fetcher (connection pooling, DNS cache, retries)
@@ -3275,6 +3324,7 @@ pub(crate) async fn perform_scrape(
             extract: None,
             ai: None,
             screenshot: None,
+            actions: actions_result,
             warning: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
@@ -3551,6 +3601,7 @@ pub(crate) async fn perform_scrape(
         extract: custom_extract,
         ai: ai_result,
         screenshot: screenshot_png.map(|png| BASE64.encode(png)),
+        actions: actions_result,
         warning,
         status_code,
         scrape_duration_ms,

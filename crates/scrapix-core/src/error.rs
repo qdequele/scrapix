@@ -64,6 +64,15 @@ pub enum ScrapixError {
     #[error("AI error: {0}")]
     Ai(String),
 
+    /// A browser page action (`/scrape` `actions`) failed: `index` is its
+    /// position in the request, `action` its type (e.g. `click`).
+    #[error("actions[{index}] ({action}) failed: {message}")]
+    Action {
+        index: usize,
+        action: String,
+        message: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }

@@ -2072,6 +2072,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "A browser action failed (`action_error`; `details` names the action)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3158,6 +3168,142 @@
             "type": "string"
           }
         }
+      },
+      "Action": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Wait a fixed time (`ms`) or until an element matching `selector`\nexists. Exactly one of the two must be set.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "selector": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "wait"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Click the first element matching `selector` (waits for it to exist).",
+            "required": [
+              "selector",
+              "type"
+            ],
+            "properties": {
+              "selector": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "click"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Scroll the page by `amount` viewport heights (default 1).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "amount": {
+                "type": "number",
+                "format": "double"
+              },
+              "direction": {
+                "$ref": "#/components/schemas/ScrollDirection"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "scroll"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Focus the first element matching `selector` and type `text` into it.",
+            "required": [
+              "selector",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "selector": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "write"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Press a key (e.g. `Enter`, `Tab`, `ArrowDown`, `Escape`, `a`) on the\nfocused element.",
+            "required": [
+              "key",
+              "type"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "press"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Run JavaScript in the page. The value of the script (or of its\n`return` statement; `await` is allowed) is returned in\n`actions.javascript_returns`, JSON-serialized.",
+            "required": [
+              "script",
+              "type"
+            ],
+            "properties": {
+              "script": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "execute_javascript"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A browser interaction run on the page after it loads and before content\n(and any screenshot) is captured. Actions run in order; the first one to\nfail stops the sequence and fails the request."
       },
       "AiExtractOptions": {
         "type": "object",
@@ -5047,6 +5193,20 @@
         ],
         "description": "A single schema.org item"
       },
+      "ScrapeActionsResult": {
+        "type": "object",
+        "description": "Results of the /scrape `actions`",
+        "required": [
+          "javascript_returns"
+        ],
+        "properties": {
+          "javascript_returns": {
+            "type": "array",
+            "items": {},
+            "description": "Values of the `execute_javascript` actions, in order (JSON\nround-tripped; `undefined` is `null`)"
+          }
+        }
+      },
       "ScrapeFormat": {
         "type": "string",
         "description": "Output formats for scrape",
@@ -5132,6 +5292,13 @@
           "url"
         ],
         "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Browser actions run after the page loads and before content (and\nany screenshot) is captured: wait, click, scroll, write, press,\nexecute_javascript. Forces browser rendering. At most 50; all\nactions together must finish within 30s."
+          },
           "ai": {
             "oneOf": [
               {
@@ -5229,6 +5396,17 @@
           "scrape_duration_ms"
         ],
         "properties": {
+          "actions": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScrapeActionsResult",
+                "description": "Results of the request's `actions` (present when actions were sent)"
+              }
+            ]
+          },
           "ai": {
             "oneOf": [
               {
@@ -5373,6 +5551,14 @@
             "description": "Capture the whole scrollable page (default) instead of only the\nviewport. Very long pages are cropped to 16384 px."
           }
         }
+      },
+      "ScrollDirection": {
+        "type": "string",
+        "description": "Scroll direction for a [`Action::Scroll`].",
+        "enum": [
+          "up",
+          "down"
+        ]
       },
       "SearchRequest": {
         "type": "object",

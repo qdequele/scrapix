@@ -47,6 +47,9 @@ use scrapix_core::{CrawlUrl, RawPage, Result, ScrapixError};
 use chromiumoxide::cdp::browser_protocol::network::{Headers, SetExtraHttpHeadersParams};
 use chromiumoxide::ArcHttpRequest;
 
+use scrapix_core::browser::Action;
+
+use crate::cdp_actions::{execute_actions, install_request_guard, ACTIONS_BUDGET};
 use crate::fetcher::FetchOptions;
 use crate::robots::RobotsCache;
 use crate::safe_client::reject_ip_host;
@@ -88,8 +91,19 @@ pub struct PageOptions {
     pub extra_headers: Vec<(String, String)>,
     /// `Some(false)` skips the robots.txt check (the SSRF check always runs).
     pub respect_robots: Option<bool>,
-    /// Capture a PNG screenshot after the page loaded.
+    /// Capture a PNG screenshot after the page loaded (and after
+    /// `actions`).
     pub screenshot: Option<ScreenshotOptions>,
+    /// Page actions run after load, before content/screenshot capture
+    /// (validate them with `scrapix_core::browser::validate_actions`).
+    /// Their total run time is bounded by [`ACTIONS_BUDGET`].
+    pub actions: Vec<Action>,
+    /// Overrides [`ACTIONS_BUDGET`] for this render.
+    pub actions_budget: Option<Duration>,
+    /// Intercept every request the page makes and fail those to non-public
+    /// addresses (see `install_request_guard`). Recommended whenever the
+    /// page runs caller-supplied actions or scripts.
+    pub guard_requests: bool,
 }
 
 /// HTTP status of the main document as reported by CDP (`Network.Response.status`),
@@ -178,10 +192,12 @@ async fn check_ssrf_target(parsed: &url::Url, allow_private_ips: bool) -> Result
 ///
 /// This covers where the main frame landed only. The browser may still have
 /// *requested* an internal URL on the way (a redirect hop, a subresource, a
-/// fetch/XHR, an iframe, a JS navigation that was redirected again); full
-/// coverage needs CDP `Fetch` interception of every request, which is
-/// deferred. Workers that render untrusted pages should run the browser in
-/// a network namespace without access to internal addresses.
+/// fetch/XHR, an iframe, a JS navigation that was redirected again). Full
+/// coverage is the opt-in request guard (`PageOptions::guard_requests`,
+/// CDP `Fetch` interception of every request; `/scrape` enables it); it
+/// still checks DNS separately from the browser's own resolution, so
+/// workers that render untrusted pages should also run the browser in a
+/// network namespace without access to internal addresses.
 pub(crate) async fn check_render_final_url(
     final_url: &str,
     requested: &str,
@@ -433,6 +449,9 @@ pub struct RenderResult {
     /// Screenshot (if requested)
     pub screenshot: Option<Vec<u8>>,
 
+    /// Values of the `execute_javascript` actions, in order
+    pub javascript_returns: Vec<serde_json::Value>,
+
     /// Console log messages
     pub console_logs: Vec<String>,
 
@@ -631,9 +650,16 @@ impl CdpRenderer {
             .await
             .map_err(|e| CdpError::LaunchFailed(format!("Failed to create page: {}", e)))?;
 
-        // Always close the page, including on error paths.
-        let result = self.render_on_page(&page, url, req, start).await;
+        // Always close the page (and stop its request guard), including on
+        // error paths.
+        let mut guard = None;
+        let result = self
+            .render_on_page(&page, url, req, start, &mut guard)
+            .await;
         let _ = page.close().await;
+        if let Some(guard) = guard {
+            guard.abort();
+        }
         result
     }
 
@@ -643,9 +669,18 @@ impl CdpRenderer {
         url: &str,
         req: &PageOptions,
         start: Instant,
+        guard: &mut Option<tokio::task::JoinHandle<()>>,
     ) -> Result<RenderResult> {
         // Setup page
         self.setup_page(page).await?;
+
+        if req.guard_requests {
+            *guard = Some(
+                install_request_guard(page, self.config.allow_private_ips)
+                    .await
+                    .map_err(CdpError::NavigationFailed)?,
+            );
+        }
 
         // Per-job user agent and headers, set on this page only (the browser
         // is shared by every job on the worker).
@@ -689,6 +724,37 @@ impl CdpRenderer {
             .unwrap_or_else(|| url.to_string());
         // A redirect must not land the browser on an internal target.
         check_render_final_url(&final_url, url, self.config.allow_private_ips).await?;
+
+        // Page actions; after each one the page must still be on a public
+        // target (a click or script may have navigated).
+        let (javascript_returns, final_url) = if req.actions.is_empty() {
+            (Vec::new(), final_url)
+        } else {
+            let allow_private_ips = self.config.allow_private_ips;
+            let budget = req.actions_budget.unwrap_or(ACTIONS_BUDGET);
+            let returns = execute_actions(page, &req.actions, budget, || async move {
+                let current = page
+                    .url()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+                check_render_final_url(&current, url, allow_private_ips)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|f| ScrapixError::Action {
+                index: f.index,
+                action: f.action.to_string(),
+                message: f.message,
+            })?;
+            let final_url = page
+                .url()
+                .await
+                .map_err(|e| CdpError::NavigationFailed(e.to_string()))?
+                .unwrap_or(final_url);
+            (returns, final_url)
+        };
 
         let screenshot = match req.screenshot {
             Some(opts) => Some(capture_screenshot(page, opts).await?),
@@ -743,6 +809,7 @@ impl CdpRenderer {
             headers,
             content_type,
             screenshot,
+            javascript_returns,
             console_logs,
             js_errors,
             render_duration,
@@ -799,29 +866,21 @@ impl CdpRenderer {
 
     /// Execute JavaScript on a page and return the result
     pub async fn execute_script(&self, url: &str, script: &str) -> Result<serde_json::Value> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| CdpError::PoolExhausted)?;
-
-        let page = self
-            .browser
-            .new_page(url)
-            .await
-            .map_err(|e| CdpError::LaunchFailed(format!("Failed to create page: {}", e)))?;
-
-        self.setup_page(&page).await?;
-        self.wait_for_page(&page).await?;
-
-        let result = page
-            .evaluate(script)
-            .await
-            .map_err(|e| CdpError::JsExecutionFailed(e.to_string()))?;
-
-        let _ = page.close().await;
-
-        Ok(result.into_value()?)
+        // Same path as any render: SSRF-checked navigation, request guard,
+        // and the action timeouts.
+        let mut result = self
+            .render_page(
+                url,
+                &PageOptions {
+                    actions: vec![Action::ExecuteJavascript {
+                        script: script.to_string(),
+                    }],
+                    guard_requests: !self.config.allow_private_ips,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(result.javascript_returns.pop().unwrap_or_default())
     }
 
     /// Set cookies for a domain
