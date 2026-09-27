@@ -1,0 +1,240 @@
+---
+title: Crawl Engine Rollout
+description: Rollout order and checklist for shipping the crawl-engine-fixes branch to the qdq-server production box
+---
+
+# Crawl Engine Rollout
+
+This is the deploy checklist for rolling the `crawl-engine-fixes` branch out
+to the production box (`hackersearch`, deployed from the separate
+`qdq-server` repo, systemd-managed, env in `/etc/scrapix/scrapix.env`). It is
+a checklist, not automation — work through it in order.
+
+## 0. Drain or cancel running jobs first
+
+Upgrade with **no job running**. Wait for running jobs to finish, or cancel
+them (`DELETE /job/{id}`), before stopping the old services. A job that spans
+the upgrade loses the old frontier's in-memory queue (the new frontier
+starts from an empty `FrontierStore`) and has no restored accounting on the
+new API, so it can never balance: it ends `FailStalled` after
+`JOB_STALL_TIMEOUT_SECS` (30 min) and is **billed** for the pages it
+crawled. Pick a window with no scheduled cron runs (or temporarily turn
+off `cron_enabled` on the saved configs due in it) so no new job starts
+mid-rollout.
+
+## 1. Rails migration and pre-merge checks
+
+The engine degrades to in-memory-only accounting (see `CLAUDE.md` → "Degraded
+mode") if the `jobs.accounting` column is missing, so the Rails migration
+**must** run before the API is deployed:
+
+```bash
+cd saas
+bin/rails db:migrate
+```
+
+This applies `20260926000001_add_accounting_to_jobs` (and any later
+migrations on the branch).
+
+Before merging to `main`, also run — neither of these ran during
+development because Postgres was down locally:
+
+```bash
+just saas-test
+```
+
+and one real accounting flush/restore round trip against a live Postgres
+(create a job, let it accumulate a few events, kill and restart the API,
+confirm the job's counters survive and it still reaches a terminal state).
+
+## 2. Create Kafka topics
+
+```bash
+rpk topic create scrapix.fetch.feedback --partitions 6
+rpk topic list | grep -E 'scrapix\.(jobs\.status|dlq\.urls)'
+```
+
+`scrapix.fetch.feedback` carries the crawler's per-URL fetch outcome back to
+the frontier (releases the domain politeness slot, feeds robots
+`Crawl-delay`/`Retry-After` into the domain's delay) — it must exist before
+crawlers that publish to it are rolled out (see step 4). Confirm
+`scrapix.jobs.status` and `scrapix.dlq.urls` already exist; create them with
+`rpk topic create` if not.
+
+## 3. Environment: `REDIS_URL`, instance ids, wake ports
+
+In `/etc/scrapix/scrapix.env`, set `REDIS_URL` for both `scrapix-frontier` and
+`scrapix-crawler`:
+
+```bash
+REDIS_URL=redis://<host>:6379
+```
+
+This makes frontier admission/dedup state and per-domain politeness state
+durable and shared (`FrontierStore`), and lets more than one frontier
+instance run if `qdq-server` ever scales it out. Leave `ALLOW_PRIVATE_IPS`
+**unset** (it defaults to `false`) — production crawls should keep the SSRF
+guard (private/loopback/link-local/unique-local/CGNAT/multicast/unspecified
+addresses refused) on.
+
+**Redis persistence.** The frontier queue and seen sets live in that Redis;
+the frontier is only as durable as it is. Enable AOF (`appendonly yes`,
+`appendfsync everysec`) or at least RDB snapshots on the `REDIS_URL`
+instance — without persistence, a Redis restart empties every running job's
+queue and those jobs end `FailStalled`. Check with
+`redis-cli CONFIG GET appendonly` / `CONFIG GET save`.
+
+**Stable `INSTANCE_ID` / `WORKER_ID`.** Each frontier instance must have a
+stable `INSTANCE_ID`, and each crawler and content worker a stable
+`WORKER_ID` (e.g. `frontier-1`, `crawler-1`, `content-1`), set per systemd
+unit, not in the shared env file. The id names the service's job-control
+consumer group (`scrapix.jobs.status`). With the default random id, every
+restart joins a *new* group starting at the latest offset: controls
+published while the service was down (a Cancel, a Pause) are never seen,
+and one abandoned consumer group leaks per restart. The services log a
+warning at startup when the id is unset.
+
+**Distinct `WAKE_PORT` per service on one box.** Every worker binary serves
+`/metrics` and `/health` on `WAKE_PORT`, default `8081`, which is also the
+Rails SaaS port on `hackersearch`. A bind failure only logs a warning, so a
+service that loses the race simply has no metrics. Set, per unit:
+
+| Service | `WAKE_PORT` | Prometheus target |
+|---------|-------------|-------------------|
+| `scrapix-api` | — (serves `/metrics` on `PORT`, 8080) | `localhost:8080` |
+| `scrapix-frontier` | `9101` | `localhost:9101` |
+| `scrapix-crawler` | `9102` | `localhost:9102` |
+| `scrapix-content` | `9103` | `localhost:9103` |
+
+(Unit names as deployed by `qdq-server`; use the next free ports if more
+instances run on the box, e.g. a second crawler on `9104`.) Rails keeps
+`8081`.
+
+For example, with `systemctl edit scrapix-frontier`:
+
+```ini
+[Service]
+Environment=INSTANCE_ID=frontier-1
+Environment=WAKE_PORT=9101
+```
+
+## 4. Deploy order
+
+Deploy in this order — **content workers, then crawlers, then frontier, then
+API**:
+
+1. **Content workers** — understand both the old and new message shapes
+   (every new Kafka message field is `#[serde(default)]`), so they can absorb
+   messages from either old or new crawlers during the rollout window.
+2. **Crawlers** — old crawlers publish no `FetchFeedback`, so crawlers must
+   go out *before* the frontier starts relying on that feedback to release
+   politeness slots. Deploying crawlers before the frontier avoids a window
+   where the (already-updated) frontier is waiting on feedback that
+   old crawlers never send (it would fall back to the `2 × REQUEST_TIMEOUT`
+   safety expiry for every slot in that window, which is correct but slow).
+3. **Frontier**.
+4. **API** last.
+
+## 5. Redis store conformance suite
+
+Dev only ever exercises the frontier's Redis-backed `FrontierStore` against
+Dragonfly (`just infra`); it has only been verified against real Redis 7 in
+CI/this test suite. Before relying on it in production, run the conformance
+suite against Dragonfly to confirm the two backends still agree on the
+contract `FrontierStore` needs:
+
+```bash
+just infra
+SCRAPIX_TEST_REDIS_URL=redis://localhost:6379 \
+  cargo test -p scrapix-frontier --features conformance,redis-store --test store_redis
+```
+
+## 6. Prometheus scrape targets
+
+Add scrape targets for the new `/metrics` endpoints to the `scrapix-ops`
+monitoring dashboard:
+
+- `scrapix-api`: `GET /metrics` on its HTTP port (8080).
+- Each crawler/content-worker/frontier process: `GET /metrics` on its own
+  `WAKE_PORT` — on `hackersearch`, the ports from the table in step 3
+  (`localhost:9101`, `9102`, `9103`); on Fly, one target per machine
+  (`WAKE_PORT` 8081 there, where nothing else binds it).
+
+Import the metric names from `crates/scrapix-core/src/metrics.rs`:
+`scrapix_crawler_fetches_total{outcome}`,
+`scrapix_crawler_fetch_duration_seconds`, `scrapix_crawler_bytes_total`,
+`scrapix_frontier_admissions_total{result}`, `scrapix_frontier_queued{job}`,
+`scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
+`scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
+`scrapix_consumer_uncommitted{topic}`.
+
+## 6b. Politeness defaults changed (single-site crawls are slower)
+
+The frontier defaults went from `DOMAIN_DELAY_MS=50` /
+`CONCURRENT_PER_DOMAIN=50` to `DOMAIN_DELAY_MS=250` /
+`CONCURRENT_PER_DOMAIN=4`, and the per-domain slot is now held until the
+crawler reports the fetch back. A crawl of a single site is therefore
+roughly **5–12× slower** than before (up to ~4 req/s per domain instead of
+up to ~20). Multi-domain crawls are much less affected. This is intended
+(it stops hammering sites), but tell users who crawl their own site.
+
+To override:
+
+- **Box-wide**, in the frontier's env: e.g. `DOMAIN_DELAY_MS=50` and
+  `CONCURRENT_PER_DOMAIN=16` (these are the floor for every job; a job can
+  only be made slower than them).
+- **Per job**, a job can only *raise* the delay (`rate_limit.per_domain_delay_ms`,
+  `rate_limit.requests_per_second`, robots `Crawl-delay`); it cannot go faster
+  than the frontier's `DOMAIN_DELAY_MS`.
+
+## 7. Fixed Meilisearch instance on port 7701
+
+As of 2026-09-25, the Meilisearch instance pinned to port 7701 on the
+production box was reported crash-looping and slated for retirement. Resolve
+this **before** running `verify.sh`:
+
+- If it's being retired, repoint whatever job configs or engines still target
+  `:7701` at its replacement first.
+- If it's meant to keep running, get it out of its crash loop and confirm
+  it's healthy.
+
+Don't run `verify.sh` against a box with a known-bad Meilisearch target — a
+crawl job that indexes to it will fail or hang in ways that look like a
+regression in this branch.
+
+## 8. Watch the first jobs
+
+After all services are deployed:
+
+1. Submit a small real crawl and watch it reach `Completed` (not stuck
+   `Running`, not `FailStalled`) via `GET /job/{id}/status`.
+2. Check that its billing came out right (pages crawled × the credits
+   formula in `docs/guides/billing.mdx` — verify against
+   `crates/scrapix-billing/src/credits.rs` if anything looks off).
+3. Confirm the completion email was sent (exactly one).
+4. Cancel a second crawl mid-way and confirm the frontier and workers stop
+   dispatching/processing its URLs, and that it's billed for the pages
+   crawled before cancellation.
+
+## Known caveats after the rollout
+
+- A frontier **crash** (SIGKILL, OOM, power loss — not a graceful stop)
+  between popping a batch from Redis and sending it loses that batch: the
+  URLs are counted dispatched but never crawled, and the job ends
+  `FailStalled` (billed). A graceful stop (SIGTERM) requeues every unsent
+  URL within `DISPATCH_SHUTDOWN_GRACE_MS` (10 s).
+- The API's accounting "seen" sets (which drop duplicate outcome events)
+  are not persisted. A duplicate outcome whose original was accounted
+  before an API restart can be counted twice after it (rare: needs a
+  redelivery that straddles the restart).
+- Jobs retried from the console ("Retry") resubmit the stored config, in
+  which secrets are masked (`***`): Meilisearch API key, webhook auth,
+  proxy credentials and custom header values. Re-enter them for a retried
+  job that needs them.
+
+## Reference
+
+- Rollout order and the reasoning for it: `docs/superpowers/specs/2026-09-26-crawl-engine-fixes.md`
+- Politeness/job-lifecycle/webhook/metrics behavior: `CLAUDE.md` → "Crawl
+  Pipeline Behavior"
+- Fly-specific politeness/wake/scaling notes: `deploy/fly/README.md`

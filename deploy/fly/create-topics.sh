@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the 7 Kafka topics Scrapix expects, with the partition counts used
+# Create the 8 Kafka topics Scrapix expects, with the partition counts used
 # in docker-compose.yml. Idempotent: `rpk topic create` skips existing topics.
 #
 # Usage: ./deploy/fly/create-topics.sh
@@ -21,6 +21,7 @@ run_rpk "topic create scrapix.documents        -p 6  -c max.message.bytes=104857
 run_rpk "topic create scrapix.events           -p 3"
 run_rpk "topic create scrapix.dlq.urls         -p 3"
 run_rpk "topic create scrapix.jobs.status      -p 3"
+run_rpk "topic create scrapix.fetch.feedback   -p 6"
 
 echo "Done. Listing topics:"
 run_rpk "topic list"

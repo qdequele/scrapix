@@ -65,6 +65,8 @@ pub mod extractor;
 pub mod fetcher;
 pub mod proxy;
 pub mod robots;
+pub(crate) mod safe_client;
+pub(crate) mod safe_dns;
 pub mod sitemap;
 
 #[cfg(feature = "browser-cdp")]
@@ -76,17 +78,20 @@ pub mod renderer_webdriver;
 // Re-exports for convenience
 pub use dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 pub use extractor::{
-    is_non_page_url, is_non_page_url_with_pdf, ExtractorConfig, UrlExtractor, UrlExtractorBuilder,
+    is_non_page_url, is_non_page_url_with_pdf, url_allowed, ExtractorConfig, UrlExtractor,
+    UrlExtractorBuilder,
 };
 pub use fetcher::{
-    ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig, HttpFetcher,
-    HttpFetcherBuilder, RetryConfig,
+    parse_retry_after, ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig,
+    HttpFetcher, HttpFetcherBuilder, RetryConfig,
 };
 pub use proxy::{ProxyConfig, ProxyPool, RotationStrategy};
 pub use robots::{
     PersistentRobotsCache, PersistentRobotsEntry, RobotsCache, RobotsCacheStats, RobotsConfig,
     RobotsPersistence, RocksDbOps, RocksRobotsPersistence,
 };
+pub use safe_client::safe_client_builder;
+pub use safe_dns::{is_public_ip, validate_proxy_url};
 pub use sitemap::{
     ChangeFrequency, SitemapConfig, SitemapContent, SitemapEntry, SitemapParser, SitemapUrl,
 };
@@ -95,6 +100,7 @@ pub use sitemap::{
 #[cfg(feature = "browser-cdp")]
 pub use renderer_cdp::{
     CdpConfig, CdpError, CdpRenderer, CdpRendererBuilder, RenderResult, WaitUntil,
+    BROWSER_PROXY_UNSUPPORTED,
 };
 
 // WebDriver renderer re-exports

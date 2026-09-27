@@ -110,6 +110,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let frontier_consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
     frontier_consumer.subscribe(&[topic_names::URL_FRONTIER])?;
 
+    // Frontier fetch-feedback consumer (FETCH_FEEDBACK, politeness slots)
+    let frontier_feedback = Arc::new(AnyConsumer::channel(bus.consumer()));
+    frontier_feedback.subscribe(&[topic_names::FETCH_FEEDBACK])?;
+
     // Crawler consumer (URL_PROCESSING)
     let crawler_consumer = AnyConsumer::channel(bus.consumer());
     crawler_consumer.subscribe(&[topic_names::URL_PROCESSING])?;
@@ -117,6 +121,17 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     // Content consumer (PAGES_RAW)
     let content_consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
     content_consumer.subscribe(&[topic_names::PAGES_RAW])?;
+
+    // Job control (JOB_STATUS): one named group per service, so the
+    // frontier and both workers each receive every cancel/pause/resume.
+    let control_consumer = |group: &str| -> anyhow::Result<AnyConsumer> {
+        let c = AnyConsumer::channel(bus.consumer_in_group(group));
+        c.subscribe(&[topic_names::JOB_STATUS])?;
+        Ok(c)
+    };
+    let frontier_control = Arc::new(control_consumer("frontier-control")?);
+    let crawler_control = control_consumer("crawler-control")?;
+    let content_control = Arc::new(control_consumer("content-control")?);
 
     // Build service-specific args
     let api_args = scrapix_api::Args {
@@ -127,18 +142,36 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
         verbose: args.verbose,
     };
 
     let frontier_args = scrapix_frontier_service::Args {
         brokers: String::new(),
         group_id: "scrapix-frontier".to_string(),
+        // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
+        redis_url: std::env::var("REDIS_URL").ok(),
+        frontier_key_prefix: "scrapix:frontier".to_string(),
+        job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
-        domain_delay_ms: 50,
-        concurrent_per_domain: 50,
+        domain_delay_ms: 250,
+        concurrent_per_domain: 4,
+        request_timeout_secs: 30,
+        robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
+        dispatch_shutdown_grace_ms: env_or("DISPATCH_SHUTDOWN_GRACE_MS", 10_000),
         max_pending_per_job: 1_000_000,
         instance_id: Some("all-in-one".to_string()),
         verbose: args.verbose,
@@ -182,6 +215,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,
+        // Same opt-out env var as the standalone worker (off by default).
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     };
 
     let content_args = build_content_args(args, String::new());
@@ -196,6 +233,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         }
     });
 
+    let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
         if let Err(e) = scrapix_frontier_service::run_with_bus(
             frontier_args,
@@ -203,6 +241,9 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
             frontier_consumer,
             None, // links consumer
             None, // history consumer
+            Some(frontier_feedback),
+            Some(frontier_control),
+            frontier_store,
         )
         .await
         {
@@ -211,18 +252,26 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     });
 
     let crawler_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_crawler::run_with_bus(crawler_args, crawler_producer, crawler_consumer)
-                .await
+        if let Err(e) = scrapix_worker_crawler::run_with_bus(
+            crawler_args,
+            crawler_producer,
+            crawler_consumer,
+            Some(crawler_control),
+        )
+        .await
         {
             error!(error = %e, "Crawler worker failed");
         }
     });
 
     let content_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_content::run_with_bus(content_args, content_consumer, content_producer)
-                .await
+        if let Err(e) = scrapix_worker_content::run_with_bus(
+            content_args,
+            content_consumer,
+            content_producer,
+            Some(content_control),
+        )
+        .await
         {
             error!(error = %e, "Content worker failed");
         }
@@ -327,6 +376,22 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         AnyConsumer::from(c)
     });
 
+    // One instance here: its feedback group is shared only with Redis
+    // politeness (see `feedback_group_id`).
+    let feedback_group = scrapix_frontier_service::feedback_group_id(
+        "scrapix-all-frontier",
+        "all-in-one",
+        std::env::var("REDIS_URL").is_ok_and(|u| !u.is_empty()),
+    );
+    let frontier_feedback: Arc<AnyConsumer> = Arc::new({
+        let c = ConsumerBuilder::new(brokers, &feedback_group)
+            .client_id("scrapix-all-frontier-feedback")
+            .auto_offset_reset("latest")
+            .build()?;
+        c.subscribe(&[topic_names::FETCH_FEEDBACK])?;
+        AnyConsumer::from(c)
+    });
+
     let crawler_producer: AnyProducer = ProducerBuilder::new(brokers)
         .client_id("scrapix-all-crawler")
         .compression("lz4")
@@ -359,6 +424,21 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         AnyConsumer::from(c)
     });
 
+    // Job control (JOB_STATUS): one group per service (each sees every
+    // control), `latest` so a new group does not replay the history.
+    let control_consumer = |service: &str| -> anyhow::Result<AnyConsumer> {
+        let group = scrapix_queue::control_group_id(service, "all-in-one");
+        let c = ConsumerBuilder::new(brokers, &group)
+            .client_id(format!("{service}-control"))
+            .auto_offset_reset("latest")
+            .build()?;
+        c.subscribe(&[topic_names::JOB_STATUS])?;
+        Ok(AnyConsumer::from(c))
+    };
+    let frontier_control = Arc::new(control_consumer("scrapix-all-frontier")?);
+    let crawler_control = control_consumer("scrapix-all-crawlers")?;
+    let content_control = Arc::new(control_consumer("scrapix-all-content")?);
+
     // Build the same args as channel mode
     let api_args = scrapix_api::Args {
         host: args.host.clone(),
@@ -368,18 +448,36 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         jwt_secret: args.jwt_secret.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
         verbose: args.verbose,
     };
 
     let frontier_args = scrapix_frontier_service::Args {
         brokers: brokers.to_string(),
         group_id: "scrapix-all-frontier".to_string(),
+        // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
+        redis_url: std::env::var("REDIS_URL").ok(),
+        frontier_key_prefix: "scrapix:frontier".to_string(),
+        job_retention_hours: 168,
         bloom_capacity: 10_000_000,
         bloom_fp_rate: 0.01,
-        domain_delay_ms: 50,
-        concurrent_per_domain: 50,
+        domain_delay_ms: 250,
+        concurrent_per_domain: 4,
+        request_timeout_secs: 30,
+        robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
+        dispatch_shutdown_grace_ms: env_or("DISPATCH_SHUTDOWN_GRACE_MS", 10_000),
         max_pending_per_job: 1_000_000,
         instance_id: Some("all-in-one".to_string()),
         verbose: args.verbose,
@@ -423,6 +521,10 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,
+        // Same opt-out env var as the standalone worker (off by default).
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
     };
 
     let content_args = build_content_args(args, brokers.to_string());
@@ -436,6 +538,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         }
     });
 
+    let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
         if let Err(e) = scrapix_frontier_service::run_with_bus(
             frontier_args,
@@ -443,6 +546,9 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
             frontier_consumer,
             None,
             None,
+            Some(frontier_feedback),
+            Some(frontier_control),
+            frontier_store,
         )
         .await
         {
@@ -451,18 +557,26 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     });
 
     let crawler_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_crawler::run_with_bus(crawler_args, crawler_producer, crawler_consumer)
-                .await
+        if let Err(e) = scrapix_worker_crawler::run_with_bus(
+            crawler_args,
+            crawler_producer,
+            crawler_consumer,
+            Some(crawler_control),
+        )
+        .await
         {
             error!(error = %e, "Crawler worker failed");
         }
     });
 
     let content_handle = tokio::spawn(async move {
-        if let Err(e) =
-            scrapix_worker_content::run_with_bus(content_args, content_consumer, content_producer)
-                .await
+        if let Err(e) = scrapix_worker_content::run_with_bus(
+            content_args,
+            content_consumer,
+            content_producer,
+            Some(content_control),
+        )
+        .await
         {
             error!(error = %e, "Content worker failed");
         }
@@ -486,4 +600,12 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     info!("All services stopped.");
     Ok(())
+}
+
+/// Parse an optional numeric env var, falling back to `default`.
+fn env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }

@@ -36,3 +36,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # Base64 decode for PDF bodies carried through RawPageMessage.html
 base64 = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+serde = { workspace = true }

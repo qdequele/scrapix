@@ -62,9 +62,17 @@ See [Crawl Configs](/configuration/crawl-configs) for the complete schema with a
   "status": "running",
   "index_uid": "my-docs",
   "start_urls_count": 1,
-  "message": "Crawl job started with 1 seed URLs"
+  "message": "Crawl job started with 1 seed URLs",
+  "warnings": []
 }
 ```
+
+`warnings` lists non-fatal notices about config fields that were accepted but
+can't be fully honored per job — e.g. `concurrency.browser_pool_size` (a
+worker-level setting) or `proxy` combined with `"crawler_type": "browser"`.
+It's empty when nothing needed a warning. The same field also appears on
+`GET /job/{id}/status`, accumulating any warnings workers raise while the job
+runs.
 
 ### Billing Tier Limits
 

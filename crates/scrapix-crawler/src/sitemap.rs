@@ -54,6 +54,10 @@ pub struct SitemapConfig {
     pub max_depth: u32,
     /// Follow sitemap index files
     pub follow_index: bool,
+    /// Whether to allow fetching sitemaps/robots.txt from hosts that resolve
+    /// to private/internal IP ranges. Defaults to `false` (deny) for SSRF
+    /// safety, matching `FetcherConfig::allow_private_ips`.
+    pub allow_private_ips: bool,
 }
 
 impl Default for SitemapConfig {
@@ -65,6 +69,7 @@ impl Default for SitemapConfig {
             max_urls: 100_000,
             max_depth: 3,
             follow_index: true,
+            allow_private_ips: false,
         }
     }
 }
@@ -167,7 +172,7 @@ pub struct SitemapParser {
 impl SitemapParser {
     /// Create a new sitemap parser
     pub fn new(config: SitemapConfig) -> Self {
-        let client = Client::builder()
+        let client = crate::safe_client::safe_client_builder(None, config.allow_private_ips)
             .timeout(config.timeout)
             .user_agent(&config.user_agent)
             .gzip(true)
@@ -186,6 +191,10 @@ impl SitemapParser {
     #[instrument(skip(self))]
     pub async fn discover_from_robots(&self, base_url: &str) -> Result<Vec<String>> {
         let parsed = Url::parse(base_url)?;
+        // Raw-IP hosts bypass `SafeResolver` entirely, so they must be
+        // refused explicitly — `base_url` here can be user-supplied (e.g.
+        // the /map endpoint's request URL).
+        crate::safe_client::reject_ip_host(&parsed)?;
         let robots_url = format!(
             "{}://{}/robots.txt",
             parsed.scheme(),
@@ -309,6 +318,13 @@ impl SitemapParser {
 
     /// Fetch sitemap content
     async fn fetch_sitemap(&self, url: &str) -> Result<String> {
+        // Raw-IP hosts bypass `SafeResolver` entirely, so they must be
+        // refused explicitly. This also covers sitemap-index entries, whose
+        // `loc` values are attacker-controlled content from a fetched
+        // sitemap (a malicious index could point sub-sitemap entries at an
+        // internal address).
+        crate::safe_client::reject_ip_host(&Url::parse(url)?)?;
+
         let response = self
             .client
             .get(url)

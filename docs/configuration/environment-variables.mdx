@@ -19,6 +19,12 @@ All Scrapix services are configured through environment variables. When running 
 | `JWT_SECRET` | `dev-jwt-secret-change-in-production` | JWT signing secret |
 | `DATABASE_URL` | — | PostgreSQL URL for auth (optional) |
 | `MAX_JOBS` | `10000` | Maximum tracked jobs |
+| `JOB_STALL_TIMEOUT_SECS` | `1800` | Seconds without progress before a job is finalized as `FailStalled` (stalled jobs are still billed for pages crawled) |
+| `JOB_COMPLETION_GRACE_MS` | `3000` | Grace period after exact work accounting says a job is done, before finalizing it, to absorb straggler events |
+| `RESUME_HEAL_AFTER_SECS` | `60` | A `Running` job whose work is not fully accounted for and that received no pipeline event for this long gets its `Resume` control re-published (self-heal of a lost or reordered Resume; a no-op for a job the frontier already runs). Rate-limited to one re-publish per job per 10 s |
+| `MAX_PENDING_ACKS` | `50000` | Maximum event acks held while waiting for the accounting flush; the event consumer blocks (backpressure) at this cap until a flush frees room |
+| `ALLOW_PRIVATE_IPS` | `false` | Allow webhook deliveries to reach private/loopback/link-local addresses (SSRF opt-out; same policy as the crawler's own `ALLOW_PRIVATE_IPS` — off by default, tests only) |
+| `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Maximum webhook deliveries in flight at once, across all jobs and hooks |
 
 ## Message Queue
 
@@ -64,12 +70,19 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 |----------|---------|-------------|
 | `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches |
 | `DISPATCH_BATCH_SIZE` | `2000` | URLs per dispatch batch |
-| `DOMAIN_DELAY_MS` | `50` | Minimum delay between requests to same domain |
-| `BLOOM_CAPACITY` | `10000000` | Bloom filter expected capacity per job |
-| `BLOOM_FP_RATE` | `0.01` | Bloom filter false positive rate |
+| `DOMAIN_DELAY_MS` | `250` | Minimum delay between requests to same domain (jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it) |
+| `BLOOM_CAPACITY` | `10000000` | **Deprecated and ignored.** Dedup now lives in the `FrontierStore` (Redis or in-memory), not a bloom filter; kept only so old env files don't fail to parse |
+| `BLOOM_FP_RATE` | `0.01` | **Deprecated and ignored** (see `BLOOM_CAPACITY`) |
 | `MAX_PENDING_PER_JOB` | `1000000` | Maximum pending URLs per job |
-| `CONCURRENT_PER_DOMAIN` | `50` | Maximum concurrent requests per domain |
-| `INSTANCE_ID` | — | Instance identifier for multi-instance frontier |
+| `CONCURRENT_PER_DOMAIN` | `4` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
+| `REQUEST_TIMEOUT` | `30` | Crawler request timeout (s); a politeness slot without feedback expires after 2× this |
+| `ROBOTS_DELAY_MULTIPLIER` | `1.0` | Multiplier applied to robots.txt `Crawl-delay` |
+| `REDIS_URL` | — | When set, frontier state (dedup/queue via `FrontierStore`) and per-domain politeness state are shared in Redis across instances, so more than one frontier instance can run at once |
+| `FRONTIER_KEY_PREFIX` | `scrapix:frontier` | Redis key prefix for the frontier store (only relevant with `REDIS_URL` set) |
+| `JOB_RETENTION_HOURS` | `168` | How long a finished/cancelled job's counters and state stay queryable after its queue and seen set are released |
+| `INSTANCE_ID` | random per start | Instance identifier. **Set a stable value per frontier instance in production**: it names the instance's job-control consumer group, so a random id loses controls published while the instance was down and leaks one consumer group per restart (a warning is logged when unset) |
+| `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight send and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (Fly `kill_timeout` is 30 s) |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health`. On a single box give each service its own port (8081 is also the Rails SaaS port; a failed bind only logs a warning) |
 
 ### Link Graph (optional)
 
@@ -101,8 +114,11 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `MAX_DEPTH` | `100` | Maximum crawl depth |
 | `MAX_BODY_SIZE_MB` | `10` | Maximum response body size in MB |
 | `RESPECT_ROBOTS` | `true` | Respect robots.txt directives |
-| `WORKER_ID` | — | Worker identifier |
+| `WORKER_ID` | random per start | Worker identifier. **Set a stable value per worker instance in production** (same reason as the frontier's `INSTANCE_ID`: it names the job-control consumer group; a warning is logged when unset). Applies to content workers too |
 | `ROCKSDB_PATH` | `./data/crawler-rocksdb` | RocksDB storage path |
+| `REDIS_URL` | — | Optional; when set, enables incremental-crawl header lookups shared across crawler instances (without it, incremental crawling uses in-message headers only) |
+| `ALLOW_PRIVATE_IPS` | `false` | Allow fetching hosts that resolve to private/loopback/link-local/CGNAT/multicast/unspecified addresses (SSRF opt-out). Tests and self-hosted private-network crawls only — never enable in production. Raw-IP URLs stay refused regardless |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` (Prometheus text) and `GET /health`, and used by Fly's proxy to autostart a suspended machine |
 
 ### DNS Cache
 
@@ -122,7 +138,7 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LINK_GRAPH` | `true` | Track link relationships locally |
+| `LINK_GRAPH` | `false` | Track link relationships locally (off by default — it only feeds internal logging today, per spec R9) |
 | `LINK_GRAPH_INTERVAL` | `1000` | Links before sending batch update |
 | `PUBLISH_LINKS` | `false` | Publish link graph to Kafka topic |
 | `INCREMENTAL_CRAWL` | `true` | Track ETags/Last-Modified for incremental crawls |
@@ -201,5 +217,14 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info,scrapix=debug` | Log level filter |
-| `METRICS_PORT` | `9090` | Prometheus metrics endpoint port |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OpenTelemetry OTLP collector endpoint |
+
+<Note>
+There is no separate `METRICS_PORT`. The engine (`scrapix-api`) serves
+`GET /metrics` (Prometheus text format, unauthenticated) on its normal HTTP
+port (`PORT`, default `8080`). Every worker (`scrapix-worker-crawler`,
+`scrapix-worker-content`, `scrapix-frontier-service`) serves the same
+`GET /metrics` and `GET /health` on its `WAKE_PORT` (default `8081`) — the
+same bare-TCP listener Fly's proxy connects to for autostart. Metric names
+are a contract with `qdq-server/monitoring`; see `crates/scrapix-core/src/metrics.rs`.
+</Note>

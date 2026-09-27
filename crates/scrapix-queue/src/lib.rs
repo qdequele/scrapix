@@ -50,19 +50,26 @@
 //! }
 //! ```
 
+pub mod accounting;
 pub mod bus;
 pub mod channel;
 pub mod consumer;
+pub mod control;
+pub mod offsets;
 pub mod producer;
 pub mod topics;
 pub mod traits;
 
 // Re-exports
+pub use accounting::{EventPosition, FrontierSnapshot, JobAccounting};
 pub use consumer::{ConsumerBuilder, ConsumerConfig, KafkaConsumer, MessageMetadata};
+pub use control::{control_group_id, CancelledJobs, CANCELLED_JOBS_CAP};
+pub use offsets::OffsetTracker;
 pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};
+pub use scrapix_core::Ack;
 pub use topics::{
     names as topic_names, CrawlEvent, CrawlHistoryMessage, DlqMessage, DocumentMessage,
-    LinksMessage, RawPageMessage, UrlMessage,
+    FetchFeedback, JobAction, JobControl, LinksMessage, RawPageMessage, UrlMessage,
 };
 
 // Message bus abstractions

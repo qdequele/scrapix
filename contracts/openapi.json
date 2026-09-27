@@ -1734,6 +1734,7 @@
           "jobs"
         ],
         "summary": "Cancel a job",
+        "description": "Stops the job everywhere (frontier and workers) and bills the pages\ncrawled so far. Only a pending, running or paused job can be cancelled:\na job that already completed, failed or was cancelled returns 409 and\nkeeps its status.",
         "operationId": "cancel_job",
         "parameters": [
           {
@@ -1748,10 +1749,143 @@
         ],
         "responses": {
           "200": {
-            "description": ""
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is already terminal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/job/{id}/pause": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Pause a running job",
+        "description": "The frontier stops dispatching the job's URLs (pages already in flight\nfinish). Only a running job can be paused; any other status returns 409.",
+        "operationId": "pause_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/job/{id}/resume": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Resume a paused job",
+        "description": "Only a paused job can be resumed; any other status returns 409.",
+        "operationId": "resume_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job is not paused",
             "content": {
               "application/json": {
                 "schema": {
@@ -3663,6 +3797,13 @@
           },
           "status": {
             "type": "string"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Non-fatal warnings about config fields that were accepted but cannot\nbe honored per-job (worker-level settings). Empty when there are none."
           }
         }
       },
@@ -4301,6 +4442,18 @@
           "replace"
         ]
       },
+      "JobStatus": {
+        "type": "string",
+        "description": "Crawl job status",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "paused"
+        ]
+      },
       "JobStatusResponse": {
         "type": "object",
         "description": "Job status response",
@@ -4394,7 +4547,15 @@
             ]
           },
           "status": {
-            "type": "string"
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "One of `pending`, `running`, `paused`, `completed`, `failed`,\n`cancelled`"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Job-level warnings raised by workers while running the job (e.g. a\nrequested feature a worker cannot honor), deduplicated. Omitted when\nthere are none."
           }
         }
       },
@@ -4798,7 +4959,7 @@
           "default_crawl_delay_ms": {
             "type": "integer",
             "format": "int64",
-            "description": "Default crawl delay if not specified in robots.txt (ms)",
+            "description": "Per-domain delay (ms) used when the domain's robots.txt was fetched\nand sets no `Crawl-delay`, and the job sets neither\n`per_domain_delay_ms` (> 0) nor `requests_per_second` /\n`requests_per_minute`. 0 (default) = no extra delay.",
             "minimum": 0
           },
           "per_domain_delay_ms": {
@@ -5385,7 +5546,8 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether to discover and use sitemaps"
+            "description": "Whether to discover and use sitemaps (default: true)",
+            "default": true
           },
           "urls": {
             "type": "array",

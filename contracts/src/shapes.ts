@@ -192,3 +192,24 @@ export const RODAUTH_ERROR: Spec = {
   error: "string",
   "field-error": "any?",
 };
+
+/** Engine job status (JobStatusResponse); optional keys are omitted when empty. */
+export const JOB_STATUS: Spec = {
+  job_id: "string",
+  status: "string",
+  index_uid: "string",
+  pages_crawled: "number",
+  pages_indexed: "number",
+  documents_sent: "number",
+  errors: "number",
+  started_at: "string?",
+  completed_at: "string?",
+  duration_seconds: "number?",
+  error_message: "string?",
+  crawl_rate: "number",
+  eta_seconds: "number?",
+  start_urls: "any?",
+  max_pages: "number?",
+  config: "any?",
+  warnings: "any?",
+};

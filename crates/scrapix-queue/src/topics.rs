@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scrapix_core::{CrawlUrl, Document, FeaturesConfig, UrlPatterns};
+use scrapix_core::{CrawlUrl, Document, FeaturesConfig, JobSpec, RawPage, UrlPatterns};
 
 /// Predefined topic names
 pub mod names {
@@ -18,12 +18,16 @@ pub mod names {
     pub const DLQ_URLS: &str = "scrapix.dlq.urls";
     /// Crawl events for monitoring
     pub const EVENTS: &str = "scrapix.events";
-    /// Job status updates
+    /// Job control messages ([`JobControl`](super::JobControl)): API →
+    /// frontier/workers (finish, cancel, pause, resume)
     pub const JOB_STATUS: &str = "scrapix.jobs.status";
     /// Link graph updates (discovered links)
     pub const LINKS: &str = "scrapix.links";
     /// Crawl history updates (for incremental crawling)
     pub const CRAWL_HISTORY: &str = "scrapix.crawl.history";
+    /// Crawler → frontier feedback after every fetch attempt (politeness
+    /// slot release, robots crawl-delay, Retry-After)
+    pub const FETCH_FEEDBACK: &str = "scrapix.fetch.feedback";
 }
 
 /// Message types for the URL frontier queue
@@ -67,6 +71,10 @@ pub struct UrlMessage {
     /// Defaults to true. Set to false for Replace index strategy (full re-crawl).
     #[serde(default = "default_true")]
     pub incremental: bool,
+    /// Job-scoped crawl settings (rate limits, proxy, meilisearch settings, etc.)
+    /// that workers need but that are not per-URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobSpec>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +98,7 @@ impl UrlMessage {
             max_depth: None,
             max_pages: None,
             incremental: true,
+            job: None,
         }
     }
 
@@ -101,20 +110,8 @@ impl UrlMessage {
         account_id: impl Into<String>,
     ) -> Self {
         Self {
-            url,
-            job_id: job_id.into(),
-            index_uid: index_uid.into(),
-            source: None,
             account_id: Some(account_id.into()),
-            message_id: uuid::Uuid::new_v4().to_string(),
-            created_at: chrono::Utc::now().timestamp_millis(),
-            url_patterns: None,
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            features: None,
-            max_depth: None,
-            max_pages: None,
-            incremental: true,
+            ..Self::new(url, job_id, index_uid)
         }
     }
 
@@ -126,20 +123,8 @@ impl UrlMessage {
         patterns: UrlPatterns,
     ) -> Self {
         Self {
-            url,
-            job_id: job_id.into(),
-            index_uid: index_uid.into(),
-            source: None,
-            account_id: None,
-            message_id: uuid::Uuid::new_v4().to_string(),
-            created_at: chrono::Utc::now().timestamp_millis(),
             url_patterns: Some(patterns),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            features: None,
-            max_depth: None,
-            max_pages: None,
-            incremental: true,
+            ..Self::new(url, job_id, index_uid)
         }
     }
 
@@ -180,6 +165,35 @@ impl UrlMessage {
     pub fn with_incremental(mut self, incremental: bool) -> Self {
         self.incremental = incremental;
         self
+    }
+
+    /// Set the job-scoped crawl settings (builder pattern)
+    pub fn with_job(mut self, job: Option<JobSpec>) -> Self {
+        self.job = job;
+        self
+    }
+
+    /// Derive a new `UrlMessage` for a discovered/child URL, copying every
+    /// job-scoped field from `self` except `url`, `message_id` (fresh uuid)
+    /// and `created_at` (now).
+    pub fn child(&self, url: CrawlUrl) -> Self {
+        Self {
+            url,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+            job_id: self.job_id.clone(),
+            index_uid: self.index_uid.clone(),
+            source: self.source.clone(),
+            account_id: self.account_id.clone(),
+            url_patterns: self.url_patterns.clone(),
+            meilisearch_url: self.meilisearch_url.clone(),
+            meilisearch_api_key: self.meilisearch_api_key.clone(),
+            features: self.features.clone(),
+            max_depth: self.max_depth,
+            max_pages: self.max_pages,
+            incremental: self.incremental,
+            job: self.job.clone(),
+        }
     }
 
     /// Get the partition key (domain for locality)
@@ -241,6 +255,51 @@ pub struct RawPageMessage {
     /// Per-job feature configuration (overrides worker defaults)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<FeaturesConfig>,
+    /// Job-scoped crawl settings (rate limits, proxy, meilisearch settings, etc.)
+    /// that workers need but that are not per-URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobSpec>,
+    /// The `message_id` of the `UrlMessage` this page was fetched for.
+    /// Used by accounting to tie billing events back to the originating
+    /// frontier message.
+    #[serde(default)]
+    pub url_message_id: String,
+}
+
+impl RawPageMessage {
+    /// Build a `RawPageMessage` from the `UrlMessage` it was fetched for and
+    /// the resulting `RawPage`, copying every job-scoped field from `msg`.
+    pub fn from_url_message(
+        msg: &UrlMessage,
+        page: RawPage,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
+        let content_length = page.html.len() as u64;
+        Self {
+            url: page.url,
+            final_url: page.final_url,
+            status: page.status,
+            html: page.html,
+            content_type: page.content_type,
+            content_length,
+            js_rendered: page.js_rendered,
+            fetched_at: page.fetched_at.timestamp_millis(),
+            fetch_duration_ms: page.fetch_duration_ms,
+            job_id: msg.job_id.clone(),
+            index_uid: msg.index_uid.clone(),
+            source: msg.source.clone(),
+            account_id: msg.account_id.clone(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+            etag,
+            last_modified,
+            meilisearch_url: msg.meilisearch_url.clone(),
+            meilisearch_api_key: msg.meilisearch_api_key.clone(),
+            features: msg.features.clone(),
+            job: msg.job.clone(),
+            url_message_id: msg.message_id.clone(),
+        }
+    }
 }
 
 /// Message for processed documents
@@ -318,8 +377,25 @@ pub enum CrawlEvent {
         content_length: u64,
         duration_ms: u64,
         timestamp: i64,
+        /// Number of discovered links published back to the frontier
+        #[serde(default)]
+        links_published: u64,
+        /// `message_id` of the `UrlMessage` this page was fetched for
+        #[serde(default)]
+        url_message_id: String,
+        /// Whether the page was rendered by a browser (browser billing)
+        #[serde(default)]
+        js_rendered: bool,
+        /// Whether this message is the one that spawned a first-time
+        /// sitemap discovery for (job, domain) (R-18). When true, a
+        /// `SitemapPublished` with this same `url_message_id` is
+        /// guaranteed to follow (with `count: 0` on the disabled/empty/
+        /// error paths), so job-completion accounting knows to wait for
+        /// it before balancing.
+        #[serde(default)]
+        sitemap_pending: bool,
     },
-    /// Page crawl failed
+    /// Page crawl failed (terminal for this URL)
     PageFailed {
         job_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +403,25 @@ pub enum CrawlEvent {
         url: String,
         error: String,
         retry_count: u32,
+        timestamp: i64,
+        /// Final HTTP status, when the failure came from a response
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// `message_id` of the `UrlMessage` that failed
+        #[serde(default)]
+        url_message_id: String,
+    },
+    /// A URL failed transiently and was re-queued with `retry_count + 1`
+    PageRetried {
+        job_id: String,
+        url: String,
+        /// `message_id` of the `UrlMessage` that was retried (the re-queued
+        /// message gets a fresh id)
+        #[serde(default)]
+        url_message_id: String,
+        /// Retry count of the re-queued message
+        retry_count: u32,
+        error: String,
         timestamp: i64,
     },
     /// Document indexed
@@ -336,6 +431,99 @@ pub enum CrawlEvent {
         account_id: Option<String>,
         url: String,
         document_id: String,
+        timestamp: i64,
+        /// `message_id` of the `UrlMessage` this page was fetched for
+        #[serde(default)]
+        url_message_id: String,
+        /// Whether AI enrichment actually ran on this page (AI billing)
+        #[serde(default)]
+        ai_enriched: bool,
+    },
+    /// The content worker processed a page but indexed nothing for it
+    /// (non-2xx page from an old crawler, `index_only` mismatch, no content,
+    /// near-duplicate, non-HTML content type, ...). Terminal for the page.
+    DocumentSkipped {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// The content worker could not turn a page into a document (parse
+    /// error, ...). Terminal for the page.
+    DocumentFailed {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
+        error: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// One LLM call made by a content worker while enriching a page.
+    AiUsage {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        prompt_tokens: u32,
+        #[serde(default)]
+        completion_tokens: u32,
+        #[serde(default)]
+        duration_ms: u64,
+        /// AI feature that made the call (`ai_summary`, `ai_extraction`)
+        #[serde(default)]
+        feature: String,
+        /// Page the call was made for
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// Job-level warning raised by a worker (e.g. a requested feature that
+    /// this worker cannot honor). At most once per (job, message) per worker.
+    JobWarning {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        timestamp: i64,
+    },
+    /// Periodic per-job frontier snapshot (cumulative store counters plus
+    /// the current queue depth), published by the frontier instance that
+    /// holds the job's dispatch lease whenever the counters change.
+    FrontierProgress {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        received: u64,
+        #[serde(default)]
+        admitted: u64,
+        #[serde(default)]
+        dispatched: u64,
+        #[serde(default)]
+        rejected: u64,
+        #[serde(default)]
+        dropped: u64,
+        #[serde(default)]
+        queued: u64,
+        #[serde(default)]
         timestamp: i64,
     },
     /// URLs discovered
@@ -357,6 +545,29 @@ pub enum CrawlEvent {
         job_id: String,
         url: String,
         reason: String,
+        timestamp: i64,
+        /// `message_id` of the `UrlMessage` that was skipped (empty when the
+        /// skip is not tied to a frontier message)
+        #[serde(default)]
+        url_message_id: String,
+    },
+    /// Sitemap URLs published to the frontier for a job's domain.
+    ///
+    /// Distinct from `UrlsDiscovered` (which is also published alongside
+    /// this event) so job completion accounting can attribute
+    /// sitemap-seeded URLs to the `UrlMessage` that triggered discovery.
+    /// All fields default so old and new workers interoperate during a
+    /// rolling deploy.
+    SitemapPublished {
+        #[serde(default)]
+        job_id: String,
+        #[serde(default)]
+        count: usize,
+        /// `message_id` of the `UrlMessage` whose successful fetch
+        /// triggered this sitemap discovery.
+        #[serde(default)]
+        url_message_id: String,
+        #[serde(default)]
         timestamp: i64,
     },
 }
@@ -406,6 +617,10 @@ impl CrawlEvent {
             content_length: 0,
             duration_ms,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            links_published: 0,
+            url_message_id: String::new(),
+            js_rendered: false,
+            sitemap_pending: false,
         }
     }
 
@@ -426,6 +641,10 @@ impl CrawlEvent {
             content_length,
             duration_ms,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            links_published: 0,
+            url_message_id: String::new(),
+            js_rendered: false,
+            sitemap_pending: false,
         }
     }
 
@@ -442,6 +661,8 @@ impl CrawlEvent {
             error: error.into(),
             retry_count,
             timestamp: chrono::Utc::now().timestamp_millis(),
+            status: None,
+            url_message_id: String::new(),
         }
     }
 }
@@ -587,9 +808,139 @@ impl CrawlHistoryMessage {
     }
 }
 
+/// Crawler → frontier: one per dispatched `UrlMessage` the crawler handled,
+/// published to [`names::FETCH_FEEDBACK`] keyed by `domain`. It releases the
+/// politeness slot the frontier took at dispatch and carries what the fetch
+/// learned about the domain.
+///
+/// Every field is `#[serde(default)]` so old and new workers interoperate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FetchFeedback {
+    /// Politeness key of the URL (its host, as `extract_domain` returns it)
+    #[serde(default)]
+    pub domain: String,
+    /// Job the URL belongs to (per-job in-flight cap)
+    #[serde(default)]
+    pub job_id: String,
+    /// `message_id` of the dispatched `UrlMessage` (identifies the slot)
+    #[serde(default)]
+    pub message_id: String,
+    /// The URL fetched
+    #[serde(default)]
+    pub url: String,
+    /// HTTP status of the response (`304` for not-modified); `None` when no
+    /// response was received (transport error, or no request was made)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// A transport-level failure (timeout, connection, network) reached the
+    /// domain without a response
+    #[serde(default)]
+    pub transport_error: bool,
+    /// Server `Retry-After` (429/503), in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// robots.txt `Crawl-delay` of the URL's origin, in milliseconds (only
+    /// for jobs that respect robots.txt, and only when already cached)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crawl_delay_ms: Option<u64>,
+    /// The URL's robots.txt was fetched (the crawler's robots cache holds
+    /// its origin) and the job respects robots.txt — so `crawl_delay_ms:
+    /// None` means "robots.txt sets no Crawl-delay", not "unknown"
+    #[serde(default)]
+    pub robots_checked: bool,
+    /// When the feedback was produced (ms since epoch)
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+impl FetchFeedback {
+    /// Feedback for `url` of message `message_id`; fill in the rest with
+    /// struct update syntax.
+    pub fn new(
+        domain: impl Into<String>,
+        job_id: impl Into<String>,
+        message_id: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            job_id: job_id.into(),
+            message_id: message_id.into(),
+            url: url.into(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Action carried by a [`JobControl`] message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    /// Stop dispatching and drop the job's queued work.
+    Cancel,
+    /// Stop dispatching but keep the job's queued work.
+    Pause,
+    /// Resume dispatching a paused job.
+    Resume,
+    /// The job is terminal (completed or failed): release its state.
+    #[default]
+    Finish,
+}
+
+/// API → pipeline job control, published to [`names::JOB_STATUS`] keyed by
+/// `job_id`. Every field is `#[serde(default)]` so old and new services
+/// interoperate during a rolling deploy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobControl {
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub action: JobAction,
+    /// When the control message was produced (ms since epoch)
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+impl JobControl {
+    pub fn new(job_id: impl Into<String>, action: JobAction) -> Self {
+        Self {
+            job_id: job_id.into(),
+            action,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_control_round_trips_and_tolerates_missing_fields() {
+        let json = serde_json::to_string(&JobControl::new("j1", JobAction::Finish)).unwrap();
+        assert!(json.contains(r#""action":"finish""#), "{json}");
+        let back: JobControl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.job_id, "j1");
+        assert_eq!(back.action, JobAction::Finish);
+        let partial: JobControl =
+            serde_json::from_str(r#"{"job_id":"j2","action":"pause"}"#).unwrap();
+        assert_eq!(partial.action, JobAction::Pause);
+        assert_eq!(partial.timestamp, 0);
+    }
+
+    #[test]
+    fn fetch_feedback_tolerates_missing_fields_and_skips_nones() {
+        let fb: FetchFeedback = serde_json::from_str(r#"{"domain":"a.test"}"#).unwrap();
+        assert_eq!(fb.domain, "a.test");
+        assert_eq!(fb.status, None);
+        assert!(!fb.transport_error);
+        let json = serde_json::to_string(&FetchFeedback::new("a.test", "j", "m", "u")).unwrap();
+        assert!(!json.contains("status"), "{json}");
+        assert!(!json.contains("retry_after_ms"), "{json}");
+        let back: FetchFeedback = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message_id, "m");
+    }
 
     #[test]
     fn test_links_message_creation() {
@@ -763,6 +1114,187 @@ mod tests {
                 assert_eq!(retry_count, 3);
             }
             _ => panic!("Expected PageFailed"),
+        }
+    }
+
+    #[test]
+    fn page_events_without_new_fields_still_deserialize() {
+        // Events written by a pre-upgrade worker (rolling deploy).
+        let failed: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_failed","job_id":"j","url":"u","error":"e","retry_count":0,"timestamp":1}"#,
+        )
+        .unwrap();
+        match failed {
+            CrawlEvent::PageFailed {
+                status,
+                url_message_id,
+                ..
+            } => {
+                assert_eq!(status, None);
+                assert!(url_message_id.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        let crawled: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_crawled","job_id":"j","url":"u","status":200,"duration_ms":1,"timestamp":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            crawled,
+            CrawlEvent::PageCrawled {
+                links_published: 0,
+                js_rendered: false,
+                ..
+            }
+        ));
+        let skipped: CrawlEvent = serde_json::from_str(
+            r#"{"type":"page_skipped","job_id":"j","url":"u","reason":"r","timestamp":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(skipped, CrawlEvent::PageSkipped { .. }));
+    }
+
+    #[test]
+    fn page_retried_round_trips() {
+        let ev = CrawlEvent::PageRetried {
+            job_id: "j".into(),
+            url: "https://a.test/".into(),
+            url_message_id: "m1".into(),
+            retry_count: 2,
+            error: "HTTP 503".into(),
+            timestamp: 5,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""type":"page_retried""#));
+        match serde_json::from_str::<CrawlEvent>(&json).unwrap() {
+            CrawlEvent::PageRetried {
+                retry_count,
+                url_message_id,
+                ..
+            } => {
+                assert_eq!(retry_count, 2);
+                assert_eq!(url_message_id, "m1");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_copies_every_job_scoped_field() {
+        let parent = UrlMessage::new(CrawlUrl::seed("https://a.test/"), "job", "idx")
+            .with_source(Some("src".into()))
+            .account("acct")
+            .with_meilisearch(Some("http://ms".into()), Some("key".into()))
+            .with_features(Some(FeaturesConfig::default()))
+            .with_limits(Some(3), Some(50))
+            .with_incremental(false)
+            .with_job(Some(scrapix_core::JobSpec {
+                user_agents: vec!["UA".into()],
+                ..Default::default()
+            }));
+        let child = parent.child(CrawlUrl::new("https://a.test/x", 1));
+
+        let strip = |m: &UrlMessage| {
+            let mut v = serde_json::to_value(m).unwrap();
+            let o = v.as_object_mut().unwrap();
+            o.remove("url");
+            o.remove("message_id");
+            o.remove("created_at");
+            v
+        };
+        assert_eq!(strip(&parent), strip(&child));
+        assert_ne!(parent.message_id, child.message_id);
+        assert_eq!(child.url.url, "https://a.test/x");
+    }
+
+    #[test]
+    fn old_url_message_without_job_still_deserializes() {
+        let json = r#"{"url":{"url":"https://a.test/","depth":0,"priority":0,"discovered_at":"2024-01-01T00:00:00Z","retry_count":0,"requires_js":false},
+                       "job_id":"j","index_uid":"i","message_id":"m","created_at":0}"#;
+        let m: UrlMessage = serde_json::from_str(json).unwrap();
+        assert!(m.job.is_none());
+        assert!(m.incremental);
+    }
+
+    #[test]
+    fn raw_page_message_from_url_message_copies_job_scoped_fields() {
+        let parent = UrlMessage::new(CrawlUrl::seed("https://a.test/"), "job", "idx")
+            .with_source(Some("src".into()))
+            .account("acct")
+            .with_meilisearch(Some("http://ms".into()), Some("key".into()))
+            .with_features(Some(FeaturesConfig::default()))
+            .with_job(Some(scrapix_core::JobSpec {
+                user_agents: vec!["UA".into()],
+                ..Default::default()
+            }));
+
+        let page = scrapix_core::RawPage {
+            url: "https://a.test/".to_string(),
+            final_url: "https://a.test/".to_string(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            html: "<html></html>".to_string(),
+            content_type: Some("text/html".to_string()),
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 10,
+        };
+
+        let raw = RawPageMessage::from_url_message(
+            &parent,
+            page.clone(),
+            Some("etag-1".to_string()),
+            Some("Wed, 21 Oct 2023 07:28:00 GMT".to_string()),
+        );
+
+        assert_eq!(raw.job_id, parent.job_id);
+        assert_eq!(raw.index_uid, parent.index_uid);
+        assert_eq!(raw.source, parent.source);
+        assert_eq!(raw.account_id, parent.account_id);
+        assert_eq!(raw.meilisearch_url, parent.meilisearch_url);
+        assert_eq!(raw.meilisearch_api_key, parent.meilisearch_api_key);
+        assert_eq!(
+            serde_json::to_value(&raw.features).unwrap(),
+            serde_json::to_value(&parent.features).unwrap()
+        );
+        assert_eq!(raw.job, parent.job);
+        assert_eq!(raw.url_message_id, parent.message_id);
+        assert_eq!(raw.content_length, page.html.len() as u64);
+        assert_eq!(raw.etag, Some("etag-1".to_string()));
+        assert_ne!(raw.message_id, parent.message_id);
+    }
+
+    #[test]
+    fn old_document_indexed_deserializes_with_defaults() {
+        let json =
+            r#"{"type":"document_indexed","job_id":"j","url":"u","document_id":"d","timestamp":1}"#;
+        match serde_json::from_str::<CrawlEvent>(json).unwrap() {
+            CrawlEvent::DocumentIndexed {
+                url_message_id,
+                ai_enriched,
+                ..
+            } => {
+                assert!(url_message_id.is_empty());
+                assert!(!ai_enriched);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_content_outcome_events_round_trip() {
+        for json in [
+            r#"{"type":"document_skipped","job_id":"j","url":"u","url_message_id":"m","reason":"index_only","timestamp":1}"#,
+            r#"{"type":"document_failed","job_id":"j","url":"u","url_message_id":"m","error":"e","timestamp":1}"#,
+            r#"{"type":"ai_usage","job_id":"j","model":"m","prompt_tokens":1,"completion_tokens":2,"feature":"ai_summary","timestamp":1}"#,
+            r#"{"type":"job_warning","job_id":"j","message":"w","timestamp":1}"#,
+        ] {
+            let event: CrawlEvent = serde_json::from_str(json).unwrap();
+            let back = serde_json::to_value(&event).unwrap();
+            let orig: serde_json::Value = serde_json::from_str(json).unwrap();
+            for (k, v) in orig.as_object().unwrap() {
+                assert_eq!(&back[k], v, "{json}: field {k}");
+            }
         }
     }
 }

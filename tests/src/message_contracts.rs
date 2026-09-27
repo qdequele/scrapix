@@ -155,6 +155,8 @@ fn test_raw_page_message_round_trip_all_fields() {
         meilisearch_url: Some("http://meili:7700".to_string()),
         meilisearch_api_key: Some("key123".to_string()),
         features: Some(FeaturesConfig::default()),
+        job: None,
+        url_message_id: "url-msg-1".to_string(),
     };
 
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -233,6 +235,8 @@ fn test_raw_page_message_pdf_base64_round_trip() {
         meilisearch_url: None,
         meilisearch_api_key: None,
         features: None,
+        job: None,
+        url_message_id: "url-msg-pdf".to_string(),
     };
 
     let json = serde_json::to_string(&msg).expect("serialize PDF message");
@@ -270,6 +274,8 @@ fn test_raw_page_message_with_large_html() {
         meilisearch_url: None,
         meilisearch_api_key: None,
         features: None,
+        job: None,
+        url_message_id: "url-msg-1".to_string(),
     };
 
     let json = serde_json::to_string(&msg).expect("serialize large HTML");

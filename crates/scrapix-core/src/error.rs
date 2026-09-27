@@ -53,6 +53,14 @@ pub enum ScrapixError {
     #[error("Connection error: {0}")]
     Connection(String),
 
+    /// An SSRF-safety refusal: a raw-IP host/redirect target, or a hostname
+    /// whose DNS results are all non-public, was rejected outright. Callers
+    /// (notably `HttpFetcher::fetch_inner`) must treat this as terminal and
+    /// never retry it — retrying would just re-run the same refused
+    /// resolution/redirect and burn through the retry backoff for nothing.
+    #[error("Refused: {0}")]
+    Refused(String),
+
     #[error("AI error: {0}")]
     Ai(String),
 

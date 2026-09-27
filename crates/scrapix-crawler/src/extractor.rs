@@ -6,6 +6,9 @@ use scraper::{Html, Selector};
 use tracing::debug;
 use url::Url;
 
+#[cfg(test)]
+use scrapix_core::url_glob::matches_glob;
+use scrapix_core::url_glob::matches_include_exclude;
 use scrapix_core::{CrawlUrl, RawPage, UrlPatterns};
 
 /// URL extraction configuration
@@ -173,6 +176,7 @@ impl UrlExtractor {
             requires_js: false,
             etag: None,
             last_modified: None,
+            not_before_ms: None,
         })
     }
 
@@ -223,7 +227,7 @@ impl UrlExtractor {
 
         // Apply URL pattern filters
         if let Some(ref patterns) = self.config.patterns {
-            if !self.matches_patterns(&normalized, patterns) {
+            if !matches_patterns(&normalized, patterns) {
                 return None;
             }
         }
@@ -267,17 +271,26 @@ impl UrlExtractor {
             .unwrap_or(domain)
     }
 
+    /// Whether `host` is in an explicit `allowed_domains` whitelist, with
+    /// the same matching link extraction uses (case-insensitive, a leading
+    /// `www.` ignored on both sides). An empty list allows every host.
+    pub fn host_in_allowed_domains(host: &str, allowed_domains: &[String]) -> bool {
+        if allowed_domains.is_empty() {
+            return true;
+        }
+        let host = Self::normalize_domain(host);
+        allowed_domains
+            .iter()
+            .any(|d| Self::normalize_domain(d).eq_ignore_ascii_case(host))
+    }
+
     /// Check if a domain is allowed based on configuration
     fn is_allowed_domain(&self, url_domain: &str, base_domain: &str) -> bool {
         let url_norm = Self::normalize_domain(url_domain);
 
         // If explicit allowed_domains whitelist is set, use ONLY that (strict mode)
         if !self.config.allowed_domains.is_empty() {
-            return self
-                .config
-                .allowed_domains
-                .iter()
-                .any(|d| Self::normalize_domain(d).eq_ignore_ascii_case(url_norm));
+            return Self::host_in_allowed_domains(url_domain, &self.config.allowed_domains);
         }
 
         // Fallback to automatic domain inference
@@ -300,67 +313,37 @@ impl UrlExtractor {
 
         self.config.follow_external
     }
+}
 
-    /// Check if URL matches configured patterns
-    fn matches_patterns(&self, url: &str, patterns: &UrlPatterns) -> bool {
-        // Check exclude patterns first
-        for pattern in &patterns.exclude {
-            if self.matches_glob(url, pattern) {
-                return false;
-            }
-        }
+/// Check if URL matches configured include/exclude glob patterns.
+///
+/// Exclude patterns win over include patterns. An empty include list allows
+/// everything (subject to exclude). Shared by [`UrlExtractor::resolve_and_filter`]
+/// and [`url_allowed`] so link extraction and sitemap discovery can't diverge.
+fn matches_patterns(url: &str, patterns: &UrlPatterns) -> bool {
+    matches_include_exclude(url, &patterns.include, &patterns.exclude)
+}
 
-        // Check include patterns
-        if patterns.include.is_empty() {
-            return true;
-        }
-        for pattern in &patterns.include {
-            if self.matches_glob(url, pattern) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Simple glob-style pattern matching
-    fn matches_glob(&self, url: &str, pattern: &str) -> bool {
-        // Convert glob to simple matching
-        // * matches any characters except /
-        // ** matches any characters including /
-
-        if pattern.contains("**") {
-            // Handle ** as "match anything"
-            let parts: Vec<&str> = pattern.split("**").collect();
-            if parts.len() == 2 {
-                return url.starts_with(parts[0])
-                    && (parts[1].is_empty() || url.ends_with(parts[1]));
-            }
-        }
-
-        if pattern.contains('*') {
-            // Handle * as "match anything except /"
-            let parts: Vec<&str> = pattern.split('*').collect();
-            let mut pos = 0;
-            for part in parts {
-                if part.is_empty() {
-                    continue;
-                }
-                if let Some(found) = url[pos..].find(part) {
-                    // Check no / between pos and found
-                    if url[pos..pos + found].contains('/') && !pattern.contains("**") {
-                        return false;
-                    }
-                    pos = pos + found + part.len();
-                } else {
-                    return false;
-                }
-            }
-            true
-        } else {
-            // Exact match
-            url == pattern
+/// Whether `url` is allowed by `patterns` — the same domain whitelist and
+/// include/exclude glob matching link extraction applies
+/// ([`UrlExtractor::resolve_and_filter`]). Used by sitemap discovery so a
+/// sitemap URL and a discovered link are judged identically: an
+/// auto-generated `https://host/path/*` include pattern that would accept a
+/// link also accepts the equivalent sitemap entry.
+///
+/// An empty `allowed_domains` allows every host (domain filtering is opt-in).
+pub fn url_allowed(patterns: &UrlPatterns, url: &str) -> bool {
+    if !patterns.allowed_domains.is_empty() {
+        let host_allowed = Url::parse(url).ok().and_then(|u| {
+            u.host_str()
+                .map(|h| UrlExtractor::host_in_allowed_domains(h, &patterns.allowed_domains))
+        });
+        if host_allowed != Some(true) {
+            return false;
         }
     }
+
+    matches_patterns(url, patterns)
 }
 
 /// Check if a URL points to a non-page resource (image, PDF, CSS, JS, font, etc.)
@@ -635,25 +618,15 @@ mod tests {
 
     #[test]
     fn test_glob_patterns() {
-        let extractor = UrlExtractor::new(ExtractorConfig {
-            patterns: Some(UrlPatterns {
-                include: vec!["https://example.com/docs/**".to_string()],
-                exclude: vec!["**/_internal/**".to_string()],
-                index_only: vec![],
-                allowed_domains: vec![],
-            }),
-            ..Default::default()
-        });
-
-        assert!(extractor.matches_glob(
+        assert!(matches_glob(
             "https://example.com/docs/page",
             "https://example.com/docs/**"
         ));
-        assert!(extractor.matches_glob(
+        assert!(matches_glob(
             "https://example.com/docs/deep/page",
             "https://example.com/docs/**"
         ));
-        assert!(!extractor.matches_glob(
+        assert!(!matches_glob(
             "https://example.com/blog/page",
             "https://example.com/docs/**"
         ));
@@ -709,9 +682,8 @@ mod tests {
 
     #[test]
     fn test_glob_multiple_double_star() {
-        let extractor = UrlExtractor::with_defaults();
         // Pattern with multiple ** segments currently only handles 2-part split
-        assert!(extractor.matches_glob(
+        assert!(matches_glob(
             "https://example.com/docs/v2/api",
             "https://example.com/docs/**/api"
         ));
@@ -719,9 +691,8 @@ mod tests {
 
     #[test]
     fn test_glob_single_star_no_slash_crossing() {
-        let extractor = UrlExtractor::with_defaults();
         // Single * should NOT cross directory boundaries
-        assert!(!extractor.matches_glob(
+        assert!(!matches_glob(
             "https://example.com/docs/a/b/page",
             "https://example.com/docs/*/page"
         ));
@@ -729,9 +700,14 @@ mod tests {
 
     #[test]
     fn test_glob_exact_match() {
-        let extractor = UrlExtractor::with_defaults();
-        assert!(extractor.matches_glob("https://example.com/page", "https://example.com/page"));
-        assert!(!extractor.matches_glob("https://example.com/other", "https://example.com/page"));
+        assert!(matches_glob(
+            "https://example.com/page",
+            "https://example.com/page"
+        ));
+        assert!(!matches_glob(
+            "https://example.com/other",
+            "https://example.com/page"
+        ));
     }
 
     #[test]
@@ -829,5 +805,25 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"https://example.com/page1".to_string()));
         assert!(urls.contains(&"https://example.com/page2".to_string()));
+    }
+
+    #[test]
+    fn url_allowed_matches_auto_generated_path_prefix() {
+        let p = UrlPatterns {
+            include: vec!["https://docs.a.test/guide/*".into()],
+            ..Default::default()
+        };
+        assert!(url_allowed(&p, "https://docs.a.test/guide/intro"));
+        assert!(!url_allowed(&p, "https://docs.a.test/blog/post"));
+    }
+
+    #[test]
+    fn url_allowed_respects_allowed_domains_with_www_normalization() {
+        let p = UrlPatterns {
+            allowed_domains: vec!["a.test".into()],
+            ..Default::default()
+        };
+        assert!(url_allowed(&p, "https://www.a.test/x"));
+        assert!(!url_allowed(&p, "https://b.test/x"));
     }
 }

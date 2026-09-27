@@ -69,6 +69,11 @@ fn row_to_job_state(row: &sqlx::postgres::PgRow) -> JobState {
         swap_temp_index: row.get("swap_temp_index"),
         swap_meilisearch_url: row.get("swap_meilisearch_url"),
         swap_meilisearch_api_key: row.get("swap_meilisearch_api_key"),
+        warnings: Vec::new(),
+        // Webhook auth secrets are never persisted (redacted before the
+        // `config` blob is stored); a job recovered from Postgres after a
+        // restart has no real webhooks to deliver to.
+        webhooks: Vec::new(),
     }
 }
 
@@ -128,7 +133,10 @@ pub async fn insert_job(pool: &PgPool, job: &JobState) {
 }
 
 /// Full update of a single job's mutable fields (lifecycle events: complete, fail, cancel).
-pub async fn update_job_full(pool: &PgPool, job: &JobState) {
+///
+/// Returns `Err` (after logging) so the flush can retry an owed terminal
+/// write before releasing the job's held acks.
+pub async fn update_job_full(pool: &PgPool, job: &JobState) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
         "UPDATE jobs SET
             status = $2,
@@ -154,8 +162,12 @@ pub async fn update_job_full(pool: &PgPool, job: &JobState) {
     .execute(pool)
     .await;
 
-    if let Err(e) = result {
-        warn!(job_id = %job.job_id, error = %e, "Failed to update job in Postgres");
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!(job_id = %job.job_id, error = %e, "Failed to update job in Postgres");
+            Err(e)
+        }
     }
 }
 
@@ -224,6 +236,53 @@ pub async fn flush_job_counters(pool: &PgPool, snapshots: &[JobState]) {
     }
 }
 
+/// Persist per-job work-accounting snapshots (`jobs.accounting` jsonb, R5)
+/// in a single round-trip.
+///
+/// Deliberately a separate statement from [`flush_job_counters`]: if the
+/// engine runs against a database where the Rails migration adding the
+/// column has not been applied yet, only this statement fails (logged) and
+/// the counter flush keeps working.
+///
+/// Returns `Err` (after logging) when the statement fails, so the caller can
+/// keep the covered events un-acked.
+pub async fn flush_job_accounting(
+    pool: &PgPool,
+    entries: &[(String, serde_json::Value)],
+) -> Result<(), sqlx::Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+    let values: Vec<serde_json::Value> = entries.iter().map(|(_, v)| v.clone()).collect();
+
+    let result = sqlx::query(
+        "UPDATE jobs AS j SET accounting = d.accounting
+        FROM (
+            SELECT * FROM unnest($1::text[], $2::jsonb[]) AS t(job_id, accounting)
+        ) AS d
+        WHERE j.job_id = d.job_id",
+    )
+    .bind(&ids)
+    .bind(&values)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(r) => {
+            debug!(
+                rows = r.rows_affected(),
+                "Flushed job accounting to Postgres"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to flush job accounting to Postgres");
+            Err(e)
+        }
+    }
+}
+
 // ============================================================================
 // Reads
 // ============================================================================
@@ -240,6 +299,32 @@ pub async fn load_active_jobs(pool: &PgPool) -> Vec<JobState> {
         Ok(rows) => rows.iter().map(row_to_job_state).collect(),
         Err(e) => {
             warn!(error = %e, "Failed to load active jobs from Postgres");
+            Vec::new()
+        }
+    }
+}
+
+/// Load the persisted work-accounting snapshots of running/paused jobs for
+/// startup recovery. Returns an empty list (logged) if the query fails, e.g.
+/// when the `accounting` column does not exist yet.
+pub async fn load_active_job_accounting(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
+    use sqlx::Row;
+    let rows =
+        sqlx::query("SELECT job_id, accounting FROM jobs WHERE status IN ('running', 'paused')")
+            .fetch_all(pool)
+            .await;
+
+    match rows {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| {
+                let id: String = row.try_get("job_id").ok()?;
+                let acc: serde_json::Value = row.try_get("accounting").ok()?;
+                Some((id, acc))
+            })
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "Failed to load job accounting from Postgres");
             Vec::new()
         }
     }

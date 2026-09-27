@@ -311,6 +311,152 @@ The frontier uses dual locality-sensitive hashing:
 - **SimHash:** 64-bit fingerprints for quick similarity checks (Hamming distance threshold ~10 bits)
 - **MinHash:** 128 hash functions for accurate Jaccard similarity estimation (threshold ~0.8)
 
+## Crawl Pipeline Behavior
+
+### Job lifecycle: completion, cancel, pause/resume
+
+A job completes from **exact accounting** of the work derived from it (dispatched
+URLs, crawled/failed pages, indexed documents) — not an idle timer. Once every
+dispatched URL is accounted for, the job waits `JOB_COMPLETION_GRACE_MS`
+(default `3000`, `bins/scrapix-api/src/lib.rs`) for straggler events before
+finalizing, to absorb ordinary event-arrival jitter. A job with **zero crawled
+pages** is marked `Failed` rather than `Completed`. A job that stops making
+progress for `JOB_STALL_TIMEOUT_SECS` (default `1800`) is finalized as
+`FailStalled`; **stalled jobs are billed** for the pages they did crawl.
+`Replace`-strategy stale-document cleanup only runs after true completion, and
+never deletes a document whose page returned `304` in this job.
+
+- `DELETE /job/{id}` cancels a pending, running or paused job: it stops the
+  frontier and every worker for that job and bills the pages crawled so far.
+  Only a non-terminal job can be cancelled — cancelling a `completed`,
+  `failed` or `cancelled` job returns `409`.
+- `POST /job/{id}/pause` / `POST /job/{id}/resume` — the frontier stops
+  dispatching a paused job's URLs (in-flight pages finish, and links they
+  discover keep being **admitted** into the queue, just not dispatched); a
+  paused job is never auto-completed or stall-failed. Only `Running → Paused`
+  and `Paused → Running` are valid; any other starting status returns `409`.
+  Resuming restarts the job's stall clock from zero.
+- Exactly one completion email is sent per job.
+- The crawl-creation response and `GET /job/{id}/status` both carry a
+  `warnings` array: non-fatal notices about config fields the engine accepted
+  but could not fully honor (see "Per-job config fields" below) plus
+  worker-raised warnings during the run.
+
+### Degraded mode (accounting column missing)
+
+If the Rails `accounting` migration
+(`20260926000001_add_accounting_to_jobs`) hasn't run against Postgres, the API
+logs an error, turns off durable accounting for that process, and keeps job
+accounting in memory only (events are acked immediately instead of held for a
+durable flush). In this mode, jobs still running across an API restart end up
+`FailStalled` once the stall timeout elapses, since no state survives the
+restart to resume them from.
+
+### Durability, controls and rollout caveats
+
+- **Upgrade with no job running** (drain or cancel first): a job spanning
+  the upgrade loses the old in-memory frontier queue and has no restored
+  accounting, so it ends `FailStalled` (billed). Checklist:
+  `docs/operations/crawl-engine-rollout.mdx`.
+- `INSTANCE_ID` (frontier) / `WORKER_ID` (crawler, content) must be **stable
+  per instance**: they name the job-control consumer group; a random id
+  (default, warned at startup) misses controls sent while down and leaks a
+  group per restart.
+- On one box, give each service a distinct `WAKE_PORT` (default `8081`
+  collides with the Rails SaaS; a failed bind only warns and metrics go
+  missing), e.g. frontier 9101, crawler 9102, content 9103.
+- The `REDIS_URL` Redis needs persistence (AOF or RDB) for frontier
+  durability.
+- Graceful frontier shutdown requeues popped-but-unsent URLs
+  (`DISPATCH_SHUTDOWN_GRACE_MS`, 10 s); store calls are bounded at 5 s. A
+  **crash** between pop and send still loses that batch.
+- Accounting seen-sets are not persisted: a duplicate outcome whose original
+  landed before an API restart can be double-counted (rare).
+- The API publishes `JobControl`s in request order (one queue, one task);
+  a Running job silent and unbalanced for `RESUME_HEAL_AFTER_SECS` (60) gets
+  `Resume` re-published (no-op at the frontier for running jobs).
+- Stored/returned job configs mask proxy credentials and custom header
+  values (as well as the Meilisearch key and webhook secrets); the crawler
+  uses the in-memory values.
+
+### Politeness
+
+Defaults: `CONCURRENT_PER_DOMAIN=4`, `DOMAIN_DELAY_MS=250`
+(`bins/scrapix-frontier-service/src/lib.rs`), down from 50 / 50: single-site
+crawls are roughly 5–12× slower unless the frontier env overrides them
+(e.g. `DOMAIN_DELAY_MS=50 CONCURRENT_PER_DOMAIN=16`; a job can only raise
+the delay, never lower it). The frontier holds a per-domain
+slot from dispatch until the crawler's `FetchFeedback` — topic
+`scrapix.fetch.feedback` — reports the fetch back (not at dispatch time); a
+slot without feedback expires after `2 × REQUEST_TIMEOUT` (default `30`s), so
+a lagging `scrapix.urls.processing` consumer effectively widens that safety
+window. The effective per-domain delay is
+`max(DOMAIN_DELAY_MS, job.rate_limit.per_domain_delay_ms, robots Crawl-delay
+if respected, 1000 / requests_per_second)`. `rate_limit.default_crawl_delay_ms`
+(config default `0`) is a fallback `Crawl-delay` used only when robots.txt was
+fetched and set no `Crawl-delay` of its own, and the job set no explicit delay
+or rate — it never lowers an explicit value. With `REDIS_URL` set on the
+frontier, politeness state (and the frontier's admission/dedup state, via
+`FrontierStore`) is shared across every frontier instance, so more than one
+frontier instance can run at once (each holds a per-job dispatch lease).
+
+### `/metrics`
+
+The engine (`scrapix-api`) exposes unauthenticated Prometheus text-format
+metrics at `GET /metrics` on its normal HTTP port (8080). Every worker
+(`scrapix-worker-crawler`, `scrapix-worker-content`,
+`scrapix-frontier-service`) exposes the same `/metrics` and a `GET /health`
+on its `WAKE_PORT` (default `8081`) — the same bare-TCP listener Fly's proxy
+uses to autostart a suspended machine. Metric names are a contract with
+`qdq-server/monitoring` (see `crates/scrapix-core/src/metrics.rs`): don't
+rename without updating the scrape config there. Current metrics:
+`scrapix_crawler_fetches_total{outcome}`,
+`scrapix_crawler_fetch_duration_seconds`, `scrapix_crawler_bytes_total`,
+`scrapix_frontier_admissions_total{result}`, `scrapix_frontier_queued{job}`,
+`scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
+`scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
+`scrapix_consumer_uncommitted{topic}`.
+
+### Webhooks (SCR-72)
+
+Body: `{"event": "<snake_case>", "job_id", "timestamp", "data": <event JSON>}`,
+headers `X-Scrapix-Event` (same event name) and `X-Scrapix-Delivery` (one UUID
+per delivery, stable across its retries — dedupe on this, order by
+`timestamp`, since concurrent delivery means events can arrive out of order).
+Auth: `Bearer { token }`, `Headers { headers }` (validated against
+`Content-Type`/`Host`/`X-Scrapix-*` collisions), or
+`Hmac { secret, algorithm: "sha256", header }` sending
+`header: sha256=<hex hmac-sha256 of the body>`. `timeout_ms` is clamped to
+1000–30000ms. Up to 3 attempts total (1s then 5s backoff); a 4xx response is
+terminal, a network error or 5xx retries. `crawl_failed` is also how
+cancellation is reported (`data.error == "cancelled"`); `batch_sent` is
+accepted in a hook's `events` list but never fires — there is no "batch
+flushed to the store" `CrawlEvent` today. **Known limitation:** webhook
+configs live in the API process's memory only (never persisted), so a job
+that spans an API restart stops delivering webhooks after the restart.
+
+### Per-job config fields now honored
+
+Per job: `headers`, `user_agents` (rotation), `proxy` (urls/rotation/tiered,
+`http`/`https` only — `socks5`/`socks5h` are rejected at job creation),
+`crawler_type: browser` (JS rendering), `rate_limit.*`, `concurrency.max_concurrent_requests`,
+`sitemap.enabled` (**default: `true`**, was `false`) / `sitemap.urls`,
+`url_patterns.index_only`, every feature's `include_pages`/`exclude_pages`,
+`schema.only_types`/`convert_dates`, `meilisearch.primary_key`/`batch_size`/
+`settings`/`keep_settings`, `webhooks`. A browser job (`crawler_type:
+"browser"`) that also sets `proxy` fails closed — its warning says the shared
+browser only has one worker-level proxy, so browser-rendered pages of that
+job fail rather than silently connect unproxied.
+
+Fields accepted but **worker-level only** (ignored per job, warned about when
+set to a non-default value): `concurrency.browser_pool_size`,
+`concurrency.dns_concurrency`, `features.pdf.extract_links` (reserved no-op).
+
+### `scrapix all` limitation
+
+The in-process channel bus used by `scrapix all` has no redelivery on
+failure — at-least-once delivery only holds when running over Kafka/Redpanda.
+
 ## Marketing Product Pages
 
 Product landing pages live in `console/src/app/(marketing)/products/{scrape,map,crawl,search}/page.tsx`. All pages follow a consistent section structure and visual pattern.
@@ -398,6 +544,20 @@ GROUP BY date ORDER BY date;
 | `CLICKHOUSE_PASSWORD` | ClickHouse password |
 | `RUST_LOG` | Log level (info, debug, trace) |
 | `OPENAI_API_KEY` | For AI enrichment features |
+| `JOB_STALL_TIMEOUT_SECS` | API: seconds without progress before a job is finalized `FailStalled` (default `1800`) |
+| `JOB_COMPLETION_GRACE_MS` | API: grace period after exact accounting says a job is done, before finalizing (default `3000`) |
+| `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
+| `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
+| `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
+| `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
+| `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
+| `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |
+| `JOB_RETENTION_HOURS` | Frontier: how long a finished/cancelled job's state stays queryable after release (default `168`) |
+| `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` and triggering Fly autostart (default `8081`) |
+
+`BLOOM_CAPACITY`/`BLOOM_FP_RATE` on the frontier are now deprecated and
+ignored — dedup lives in the `FrontierStore` (Redis or in-memory), not a
+bloom filter.
 
 ## Kubernetes Deployment
 

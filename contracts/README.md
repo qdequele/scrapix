@@ -42,6 +42,11 @@ npm install
 npm test   # defaults to the Rails app on :8081
 ```
 
+The job routes (`/crawl`, `/jobs`, `/job/*`, used by
+`tests/jobs.contract.test.ts`) go straight to the engine at
+`CONTRACT_ENGINE_BASE_URL` (default `http://localhost:8080`), which needs its
+pipeline (Kafka + frontier) up to accept a crawl.
+
 Each test file signs up fresh throwaway users (`contract-*@example.com`), so
 runs are self-contained; no seeding or cleanup required. Analytics tests
 self-skip when ClickHouse isn't configured.

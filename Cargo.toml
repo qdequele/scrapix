@@ -109,6 +109,7 @@ tiktoken-rs = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 time = { version = "0.3", features = ["formatting"] }
+prometheus = { version = "0.13", default-features = false }
 
 # Error handling
 thiserror = "1.0"

@@ -35,6 +35,17 @@ parking_lot = { workspace = true }
 # For PDF payload round-trip tests
 base64 = { workspace = true }
 
+# Test-target-only dependencies. Dev-dependency features are not unified
+# into normal builds (resolver 2), so `test-hooks` never reaches the
+# shipped binaries (`cargo build --release --workspace`).
+[dev-dependencies]
+scrapix-queue = { path = "../crates/scrapix-queue", features = ["test-hooks"] }
+# Real services, run together over the in-process bus (distributed_pipeline)
+scrapix-frontier-service = { path = "../bins/scrapix-frontier-service" }
+scrapix-worker-crawler = { path = "../bins/scrapix-worker-crawler" }
+scrapix-worker-content = { path = "../bins/scrapix-worker-content" }
+clap = { workspace = true }
+
 [lib]
 name = "scrapix_tests"
 path = "src/lib.rs"
@@ -102,3 +113,7 @@ path = "src/document_uid.rs"
 [[test]]
 name = "simhash_properties"
 path = "src/simhash_properties.rs"
+
+[[test]]
+name = "distributed_pipeline"
+path = "src/distributed_pipeline.rs"

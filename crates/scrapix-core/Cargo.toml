@@ -24,7 +24,9 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Telemetry
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
 
 # Utilities
 uuid = { workspace = true }

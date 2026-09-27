@@ -33,7 +33,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "pluginVersion": "10.3.0",
       "targets": [
-        { "expr": "sum(rate(scrapix_crawler_pages_fetched_total[5m]))", "legendFormat": "Pages/sec", "refId": "A" }
+        { "expr": "sum(rate(scrapix_crawler_fetches_total[5m]))", "legendFormat": "Fetches/sec", "refId": "A" }
       ],
       "title": "Crawl Rate",
       "type": "stat"
@@ -53,7 +53,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "pluginVersion": "10.3.0",
       "targets": [
-        { "expr": "sum(rate(scrapix_crawler_bytes_downloaded_total[5m]))", "legendFormat": "Bytes/sec", "refId": "A" }
+        { "expr": "sum(rate(scrapix_crawler_bytes_total[5m]))", "legendFormat": "Bytes/sec", "refId": "A" }
       ],
       "title": "Download Rate",
       "type": "stat"
@@ -73,7 +73,7 @@
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "pluginVersion": "10.3.0",
       "targets": [
-        { "expr": "sum(rate(scrapix_crawler_errors_total[5m])) / sum(rate(scrapix_crawler_pages_fetched_total[5m]))", "legendFormat": "Error Rate", "refId": "A" }
+        { "expr": "sum(rate(scrapix_crawler_fetches_total{outcome=\"failed\"}[5m])) / sum(rate(scrapix_crawler_fetches_total[5m]))", "legendFormat": "Error Rate", "refId": "A" }
       ],
       "title": "Error Rate",
       "type": "stat"
@@ -93,7 +93,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "pluginVersion": "10.3.0",
       "targets": [
-        { "expr": "scrapix_frontier_queue_size", "legendFormat": "Queue Size", "refId": "A" }
+        { "expr": "sum(scrapix_frontier_queued)", "legendFormat": "Queue Size", "refId": "A" }
       ],
       "title": "Queue Size",
       "type": "stat"
@@ -161,9 +161,9 @@
       "id": 11,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "sum(rate(scrapix_crawler_pages_fetched_total[1m])) by (worker_id)", "legendFormat": "{{ worker_id }}", "refId": "A" }
+        { "expr": "sum(rate(scrapix_crawler_fetches_total[1m])) by (outcome)", "legendFormat": "{{ outcome }}", "refId": "A" }
       ],
-      "title": "Pages Fetched per Worker",
+      "title": "Crawler Fetches by Outcome",
       "type": "timeseries"
     },
     {
@@ -189,48 +189,8 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 80, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "normal" }, "thresholdsStyle": { "mode": "off" } },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-      "id": 13,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [
-        { "expr": "sum(rate(scrapix_crawler_status_codes_total[5m])) by (status_code)", "legendFormat": "{{ status_code }}", "refId": "A" }
-      ],
-      "title": "HTTP Status Code Distribution",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "smooth", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-      "id": 14,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [
-        { "expr": "sum(rate(scrapix_crawler_errors_total[5m])) by (error_type)", "legendFormat": "{{ error_type }}", "refId": "A" }
-      ],
-      "title": "Errors by Type",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
       "id": 20,
       "panels": [],
       "title": "Content Processing",
@@ -247,41 +207,21 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "id": 21,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "sum(rate(scrapix_content_extractions_total[1m])) by (worker_id)", "legendFormat": "{{ worker_id }}", "refId": "A" }
+        { "expr": "sum(rate(scrapix_content_documents_total[1m])) by (outcome)", "legendFormat": "{{ outcome }}", "refId": "A" }
       ],
-      "title": "Content Extractions per Worker",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "smooth", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-      "id": 22,
-      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [
-        { "expr": "sum(rate(scrapix_ai_tokens_consumed_total[5m])) by (model)", "legendFormat": "{{ model }}", "refId": "A" }
-      ],
-      "title": "AI Token Consumption by Model",
+      "title": "Content Documents by Outcome",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
       "id": 30,
       "panels": [],
-      "title": "System Resources",
+      "title": "Pipeline & Infra",
       "type": "row"
     },
     {
@@ -292,16 +232,16 @@
           "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "smooth", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
           "mappings": [],
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "bytes"
+          "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "id": 31,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "process_resident_memory_bytes{job=~\"scrapix-.*\"}", "legendFormat": "{{ instance }}", "refId": "A" }
+        { "expr": "scrapix_api_jobs", "legendFormat": "{{ status }}", "refId": "A" }
       ],
-      "title": "Memory Usage",
+      "title": "Jobs by Status",
       "type": "timeseries"
     },
     {
@@ -315,13 +255,13 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "id": 32,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "rate(process_cpu_seconds_total{job=~\"scrapix-.*\"}[1m])", "legendFormat": "{{ instance }}", "refId": "A" }
+        { "expr": "scrapix_consumer_uncommitted", "legendFormat": "{{ topic }}", "refId": "A" }
       ],
-      "title": "CPU Usage",
+      "title": "Consumer In-Flight (Unacked) Messages",
       "type": "timeseries"
     }
   ],

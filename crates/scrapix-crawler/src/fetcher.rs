@@ -10,10 +10,10 @@ use chrono::Utc;
 use reqwest::{
     header::{
         HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
-        IF_MODIFIED_SINCE, IF_NONE_MATCH,
+        IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER, USER_AGENT,
     },
     redirect::Policy,
-    Client, Response, StatusCode,
+    Client, Proxy, Response, StatusCode,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -35,6 +35,25 @@ pub struct FetchOptions {
     /// Maximum PDF size in bytes. When `None`, the fetcher's generic
     /// `max_body_size` applies. Only consulted when `allow_pdf` is `true`.
     pub pdf_max_size_bytes: Option<u64>,
+
+    /// Extra request headers for this fetch (per-job `headers`). Applied on
+    /// top of the fetcher's default headers, replacing any with the same
+    /// name.
+    pub extra_headers: Vec<(String, String)>,
+
+    /// User-Agent for this fetch (per-job `user_agents` rotation). `None`
+    /// keeps the fetcher's configured user agent.
+    pub user_agent: Option<String>,
+
+    /// Proxy URL for this fetch (per-job `proxy`). Requests go through a
+    /// per-proxy client that keeps every SSRF protection of the default
+    /// client. `None` connects directly.
+    pub proxy: Option<String>,
+
+    /// Per-job robots.txt override. `Some(false)` skips the robots.txt
+    /// check for this fetch; `None`/`Some(true)` keep the fetcher's robots
+    /// cache behavior.
+    pub respect_robots: Option<bool>,
 }
 
 impl FetchOptions {
@@ -44,12 +63,15 @@ impl FetchOptions {
         Self {
             allow_pdf: true,
             pdf_max_size_bytes: max_size_bytes,
+            ..Default::default()
         }
     }
 }
 
 use crate::dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 use crate::robots::RobotsCache;
+use crate::safe_client::{reject_ip_host, safe_client_builder, safe_redirect_policy};
+use crate::safe_dns::{validate_proxy_url, NonPublicAddress};
 
 /// Conditional request headers for incremental crawling
 #[derive(Debug, Clone, Default)]
@@ -119,6 +141,11 @@ pub struct FetcherConfig {
     pub custom_headers: HashMap<String, String>,
     /// Retry configuration
     pub retry_config: RetryConfig,
+    /// Whether to allow fetching hosts that resolve to private/internal IP
+    /// ranges. Defaults to `false` (deny) for SSRF safety. Applies to
+    /// hostnames whose DNS results are private; raw-IP hosts (seed URLs and
+    /// redirect targets) are always refused regardless of this flag.
+    pub allow_private_ips: bool,
 }
 
 impl Default for FetcherConfig {
@@ -134,8 +161,22 @@ impl Default for FetcherConfig {
             follow_redirects: true,
             custom_headers: HashMap::new(),
             retry_config: RetryConfig::default(),
+            allow_private_ips: false,
         }
     }
+}
+
+/// Parse a `Retry-After` header value, which may be either a number of
+/// seconds or an HTTP-date (RFC 2822 format).
+///
+/// Returns `None` if the value is neither form.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(v).ok()?.to_utc();
+    Some((when - now).to_std().unwrap_or(Duration::ZERO))
 }
 
 /// Retry configuration
@@ -171,7 +212,14 @@ pub struct HttpFetcher {
     config: FetcherConfig,
     robots_cache: Arc<RobotsCache>,
     dns_resolver: Option<Arc<CachingDnsResolver>>,
+    /// Per-proxy clients (keyed by proxy URL), built lazily with the same
+    /// settings as `client` plus `.proxy(..)`.
+    proxy_clients: dashmap::DashMap<String, Client>,
 }
+
+/// Upper bound on cached per-proxy clients. Past it the cache is cleared
+/// (clients are cheap to rebuild; this only bounds memory).
+const MAX_PROXY_CLIENTS: usize = 1024;
 
 impl HttpFetcher {
     /// Create a new HTTP fetcher with the given configuration
@@ -185,6 +233,26 @@ impl HttpFetcher {
         robots_cache: Arc<RobotsCache>,
         dns_resolver: Option<Arc<CachingDnsResolver>>,
     ) -> Result<Self> {
+        let client = Self::build_client(&config, dns_resolver.clone(), None)?;
+
+        Ok(Self {
+            client,
+            config,
+            robots_cache,
+            dns_resolver,
+            proxy_clients: dashmap::DashMap::new(),
+        })
+    }
+
+    /// Build a `reqwest::Client` from `config`. Always starts from
+    /// [`safe_client_builder`] (SSRF resolver, raw-IP-refusing redirect
+    /// policy, `.no_proxy()`); when `proxy` is given, the explicit job proxy
+    /// is added on top.
+    fn build_client(
+        config: &FetcherConfig,
+        dns_resolver: Option<Arc<CachingDnsResolver>>,
+        proxy: Option<&str>,
+    ) -> Result<Client> {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             ACCEPT,
@@ -208,13 +276,26 @@ impl HttpFetcher {
             }
         }
 
+        // Raw-IP redirect targets are always refused, the same as raw-IP
+        // seeds (`reject_ip_host`), regardless of `allow_private_ips` — that
+        // flag only relaxes the private-IP check on *resolved hostnames*
+        // (see `SafeResolver`). A redirect to a link-local address such as
+        // the cloud metadata endpoint (169.254.169.254) must still be
+        // refused even when `allow_private_ips` is set for tests that point
+        // the fetcher at a local wiremock server.
         let redirect_policy = if config.follow_redirects {
-            Policy::limited(config.max_redirects)
+            safe_redirect_policy(config.max_redirects)
         } else {
             Policy::none()
         };
 
-        let client = Client::builder()
+        let mut builder = safe_client_builder(dns_resolver, config.allow_private_ips);
+        if let Some(proxy) = proxy {
+            let proxy = Proxy::all(proxy)
+                .map_err(|e| ScrapixError::Config(format!("Invalid proxy URL: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+        builder
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout)
@@ -229,29 +310,36 @@ impl HttpFetcher {
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
             .build()
-            .map_err(|e| ScrapixError::Crawl(format!("Failed to build HTTP client: {}", e)))?;
-
-        Ok(Self {
-            client,
-            config,
-            robots_cache,
-            dns_resolver,
-        })
+            .map_err(|e| ScrapixError::Crawl(format!("Failed to build HTTP client: {}", e)))
     }
 
-    /// Reject URLs whose host is a raw IP address (v4 or v6) to prevent SSRF.
-    /// Only hostnames (domain names) are allowed.
-    fn reject_ip_host(url: &Url) -> Result<()> {
-        match url.host() {
-            Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
-                Err(ScrapixError::Crawl(format!(
-                    "Raw IP addresses are not allowed, use a hostname instead: {}",
-                    url
-                )))
-            }
-            Some(url::Host::Domain(_)) => Ok(()),
-            None => Err(ScrapixError::Crawl(format!("URL has no host: {}", url))),
+    /// The client to use for one fetch: the default client, or the cached
+    /// per-proxy client for `options.proxy`.
+    ///
+    /// The proxy URL is validated on every call (see
+    /// [`validate_proxy_url`]): hyper connects to an IP-literal proxy without
+    /// consulting the SSRF-safe resolver, so an unchecked tenant proxy such
+    /// as `http://169.254.169.254` would bypass it. Validation goes through
+    /// the DNS cache, so repeat calls are cheap.
+    async fn client_for(&self, options: &FetchOptions) -> Result<Client> {
+        let Some(proxy) = options.proxy.as_deref() else {
+            return Ok(self.client.clone());
+        };
+        validate_proxy_url(
+            proxy,
+            self.dns_resolver.as_ref(),
+            self.config.allow_private_ips,
+        )
+        .await?;
+        if let Some(client) = self.proxy_clients.get(proxy) {
+            return Ok(client.clone());
         }
+        let client = Self::build_client(&self.config, self.dns_resolver.clone(), Some(proxy))?;
+        if self.proxy_clients.len() >= MAX_PROXY_CLIENTS {
+            self.proxy_clients.clear();
+        }
+        self.proxy_clients.insert(proxy.to_string(), client.clone());
+        Ok(client)
     }
 
     /// Create a new HTTP fetcher with default configuration
@@ -272,69 +360,21 @@ impl HttpFetcher {
     }
 
     /// Fetch a URL with retry logic and per-call options (e.g., PDF support).
-    #[instrument(skip(self, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
     pub async fn fetch_with_options(
         &self,
         url: &CrawlUrl,
         options: FetchOptions,
     ) -> Result<RawPage> {
-        let parsed_url = Url::parse(&url.url)?;
-
-        // Block raw IP addresses to prevent SSRF
-        Self::reject_ip_host(&parsed_url)?;
-
-        // Check robots.txt
-        if !self.robots_cache.is_allowed(&url.url).await? {
-            return Err(ScrapixError::RobotsDisallowed {
-                url: url.url.clone(),
-            });
+        match self.fetch_inner(url, None, options).await? {
+            FetchResult::Fetched(page) => Ok(page),
+            // Can't happen without conditional headers (no If-None-Match /
+            // If-Modified-Since was sent, so a well-behaved server has no
+            // basis to return 304), but handle it defensively rather than
+            // panicking or silently dropping the response.
+            FetchResult::NotModified { url, .. } => Err(ScrapixError::Crawl(format!(
+                "Received unexpected 304 Not Modified for {url} without conditional headers"
+            ))),
         }
-
-        let mut last_error = None;
-        let mut backoff = self.config.retry_config.initial_backoff;
-
-        for attempt in 0..=self.config.retry_config.max_retries {
-            if attempt > 0 {
-                debug!(attempt, "Retrying request after {:?}", backoff);
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
-                        .min(self.config.retry_config.max_backoff.as_secs_f64()),
-                );
-            }
-
-            let start = Instant::now();
-
-            match self.fetch_once(&parsed_url).await {
-                Ok((response, final_url)) => {
-                    let fetch_duration = start.elapsed();
-                    return self
-                        .process_response(url, response, final_url, fetch_duration, &options)
-                        .await;
-                }
-                Err(e) => {
-                    // Check if this is a non-retryable HTTP error
-                    if let ScrapixError::Http { status, .. } = e {
-                        if !self
-                            .config
-                            .retry_config
-                            .retryable_status_codes
-                            .contains(&status)
-                        {
-                            return Err(ScrapixError::Http {
-                                status,
-                                url: url.url.clone(),
-                            });
-                        }
-                    }
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            ScrapixError::Crawl(format!("Failed to fetch {} after retries", url.url))
-        }))
     }
 
     /// Fetch a URL with conditional headers for incremental crawling.
@@ -355,54 +395,108 @@ impl HttpFetcher {
     /// global `max_body_size` with a PDF-specific cap. Sends If-None-Match /
     /// If-Modified-Since headers if provided, allowing the server to return
     /// 304 Not Modified when content hasn't changed.
-    #[instrument(skip(self, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
     pub async fn fetch_conditional_with_options(
         &self,
         url: &CrawlUrl,
         conditional_headers: &ConditionalRequestHeaders,
         options: FetchOptions,
     ) -> Result<FetchResult> {
+        self.fetch_inner(url, Some(conditional_headers), options)
+            .await
+    }
+
+    /// Shared implementation behind `fetch_with_options` and
+    /// `fetch_conditional_with_options`.
+    ///
+    /// Retries on network errors and on statuses in
+    /// `retry_config.retryable_status_codes` (429/5xx by default), honoring
+    /// a server `Retry-After` hint (seconds or HTTP-date) by sleeping for
+    /// `max(exponential backoff, hint)`, capped at `max_backoff`. A status is
+    /// never turned into an `Err` — after the last attempt the final status
+    /// is returned as `Ok(FetchResult::Fetched(RawPage { status, .. }))`;
+    /// classifying success/failure from `status` is the caller's job.
+    #[instrument(skip(self, conditional_headers, options), fields(url = %url.url, allow_pdf = options.allow_pdf))]
+    async fn fetch_inner(
+        &self,
+        url: &CrawlUrl,
+        conditional_headers: Option<&ConditionalRequestHeaders>,
+        options: FetchOptions,
+    ) -> Result<FetchResult> {
         let parsed_url = Url::parse(&url.url)?;
 
         // Block raw IP addresses to prevent SSRF
-        Self::reject_ip_host(&parsed_url)?;
+        reject_ip_host(&parsed_url)?;
 
-        // Check robots.txt
-        if !self.robots_cache.is_allowed(&url.url).await? {
+        // Check robots.txt (unless the job opted out)
+        if options.respect_robots != Some(false) && !self.robots_cache.is_allowed(&url.url).await? {
             return Err(ScrapixError::RobotsDisallowed {
                 url: url.url.clone(),
             });
         }
 
+        let client = self.client_for(&options).await?;
+
         let mut last_error = None;
+        // `backoff` is the pure exponential series (grows every attempt,
+        // independent of any server hint) — it's what determines the *next*
+        // attempt's default wait. `sleep_for` is what we actually sleep for
+        // before the next attempt: `max(backoff, Retry-After hint)`. Keeping
+        // them separate means a large one-off Retry-After hint doesn't
+        // permanently inflate the exponential backoff for later retries.
         let mut backoff = self.config.retry_config.initial_backoff;
+        let mut sleep_for = backoff;
 
         for attempt in 0..=self.config.retry_config.max_retries {
             if attempt > 0 {
-                debug!(attempt, "Retrying request after {:?}", backoff);
-                tokio::time::sleep(backoff).await;
-                backoff = Duration::from_secs_f64(
-                    (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
-                        .min(self.config.retry_config.max_backoff.as_secs_f64()),
-                );
+                debug!(attempt, "Retrying request after {:?}", sleep_for);
+                tokio::time::sleep(sleep_for).await;
             }
 
             let start = Instant::now();
 
-            match self
-                .fetch_once_conditional(&parsed_url, conditional_headers)
-                .await
-            {
+            let fetch_once_result = self
+                .fetch_once(&client, &parsed_url, conditional_headers, &options)
+                .await;
+
+            match fetch_once_result {
                 Ok((response, final_url)) => {
                     let fetch_duration = start.elapsed();
 
-                    // Check for 304 Not Modified
-                    if response.status() == StatusCode::NOT_MODIFIED {
+                    // Check for 304 Not Modified (only meaningful with conditional headers)
+                    if conditional_headers.is_some()
+                        && response.status() == StatusCode::NOT_MODIFIED
+                    {
                         debug!(url = %url.url, "Content not modified (304)");
                         return Ok(FetchResult::NotModified {
                             url: url.url.clone(),
                             fetch_duration_ms: fetch_duration.as_millis() as u64,
                         });
+                    }
+
+                    let status = response.status().as_u16();
+                    let retryable = self
+                        .config
+                        .retry_config
+                        .retryable_status_codes
+                        .contains(&status);
+                    if retryable && attempt < self.config.retry_config.max_retries {
+                        let hinted = response
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| parse_retry_after(v, Utc::now()));
+                        sleep_for = hinted
+                            .map_or(backoff, |h| h.max(backoff))
+                            .min(self.config.retry_config.max_backoff);
+                        debug!(status, attempt, ?sleep_for, "Retryable status, backing off");
+                        // Advance the pure exponential series independent of
+                        // the hint, so a one-off large Retry-After doesn't
+                        // inflate later retries.
+                        backoff = Duration::from_secs_f64(
+                            (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
+                                .min(self.config.retry_config.max_backoff.as_secs_f64()),
+                        );
+                        continue;
                     }
 
                     let page = self
@@ -411,6 +505,15 @@ impl HttpFetcher {
                     return Ok(FetchResult::Fetched(page));
                 }
                 Err(e) => {
+                    // SSRF refusals (raw-IP/non-public redirect target, or a
+                    // hostname resolving only to non-public addresses) are
+                    // never retryable: retrying re-runs the exact same
+                    // resolution/redirect and would just burn through
+                    // max_retries × backoff for a request that can never
+                    // succeed.
+                    if matches!(e, ScrapixError::Refused(_)) {
+                        return Err(e);
+                    }
                     // Check if this is a non-retryable HTTP error
                     if let ScrapixError::Http { status, .. } = e {
                         if !self
@@ -426,6 +529,13 @@ impl HttpFetcher {
                         }
                     }
                     last_error = Some(e);
+                    // No Retry-After hint available for a transport-level
+                    // error — fall back to the pure exponential backoff.
+                    sleep_for = backoff;
+                    backoff = Duration::from_secs_f64(
+                        (backoff.as_secs_f64() * self.config.retry_config.backoff_multiplier)
+                            .min(self.config.retry_config.max_backoff.as_secs_f64()),
+                    );
                 }
             }
         }
@@ -435,80 +545,88 @@ impl HttpFetcher {
         }))
     }
 
-    /// Perform a single fetch attempt
-    async fn fetch_once(&self, url: &Url) -> Result<(Response, String)> {
-        // Pre-resolve DNS if resolver is configured (warms cache for future requests)
-        if let Some(ref resolver) = self.dns_resolver {
-            if let Some(host) = url.host_str() {
-                // Pre-resolve to warm the cache; we don't fail on DNS errors here
-                // since reqwest will still try to resolve
-                if let Err(e) = resolver.resolve(host).await {
-                    debug!(host, error = %e, "DNS pre-resolution failed, reqwest will resolve");
-                }
-            }
+    /// Classify a `reqwest::Error` from `send().await` into a `ScrapixError`.
+    ///
+    /// Two SSRF-specific cases are checked first, both mapped to
+    /// `ScrapixError::Refused` so `fetch_inner` can recognize them and skip
+    /// the retry loop entirely (retrying a refusal just re-runs the same
+    /// resolution/redirect and burns through the backoff for nothing):
+    /// - A redirect the custom `Policy` refused (raw-IP or non-public
+    ///   redirect target) surfaces as `reqwest`'s `Kind::Redirect`.
+    /// - A `SafeResolver` refusal (hostname resolves only to non-public
+    ///   addresses) is wrapped several layers deep inside the connect
+    ///   error's source chain as a typed `NonPublicAddress`. We walk
+    ///   `source()` and `downcast_ref` onto it rather than pattern-matching
+    ///   text out of `reqwest::Error`'s `Debug` output (which would dump the
+    ///   whole chain, not just this message).
+    fn map_send_error(e: &reqwest::Error, url: &Url) -> ScrapixError {
+        if e.is_redirect() {
+            return ScrapixError::Refused(format!("redirect refused: {e}"));
         }
-
-        let response = self.client.get(url.as_str()).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ScrapixError::Timeout(format!("Request timed out: {}", url))
-            } else if e.is_connect() {
-                ScrapixError::Connection(format!("Connection failed: {}", e))
-            } else if let Some(status) = e.status() {
-                ScrapixError::Http {
-                    status: status.as_u16(),
-                    url: url.to_string(),
-                }
-            } else {
-                ScrapixError::Network(e.to_string())
+        let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+        while let Some(err) = source {
+            if let Some(non_public) = err.downcast_ref::<NonPublicAddress>() {
+                return ScrapixError::Refused(non_public.to_string());
             }
-        })?;
-        let final_url = response.url().to_string();
-        Ok((response, final_url))
+            source = err.source();
+        }
+        if e.is_timeout() {
+            ScrapixError::Timeout(format!("Request timed out: {}", url))
+        } else if e.is_connect() {
+            ScrapixError::Connection(format!("Connection failed: {}", e))
+        } else if let Some(status) = e.status() {
+            ScrapixError::Http {
+                status: status.as_u16(),
+                url: url.to_string(),
+            }
+        } else {
+            ScrapixError::Network(e.to_string())
+        }
     }
 
-    /// Perform a single fetch attempt with conditional headers
-    async fn fetch_once_conditional(
+    /// Perform a single fetch attempt, applying conditional headers (when
+    /// given) and the per-fetch user agent / extra headers.
+    async fn fetch_once(
         &self,
+        client: &Client,
         url: &Url,
-        conditional_headers: &ConditionalRequestHeaders,
+        conditional_headers: Option<&ConditionalRequestHeaders>,
+        options: &FetchOptions,
     ) -> Result<(Response, String)> {
-        // Pre-resolve DNS if resolver is configured (warms cache for future requests)
-        if let Some(ref resolver) = self.dns_resolver {
-            if let Some(host) = url.host_str() {
-                if let Err(e) = resolver.resolve(host).await {
-                    debug!(host, error = %e, "DNS pre-resolution failed, reqwest will resolve");
+        let mut request = client.get(url.as_str());
+
+        for (name, value) in &options.extra_headers {
+            match (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => request = request.header(name, value),
+                _ => debug!(header = %name, "Skipping invalid per-job header"),
+            }
+        }
+        if let Some(ref ua) = options.user_agent {
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                request = request.header(USER_AGENT, value);
+            }
+        }
+
+        if let Some(conditional) = conditional_headers {
+            if let Some(ref etag) = conditional.etag {
+                if let Ok(value) = HeaderValue::from_str(etag) {
+                    request = request.header(IF_NONE_MATCH, value);
+                }
+            }
+            if let Some(ref last_modified) = conditional.last_modified {
+                if let Ok(value) = HeaderValue::from_str(last_modified) {
+                    request = request.header(IF_MODIFIED_SINCE, value);
                 }
             }
         }
 
-        let mut request = self.client.get(url.as_str());
-
-        // Add conditional headers if present
-        if let Some(ref etag) = conditional_headers.etag {
-            if let Ok(value) = HeaderValue::from_str(etag) {
-                request = request.header(IF_NONE_MATCH, value);
-            }
-        }
-        if let Some(ref last_modified) = conditional_headers.last_modified {
-            if let Ok(value) = HeaderValue::from_str(last_modified) {
-                request = request.header(IF_MODIFIED_SINCE, value);
-            }
-        }
-
-        let response = request.send().await.map_err(|e| {
-            if e.is_timeout() {
-                ScrapixError::Timeout(format!("Request timed out: {}", url))
-            } else if e.is_connect() {
-                ScrapixError::Connection(format!("Connection failed: {}", e))
-            } else if let Some(status) = e.status() {
-                ScrapixError::Http {
-                    status: status.as_u16(),
-                    url: url.to_string(),
-                }
-            } else {
-                ScrapixError::Network(e.to_string())
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Self::map_send_error(&e, url))?;
         let final_url = response.url().to_string();
         Ok((response, final_url))
     }
@@ -546,28 +664,31 @@ impl HttpFetcher {
                 .as_deref()
                 .is_some_and(|ct| ct.contains("application/pdf"));
 
+        let is_success = (200..=299).contains(&status);
+
         // Check content type — we accept HTML, markdown, and (when opted in) PDF.
-        if let Some(ref ct) = content_type {
-            let accepted = ct.contains("text/html")
-                || ct.contains("application/xhtml")
-                || ct.contains("text/markdown")
-                || is_pdf;
-            if !accepted {
-                return Err(ScrapixError::Crawl(format!(
-                    "Unsupported content type: {}",
-                    ct
-                )));
+        // Non-2xx responses (error pages) skip this check: they are never
+        // indexed and are often served as text/plain regardless of what the
+        // "real" content type would be.
+        if is_success {
+            if let Some(ref ct) = content_type {
+                let accepted = ct.contains("text/html")
+                    || ct.contains("application/xhtml")
+                    || ct.contains("text/markdown")
+                    || is_pdf;
+                if !accepted {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Unsupported content type: {}",
+                        ct
+                    )));
+                }
             }
         }
 
-        // Read body with size limit
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ScrapixError::Network(format!("Failed to read response body: {}", e)))?;
-
         // Effective size cap: PDFs may use a feature-specific cap that supersedes
         // the generic `max_body_size` (since PDFs are often larger than HTML).
+        // Non-2xx bodies are never indexed, so cap them at a small fixed size
+        // regardless of the configured limit.
         let effective_cap = if is_pdf {
             options
                 .pdf_max_size_bytes
@@ -576,13 +697,59 @@ impl HttpFetcher {
         } else {
             self.config.max_body_size
         };
+        let effective_cap = if is_success {
+            effective_cap
+        } else {
+            effective_cap.min(64 * 1024)
+        };
 
-        if bytes.len() > effective_cap {
-            return Err(ScrapixError::Crawl(format!(
-                "Response body too large: {} bytes (max: {})",
-                bytes.len(),
-                effective_cap
-            )));
+        // Whether exceeding `effective_cap` is a hard failure (2xx — the page
+        // would be indexed, so we must not silently truncate it) or just a
+        // truncation point (non-2xx — the body is never indexed, it's only
+        // kept for diagnostics, so R1 requires we still return `Ok` with the
+        // final status rather than turning it into an `Err`).
+        let hard_cap = is_success;
+
+        // Reject up front when the server told us the size via Content-Length.
+        // Only for 2xx — a non-2xx body is truncated below instead.
+        if hard_cap {
+            if let Some(len) = response.content_length() {
+                if len as usize > effective_cap {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Response body too large: {len} bytes (max: {effective_cap})"
+                    )));
+                }
+            }
+        }
+
+        // Read the body as a stream so we never buffer more than the cap,
+        // even when the server lies about (or omits) Content-Length.
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(effective_cap as u64) as usize,
+        );
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ScrapixError::Network(format!("Failed to read response body: {e}")))?
+        {
+            if bytes.len() + chunk.len() > effective_cap {
+                if hard_cap {
+                    return Err(ScrapixError::Crawl(format!(
+                        "Response body too large: exceeded {effective_cap} bytes"
+                    )));
+                }
+                // Non-2xx: keep the prefix up to the cap and stop reading —
+                // never indexed, so a status is still never turned into an
+                // `Err` just because the error page happened to be large.
+                let remaining = effective_cap.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         // Encode body:
@@ -615,6 +782,12 @@ impl HttpFetcher {
     /// Get crawl delay for a domain
     pub async fn get_crawl_delay(&self, domain: &str) -> Result<Option<u64>> {
         self.robots_cache.get_crawl_delay(domain).await
+    }
+
+    /// Cached robots.txt `Crawl-delay` for `url`'s origin (never fetches):
+    /// `None` = not cached, `Some(None)` = fetched, no crawl-delay.
+    pub fn cached_crawl_delay(&self, url: &str) -> Option<Option<u64>> {
+        self.robots_cache.cached_crawl_delay(url)
     }
 
     /// Pre-resolve DNS for a hostname (warms the cache)
@@ -731,6 +904,27 @@ impl HttpFetcherBuilder {
 
     pub fn max_retries(mut self, max: u32) -> Self {
         self.config.retry_config.max_retries = max;
+        self
+    }
+
+    /// Set the initial backoff duration between retries (grows by
+    /// `backoff_multiplier` on each subsequent retry, capped at `max_backoff`).
+    pub fn initial_backoff(mut self, backoff: Duration) -> Self {
+        self.config.retry_config.initial_backoff = backoff;
+        self
+    }
+
+    /// Cap on a single in-process retry wait (exponential backoff or a
+    /// server `Retry-After` hint).
+    pub fn max_backoff(mut self, max: Duration) -> Self {
+        self.config.retry_config.max_backoff = max;
+        self
+    }
+
+    /// Allow fetching hosts that resolve to private/internal IP ranges.
+    /// Defaults to `false`.
+    pub fn allow_private_ips(mut self, allow: bool) -> Self {
+        self.config.allow_private_ips = allow;
         self
     }
 

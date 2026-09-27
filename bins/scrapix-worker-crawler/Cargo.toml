@@ -37,3 +37,7 @@ chrono = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+serde = { workspace = true }

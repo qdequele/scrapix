@@ -231,6 +231,13 @@ pub struct RawPage {
     pub fetch_duration_ms: u64,
 }
 
+impl RawPage {
+    /// Whether the HTTP status indicates a successful response (200..=299).
+    pub fn is_success(&self) -> bool {
+        (200..=299).contains(&self.status)
+    }
+}
+
 /// URL to be crawled
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlUrl {
@@ -265,6 +272,12 @@ pub struct CrawlUrl {
     /// Last-Modified timestamp from previous crawl (for conditional requests)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
+
+    /// Earliest time (Unix millis) this URL may be dispatched again. Set by
+    /// the crawler when it re-queues a URL for a retry with backoff; the
+    /// frontier holds the URL back until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_ms: Option<i64>,
 }
 
 impl CrawlUrl {
@@ -280,6 +293,7 @@ impl CrawlUrl {
             requires_js: false,
             etag: None,
             last_modified: None,
+            not_before_ms: None,
         }
     }
 
@@ -402,6 +416,27 @@ pub struct JobState {
     /// Meilisearch API key for performing the swap
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_meilisearch_api_key: Option<String>,
+
+    /// Job-level warnings raised by workers (`JobWarning` events), deduped,
+    /// in arrival order. In-memory only (not persisted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+
+    /// The job's webhook subscriptions, with auth secrets intact (unlike
+    /// `config`, which is redacted before being stored). In-memory only:
+    /// never persisted to Postgres (see `jobs_db::row_to_job_state`, which
+    /// always sets this to empty), so webhook delivery for a job recovered
+    /// after a restart is a known gap — the job's `config.webhooks` still
+    /// carries the URLs but its secrets read back as `"***"`.
+    ///
+    /// `#[serde(skip)]`, not just secret-redacted: `JobState` derives
+    /// `Serialize`/`Deserialize` and nothing about those derives should
+    /// ever be trusted to carry real webhook secrets across a process
+    /// boundary (a debug dump, a future serialization path, ...) — the only
+    /// sanctioned way this field's secrets leave the process is an actual
+    /// HTTP delivery. `Vec::default()` (empty) is used on deserialize.
+    #[serde(skip)]
+    pub webhooks: Vec<crate::config::WebhookConfig>,
 }
 
 impl JobState {
@@ -428,6 +463,8 @@ impl JobState {
             swap_temp_index: None,
             swap_meilisearch_url: None,
             swap_meilisearch_api_key: None,
+            warnings: Vec::new(),
+            webhooks: Vec::new(),
         }
     }
 

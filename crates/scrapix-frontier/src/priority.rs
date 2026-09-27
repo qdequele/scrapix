@@ -297,6 +297,7 @@ mod tests {
             requires_js: false,
             etag: None,
             last_modified: None,
+            not_before_ms: None,
         }
     }
 

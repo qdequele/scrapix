@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Test-only hooks on the in-process channel bus (un-acked message tracking,
+# simulated consumer crash, redelivery). Never enable in production builds.
+test-hooks = []
+
 [dependencies]
 scrapix-core = { path = "../scrapix-core" }
 

@@ -48,6 +48,8 @@ pub enum RotationStrategy {
 struct ProxyState {
     /// Proxy URL
     url: String,
+    /// `url` with its credentials masked, for logs (never log `url`).
+    display: String,
     /// Number of consecutive failures
     failures: u32,
     /// Last failure time
@@ -63,6 +65,7 @@ struct ProxyState {
 impl ProxyState {
     fn new(url: String) -> Self {
         Self {
+            display: scrapix_core::redact::redact_userinfo_str(&url),
             url,
             failures: 0,
             last_failure: None,
@@ -214,7 +217,7 @@ impl ProxyPool {
             proxy.failures = 0;
             proxy.last_failure = None;
             proxy.successful_requests += 1;
-            debug!(proxy = %proxy_url, "Proxy request succeeded");
+            debug!(proxy = %proxy.display, "Proxy request succeeded");
         }
     }
 
@@ -226,14 +229,14 @@ impl ProxyPool {
             proxy.last_failure = Some(Instant::now());
 
             warn!(
-                proxy = %proxy_url,
+                proxy = %proxy.display,
                 failures = proxy.failures,
                 "Proxy request failed"
             );
 
             if proxy.failures >= self.config.max_failures {
                 warn!(
-                    proxy = %proxy_url,
+                    proxy = %proxy.display,
                     "Proxy exceeded max failures, removing from pool"
                 );
                 // Mark for removal by setting very high failure count
@@ -248,7 +251,7 @@ impl ProxyPool {
         proxies
             .iter()
             .map(|p| ProxyStats {
-                url: p.url.clone(),
+                url: p.display.clone(),
                 total_requests: p.total_requests,
                 successful_requests: p.successful_requests,
                 success_rate: p.success_rate(),
@@ -283,6 +286,7 @@ impl ProxyPool {
 /// Proxy statistics
 #[derive(Debug, Clone)]
 pub struct ProxyStats {
+    /// The proxy URL with its credentials masked.
     pub url: String,
     pub total_requests: u64,
     pub successful_requests: u64,
@@ -294,6 +298,29 @@ pub struct ProxyStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final review fix 3: what the pool logs and reports never carries
+    /// the proxy credentials.
+    #[test]
+    fn logged_and_reported_proxy_urls_mask_credentials() {
+        let state = ProxyState::new("http://alice:s3cret@proxy.test:3128".to_string());
+        assert!(!state.display.contains("s3cret") && !state.display.contains("alice"));
+        assert_eq!(state.display, "http://***@proxy.test:3128/");
+        assert_eq!(
+            state.url, "http://alice:s3cret@proxy.test:3128",
+            "real URL kept for use"
+        );
+
+        let pool = ProxyPool::new(ProxyConfig {
+            proxies: vec!["http://alice:s3cret@proxy.test:3128".to_string()],
+            ..Default::default()
+        });
+        assert!(pool.stats().iter().all(|s| !s.url.contains("s3cret")));
+        assert_eq!(
+            pool.get_proxy().as_deref(),
+            Some("http://alice:s3cret@proxy.test:3128")
+        );
+    }
 
     #[test]
     fn test_empty_pool() {

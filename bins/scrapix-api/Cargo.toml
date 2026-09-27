@@ -25,6 +25,9 @@ scrapix-extractor = { path = "../../crates/scrapix-extractor" }
 scrapix-crawler = { path = "../../crates/scrapix-crawler", features = ["browser-cdp"] }
 scrapix-ai = { path = "../../crates/scrapix-ai" }
 
+# Config validation (CrawlConfig::validate())
+validator = { workspace = true }
+
 # HTTP client for /scrape endpoint
 reqwest = { workspace = true }
 scraper = { workspace = true }
@@ -78,3 +81,6 @@ hmac = "0.12"
 # OpenAPI
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+[dev-dependencies]
+wiremock = { workspace = true }

@@ -208,6 +208,7 @@ CREATE TABLE public.jobs (
     swap_meilisearch_api_key text,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
     updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    accounting jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'paused'::text])))
 );
 
@@ -1817,6 +1818,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260926000001'),
 ('20260817160001'),
 ('20260817131333'),
 ('20260817000015'),

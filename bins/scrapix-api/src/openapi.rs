@@ -51,6 +51,8 @@ use utoipa::OpenApi;
         crate::list_jobs,
         crate::job_status,
         crate::cancel_job,
+        crate::pause_job,
+        crate::resume_job,
     ),
     components(schemas(
         // Core API types
@@ -73,6 +75,7 @@ use utoipa::OpenApi;
         crate::BulkCrawlResponse,
         crate::BulkCrawlError,
         crate::JobStatusResponse,
+        scrapix_core::JobStatus,
         crate::ApiError,
         // Diagnostic types
         crate::SystemStatsResponse,
