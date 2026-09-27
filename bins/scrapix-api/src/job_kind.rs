@@ -30,6 +30,14 @@ pub(crate) enum JobKind {
 }
 
 impl JobKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Crawl => "crawl",
+            JobKind::BatchScrape => "batch_scrape",
+            JobKind::Extract => "extract",
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "crawl" => Some(JobKind::Crawl),
@@ -47,6 +55,12 @@ impl JobKind {
             .and_then(|v| v.as_str())
             .and_then(Self::parse)
             .unwrap_or(JobKind::Crawl)
+    }
+
+    /// Whether jobs of this kind are driven by the Kafka pipeline (frontier,
+    /// workers, work accounting, completion loop, per-page crawl billing).
+    pub(crate) fn is_pipeline(self) -> bool {
+        self == JobKind::Crawl
     }
 }
 
@@ -71,6 +85,10 @@ mod tests {
             let name = serde_json::to_value(kind).unwrap();
             job.config = Some(serde_json::json!({ JOB_TYPE_KEY: name }));
             assert_eq!(JobKind::of(&job), kind);
+            assert_eq!(name, kind.as_str());
         }
+        assert!(JobKind::Crawl.is_pipeline());
+        assert!(!JobKind::BatchScrape.is_pipeline());
+        assert!(!JobKind::Extract.is_pipeline());
     }
 }

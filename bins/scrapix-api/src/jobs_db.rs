@@ -82,7 +82,14 @@ fn row_to_job_state(row: &sqlx::postgres::PgRow) -> JobState {
 // ============================================================================
 
 /// Insert a new job row. Uses ON CONFLICT DO NOTHING for idempotency.
+/// Failures are logged.
 pub async fn insert_job(pool: &PgPool, job: &JobState) {
+    let _ = try_insert_job(pool, job).await;
+}
+
+/// Insert a new job row (ON CONFLICT DO NOTHING), returning the error, if
+/// any, after logging it.
+pub async fn try_insert_job(pool: &PgPool, job: &JobState) -> Result<(), sqlx::Error> {
     let account_id: Option<uuid::Uuid> = job.account_id.as_deref().and_then(|s| s.parse().ok());
     let api_key_id: Option<uuid::Uuid> = job.api_key_id.as_deref().and_then(|s| s.parse().ok());
 
@@ -127,8 +134,12 @@ pub async fn insert_job(pool: &PgPool, job: &JobState) {
     .execute(pool)
     .await;
 
-    if let Err(e) = result {
-        warn!(job_id = %job.job_id, error = %e, "Failed to insert job into Postgres");
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            warn!(job_id = %job.job_id, error = %e, "Failed to insert job into Postgres");
+            Err(e)
+        }
     }
 }
 

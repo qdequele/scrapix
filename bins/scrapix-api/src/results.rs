@@ -7,8 +7,12 @@
 //!   every document carries `_crawl_job_id`, which is always filterable.
 //!   Results are read from the job's index with
 //!   `POST /indexes/{uid}/documents/fetch` filtered on `_crawl_job_id`.
-//! - Jobs the engine runs itself (batch scrape, extract) store their results
-//!   through [`ResultsState`] (see the stored-results source).
+//! - Jobs the engine runs itself (batch scrape, extract) store one result
+//!   per URL with [`store_page`]: in the `job_results` Postgres table
+//!   (`seq` = completion order, append-only), or in memory when the engine
+//!   has no database (or could not persist the job row). The cursor is the
+//!   `seq` of the last item read, so paging never skips or repeats an item
+//!   even while the job runs.
 //!
 //! ## Paging and ordering
 //!
@@ -181,6 +185,8 @@ pub(crate) struct ResultsState {
     /// Meilisearch connection of recent crawl jobs (the persisted job config
     /// has its API key redacted). Insertion-ordered, bounded.
     crawl_targets: RwLock<(HashMap<String, MeiliTarget>, VecDeque<String>)>,
+    /// Results of engine-run jobs that are not persisted in Postgres.
+    memory: RwLock<MemoryResults>,
 }
 
 impl Default for ResultsState {
@@ -191,6 +197,7 @@ impl Default for ResultsState {
                 .build()
                 .unwrap_or_default(),
             crawl_targets: RwLock::new((HashMap::new(), VecDeque::new())),
+            memory: RwLock::new(MemoryResults::default()),
         }
     }
 }
@@ -351,10 +358,7 @@ pub(crate) async fn results_page(
     let slice = match kind {
         JobKind::Crawl => crawl_results(state, job, start, limit).await?,
         JobKind::BatchScrape | JobKind::Extract => {
-            return Err(ApiError::new(
-                "Results are not available for this job type",
-                "bad_request",
-            ))
+            stored_results(state, &job.job_id, start, limit).await?
         }
     };
     Ok(JobResultsResponse {
@@ -735,6 +739,155 @@ pub(crate) fn document_to_item(doc: &Value) -> JobResultItem {
         block_url: str_field(doc, "block_url"),
         ..Default::default()
     }
+}
+
+// ============================================================================
+// Engine-run jobs (batch scrape, extract): stored results
+// ============================================================================
+
+/// How many jobs' results the in-memory fallback keeps.
+const MAX_MEMORY_RESULT_JOBS: usize = 50;
+
+/// In-memory results of jobs that are not persisted (no Postgres, or the
+/// job row could not be written).
+#[derive(Default)]
+pub(crate) struct MemoryResults {
+    pages: HashMap<String, Vec<Value>>,
+    summaries: HashMap<String, Value>,
+    order: VecDeque<String>,
+}
+
+impl ResultsState {
+    /// Keep `job_id`'s results in memory instead of Postgres.
+    pub(crate) fn use_memory(&self, job_id: &str) {
+        let mut m = self.memory.write();
+        if m.pages.contains_key(job_id) {
+            return;
+        }
+        m.pages.insert(job_id.to_string(), Vec::new());
+        m.order.push_back(job_id.to_string());
+        while m.order.len() > MAX_MEMORY_RESULT_JOBS {
+            if let Some(old) = m.order.pop_front() {
+                m.pages.remove(&old);
+                m.summaries.remove(&old);
+            }
+        }
+    }
+
+    fn in_memory(&self, job_id: &str) -> bool {
+        self.memory.read().pages.contains_key(job_id)
+    }
+}
+
+/// Store result `seq` (1-based, in completion order) of an engine-run job.
+/// A Postgres write is retried; if it keeps failing the item is lost from
+/// the results (logged, and counted as a job warning).
+pub(crate) async fn store_page(
+    state: &AppState,
+    job_id: &str,
+    seq: u64,
+    url: &str,
+    success: bool,
+    payload: Value,
+) {
+    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+        let mut m = state.results.memory.write();
+        if let Some(pages) = m.pages.get_mut(job_id) {
+            pages.push(payload);
+        }
+        return;
+    }
+    let Some(ref pool) = state.db_pool else {
+        return;
+    };
+    let mut last_error = None;
+    for attempt in 0..3u64 {
+        let res = sqlx::query(
+            "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
+             VALUES ($1, $2, 'page', $3, $4, $5) ON CONFLICT (job_id, seq) DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(seq as i32)
+        .bind(url)
+        .bind(success)
+        .bind(&payload)
+        .execute(pool)
+        .await;
+        match res {
+            Ok(_) => return,
+            Err(e) => {
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+            }
+        }
+    }
+    let error = last_error.map(|e| e.to_string()).unwrap_or_default();
+    tracing::error!(job_id = %job_id, seq, error = %error, "Failed to store a job result");
+    state.update_job(job_id, |j| {
+        let msg = "Some results could not be stored (database error)".to_string();
+        if !j.warnings.contains(&msg) {
+            j.warnings.push(msg);
+        }
+    });
+}
+
+/// Stored results of an engine-run job after position `after` (the seq of
+/// the last item already read).
+async fn stored_results(
+    state: &AppState,
+    job_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<ResultsSlice, ApiError> {
+    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+        let m = state.results.memory.read();
+        let pages = m.pages.get(job_id).map(Vec::as_slice).unwrap_or_default();
+        let start = (after as usize).min(pages.len());
+        let end = (start + limit).min(pages.len());
+        return Ok(ResultsSlice {
+            data: pages[start..end].to_vec(),
+            total: pages.len() as u64,
+            end: end as u64,
+            has_more: end < pages.len(),
+        });
+    }
+    let Some(ref pool) = state.db_pool else {
+        unreachable!("checked above");
+    };
+    use sqlx::Row as _;
+    let db_error = |e: sqlx::Error| {
+        warn!(job_id = %job_id, error = %e, "Failed to read job results");
+        ApiError::new("Could not read the job's results", "service_unavailable")
+    };
+    let rows = sqlx::query(
+        "SELECT seq, payload FROM job_results \
+         WHERE job_id = $1 AND kind = 'page' AND seq > $2 ORDER BY seq LIMIT $3",
+    )
+    .bind(job_id)
+    .bind(after.min(i32::MAX as u64) as i32)
+    .bind(limit as i64 + 1)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_results WHERE job_id = $1 AND kind = 'page'")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
+    let has_more = rows.len() > limit;
+    let mut end = after;
+    let mut data = Vec::with_capacity(rows.len().min(limit));
+    for row in rows.into_iter().take(limit) {
+        end = row.get::<i32, _>("seq") as u64;
+        data.push(row.get::<Value, _>("payload"));
+    }
+    Ok(ResultsSlice {
+        data,
+        total: total as u64,
+        end,
+        has_more,
+    })
 }
 
 /// Test helpers shared by the results, batch and extract tests.

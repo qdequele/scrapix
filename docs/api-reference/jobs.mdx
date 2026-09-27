@@ -1,6 +1,6 @@
 ---
 title: Jobs
-description: Monitor, list, and cancel crawl jobs
+description: Monitor, list, and cancel jobs (crawls, batch scrapes, extractions)
 ---
 
 # Jobs
@@ -24,6 +24,7 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 ```json
 {
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_type": "crawl",
   "status": "running",
   "index_uid": "my-docs",
   "pages_crawled": 142,
@@ -48,6 +49,7 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 | Field | Type | Description |
 |-------|------|-------------|
 | `job_id` | string | Unique job identifier |
+| `job_type` | string | `crawl`, `batch_scrape` ([Batch Scrape](/api-reference/batch-scrape)) or `extract` ([Extract](/api-reference/extract)). For batch scrape and extract jobs, `pages_crawled` / `errors` count the URLs scraped / failed, and `index_uid` is empty |
 | `status` | string | `pending`, `running`, `completed`, `failed`, `cancelled`, or `paused` |
 | `index_uid` | string | Target Meilisearch index |
 | `pages_crawled` | integer | Number of pages successfully fetched |

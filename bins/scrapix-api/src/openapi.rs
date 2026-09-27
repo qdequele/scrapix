@@ -42,6 +42,7 @@ use utoipa::OpenApi;
         crate::handle_domains,
         // Core endpoints
         crate::scrape_url,
+        crate::batch::batch_scrape,
         crate::map_url,
         crate::search_url,
         crate::create_crawl,
@@ -61,6 +62,8 @@ use utoipa::OpenApi;
         crate::ServiceHealthResponse,
         crate::ServiceStatus,
         crate::ScrapeRequest,
+        crate::batch::BatchScrapeRequest,
+        crate::batch::BatchScrapeResponse,
         crate::ScrapeResponse,
         crate::ScrapeFormat,
         crate::ScrapeMetadata,

@@ -26,6 +26,7 @@ class McpTest < ActionDispatch::IntegrationTest
     assert_operator names.size, :>=, 40
     assert_includes names, "scrape_url"
     assert_includes names, "job_results"
+    assert_includes names, "batch_scrape"
     assert_includes names, "list_configs"
   end
 end

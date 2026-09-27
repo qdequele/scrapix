@@ -23,6 +23,63 @@
     }
   ],
   "paths": {
+    "/batch/scrape": {
+      "post": {
+        "tags": [
+          "scrape"
+        ],
+        "summary": "Scrape many URLs as one job",
+        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Credits: same as `/scrape`, per URL scraped.",
+        "operationId": "batch_scrape",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchScrapeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchScrapeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Not enough credits for the whole batch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/crawl": {
       "post": {
         "tags": [
@@ -936,6 +993,160 @@
           "details": {},
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "BatchScrapeRequest": {
+        "type": "object",
+        "description": "Request body for `POST /batch/scrape`. Every field besides `urls`,\n`concurrency` and `webhooks` is a `POST /scrape` option applied to each\nURL (the most common ones are listed; any `/scrape` option is accepted).",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "ai": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AiOptions",
+                "description": "AI enrichment, per URL"
+              }
+            ]
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "URLs scraped at once (default 10, max 25)",
+            "minimum": 0
+          },
+          "exclude_selectors": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "CSS selectors to remove before extraction"
+          },
+          "extract": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom CSS selector extraction (field_name -> selector definition)",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SelectorDefinition"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "formats": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ScrapeFormat"
+            },
+            "description": "Formats to return for each URL (default: markdown, content, metadata)"
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom request headers",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "include_links": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Include links found on each page"
+          },
+          "include_selectors": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "CSS selectors to keep (only extract from these)"
+          },
+          "only_main_content": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Only the main content (default true)"
+          },
+          "render_js": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Render JavaScript (requires Chrome/Chromium on the server)"
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-URL timeout in milliseconds (default 30000)",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URLs to scrape (1 to 1000)"
+          },
+          "webhooks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/WebhookConfig"
+            },
+            "description": "Webhook subscriptions (same as a crawl's `webhooks`): `crawl_started`,\n`page_crawled`, `page_error`, `crawl_completed`, `crawl_failed`"
+          }
+        }
+      },
+      "BatchScrapeResponse": {
+        "type": "object",
+        "description": "Response of `POST /batch/scrape`",
+        "required": [
+          "job_id",
+          "status",
+          "urls_count",
+          "message"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "urls_count": {
+            "type": "integer",
+            "description": "Number of URLs accepted",
+            "minimum": 0
           }
         }
       },
@@ -2056,6 +2267,7 @@
         "description": "Job status response",
         "required": [
           "job_id",
+          "job_type",
           "status",
           "index_uid",
           "pages_crawled",
@@ -2112,6 +2324,10 @@
           },
           "job_id": {
             "type": "string"
+          },
+          "job_type": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`crawl`, `batch_scrape` or `extract`"
           },
           "max_pages": {
             "type": [

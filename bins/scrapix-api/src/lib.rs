@@ -42,10 +42,12 @@ use std::time::Duration;
 
 pub mod analytics;
 pub mod auth;
+pub(crate) mod batch;
 pub mod billing;
 pub mod completion;
 pub mod configs;
 pub mod email_scheduler;
+pub(crate) mod engine_jobs;
 pub(crate) mod job_kind;
 pub mod jobs_db;
 pub mod openapi;
@@ -460,6 +462,16 @@ impl AppState {
         self.crawl.jobs.read().get(job_id).cloned()
     }
 
+    /// Whether `job_id` is a pipeline (crawl) job, as opposed to a job the
+    /// API runs itself (batch scrape, extract). Unknown jobs count as crawls.
+    fn is_pipeline_job(&self, job_id: &str) -> bool {
+        self.crawl
+            .jobs
+            .read()
+            .get(job_id)
+            .map_or(true, |j| job_kind::JobKind::of(j).is_pipeline())
+    }
+
     /// Update a job
     fn update_job<F>(&self, job_id: &str, f: F) -> Option<JobState>
     where
@@ -556,7 +568,9 @@ impl AppState {
             .jobs
             .read()
             .iter()
-            .filter(|(_, j)| matches!(j.status, JobStatus::Running))
+            .filter(|(_, j)| {
+                matches!(j.status, JobStatus::Running) && job_kind::JobKind::of(j).is_pipeline()
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -999,7 +1013,7 @@ impl AppState {
         pages_ai: u64,
     ) {
         let total_pages = pages_http + pages_browser;
-        if total_pages == 0 {
+        if total_pages == 0 || !self.is_pipeline_job(job_id) {
             return;
         }
         self.diagnostics
@@ -1467,8 +1481,16 @@ impl AppState {
             self.crawl.dirty_jobs.write().insert(job_id.to_string());
         }
 
+        // Terminal events of engine-run jobs (batch scrape, extract) get no
+        // crawl request event nor job email: their pages are billed and
+        // logged one by one as they run.
+        let pipeline_terminal = !matches!(
+            event,
+            CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. }
+        ) || self.is_pipeline_job(job_id);
+
         // Persist crawl completion to request_events (1 row per crawl job at completion)
-        if let Some(ref batcher) = self.analytics.request_batcher {
+        if let (Some(batcher), true) = (&self.analytics.request_batcher, pipeline_terminal) {
             if let CrawlEvent::JobCompleted {
                 account_id,
                 pages_crawled,
@@ -1642,7 +1664,7 @@ impl AppState {
                 // The only place a completion email is scheduled (R5).
                 self.request_job_email(
                     "job_completed",
-                    account_id.clone(),
+                    account_id.clone().filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
                         "index_uid": index_uid,
@@ -1683,7 +1705,7 @@ impl AppState {
                 // The only place a failure email is scheduled (R5).
                 self.request_job_email(
                     "job_failed",
-                    account_id,
+                    account_id.filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
                         "error_message": error,
@@ -2419,6 +2441,8 @@ struct BulkCrawlError {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct JobStatusResponse {
     job_id: String,
+    /// `crawl`, `batch_scrape` or `extract`
+    job_type: job_kind::JobKind,
     /// One of `pending`, `running`, `paused`, `completed`, `failed`,
     /// `cancelled`
     #[schema(value_type = JobStatus)]
@@ -2455,8 +2479,10 @@ struct JobStatusResponse {
 impl From<JobState> for JobStatusResponse {
     fn from(job: JobState) -> Self {
         let duration_seconds = job.duration_seconds();
+        let job_type = job_kind::JobKind::of(&job);
         Self {
             job_id: job.job_id,
+            job_type,
             status: format!("{:?}", job.status).to_lowercase(),
             index_uid: job.index_uid,
             pages_crawled: job.pages_crawled,
@@ -6250,6 +6276,9 @@ pub async fn run_with_bus(
     // Recover active jobs from Postgres on startup
     if let Some(ref pool) = state.db_pool {
         let recovered = jobs_db::load_active_jobs(pool).await;
+        // Engine-run jobs (batch scrape, extract) died with the previous
+        // process: mark them failed instead of recovering them as running.
+        let recovered = engine_jobs::fail_interrupted(pool, recovered).await;
         if !recovered.is_empty() {
             let now = std::time::Instant::now();
             let mut jobs = state.crawl.jobs.write();
@@ -6484,6 +6513,7 @@ pub async fn run_with_bus(
     // Product routes — revenue-generating API endpoints
     let product_routes = Router::new()
         .route("/scrape", post(scrape_url))
+        .route("/batch/scrape", post(batch::batch_scrape))
         .route("/map", post(map_url))
         .route("/search", post(search_url))
         .route("/crawl", post(create_crawl))

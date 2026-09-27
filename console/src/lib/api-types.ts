@@ -25,6 +25,8 @@ export interface SystemStats {
 // Also used by GET /job/{id}/status
 export interface Job {
   job_id: string;
+  /** `crawl`, `batch_scrape` or `extract` (absent from older engines) */
+  job_type?: "crawl" | "batch_scrape" | "extract";
   status: string;
   index_uid: string;
   pages_crawled: number;
