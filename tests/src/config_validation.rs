@@ -244,6 +244,8 @@ fn test_features_enabled_returns_false_when_none() {
         ai_extraction: None,
         ai_summary: None,
         pdf: None,
+        documents: None,
+        ocr: None,
     };
 
     assert!(!features.metadata_enabled());
@@ -354,6 +356,8 @@ fn test_features_config_round_trip() {
             exclude_pages: vec![],
         }),
         pdf: None,
+        documents: None,
+        ocr: None,
     };
 
     let json = serde_json::to_string(&features).expect("serialize features");

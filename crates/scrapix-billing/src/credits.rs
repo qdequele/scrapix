@@ -111,11 +111,49 @@ pub fn crawl_credits(
     http_credits + browser_credits + ai_credits
 }
 
+/// OCR surcharge per page recognized by OCR (SCR-86). Distinctly above a
+/// normal page (1 credit): each OCR'd page is rasterized and sent to a
+/// vision model or Tesseract. Charged on top of the document's own
+/// scrape/parse/crawl credits, and only for freshly recognized pages (OCR
+/// cache hits are free).
+pub const OCR_PAGE_CREDITS: i64 = 5;
+
+/// Credits for `pages` OCR'd pages.
+pub fn ocr_credits(pages: u64) -> i64 {
+    (pages as i64).saturating_mul(OCR_PAGE_CREDITS)
+}
+
+/// Compute credits for a `POST /parse` upload: billed per document like a
+/// `/scrape` call (feature formats count the same way), plus the OCR
+/// surcharge for recognized pages.
+pub fn parse_credits(feature_format_count: i64, ocr_pages: u64) -> i64 {
+    scrape_credits(feature_format_count, false, false) + ocr_credits(ocr_pages)
+}
+
 /// Map credits: flat 2 per call.
 pub const MAP_CREDITS: i64 = 2;
 
 /// Search credits: flat 2 per call.
 pub const SEARCH_CREDITS: i64 = 2;
+
+#[cfg(test)]
+mod ocr_tests {
+    use super::*;
+
+    #[test]
+    fn ocr_pages_cost_more_than_normal_pages() {
+        const { assert!(OCR_PAGE_CREDITS > 1) };
+        assert_eq!(ocr_credits(0), 0);
+        assert_eq!(ocr_credits(3), 15);
+    }
+
+    #[test]
+    fn parse_is_billed_per_document_plus_ocr() {
+        assert_eq!(parse_credits(0, 0), 1);
+        assert_eq!(parse_credits(2, 0), 2);
+        assert_eq!(parse_credits(1, 4), 1 + 20);
+    }
+}
 
 #[cfg(test)]
 mod tests {

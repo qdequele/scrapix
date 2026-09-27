@@ -2427,6 +2427,11 @@ export interface components {
             mobile?: boolean;
             /** @description Whether to only return the main content (excludes nav, footer, etc.) */
             only_main_content?: boolean;
+            /**
+             * @description Document parsing options, used when the URL serves a PDF or an
+             *     office document (OCR of scanned pages, page limits).
+             */
+            parsers?: components["schemas"]["ParserOptions"];
             /** @description Render JavaScript before extracting content (requires Chrome/Chromium) */
             render_js?: boolean;
             screenshot?: null | components["schemas"]["ScreenshotRequestOptions"];
@@ -2446,6 +2451,7 @@ export interface components {
             blocks?: components["schemas"]["ContentBlock"][] | null;
             /** @description Extracted main content text (if requested) */
             content?: string | null;
+            document?: null | components["schemas"]["DocumentInfo"];
             /** @description Custom selector extraction results */
             extract?: {
                 [key: string]: unknown;
@@ -2459,6 +2465,7 @@ export interface components {
             /** @description Markdown content (if requested) */
             markdown?: string | null;
             metadata?: null | components["schemas"]["ScrapeMetadata"];
+            ocr?: null | components["schemas"]["OcrInfo"];
             /** @description Raw HTML content (if requested) */
             raw_html?: string | null;
             schema?: null | components["schemas"]["ExtractedSchema"];
@@ -2701,6 +2708,105 @@ export interface components {
          * @enum {string}
          */
         WebhookEvent: "crawl_started" | "crawl_completed" | "crawl_failed" | "progress_update" | "page_crawled" | "page_indexed" | "page_error" | "batch_sent";
+        /** @description What OCR did (present when `parsers.ocr` is not `off`). */
+        OcrInfo: {
+            /**
+             * @description Backend that recognized pages (`vision:<provider>/<model>`,
+             *     `tesseract:<lang>`).
+             */
+            backend?: string | null;
+            mode: components["schemas"]["OcrMode"];
+            /** @description 1-indexed pages that were OCR'd. */
+            pages: number[];
+            /**
+             * Format: int32
+             * @description Of `pages_processed`, pages served from the OCR cache (not billed).
+             */
+            pages_cached: number;
+            /**
+             * Format: int32
+             * @description Pages that needed OCR but exceeded the page cap or daily budget.
+             */
+            pages_capped: number;
+            /**
+             * Format: int32
+             * @description Pages whose recognition failed.
+             */
+            pages_failed: number;
+            /**
+             * Format: int32
+             * @description Pages whose text now comes from OCR.
+             */
+            pages_processed: number;
+            /**
+             * Format: int32
+             * @description Pages left on the native text-extraction path.
+             */
+            pages_skipped: number;
+            warning?: string | null;
+        };
+        /**
+         * @description When to run OCR on a document.
+         * @enum {string}
+         */
+        OcrMode: "off" | "auto" | "force";
+        /** @description What the document parser found. */
+        DocumentInfo: {
+            /**
+             * Format: int64
+             * @description Document size in bytes.
+             */
+            bytes: number;
+            /** @description Canonical media type of the format. */
+            content_type: string;
+            /**
+             * @description Detected format: `pdf`, `docx`, `xlsx`, `pptx`, `doc`, `ppt`, `odt`,
+             *     `ods`, `odp`, `rtf`, `epub`, `csv`, `image`.
+             */
+            format: string;
+            /** @description Tables were detected and rendered as Markdown tables. */
+            has_tables: boolean;
+            /** @description Whether some pages still have no text (not OCR'd). */
+            needs_ocr: boolean;
+            /**
+             * Format: int32
+             * @description Pages in the document (PDF, image).
+             */
+            page_count?: number | null;
+            /** @description 1-indexed pages that still need OCR. */
+            pages_needing_ocr?: number[];
+            /**
+             * Format: int32
+             * @description Pages actually parsed (≤ `page_count` with `parsers.max_pages`).
+             */
+            pages_processed?: number | null;
+            /** @description Parser backend (`pdf-inspector`, `anydoc`, `image`). */
+            parser: string;
+            /** @description PDF classification: `text_based`, `scanned`, `image_based`, `mixed`. */
+            pdf_type?: string | null;
+        };
+        /** @description Document parsing options for `/scrape` and `/parse`. */
+        ParserOptions: {
+            /**
+             * Format: int32
+             * @description Parse at most this many PDF pages (the first N).
+             */
+            max_pages?: number | null;
+            /**
+             * @description OCR for scanned / image-only pages: `off` (default — scanned pages
+             *     are flagged in `document.pages_needing_ocr`, not recognized), `auto`
+             *     (OCR only the pages that need it) or `force` (OCR every page, for
+             *     PDFs whose broken font encodings extract as garbage). OCR pages are
+             *     billed at a higher per-page rate.
+             */
+            ocr?: components["schemas"]["OcrMode"];
+            /**
+             * Format: int32
+             * @description Per-document OCR page cap. Can only lower the server cap
+             *     (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50).
+             */
+            ocr_max_pages?: number | null;
+        };
     };
     responses: never;
     parameters: never;

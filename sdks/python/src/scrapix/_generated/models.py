@@ -1728,6 +1728,104 @@ class WebhookEvent(str, Enum):
     batch_sent = "batch_sent"
 
 
+class Page(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class OcrMode(str, Enum):
+    """
+    When to run OCR on a document.
+    """
+
+    off = "off"
+    auto = "auto"
+    force = "force"
+
+
+class PagesNeedingOcrItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class DocumentInfo(BaseModel):
+    """
+    What the document parser found.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    bytes: int = Field(..., ge=0)
+    """
+    Document size in bytes.
+    """
+    content_type: str
+    """
+    Canonical media type of the format.
+    """
+    format: str
+    """
+    Detected format: `pdf`, `docx`, `xlsx`, `pptx`, `doc`, `ppt`, `odt`,
+    `ods`, `odp`, `rtf`, `epub`, `csv`, `image`.
+    """
+    has_tables: bool
+    """
+    Tables were detected and rendered as Markdown tables.
+    """
+    needs_ocr: bool
+    """
+    Whether some pages still have no text (not OCR'd).
+    """
+    page_count: Optional[int] = Field(None, ge=0)
+    """
+    Pages in the document (PDF, image).
+    """
+    pages_needing_ocr: Optional[list[PagesNeedingOcrItem]] = None
+    """
+    1-indexed pages that still need OCR.
+    """
+    pages_processed: Optional[int] = Field(None, ge=0)
+    """
+    Pages actually parsed (≤ `page_count` with `parsers.max_pages`).
+    """
+    parser: str
+    """
+    Parser backend (`pdf-inspector`, `anydoc`, `image`).
+    """
+    pdf_type: Optional[str] = None
+    """
+    PDF classification: `text_based`, `scanned`, `image_based`, `mixed`.
+    """
+
+
+class ParserOptions(BaseModel):
+    """
+    Document parsing options for `/scrape` and `/parse`.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    max_pages: Optional[int] = Field(None, ge=0)
+    """
+    Parse at most this many PDF pages (the first N).
+    """
+    ocr: Optional[OcrMode] = None
+    """
+    OCR for scanned / image-only pages: `off` (default — scanned pages
+    are flagged in `document.pages_needing_ocr`, not recognized), `auto`
+    (OCR only the pages that need it) or `force` (OCR every page, for
+    PDFs whose broken font encodings extract as garbage). OCR pages are
+    billed at a higher per-page rate.
+    """
+    ocr_max_pages: Optional[int] = Field(None, ge=0)
+    """
+    Per-document OCR page cap. Can only lower the server cap
+    (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50).
+    """
+
+
 class Action3(BaseModel):
     """
     Scroll the page by `amount` viewport heights (default 1).
@@ -1997,77 +2095,6 @@ class ProxyConfig(BaseModel):
     """
 
 
-class ScrapeResponse(BaseModel):
-    """
-    Response for /scrape endpoint
-    """
-
-    model_config = ConfigDict(
-        extra="allow",
-        populate_by_name=True,
-    )
-    actions: Optional[ScrapeActionsResult] = None
-    ai: Optional[AiResult] = None
-    blocks: Optional[list[ContentBlock]] = None
-    """
-    Content blocks split by headings (if format "blocks" requested)
-    """
-    content: Optional[str] = None
-    """
-    Extracted main content text (if requested)
-    """
-    extract: Optional[dict[str, Any]] = None
-    """
-    Custom selector extraction results
-    """
-    html: Optional[str] = None
-    """
-    Cleaned HTML content (if requested)
-    """
-    language: Optional[str] = None
-    """
-    Detected language
-    """
-    links: Optional[list[str]] = None
-    """
-    Links found on the page (if requested)
-    """
-    markdown: Optional[str] = None
-    """
-    Markdown content (if requested)
-    """
-    metadata: Optional[ScrapeMetadata] = None
-    raw_html: Optional[str] = None
-    """
-    Raw HTML content (if requested)
-    """
-    schema_: Optional[ExtractedSchema] = Field(None, alias="schema")
-    scrape_duration_ms: int = Field(..., ge=0)
-    """
-    Time taken to scrape in milliseconds
-    """
-    screenshot: Optional[str] = None
-    """
-    Base64-encoded PNG screenshot (if format "screenshot" requested)
-    """
-    status_code: int = Field(..., ge=0)
-    """
-    HTTP status code
-    """
-    success: bool
-    """
-    Whether the scrape was successful
-    """
-    url: str
-    """
-    The URL that was scraped (after redirects)
-    """
-    warning: Optional[str] = None
-    """
-    Warning message (e.g. "AI requires OPENAI_API_KEY")
-    """
-
-
 class SelectorDefinition3(BaseModel):
     """
     Definition for a single selector extraction
@@ -2170,6 +2197,48 @@ class WebhookConfig(BaseModel):
     """
     Webhook URL
     """
+
+
+class OcrInfo(BaseModel):
+    """
+    What OCR did (present when `parsers.ocr` is not `off`).
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    backend: Optional[str] = None
+    """
+    Backend that recognized pages (`vision:<provider>/<model>`,
+    `tesseract:<lang>`).
+    """
+    mode: OcrMode
+    pages: list[Page]
+    """
+    1-indexed pages that were OCR'd.
+    """
+    pages_cached: int = Field(..., ge=0)
+    """
+    Of `pages_processed`, pages served from the OCR cache (not billed).
+    """
+    pages_capped: int = Field(..., ge=0)
+    """
+    Pages that needed OCR but exceeded the page cap or daily budget.
+    """
+    pages_failed: int = Field(..., ge=0)
+    """
+    Pages whose recognition failed.
+    """
+    pages_processed: int = Field(..., ge=0)
+    """
+    Pages whose text now comes from OCR.
+    """
+    pages_skipped: int = Field(..., ge=0)
+    """
+    Pages left on the native text-extraction path.
+    """
+    warning: Optional[str] = None
 
 
 class BatchScrapeRequest(BaseModel):
@@ -2473,6 +2542,11 @@ class ScrapeRequest(BaseModel):
     """
     Whether to only return the main content (excludes nav, footer, etc.)
     """
+    parsers: Optional[ParserOptions] = None
+    """
+    Document parsing options, used when the URL serves a PDF or an
+    office document (OCR of scanned pages, page limits).
+    """
     render_js: Optional[bool] = None
     """
     Render JavaScript before extracting content (requires Chrome/Chromium)
@@ -2485,6 +2559,79 @@ class ScrapeRequest(BaseModel):
     url: str
     """
     URL to scrape
+    """
+
+
+class ScrapeResponse(BaseModel):
+    """
+    Response for /scrape endpoint
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    actions: Optional[ScrapeActionsResult] = None
+    ai: Optional[AiResult] = None
+    blocks: Optional[list[ContentBlock]] = None
+    """
+    Content blocks split by headings (if format "blocks" requested)
+    """
+    content: Optional[str] = None
+    """
+    Extracted main content text (if requested)
+    """
+    document: Optional[DocumentInfo] = None
+    extract: Optional[dict[str, Any]] = None
+    """
+    Custom selector extraction results
+    """
+    html: Optional[str] = None
+    """
+    Cleaned HTML content (if requested)
+    """
+    language: Optional[str] = None
+    """
+    Detected language
+    """
+    links: Optional[list[str]] = None
+    """
+    Links found on the page (if requested)
+    """
+    markdown: Optional[str] = None
+    """
+    Markdown content (if requested)
+    """
+    metadata: Optional[ScrapeMetadata] = None
+    ocr: Optional[OcrInfo] = None
+    raw_html: Optional[str] = None
+    """
+    Raw HTML content (if requested)
+    """
+    schema_: Optional[ExtractedSchema] = Field(None, alias="schema")
+    scrape_duration_ms: int = Field(..., ge=0)
+    """
+    Time taken to scrape in milliseconds
+    """
+    screenshot: Optional[str] = None
+    """
+    Base64-encoded PNG screenshot (if format "screenshot" requested)
+    """
+    status_code: int = Field(..., ge=0)
+    """
+    HTTP status code
+    """
+    success: bool
+    """
+    Whether the scrape was successful
+    """
+    url: str
+    """
+    The URL that was scraped (after redirects)
+    """
+    warning: Optional[str] = None
+    """
+    Warning message (e.g. "AI requires OPENAI_API_KEY")
     """
 
 

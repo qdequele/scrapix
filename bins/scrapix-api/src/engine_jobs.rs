@@ -160,9 +160,7 @@ pub(crate) async fn gate(state: &AppState, job_id: &str) -> Gate {
 
 /// Whether the job was stopped (cancelled, or terminal for another reason).
 pub(crate) fn is_stopped(state: &AppState, job_id: &str) -> bool {
-    state
-        .get_job(job_id)
-        .map_or(true, |j| is_terminal(&j.status))
+    state.get_job(job_id).is_none_or(|j| is_terminal(&j.status))
 }
 
 /// Report one processed page: a `PageCrawled` / `PageFailed` event.

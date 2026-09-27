@@ -354,10 +354,21 @@ pub struct FeaturesConfig {
     pub ai_summary: Option<FeatureToggle>,
 
     /// PDF scraping (opt-in). When enabled, the crawler fetches
-    /// `application/pdf` responses, extracts text + metadata, and indexes
-    /// them alongside HTML pages. Disabled by default.
+    /// `application/pdf` responses, extracts layout-aware Markdown +
+    /// metadata, and indexes them alongside HTML pages. Disabled by default.
     #[serde(default)]
     pub pdf: Option<PdfConfig>,
+
+    /// Office/other document scraping (opt-in): Word, PowerPoint, Excel,
+    /// OpenDocument, RTF, EPUB and CSV responses are converted to Markdown
+    /// and indexed alongside HTML pages. Disabled by default.
+    #[serde(default)]
+    pub documents: Option<DocumentsConfig>,
+
+    /// OCR for scanned / image-only PDF pages (opt-in, `off` by default:
+    /// OCR is slow and billed at a higher per-page rate).
+    #[serde(default)]
+    pub ocr: Option<OcrConfig>,
 }
 
 impl FeaturesConfig {
@@ -373,13 +384,49 @@ impl FeaturesConfig {
             .and_then(|c| c.max_size_mb)
             .map(|mb| mb.saturating_mul(1024 * 1024))
     }
+
+    /// Returns the max number of PDF pages to parse, if set.
+    pub fn pdf_max_pages(&self) -> Option<u32> {
+        self.pdf.as_ref().and_then(|c| c.max_pages)
+    }
+
+    /// Whether links found inside PDFs are followed (`pdf.extract_links`).
+    pub fn pdf_extract_links(&self) -> bool {
+        self.pdf
+            .as_ref()
+            .is_some_and(|c| c.enabled && c.extract_links)
+    }
+
+    /// Returns true when office/other document scraping is enabled.
+    pub fn is_documents_enabled(&self) -> bool {
+        self.documents.as_ref().is_some_and(|c| c.enabled)
+    }
+
+    /// Returns the max office-document body size in bytes, if set.
+    pub fn documents_max_size_bytes(&self) -> Option<u64> {
+        self.documents
+            .as_ref()
+            .and_then(|c| c.max_size_mb)
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+    }
+
+    /// The job's OCR mode (`off` unless explicitly configured).
+    pub fn ocr_mode(&self) -> OcrMode {
+        self.ocr.as_ref().map(|c| c.mode).unwrap_or_default()
+    }
+
+    /// The job's per-document OCR page cap, if it set one.
+    pub fn ocr_max_pages(&self) -> Option<u32> {
+        self.ocr.as_ref().and_then(|c| c.max_pages)
+    }
 }
 
 /// Opt-in configuration for PDF scraping.
 ///
 /// When `enabled = true`, PDFs are fetched (with base64-encoded transport
-/// through the content worker), parsed for text + metadata, and indexed into
-/// the same Meilisearch index. All other fields default to conservative values.
+/// through the content worker), parsed into layout-aware Markdown (tables,
+/// multi-column reading order) + metadata, and indexed into the same
+/// Meilisearch index. All other fields default to conservative values.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PdfConfig {
     /// Whether PDF scraping is enabled.
@@ -390,8 +437,14 @@ pub struct PdfConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size_mb: Option<u64>,
 
-    /// Reserved flag for extracting URLs embedded inside PDF text.
-    /// Currently a no-op; will be wired up in a follow-up issue.
+    /// Parse at most this many pages of each PDF (the first N). `None`
+    /// parses every page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pages: Option<u32>,
+
+    /// Follow hyperlinks found inside PDFs (link annotations): the crawler
+    /// publishes them to the frontier like links found in HTML, subject to
+    /// the job's usual domain/pattern/depth rules.
     #[serde(default)]
     pub extract_links: bool,
 }
@@ -401,9 +454,75 @@ impl Default for PdfConfig {
         Self {
             enabled: false,
             max_size_mb: Some(50),
+            max_pages: None,
             extract_links: false,
         }
     }
+}
+
+/// Opt-in configuration for office/other document scraping (DOCX, XLSX,
+/// PPTX, legacy DOC/XLS/PPT, ODT/ODS/ODP, RTF, EPUB, CSV).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DocumentsConfig {
+    /// Whether office/other document scraping is enabled.
+    pub enabled: bool,
+
+    /// Maximum document size in megabytes. Larger documents are rejected
+    /// before being buffered. When `None`, the global fetcher
+    /// `max_body_size` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_mb: Option<u64>,
+}
+
+impl Default for DocumentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_size_mb: Some(50),
+        }
+    }
+}
+
+/// When to run OCR on a document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrMode {
+    /// Never OCR: scanned pages are flagged (`needs_ocr`), not recognized.
+    #[default]
+    Off,
+    /// OCR only the pages classified as needing it; text-based pages stay
+    /// on the fast native extraction path.
+    Auto,
+    /// OCR every page (up to the page cap) — for documents whose broken
+    /// font encodings extract as garbage rather than as nothing.
+    Force,
+}
+
+impl OcrMode {
+    pub fn is_off(self) -> bool {
+        self == OcrMode::Off
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OcrMode::Off => "off",
+            OcrMode::Auto => "auto",
+            OcrMode::Force => "force",
+        }
+    }
+}
+
+/// Per-job OCR configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OcrConfig {
+    /// `off` (default), `auto` or `force`.
+    #[serde(default)]
+    pub mode: OcrMode,
+
+    /// Per-document OCR page cap. Can only lower the server-wide cap
+    /// (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50), never raise it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pages: Option<u32>,
 }
 
 impl FeaturesConfig {
@@ -477,6 +596,8 @@ impl FeaturesConfig {
                 None
             },
             pdf: None,
+            documents: None,
+            ocr: None,
         }
     }
 

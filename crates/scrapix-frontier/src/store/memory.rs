@@ -121,11 +121,7 @@ fn decide_admission(entry: &JobEntry, url: &CrawlUrl, queue_cap: usize, hash: u6
 /// Remove job entries whose `release` retention window has elapsed.
 fn evict_expired(jobs: &mut HashMap<String, JobEntry>) {
     let now = Instant::now();
-    jobs.retain(|_, entry| {
-        entry
-            .release_deadline
-            .map_or(true, |deadline| now < deadline)
-    });
+    jobs.retain(|_, entry| entry.release_deadline.is_none_or(|deadline| now < deadline));
 }
 
 /// In-memory [`FrontierStore`]. State lives entirely in process memory

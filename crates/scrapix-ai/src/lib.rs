@@ -59,6 +59,8 @@ pub use client::{
     AI_USAGE_CONTEXT,
 };
 
+pub use providers::ImageInput;
+
 // Re-export extraction types
 pub use extraction::{
     AiExtractor, ExtractionConfig, ExtractionResult, ExtractionSchema, FieldDefinition,

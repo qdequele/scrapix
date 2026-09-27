@@ -6321,6 +6321,10 @@
             "type": "boolean",
             "description": "Whether to only return the main content (excludes nav, footer, etc.)"
           },
+          "parsers": {
+            "$ref": "#/components/schemas/ParserOptions",
+            "description": "Document parsing options, used when the URL serves a PDF or an\noffice document (OCR of scanned pages, page limits)."
+          },
           "render_js": {
             "type": "boolean",
             "description": "Render JavaScript before extracting content (requires Chrome/Chromium)"
@@ -6397,6 +6401,17 @@
             ],
             "description": "Extracted main content text (if requested)"
           },
+          "document": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DocumentInfo",
+                "description": "Document details, when the URL served (or the upload is) a PDF or an\noffice document: format, pages, and which pages still need OCR."
+              }
+            ]
+          },
           "extract": {
             "type": [
               "object",
@@ -6447,6 +6462,17 @@
               {
                 "$ref": "#/components/schemas/ScrapeMetadata",
                 "description": "Page metadata"
+              }
+            ]
+          },
+          "ocr": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OcrInfo",
+                "description": "What OCR did, when `parsers.ocr` requested it."
               }
             ]
           },
@@ -7329,6 +7355,187 @@
           "page_error",
           "batch_sent"
         ]
+      },
+      "OcrInfo": {
+        "type": "object",
+        "description": "What OCR did (present when `parsers.ocr` is not `off`).",
+        "required": [
+          "mode",
+          "pages_processed",
+          "pages_cached",
+          "pages_skipped",
+          "pages_capped",
+          "pages_failed",
+          "pages"
+        ],
+        "properties": {
+          "backend": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Backend that recognized pages (`vision:<provider>/<model>`,\n`tesseract:<lang>`)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/OcrMode"
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "1-indexed pages that were OCR'd."
+          },
+          "pages_cached": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Of `pages_processed`, pages served from the OCR cache (not billed).",
+            "minimum": 0
+          },
+          "pages_capped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages that needed OCR but exceeded the page cap or daily budget.",
+            "minimum": 0
+          },
+          "pages_failed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages whose recognition failed.",
+            "minimum": 0
+          },
+          "pages_processed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages whose text now comes from OCR.",
+            "minimum": 0
+          },
+          "pages_skipped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages left on the native text-extraction path.",
+            "minimum": 0
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "OcrMode": {
+        "type": "string",
+        "description": "When to run OCR on a document.",
+        "enum": [
+          "off",
+          "auto",
+          "force"
+        ]
+      },
+      "DocumentInfo": {
+        "type": "object",
+        "description": "What the document parser found.",
+        "required": [
+          "format",
+          "content_type",
+          "parser",
+          "bytes",
+          "needs_ocr",
+          "has_tables"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Document size in bytes.",
+            "minimum": 0
+          },
+          "content_type": {
+            "type": "string",
+            "description": "Canonical media type of the format."
+          },
+          "format": {
+            "type": "string",
+            "description": "Detected format: `pdf`, `docx`, `xlsx`, `pptx`, `doc`, `ppt`, `odt`,\n`ods`, `odp`, `rtf`, `epub`, `csv`, `image`."
+          },
+          "has_tables": {
+            "type": "boolean",
+            "description": "Tables were detected and rendered as Markdown tables."
+          },
+          "needs_ocr": {
+            "type": "boolean",
+            "description": "Whether some pages still have no text (not OCR'd)."
+          },
+          "page_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Pages in the document (PDF, image).",
+            "minimum": 0
+          },
+          "pages_needing_ocr": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "1-indexed pages that still need OCR."
+          },
+          "pages_processed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Pages actually parsed (\u2264 `page_count` with `parsers.max_pages`).",
+            "minimum": 0
+          },
+          "parser": {
+            "type": "string",
+            "description": "Parser backend (`pdf-inspector`, `anydoc`, `image`)."
+          },
+          "pdf_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PDF classification: `text_based`, `scanned`, `image_based`, `mixed`."
+          }
+        }
+      },
+      "ParserOptions": {
+        "type": "object",
+        "description": "Document parsing options for `/scrape` and `/parse`.",
+        "properties": {
+          "max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Parse at most this many PDF pages (the first N).",
+            "minimum": 0
+          },
+          "ocr": {
+            "$ref": "#/components/schemas/OcrMode",
+            "description": "OCR for scanned / image-only pages: `off` (default \u2014 scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\nbilled at a higher per-page rate."
+          },
+          "ocr_max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Per-document OCR page cap. Can only lower the server cap\n(`OCR_MAX_PAGES_PER_DOCUMENT`, default 50).",
+            "minimum": 0
+          }
+        }
       }
     },
     "securitySchemes": {

@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/command";
 import { Globe, Monitor, Plus, X, ChevronsUpDown, Check } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { OcrMode } from "@/lib/api-types";
 
 const SCHEMA_ORG_TYPES = [
   // Creative Works
@@ -92,6 +93,14 @@ export interface CrawlState {
   feat_ai_summary: boolean;
   feat_pdf: boolean;
   pdf_max_size_mb: string;
+  pdf_max_pages: string;
+  pdf_extract_links: boolean;
+  /** OCR of scanned PDF pages (only applies with `feat_pdf`). */
+  ocr_mode: OcrMode;
+  ocr_max_pages: string;
+  // Office documents (Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV)
+  feat_documents: boolean;
+  documents_max_size_mb: string;
   // Indexing
   index_strategy: "update" | "replace";
   // Advanced
@@ -140,6 +149,12 @@ export const defaultCrawlState: CrawlState = {
   feat_ai_summary: false,
   feat_pdf: false,
   pdf_max_size_mb: "50",
+  pdf_max_pages: "",
+  pdf_extract_links: false,
+  ocr_mode: "off",
+  ocr_max_pages: "",
+  feat_documents: false,
+  documents_max_size_mb: "50",
   index_strategy: "update",
   headers: "",
   user_agents: "",
@@ -765,17 +780,93 @@ export function CrawlOptions({ state, onChange }: CrawlOptionsProps) {
             <SwitchRow
               id="feat-pdf"
               label="PDF scraping"
-              description="Fetch and index PDF documents"
+              description="Fetch and index PDFs as Markdown, tables included"
               checked={state.feat_pdf}
               onCheckedChange={(v) => set("feat_pdf", v)}
             />
             {state.feat_pdf && (
               <div className="space-y-3 pl-1 border-l-2 border-primary/20 ml-1">
+                <div className="grid grid-cols-2 gap-3">
+                  <NumericInput
+                    id="pdf-max-size"
+                    label="Max PDF size (MB)"
+                    value={state.pdf_max_size_mb}
+                    onChange={(v) => set("pdf_max_size_mb", v)}
+                    placeholder="50"
+                  />
+                  <NumericInput
+                    id="pdf-max-pages"
+                    label="Max pages"
+                    value={state.pdf_max_pages}
+                    onChange={(v) => set("pdf_max_pages", v)}
+                    placeholder="All"
+                    min="1"
+                  />
+                </div>
+                <SwitchRow
+                  id="pdf-extract-links"
+                  label="Follow links in PDFs"
+                  description="Crawl hyperlinks found inside PDFs"
+                  checked={state.pdf_extract_links}
+                  onCheckedChange={(v) => set("pdf_extract_links", v)}
+                />
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-medium">OCR scanned pages</Label>
+                  <ToggleGroup
+                    type="single"
+                    variant="outline"
+                    value={state.ocr_mode}
+                    onValueChange={(v) => {
+                      if (v) set("ocr_mode", v as OcrMode);
+                    }}
+                    className="w-full"
+                  >
+                    {(["off", "auto", "force"] as const).map((m) => (
+                      <ToggleGroupItem
+                        key={m}
+                        value={m}
+                        className="flex-1 capitalize data-[state=on]:bg-primary/10 data-[state=on]:text-primary data-[state=on]:border-primary/30"
+                      >
+                        {m}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                  <p className="text-xs text-muted-foreground">
+                    {state.ocr_mode === "off"
+                      ? "Scanned pages are indexed flagged (metadata.needs_ocr), without text"
+                      : state.ocr_mode === "auto"
+                        ? "OCR only the pages with no text layer · 5 credits per page"
+                        : "OCR every page, for PDFs with garbled text · 5 credits per page"}
+                  </p>
+                </div>
+                {state.ocr_mode !== "off" && (
+                  <NumericInput
+                    id="ocr-max-pages"
+                    label="OCR page cap per document"
+                    value={state.ocr_max_pages}
+                    onChange={(v) => set("ocr_max_pages", v)}
+                    placeholder="50"
+                    min="1"
+                  />
+                )}
+              </div>
+            )}
+
+            {/* Office documents */}
+            <SwitchRow
+              id="feat-documents"
+              label="Office documents"
+              description="Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV"
+              checked={state.feat_documents}
+              onCheckedChange={(v) => set("feat_documents", v)}
+            />
+            {state.feat_documents && (
+              <div className="space-y-3 pl-1 border-l-2 border-primary/20 ml-1">
                 <NumericInput
-                  id="pdf-max-size"
-                  label="Max PDF size (MB)"
-                  value={state.pdf_max_size_mb}
-                  onChange={(v) => set("pdf_max_size_mb", v)}
+                  id="documents-max-size"
+                  label="Max document size (MB)"
+                  value={state.documents_max_size_mb}
+                  onChange={(v) => set("documents_max_size_mb", v)}
                   placeholder="50"
                 />
               </div>

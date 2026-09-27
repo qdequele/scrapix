@@ -13,6 +13,7 @@ pub mod ack;
 pub mod billing;
 pub mod browser;
 pub mod config;
+pub mod content_types;
 pub mod document;
 pub mod error;
 pub mod job_spec;

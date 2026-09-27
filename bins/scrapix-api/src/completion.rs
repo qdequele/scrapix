@@ -111,6 +111,7 @@ mod tests {
             timestamp: 0,
             url_message_id: id.into(),
             ai_enriched: false,
+            ocr_pages: 0,
         }
     }
 

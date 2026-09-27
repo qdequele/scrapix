@@ -183,6 +183,28 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `AI_MAX_TOKENS` | `1000` | Max tokens per AI request |
 | `AI_CONCURRENCY` | `5` | Concurrent AI requests |
 
+### Documents & OCR
+
+Read by the API (`/scrape`, `/parse`) and the content workers. See
+[Documents & OCR](/guides/documents).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOCUMENT_MAX_SIZE_MB` | `50` | API: maximum document size for `/scrape` of a document URL and `/parse` uploads |
+| `OCR_BACKEND` | `auto` | `auto` (vision LLM when an AI provider is configured, else Tesseract), `vision`, `tesseract`, or `off` |
+| `OCR_MODEL` | provider default | Vision model for `OCR_BACKEND=vision` (default: `claude-haiku-4-5-20251001` / `gpt-5-mini` / `gemini-2.5-flash` / `mistral-small-latest`) |
+| `TESSERACT_PATH` | `tesseract` | Tesseract binary |
+| `OCR_TESSERACT_LANG` | `eng` | Tesseract languages (e.g. `eng+fra`) |
+| `PDFIUM_LIB_PATH` | — | PDFium shared library (file or directory) used to rasterize PDF pages; falls back to the executable's directory, then the system loader. Set to `/opt/pdfium/lib` in the Docker images |
+| `OCR_MAX_PAGES_PER_DOCUMENT` | `50` | Hard per-document OCR page cap (requests/jobs can only lower it) |
+| `OCR_DAILY_PAGE_BUDGET` | `1000` | Per-account OCR pages per UTC day (`0` = unlimited) |
+| `OCR_RENDER_DPI` | `150` | Page rasterization resolution (72–400) |
+| `OCR_CONCURRENCY` | `4` | Pages recognized concurrently per document |
+| `OCR_REDIS_URL` | `REDIS_URL` | Redis shared by instances for the OCR cache and daily budget (in-process when unset) |
+| `OCR_REDIS_PREFIX` | `scrapix:ocr` | Redis key prefix |
+| `OCR_CACHE_TTL_DAYS` | `30` | OCR cache lifetime (keyed by page-image hash) |
+| `OCR_CACHE_CAPACITY` | `10000` | In-process cache entries (without Redis) |
+
 ### Block Splitting
 
 | Variable | Default | Description |

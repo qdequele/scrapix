@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{ChatResponse, LlmProvider, Message, MessageRole};
+use super::{ChatResponse, ImageInput, LlmProvider, Message, MessageRole};
 use crate::client::AiClientError;
 
 const GEMINI_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -57,6 +57,34 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiVisionRequest<'a> {
+    contents: Vec<GeminiVisionContent<'a>>,
+    system_instruction: GeminiSystemInstruction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiVisionContent<'a> {
+    role: &'static str,
+    parts: Vec<GeminiVisionPart<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum GeminiVisionPart<'a> {
+    InlineData { inline_data: GeminiInlineData<'a> },
+    Text { text: &'a str },
+}
+
+#[derive(Serialize)]
+struct GeminiInlineData<'a> {
+    mime_type: &'a str,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +184,50 @@ impl LlmProvider for GeminiProvider {
             generation_config,
         };
 
+        self.send(model, &request_body).await
+    }
+
+    async fn vision(
+        &self,
+        system: &str,
+        prompt: &str,
+        image: &ImageInput,
+        model: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, AiClientError> {
+        let request_body = GeminiVisionRequest {
+            contents: vec![GeminiVisionContent {
+                role: "user",
+                parts: vec![
+                    GeminiVisionPart::InlineData {
+                        inline_data: GeminiInlineData {
+                            mime_type: &image.media_type,
+                            data: image.base64(),
+                        },
+                    },
+                    GeminiVisionPart::Text { text: prompt },
+                ],
+            }],
+            system_instruction: GeminiSystemInstruction {
+                parts: vec![GeminiPart {
+                    text: system.to_string(),
+                }],
+            },
+            generation_config: max_tokens.map(|max| GeminiGenerationConfig {
+                max_output_tokens: Some(max),
+                temperature: None,
+            }),
+        };
+        self.send(model, &request_body).await
+    }
+}
+
+impl GeminiProvider {
+    async fn send<T: Serialize + ?Sized>(
+        &self,
+        model: &str,
+        request_body: &T,
+    ) -> Result<ChatResponse, AiClientError> {
         let url = format!(
             "{}/{}:generateContent?key={}",
             GEMINI_API_URL, model, self.api_key
@@ -165,7 +237,7 @@ impl LlmProvider for GeminiProvider {
             .client
             .post(&url)
             .header("content-type", "application/json")
-            .json(&request_body)
+            .json(request_body)
             .send()
             .await
             .map_err(|e| AiClientError::Config(format!("Gemini request failed: {}", e)))?;

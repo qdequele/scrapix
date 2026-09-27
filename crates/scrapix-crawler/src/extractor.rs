@@ -47,6 +47,10 @@ impl Default for ExtractorConfig {
 pub struct UrlExtractor {
     config: ExtractorConfig,
     link_selector: Selector,
+    /// Follow `.pdf` links (the job enables `features.pdf`).
+    follow_pdf: bool,
+    /// Follow office-document links (the job enables `features.documents`).
+    follow_documents: bool,
 }
 
 impl UrlExtractor {
@@ -63,7 +67,53 @@ impl UrlExtractor {
         Self {
             config,
             link_selector,
+            follow_pdf: false,
+            follow_documents: false,
         }
+    }
+
+    /// Keep links to documents the job will parse instead of filtering
+    /// them out as non-page resources: `.pdf` when `pdf`, office formats
+    /// (`.docx`, `.xlsx`, `.pptx`, ...) when `documents`.
+    pub fn follow_document_links(mut self, pdf: bool, documents: bool) -> Self {
+        self.follow_pdf = pdf;
+        self.follow_documents = documents;
+        self
+    }
+
+    /// Filter already-resolved link targets (e.g. hyperlinks found inside a
+    /// PDF) with the same rules as HTML links: normalization, non-page
+    /// filtering, domain constraints, URL patterns and depth.
+    pub fn extract_from_links<I>(
+        &self,
+        final_url: &str,
+        links: I,
+        parent_depth: u32,
+    ) -> Vec<CrawlUrl>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        if parent_depth >= self.config.max_depth {
+            return vec![];
+        }
+        let Ok(base_url) = Url::parse(final_url) else {
+            return vec![];
+        };
+        let base_domain = base_url.host_str().unwrap_or("").to_lowercase();
+        let mut seen = HashSet::new();
+        links
+            .into_iter()
+            .filter_map(|href| {
+                self.process_href(
+                    &href,
+                    &base_url,
+                    &base_domain,
+                    final_url,
+                    parent_depth,
+                    &mut seen,
+                )
+            })
+            .collect()
     }
 
     /// Create a new URL extractor with default configuration
@@ -209,8 +259,9 @@ impl UrlExtractor {
         // Normalize the URL
         let normalized = self.normalize_url(&resolved)?;
 
-        // Filter non-page URLs (images, PDFs, CSS, JS, fonts, etc.)
-        if is_non_page_url(&normalized) {
+        // Filter non-page URLs (images, CSS, JS, fonts, and documents the
+        // job does not parse)
+        if is_non_page_url_for(&normalized, self.follow_pdf, self.follow_documents) {
             return None;
         }
 
@@ -364,11 +415,43 @@ pub fn is_non_page_url(url: &str) -> bool {
 /// crawler will fetch them and the content worker will parse them. All other
 /// non-page extensions are still rejected.
 pub fn is_non_page_url_with_pdf(url: &str, pdf_enabled: bool) -> bool {
+    is_non_page_url_for(url, pdf_enabled, false)
+}
+
+/// Document-aware variant of [`is_non_page_url`]: `.pdf` URLs pass when
+/// `pdf_enabled`, office-document URLs (`.doc(x)`, `.xls(x)`, `.ppt(x)`,
+/// OpenDocument, ...) pass when `documents_enabled`. Every other non-page
+/// extension is still rejected. The extension only decides which links
+/// are *worth fetching*; the document format itself is decided from the
+/// response's `Content-Type` and bytes.
+pub fn is_non_page_url_for(url: &str, pdf_enabled: bool, documents_enabled: bool) -> bool {
     let path = url.split('?').next().unwrap_or(url);
     let path = path.split('#').next().unwrap_or(path);
     if let Some(dot_pos) = path.rfind('.') {
         let ext = &path[dot_pos..].to_ascii_lowercase();
         if pdf_enabled && ext == ".pdf" {
+            return false;
+        }
+        if documents_enabled
+            && matches!(
+                ext.as_str(),
+                ".doc"
+                    | ".docx"
+                    | ".docm"
+                    | ".xls"
+                    | ".xlsx"
+                    | ".xlsm"
+                    | ".xlsb"
+                    | ".ppt"
+                    | ".pptx"
+                    | ".pptm"
+                    | ".pps"
+                    | ".ppsx"
+                    | ".odt"
+                    | ".ods"
+                    | ".odp"
+            )
+        {
             return false;
         }
         matches!(
@@ -749,6 +832,66 @@ mod tests {
         // Case insensitive
         assert!(is_non_page_url("https://example.com/IMAGE.PNG"));
         assert!(is_non_page_url("https://example.com/style.CSS"));
+    }
+
+    #[test]
+    fn test_is_non_page_url_for_documents() {
+        assert!(is_non_page_url_for(
+            "https://example.com/r.docx",
+            false,
+            false
+        ));
+        assert!(!is_non_page_url_for(
+            "https://example.com/r.docx",
+            false,
+            true
+        ));
+        assert!(!is_non_page_url_for(
+            "https://example.com/r.XLSX?v=1",
+            false,
+            true
+        ));
+        assert!(is_non_page_url_for(
+            "https://example.com/r.pdf",
+            false,
+            true
+        ));
+        assert!(is_non_page_url_for("https://example.com/a.png", true, true));
+    }
+
+    #[test]
+    fn test_document_links_follow_the_opt_ins() {
+        let page = RawPage {
+            url: "https://example.com/".into(),
+            final_url: "https://example.com/".into(),
+            status: 200,
+            headers: Default::default(),
+            html: r#"<a href="/a.pdf">a</a><a href="/b.docx">b</a><a href="/c">c</a>"#.into(),
+            content_type: Some("text/html".into()),
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 0,
+        };
+        let urls = |e: UrlExtractor| -> Vec<String> {
+            e.extract(&page, 0).into_iter().map(|u| u.url).collect()
+        };
+        assert_eq!(
+            urls(UrlExtractor::with_defaults()),
+            vec!["https://example.com/c"]
+        );
+        assert_eq!(
+            urls(UrlExtractor::with_defaults().follow_document_links(true, true)).len(),
+            3
+        );
+        let from_pdf = UrlExtractor::with_defaults().extract_from_links(
+            "https://example.com/doc.pdf",
+            vec![
+                "https://example.com/x".to_string(),
+                "https://evil.test/y".to_string(),
+            ],
+            0,
+        );
+        assert_eq!(from_pdf.len(), 1, "domain rules apply to PDF links");
     }
 
     #[test]

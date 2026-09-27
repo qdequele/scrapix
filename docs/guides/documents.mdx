@@ -1,0 +1,201 @@
+---
+title: Documents & OCR
+description: Parse PDFs, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files into Markdown — and OCR scanned pages
+---
+
+# Documents & OCR
+
+Scrapix parses binary documents into the same Markdown it produces for web
+pages, whether they are **crawled** (a link that serves a `.docx`), **scraped**
+(`POST /scrape` of a PDF URL) or **uploaded** (`POST /parse`). All three
+share one parser dispatch, so a document yields the same Markdown whichever
+way it arrives.
+
+<Tip>
+  In the console, **Scrape → Upload file** parses a document with the same
+  options (OCR mode, page caps) and shows its format, pages and OCR outcome.
+  Crawl jobs enable PDFs, office documents and OCR under **Crawl → General →
+  Features**.
+</Tip>
+
+## Supported formats
+
+| Format | Extensions | Parser |
+|--------|-----------|--------|
+| PDF | `.pdf` | [pdf-inspector](https://github.com/firecrawl/pdf-inspector) |
+| Word | `.doc`, `.docx`, `.docm` | [anydoc](https://github.com/firecrawl/anydoc) |
+| PowerPoint | `.ppt`, `.pptx`, `.pptm`, `.pps`, `.ppsx`, `.ppsm`, `.pot` | anydoc |
+| Excel | `.xls`, `.xlsx`, `.xlsm`, `.xlsb` | anydoc |
+| OpenDocument | `.odt`, `.ods`, `.odp` | anydoc |
+| Rich Text | `.rtf` | anydoc |
+| EPUB | `.epub` | anydoc |
+| CSV | `.csv` | anydoc |
+| Images | PNG, JPEG, GIF, WebP, TIFF | OCR only (`/parse`) |
+
+Both parsers are pure Rust (no external services, no ML models).
+pdf-inspector produces layout-aware Markdown: headings, lists,
+**tables** (ruled and heuristic, including tables continuing across pages),
+multi-column reading order, right-to-left scripts and CID font decoding.
+anydoc keeps headings, inline formatting, tables (with merged cells),
+footnotes, speaker notes and equations (as LaTeX).
+
+### How the format is decided
+
+The `Content-Type` header comes first; when it is missing or generic
+(`application/octet-stream`, `application/x-download`, ...) the file's
+**magic bytes** decide (PDF header, OLE stream names, ZIP package identity).
+When the header names one format but the bytes carry another's signature,
+the bytes win. The URL extension is never trusted. CSV has no signature,
+so it needs a `text/csv` content type.
+
+## Scanned documents are flagged, not silently blank
+
+For every PDF, pdf-inspector classifies the document (`text_based`,
+`scanned`, `image_based`, `mixed`) and each page, and reports the pages with
+no usable text layer. Instead of indexing a scanned PDF as an empty
+document, Scrapix flags it:
+
+- **API responses** carry `document.needs_ocr` and
+  `document.pages_needing_ocr`, plus a `warning`.
+- **Indexed documents** carry `metadata.needs_ocr = "true"` and
+  `metadata.pages_needing_ocr = "1,3"` — filterable in Meilisearch.
+
+To get their text, turn on OCR.
+
+## OCR
+
+OCR is **opt-in** and **off by default**: it is slow and billed at a higher
+per-page rate (see [Billing](/guides/billing#ocr)).
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | Scanned pages are flagged, not recognized |
+| `auto` | Only the pages that need it are OCR'd; text-based pages stay on the fast native path |
+| `force` | Every page is OCR'd (up to the page cap) — for PDFs whose broken font encodings extract as garbage rather than as nothing |
+
+OCR'd pages are merged back into the document **in page order**, next to the
+natively extracted pages, so a mixed PDF produces one coherent Markdown
+document.
+
+```bash
+# /scrape
+curl -X POST https://scrapix.meilisearch.dev/scrape \
+  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/scan.pdf", "parsers": {"ocr": "auto"}}'
+
+# /parse
+curl -X POST https://scrapix.meilisearch.dev/parse \
+  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -F file=@scan.pdf \
+  -F 'options={"parsers": {"ocr": "auto"}}'
+```
+
+The response reports what happened:
+
+```json
+{
+  "ocr": {
+    "mode": "auto",
+    "backend": "vision:anthropic/claude-haiku-4-5-20251001",
+    "pages_processed": 3,
+    "pages_cached": 0,
+    "pages_skipped": 9,
+    "pages_capped": 0,
+    "pages_failed": 0,
+    "pages": [2, 5, 6]
+  }
+}
+```
+
+In a crawl, set it per job:
+
+```json
+{
+  "features": {
+    "pdf": { "enabled": true },
+    "ocr": { "mode": "auto", "max_pages": 20 }
+  }
+}
+```
+
+Indexed documents then carry `metadata.ocr_pages` and `metadata.ocr_backend`.
+
+### Backends
+
+Selected with `OCR_BACKEND` on the API and content workers:
+
+| `OCR_BACKEND` | Backend | Notes |
+|---------------|---------|-------|
+| `auto` (default) | vision LLM when an AI provider is configured, else Tesseract | |
+| `vision` | Vision LLM through the configured `AI_PROVIDER` (Anthropic, OpenAI, Gemini, Mistral) | Layout- and table-aware Markdown. Model: `OCR_MODEL` (default: the provider's vision model). Calls are tracked in `ai_usage_events` with `operation = 'ocr'`. |
+| `tesseract` | Local [Tesseract](https://github.com/tesseract-ocr/tesseract) CLI | No API key, no per-call cost — keeps self-hosted deployments fully functional. Weaker on tables and layout. `TESSERACT_PATH`, `OCR_TESSERACT_LANG` (e.g. `eng+fra`). |
+| `off` | — | OCR requests return the document flagged, with a warning |
+
+### Rasterization (PDFium)
+
+PDF pages are rendered to images with [PDFium](https://pdfium.googlesource.com/pdfium/),
+through the `firecrawl-pdfium` binding that pdf-inspector's own OCR
+pipeline uses. PDFium is **loaded at runtime** — builds never need it:
+
+1. `PDFIUM_LIB_PATH` (the library file, or its directory),
+2. the directory of the executable,
+3. the system loader (`libpdfium.so` on the library path).
+
+The Docker images ship the pinned
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
+build (`chromium/7988`) at `/opt/pdfium/lib` with `PDFIUM_LIB_PATH` set, and
+Tesseract (`tesseract-ocr`). Without PDFium, PDF OCR reports
+`pages_failed` with a warning and the document keeps its native content;
+image OCR (uploads) does not need PDFium.
+
+Why PDFium: best render quality and speed of the candidates, BSD-licensed
+(MuPDF is AGPL), no process spawn per page (unlike a poppler `pdftoppm`
+shell-out), and it is what pdf-inspector itself renders with.
+
+### Cost controls
+
+| Control | Default | Setting |
+|---------|---------|---------|
+| Per-document page cap | 50 | `OCR_MAX_PAGES_PER_DOCUMENT` (a request/job can lower it with `ocr_max_pages` / `ocr.max_pages`, never raise it) |
+| Per-account daily page budget | 1000 pages (UTC day) | `OCR_DAILY_PAGE_BUDGET` (`0` = unlimited) |
+| Cache keyed by page-image hash | 30 days | `OCR_CACHE_TTL_DAYS`; shared across instances via `OCR_REDIS_URL` (falls back to `REDIS_URL`), otherwise in-process (`OCR_CACHE_CAPACITY`) |
+
+Pages beyond the cap or the budget are reported as `pages_capped` and stay
+flagged. **Cache hits are not billed**: re-crawling or re-uploading the same
+document never pays twice for the same page.
+
+## Crawling documents
+
+```json
+{
+  "start_urls": ["https://example.com/reports"],
+  "index_uid": "reports",
+  "features": {
+    "markdown": { "enabled": true },
+    "pdf": { "enabled": true, "max_size_mb": 50, "max_pages": 200, "extract_links": true },
+    "documents": { "enabled": true, "max_size_mb": 50 },
+    "ocr": { "mode": "auto" }
+  }
+}
+```
+
+- `features.pdf` / `features.documents` gate PDFs and office formats
+  independently. With either on, links to those files are followed (they are
+  otherwise skipped as non-page resources), and generic downloads
+  (`application/octet-stream`) are fetched and identified from their bytes.
+- Size caps are enforced **before** buffering: a larger document is rejected
+  from its `Content-Length` or as soon as the stream crosses the cap.
+- `pdf.extract_links` follows the hyperlinks found inside PDFs (link
+  annotations and URLs spelled out in the text), with the job's usual
+  domain, pattern and depth rules.
+- The document descriptor (`metadata.content_type`, `document_format`,
+  `page_count`, `pdf_type`, `needs_ocr`, `pages_needing_ocr`, `ocr_pages`)
+  is kept on indexed documents even when `features.metadata` is off.
+
+Filter by format in Meilisearch:
+
+```
+metadata.document_format = "xlsx"
+metadata.needs_ocr = "true"
+```

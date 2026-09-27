@@ -18,11 +18,12 @@ Scrapix is a high-performance, distributed web crawler and search indexer built 
 - **Analytics** — ClickHouse-powered analytics with a Tinybird-compatible API
 - **Billing-Ready** — Per-account usage tracking built into every crawl event
 
-## Three Core Operations
+## Core Operations
 
 | Operation | Endpoint | Description |
 |-----------|----------|-------------|
-| **Scrape** | `POST /scrape` | Fetch and extract content from a single URL instantly (synchronous) |
+| **Scrape** | `POST /scrape` | Fetch and extract content from a single URL instantly (synchronous) — HTML pages, PDFs and office documents |
+| **Parse** | `POST /parse` | Upload a document (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV) and get Markdown back, with optional OCR of scanned pages |
 | **Map** | `POST /map` | Discover all URLs on a website using sitemaps and optional crawling |
 | **Crawl** | `POST /crawl` | Multi-page crawl that follows links and indexes content to Meilisearch |
 

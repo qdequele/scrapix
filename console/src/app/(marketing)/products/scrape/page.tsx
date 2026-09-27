@@ -10,12 +10,13 @@ import {
   Code,
   Zap,
   Shield,
+  FileStack,
 } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Scrape API",
   description:
-    "Extract clean markdown, metadata, and structured data from any URL with a single API call.",
+    "Extract clean markdown, metadata, and structured data from any URL, PDF, or office document with a single API call.",
 };
 
 export default function ScrapePage() {
@@ -39,9 +40,10 @@ export default function ScrapePage() {
               </span>
             </h1>
             <p className="mx-auto mb-10 max-w-xl text-lg text-zinc-400 leading-relaxed">
-              Send a URL, get back clean markdown, metadata, JSON-LD schemas,
-              and AI-powered extractions. Handles JavaScript-rendered pages out
-              of the box.
+              Send a URL or upload a file, get back clean markdown, metadata,
+              JSON-LD schemas, and AI-powered extractions. Handles
+              JavaScript-rendered pages, PDFs, and office documents out of the
+              box.
             </p>
             <div className="flex flex-col items-center gap-4 sm:flex-row sm:justify-center">
               <Button
@@ -220,14 +222,14 @@ export default function ScrapePage() {
                 description: "Structured data extracted from JSON-LD, microdata, and RDFa embedded in the page.",
               },
               {
-                icon: Brain,
-                title: "AI Summary",
-                description: "LLM-generated summary of the page content. Concise and accurate.",
+                icon: FileStack,
+                title: "PDFs & documents",
+                description: "PDF, Word, Excel, PowerPoint, OpenDocument, EPUB and CSV to markdown, tables included. Optional OCR for scanned pages.",
               },
               {
                 icon: Brain,
-                title: "AI Extraction",
-                description: "Extract structured data using a custom prompt. Define your own schema.",
+                title: "AI enrichment",
+                description: "LLM-generated summaries, and structured extraction with a custom prompt or schema.",
               },
             ].map(({ icon: Icon, title, description }) => (
               <div
@@ -264,6 +266,8 @@ export default function ScrapePage() {
                 "robots.txt compliance",
                 "Proxy rotation support",
                 "Custom headers and cookies",
+                "File uploads via /parse (up to 50 MB)",
+                "OCR for scanned PDFs and images",
               ].map((feature) => (
                 <div
                   key={feature}
@@ -292,6 +296,8 @@ export default function ScrapePage() {
                 { label: "+ each feature (metadata, schema...)", value: "+1 cr" },
                 { label: "+ AI extraction (per page)", value: "+5 cr" },
                 { label: "+ AI summary (per page)", value: "+5 cr" },
+                { label: "File upload via /parse (per file)", value: "1 cr" },
+                { label: "+ OCR (per scanned page)", value: "+5 cr" },
               ].map(({ label, value }) => (
                 <div key={label} className="flex justify-between">
                   <span className="text-zinc-400">{label}</span>

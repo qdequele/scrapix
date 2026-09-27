@@ -18,7 +18,7 @@ use reqwest::{
 use tracing::{debug, instrument};
 use url::Url;
 
-use scrapix_core::{CrawlUrl, RawPage, Result, ScrapixError};
+use scrapix_core::{content_types, CrawlUrl, RawPage, Result, ScrapixError};
 
 /// Per-fetch options that override or extend the baseline fetcher config.
 ///
@@ -35,6 +35,15 @@ pub struct FetchOptions {
     /// Maximum PDF size in bytes. When `None`, the fetcher's generic
     /// `max_body_size` applies. Only consulted when `allow_pdf` is `true`.
     pub pdf_max_size_bytes: Option<u64>,
+
+    /// When `true`, office/other document responses (Word, PowerPoint,
+    /// Excel, OpenDocument, RTF, EPUB, CSV) are accepted and, like PDFs,
+    /// base64-encoded into `RawPage.html`.
+    pub allow_documents: bool,
+
+    /// Maximum office-document size in bytes (`None`: the fetcher's
+    /// `max_body_size`). Only consulted when `allow_documents` is `true`.
+    pub document_max_size_bytes: Option<u64>,
 
     /// Extra request headers for this fetch (per-job `headers`). Applied on
     /// top of the fetcher's default headers, replacing any with the same
@@ -63,6 +72,30 @@ impl FetchOptions {
         Self {
             allow_pdf: true,
             pdf_max_size_bytes: max_size_bytes,
+            ..Default::default()
+        }
+    }
+
+    /// Options accepting the binary document types a job's features
+    /// enable (`features.pdf`, `features.documents`), with their size caps.
+    pub fn for_features(features: &scrapix_core::FeaturesConfig) -> Self {
+        Self {
+            allow_pdf: features.is_pdf_enabled(),
+            pdf_max_size_bytes: features.pdf_max_size_bytes(),
+            allow_documents: features.is_documents_enabled(),
+            document_max_size_bytes: features.documents_max_size_bytes(),
+            ..Default::default()
+        }
+    }
+
+    /// Options accepting every document type (PDF and office formats),
+    /// each capped at `max_size_bytes` — `/scrape`'s document support.
+    pub fn with_all_documents(max_size_bytes: Option<u64>) -> Self {
+        Self {
+            allow_pdf: true,
+            pdf_max_size_bytes: max_size_bytes,
+            allow_documents: true,
+            document_max_size_bytes: max_size_bytes,
             ..Default::default()
         }
     }
@@ -670,11 +703,11 @@ impl HttpFetcher {
 
     /// Process the response into a RawPage.
     ///
-    /// The `options` param allows per-fetch overrides: `allow_pdf` gates the
-    /// content-type allowlist and flips the body path to base64-encode bytes
-    /// (PDFs are binary; the Kafka payload `RawPageMessage.html` is a
-    /// `String`). When `options.allow_pdf` is `false`, behavior matches the
-    /// pre-PDF fetcher exactly.
+    /// The `options` param allows per-fetch overrides: `allow_pdf` /
+    /// `allow_documents` gate the content-type allowlist and flip the body
+    /// path to base64-encode bytes (documents are binary; the Kafka payload
+    /// `RawPageMessage.html` is a `String`). When both are `false`, behavior
+    /// matches the pre-PDF fetcher exactly.
     async fn process_response(
         &self,
         crawl_url: &CrawlUrl,
@@ -694,43 +727,63 @@ impl HttpFetcher {
         }
 
         let content_type = headers.get("content-type").cloned();
+        let ct = content_type.as_deref().unwrap_or_default();
 
-        // Is this a PDF response? Only meaningful when PDF support is enabled.
-        let is_pdf = options.allow_pdf
-            && content_type
-                .as_deref()
-                .is_some_and(|ct| ct.contains("application/pdf"));
+        // Binary documents, each gated by its opt-in. A generic download
+        // type (`application/octet-stream`) is accepted when any document
+        // type is enabled: the content worker identifies the format from
+        // the bytes (and skips what the job did not enable). Every accepted
+        // binary type travels base64-encoded — see
+        // `scrapix_core::content_types::is_binary_document`, which the
+        // content worker uses to decode.
+        let is_pdf = options.allow_pdf && content_types::is_pdf(ct);
+        let is_office = options.allow_documents && content_types::is_office_document(ct);
+        let is_generic =
+            (options.allow_pdf || options.allow_documents) && content_types::is_generic_binary(ct);
+        let is_binary = is_pdf || is_office || is_generic;
 
         let is_success = (200..=299).contains(&status);
 
-        // Check content type — we accept HTML, markdown, and (when opted in) PDF.
-        // Non-2xx responses (error pages) skip this check: they are never
-        // indexed and are often served as text/plain regardless of what the
-        // "real" content type would be.
-        if is_success {
-            if let Some(ref ct) = content_type {
-                let accepted = ct.contains("text/html")
-                    || ct.contains("application/xhtml")
-                    || ct.contains("text/markdown")
-                    || is_pdf;
-                if !accepted {
-                    return Err(ScrapixError::Crawl(format!(
-                        "Unsupported content type: {}",
-                        ct
-                    )));
-                }
+        // Check content type — we accept HTML, markdown, and (when opted in)
+        // PDF and office documents. Non-2xx responses (error pages) skip this
+        // check: they are never indexed and are often served as text/plain
+        // regardless of what the "real" content type would be.
+        if is_success && content_type.is_some() {
+            let accepted = ct.contains("text/html")
+                || ct.contains("application/xhtml")
+                || ct.contains("text/markdown")
+                || is_binary;
+            if !accepted {
+                return Err(ScrapixError::Crawl(format!(
+                    "Unsupported content type: {}",
+                    ct
+                )));
             }
         }
 
-        // Effective size cap: PDFs may use a feature-specific cap that supersedes
-        // the generic `max_body_size` (since PDFs are often larger than HTML).
+        // Effective size cap: documents use their feature-specific cap, which
+        // supersedes the generic `max_body_size` (documents are often larger
+        // than HTML); a generic download takes the larger enabled cap.
         // Non-2xx bodies are never indexed, so cap them at a small fixed size
         // regardless of the configured limit.
+        let pdf_cap = options
+            .pdf_max_size_bytes
+            .map(|b| b as usize)
+            .unwrap_or(self.config.max_body_size);
+        let doc_cap = options
+            .document_max_size_bytes
+            .map(|b| b as usize)
+            .unwrap_or(self.config.max_body_size);
         let effective_cap = if is_pdf {
-            options
-                .pdf_max_size_bytes
-                .map(|b| b as usize)
-                .unwrap_or(self.config.max_body_size)
+            pdf_cap
+        } else if is_office {
+            doc_cap
+        } else if is_generic {
+            match (options.allow_pdf, options.allow_documents) {
+                (true, true) => pdf_cap.max(doc_cap),
+                (true, false) => pdf_cap,
+                _ => doc_cap,
+            }
         } else {
             self.config.max_body_size
         };
@@ -790,9 +843,10 @@ impl HttpFetcher {
         }
 
         // Encode body:
-        // - PDFs → base64 into `html` (binary-safe over Kafka JSON payloads).
+        // - Binary documents → base64 into `html` (binary-safe over Kafka JSON
+        //   payloads).
         // - Everything else → UTF-8 (with lossy fallback, matches legacy behavior).
-        let html = if is_pdf {
+        let html = if is_binary {
             BASE64.encode(&bytes)
         } else {
             String::from_utf8_lossy(&bytes).into_owned()

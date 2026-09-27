@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use scrapix_core::{Ack, CrawlUrl, CrawlerType, RawPage, ScrapixError};
 use scrapix_crawler::{
     ConditionalRequestHeaders, ExtractorConfig, FetchOptions, FetchResult, UrlExtractor,
@@ -242,13 +243,12 @@ impl CrawlerWorker {
     async fn fetch(&self, msg: &UrlMessage) -> FetchAttempt {
         let url = &msg.url;
 
-        // PDF support travels with the UrlMessage so the fetcher can stay a
-        // long-lived per-worker singleton while honoring per-job opt-ins.
+        // PDF/document support travels with the UrlMessage so the fetcher
+        // can stay a long-lived per-worker singleton while honoring per-job
+        // opt-ins.
         let base = match msg.features {
-            Some(ref features) if features.is_pdf_enabled() => {
-                FetchOptions::with_pdf(features.pdf_max_size_bytes())
-            }
-            _ => FetchOptions::default(),
+            Some(ref features) => FetchOptions::for_features(features),
+            None => FetchOptions::default(),
         };
         let mut options = self.shaper.options_for(&msg.job_id, msg.job.as_ref(), base);
         let allowed_domains = msg
@@ -436,7 +436,7 @@ impl CrawlerWorker {
             let target_refs: Vec<&str> = target_urls.iter().map(|s| s.as_str()).collect();
             graph.record_links(&url.url, target_refs);
             let processed = self.metrics.urls_processed.load(Ordering::Relaxed);
-            if processed > 0 && processed % self.link_graph_interval == 0 {
+            if processed > 0 && processed.is_multiple_of(self.link_graph_interval) {
                 graph.compute_scores_if_dirty();
                 debug!(processed, "Recomputed link graph scores");
             }
@@ -523,26 +523,56 @@ impl CrawlerWorker {
     }
 
     /// Extract links with the job's URL patterns and per-job `max_depth`.
+    /// Links to documents the job parses (`features.pdf`,
+    /// `features.documents`) are followed; a PDF's own hyperlinks are
+    /// followed when the job sets `features.pdf.extract_links`.
     fn extract_links(&self, msg: &UrlMessage, page: &RawPage) -> Vec<CrawlUrl> {
         let depth = msg.url.depth;
         let effective_max_depth = msg.max_depth.unwrap_or(self.extractor.config().max_depth);
-        if let Some(ref patterns) = msg.url_patterns {
+        let (follow_pdf, follow_documents) = msg.features.as_ref().map_or((false, false), |f| {
+            (f.is_pdf_enabled(), f.is_documents_enabled())
+        });
+        let config = if let Some(ref patterns) = msg.url_patterns {
             // With an allowed_domains whitelist, use strict domain filtering.
-            let extractor = UrlExtractor::new(ExtractorConfig {
+            ExtractorConfig {
                 patterns: Some(patterns.clone()),
                 max_depth: effective_max_depth,
                 follow_external: false,
                 follow_subdomains: patterns.allowed_domains.is_empty(),
                 extract_from_data_attrs: false,
                 allowed_domains: patterns.allowed_domains.clone(),
-            });
-            extractor.extract(page, depth)
-        } else if msg.max_depth.is_some() {
+            }
+        } else {
             let mut config = self.extractor.config().clone();
             config.max_depth = effective_max_depth;
-            UrlExtractor::new(config).extract(page, depth)
-        } else {
-            self.extractor.extract(page, depth)
+            config
+        };
+        let extractor =
+            UrlExtractor::new(config).follow_document_links(follow_pdf, follow_documents);
+
+        let content_type = page.content_type.as_deref().unwrap_or_default();
+        if !scrapix_core::content_types::is_binary_document(content_type) {
+            return extractor.extract(page, depth);
+        }
+        // A binary document: its body is base64, not HTML. Only PDFs carry
+        // followable links, and only when the job asks for them.
+        if !msg.features.as_ref().is_some_and(|f| f.pdf_extract_links()) {
+            return Vec::new();
+        }
+        let Ok(bytes) = BASE64.decode(page.html.as_bytes()) else {
+            return Vec::new();
+        };
+        if scrapix_parser::detect_kind(Some(content_type), &bytes)
+            != Some(scrapix_parser::DocumentKind::Pdf)
+        {
+            return Vec::new();
+        }
+        match scrapix_parser::pdf::extract_links(&bytes, &page.final_url) {
+            Ok(links) => extractor.extract_from_links(&page.final_url, links, depth),
+            Err(e) => {
+                debug!(url = %page.final_url, error = %e, "PDF link extraction failed");
+                Vec::new()
+            }
         }
     }
 
@@ -1405,5 +1435,126 @@ mod tests {
         assert!(drain::<CrawlEvent>(&t.events).await.is_empty());
         assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A one-page text PDF whose text layer is `text` (Helvetica).
+    fn pdf_with_text(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    fn features(pdf: bool, extract_links: bool, documents: bool) -> scrapix_core::FeaturesConfig {
+        scrapix_core::FeaturesConfig {
+            pdf: pdf.then(|| scrapix_core::PdfConfig {
+                enabled: true,
+                extract_links,
+                ..Default::default()
+            }),
+            documents: documents.then_some(scrapix_core::DocumentsConfig {
+                enabled: true,
+                max_size_mb: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn pdf_links_are_followed_only_with_extract_links() {
+        let server = MockServer::start().await;
+        let next = url(&server, "/next");
+        Mock::given(method("GET"))
+            .and(path("/doc.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                pdf_with_text(&format!("Read more at {next} today")),
+                "application/pdf",
+            ))
+            .mount(&server)
+            .await;
+
+        for (extract_links, expected) in [(false, 0usize), (true, 1)] {
+            let bus = ChannelBus::new();
+            let t = topics(&bus);
+            let w = worker(&bus).await;
+            let mut msg = message(url(&server, "/doc.pdf"), None);
+            msg.features = Some(features(true, extract_links, false));
+            let (ack, acked) = tracked_ack();
+
+            w.handle_message(msg.clone(), ack).await;
+
+            assert!(acked.load(Ordering::SeqCst));
+            let pages: Vec<RawPageMessage> = drain(&t.pages).await;
+            assert_eq!(pages.len(), 1, "the PDF is forwarded to the content worker");
+            let children: Vec<UrlMessage> = drain(&t.frontier).await;
+            assert_eq!(children.len(), expected, "extract_links={extract_links}");
+            if expected == 1 {
+                assert_eq!(children[0].url.url, next);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn document_links_are_followed_when_the_job_parses_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"<a href="/a.pdf">a</a><a href="/b.docx">b</a><a href="/c.png">c</a>"#,
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+
+        for (pdf, documents, expected) in [
+            (false, false, vec![]),
+            (true, false, vec!["/a.pdf"]),
+            (true, true, vec!["/a.pdf", "/b.docx"]),
+        ] {
+            let bus = ChannelBus::new();
+            let t = topics(&bus);
+            let w = worker(&bus).await;
+            let mut msg = message(url(&server, "/"), None);
+            msg.features = Some(features(pdf, false, documents));
+            let (ack, _) = tracked_ack();
+            w.handle_message(msg, ack).await;
+            let children: Vec<UrlMessage> = drain(&t.frontier).await;
+            let mut got: Vec<String> = children
+                .iter()
+                .map(|c| url::Url::parse(&c.url.url).unwrap().path().to_string())
+                .collect();
+            got.sort();
+            assert_eq!(got, expected, "pdf={pdf} documents={documents}");
+        }
     }
 }

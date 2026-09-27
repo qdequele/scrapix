@@ -5,6 +5,7 @@ import type {
   CrawlConfig,
   RecentErrors,
   ScrapeResult,
+  ParserOptions,
   ServiceHealth,
   SavedConfig,
   CreateConfigRequest,
@@ -154,6 +155,8 @@ export interface ScrapeOptions {
     summary?: boolean;
     extract?: { prompt: string };
   };
+  /** Used when the URL serves a PDF or office document. */
+  parsers?: ParserOptions;
 }
 
 export async function submitScrape(opts: ScrapeOptions): Promise<ScrapeResult> {
@@ -162,6 +165,22 @@ export async function submitScrape(opts: ScrapeOptions): Promise<ScrapeResult> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(opts),
   });
+}
+
+export interface ParseOptions {
+  formats?: string[];
+  include_links?: boolean;
+  parsers?: ParserOptions;
+  ai?: ScrapeOptions["ai"];
+}
+
+/** Upload a document to POST /parse (multipart). Returns the /scrape shape. */
+export async function submitParse(file: File, opts: ParseOptions): Promise<ScrapeResult> {
+  const body = new FormData();
+  body.append("file", file, file.name);
+  body.append("options", JSON.stringify(opts));
+  // No Content-Type header: the browser sets the multipart boundary.
+  return request("/parse", { method: "POST", body });
 }
 
 // ============================================================================

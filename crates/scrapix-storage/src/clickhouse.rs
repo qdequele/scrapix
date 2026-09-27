@@ -153,6 +153,10 @@ pub struct RequestEvent {
     /// Number of search results returned (for search operations).
     #[serde(default)]
     pub results_count: u32,
+    /// Pages recognized by OCR for this request (scrape/parse/crawl), billed
+    /// at the OCR page rate — kept separate so OCR spend is attributable.
+    #[serde(default)]
+    pub ocr_pages: u32,
     /// When the request occurred.
     #[serde(with = "clickhouse::serde::time::datetime")]
     pub timestamp: time::OffsetDateTime,
@@ -181,6 +185,7 @@ impl Default for RequestEvent {
             pages_fetched: 1,
             search_query: String::new(),
             results_count: 0,
+            ocr_pages: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         }
     }
@@ -644,6 +649,15 @@ impl ClickHouseStorage {
         self.client
             .query(&format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS results_count UInt32 DEFAULT 0 AFTER search_query",
+                request_events
+            ))
+            .execute()
+            .await?;
+
+        // Migrate: add ocr_pages (SCR-86: OCR usage, billed separately)
+        self.client
+            .query(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS ocr_pages UInt32 DEFAULT 0 AFTER results_count",
                 request_events
             ))
             .execute()

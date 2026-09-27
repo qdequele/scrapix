@@ -134,6 +134,32 @@ billed.
 | `formats: ["markdown"]` + AI summary | 6 |
 | `formats: ["markdown", "metadata"]` + AI summary + AI extraction | 12 |
 
+### `/parse`
+
+Billed **per document** exactly like `/scrape` (same format and AI
+components), plus OCR pages (below).
+
+### OCR
+
+Each page recognized by OCR costs **5 credits** (`OCR_PAGE_CREDITS`) on top
+of the document's own cost — a vision-model call (or Tesseract run) per
+page, versus 1 credit for a normal page.
+
+- **`/scrape` and `/parse`**: the credit pre-flight includes the planned OCR
+  pages; after OCR, the document is charged under its operation and the
+  recognized pages as a **separate `ocr` ledger entry**, so OCR spend is
+  attributable.
+- **`/crawl`**: `pages_ocr × 5` is added to the job total (see below).
+- **Cache hits are free**: a page recognized before (same page image,
+  same backend) is never billed twice.
+- Usage analytics: `request_events.ocr_pages` counts billed OCR pages per
+  request/job; vision-LLM calls appear in `ai_usage_events` with
+  `operation = 'ocr'`.
+
+Limits: `OCR_MAX_PAGES_PER_DOCUMENT` (default 50) and
+`OCR_DAILY_PAGE_BUDGET` per account (default 1000) — see
+[Documents & OCR](/guides/documents#cost-controls).
+
 ### `/map`
 
 Flat **2 credits** per call, regardless of the number of URLs discovered.
@@ -150,6 +176,7 @@ first two) is charged:
 total = pages_http × (1 + feature_credits)
       + pages_browser × (2 + feature_credits)
       + pages_ai × ai_surcharge_per_page
+      + pages_ocr × 5
 ```
 
 - **Base cost per page** — `1` for an HTTP page, `2` for a browser-rendered
@@ -164,6 +191,8 @@ total = pages_http × (1 + feature_credits)
   `ai_summary` enabled — applied **only to the pages that were actually
   AI-enriched** (`pages_ai`), not to every page of the job just because an AI
   feature was turned on.
+- **`pages_ocr`** — document pages freshly recognized by OCR
+  (`features.ocr`), at 5 credits each; cache hits are not counted.
 
 Source of truth: `crawl_credits` / `crawl_credits_per_page` in
 `crates/scrapix-billing/src/credits.rs`.
