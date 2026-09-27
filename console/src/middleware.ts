@@ -39,7 +39,10 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
+  // `api/` is excluded: API proxy routes need no redirects, and a request
+  // that runs through middleware has its body capped at 10 MB, which would
+  // truncate document uploads to POST /parse (up to 50 MB).
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    "/((?!api/|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 };

@@ -163,6 +163,47 @@ export interface ScrapeResult {
   extract?: Record<string, unknown>;
   ai?: AiResult;
   warning?: string;
+  /** Present when the URL served (or the upload is) a PDF or office document. */
+  document?: DocumentInfo;
+  /** Present when `parsers.ocr` requested OCR. */
+  ocr?: OcrInfo;
+}
+
+export type OcrMode = "off" | "auto" | "force";
+
+/** Document parsing options for /scrape and /parse. */
+export interface ParserOptions {
+  ocr?: OcrMode;
+  ocr_max_pages?: number;
+  max_pages?: number;
+}
+
+export interface DocumentInfo {
+  /** `pdf`, `docx`, `xlsx`, `pptx`, `doc`, `ppt`, `odt`, `ods`, `odp`, `rtf`, `epub`, `csv`, `image`. */
+  format: string;
+  content_type: string;
+  /** `pdf-inspector`, `anydoc`, `image`. */
+  parser: string;
+  bytes: number;
+  page_count?: number;
+  pages_processed?: number;
+  /** `text_based`, `scanned`, `image_based`, `mixed`. */
+  pdf_type?: string;
+  needs_ocr: boolean;
+  pages_needing_ocr?: number[];
+  has_tables: boolean;
+}
+
+export interface OcrInfo {
+  mode: OcrMode;
+  backend?: string;
+  pages_processed: number;
+  pages_cached: number;
+  pages_skipped: number;
+  pages_capped: number;
+  pages_failed: number;
+  pages: number[];
+  warning?: string;
 }
 
 export interface ContentBlock {

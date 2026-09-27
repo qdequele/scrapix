@@ -209,7 +209,7 @@ export default function CrawlPage() {
               {
                 icon: Search,
                 title: "Auto-indexing",
-                description: "Crawled content is automatically indexed into Meilisearch. Search is available immediately.",
+                description: "Crawled pages, PDFs and office documents are automatically indexed into Meilisearch. Search is available immediately.",
               },
               {
                 icon: Layers,
@@ -268,6 +268,7 @@ export default function CrawlPage() {
                 { label: "+ each feature (metadata, schema...)", value: "+1 cr" },
                 { label: "+ AI extraction (per page)", value: "+5 cr" },
                 { label: "+ AI summary (per page)", value: "+5 cr" },
+                { label: "+ OCR (per scanned PDF page)", value: "+5 cr" },
                 { label: "Search indexing", value: "Free", free: true },
               ].map(({ label, value, free }) => (
                 <div key={label} className="flex justify-between">

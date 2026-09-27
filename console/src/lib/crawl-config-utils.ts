@@ -175,7 +175,23 @@ export function crawlStateToConfig(
     const pdf: Record<string, unknown> = { enabled: true };
     const maxSizeMb = parseInt(crawlState.pdf_max_size_mb, 10);
     if (maxSizeMb && maxSizeMb !== 50) pdf.max_size_mb = maxSizeMb;
+    const maxPages = parseInt(crawlState.pdf_max_pages, 10);
+    if (maxPages > 0) pdf.max_pages = maxPages;
+    if (crawlState.pdf_extract_links) pdf.extract_links = true;
     features.pdf = pdf;
+    // OCR only applies to PDFs.
+    if (crawlState.ocr_mode !== "off") {
+      const ocr: Record<string, unknown> = { mode: crawlState.ocr_mode };
+      const ocrMaxPages = parseInt(crawlState.ocr_max_pages, 10);
+      if (ocrMaxPages > 0) ocr.max_pages = ocrMaxPages;
+      features.ocr = ocr;
+    }
+  }
+  if (crawlState.feat_documents) {
+    const documents: Record<string, unknown> = { enabled: true };
+    const maxSizeMb = parseInt(crawlState.documents_max_size_mb, 10);
+    if (maxSizeMb && maxSizeMb !== 50) documents.max_size_mb = maxSizeMb;
+    features.documents = documents;
   }
   if (Object.keys(features).length > 0) config.features = features;
 
@@ -307,6 +323,21 @@ export function configToCrawlState(config: AnyConfig): CrawlState {
     if (pdf) {
       state.feat_pdf = pdf.enabled === true;
       state.pdf_max_size_mb = str(pdf.max_size_mb) || "50";
+      state.pdf_max_pages = str(pdf.max_pages);
+      state.pdf_extract_links = pdf.extract_links === true;
+    }
+
+    const ocr = features.ocr as AnyConfig | undefined;
+    const ocrMode = str(ocr?.mode);
+    if (ocrMode === "auto" || ocrMode === "force") {
+      state.ocr_mode = ocrMode;
+      state.ocr_max_pages = str(ocr?.max_pages);
+    }
+
+    const documents = features.documents as AnyConfig | undefined;
+    if (documents) {
+      state.feat_documents = documents.enabled === true;
+      state.documents_max_size_mb = str(documents.max_size_mb) || "50";
     }
   }
 

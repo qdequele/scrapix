@@ -17,6 +17,7 @@ import {
   FileText,
   AlertCircle,
   Sparkles,
+  ScanText,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useEffect, useState, useCallback } from "react";
@@ -25,13 +26,15 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { codeToHtml } from "shiki";
 import { HighlightedJson } from "@/components/highlighted-json";
-import type { ScrapeResult, Job } from "@/lib/api-types";
+import type { ScrapeResult, Job, DocumentInfo, OcrInfo } from "@/lib/api-types";
 import { fetchJobStatus } from "@/lib/api";
+import { formatBytes } from "./file-drop";
 
 interface ResultPanelProps {
   result: ScrapeResult | null;
   crawlResult: { job_id: string; status: string; message?: string } | null;
-  mode: "scrape" | "crawl";
+  /** `parse` is a scrape of an uploaded file (POST /parse). */
+  mode: "scrape" | "crawl" | "parse";
   loading: boolean;
   error: string | null;
 }
@@ -44,6 +47,14 @@ const SCRAPE_EXAMPLE = `curl -X POST https://scrapix.meilisearch.dev/scrape \\
     "formats": ["markdown", "metadata"],
     "only_main_content": true,
     "timeout_ms": 30000
+  }'`;
+
+const PARSE_EXAMPLE = `curl -X POST https://scrapix.meilisearch.dev/parse \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -F file=@report.pdf \\
+  -F 'options={
+    "formats": ["markdown", "metadata"],
+    "parsers": { "ocr": "auto" }
   }'`;
 
 const CRAWL_EXAMPLE = `curl -X POST https://scrapix.meilisearch.dev/crawl \\
@@ -79,15 +90,16 @@ export function ResultPanel({
     return <CrawlResultState result={crawlResult} />;
   }
 
-  if (mode === "scrape" && result) {
+  if ((mode === "scrape" || mode === "parse") && result) {
     return <ScrapeResultState result={result} />;
   }
 
   return <EmptyState mode={mode} />;
 }
 
-function EmptyState({ mode }: { mode: "scrape" | "crawl" }) {
-  const example = mode === "crawl" ? CRAWL_EXAMPLE : SCRAPE_EXAMPLE;
+function EmptyState({ mode }: { mode: ResultPanelProps["mode"] }) {
+  const example =
+    mode === "crawl" ? CRAWL_EXAMPLE : mode === "parse" ? PARSE_EXAMPLE : SCRAPE_EXAMPLE;
 
   return (
     <div className="flex flex-col h-full">
@@ -271,6 +283,7 @@ function ScrapeResultState({ result }: { result: ScrapeResult }) {
   const defaultTab = availableTabs[0]?.value ?? "json";
 
   const isSuccess = result.status_code >= 200 && result.status_code < 400;
+  const isUpload = result.url.startsWith("upload://");
 
   const copyText = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -309,18 +322,24 @@ function ScrapeResultState({ result }: { result: ScrapeResult }) {
           >
             <Copy className="h-3.5 w-3.5" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7"
-            asChild
-          >
-            <a href={result.url} target="_blank" rel="noopener noreferrer">
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-          </Button>
+          {!isUpload && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              asChild
+            >
+              <a href={result.url} target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </Button>
+          )}
         </div>
       </div>
+
+      {result.document && (
+        <DocumentSummary document={result.document} ocr={result.ocr} />
+      )}
 
       {/* Tabs */}
       <Tabs defaultValue={defaultTab} className="flex-1 flex flex-col min-h-0">
@@ -646,6 +665,91 @@ function MetaRow({
       >
         {value}
       </p>
+    </div>
+  );
+}
+
+const PDF_TYPES: Record<string, string> = {
+  text_based: "Text PDF",
+  scanned: "Scanned PDF",
+  image_based: "Image-based PDF",
+  mixed: "Mixed PDF",
+};
+
+function pageList(pages: number[]): string {
+  const shown = pages.slice(0, 8).join(", ");
+  return pages.length > 8 ? `${shown}, +${pages.length - 8}` : shown;
+}
+
+/** Format, pages and OCR outcome of a parsed document. */
+function DocumentSummary({ document, ocr }: { document: DocumentInfo; ocr?: OcrInfo }) {
+  const pages = document.page_count;
+  const partial =
+    pages !== undefined &&
+    document.pages_processed !== undefined &&
+    document.pages_processed < pages;
+  const needing = document.pages_needing_ocr ?? [];
+
+  return (
+    <div className="mb-3 space-y-2 rounded-md border bg-muted/30 px-3 py-2">
+      <div className="flex flex-wrap items-center gap-1.5 text-xs">
+        <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+        <Badge variant="secondary" className="text-xs uppercase">
+          {document.format}
+        </Badge>
+        {document.pdf_type && (
+          <Badge variant="outline" className="text-xs">
+            {PDF_TYPES[document.pdf_type] ?? document.pdf_type}
+          </Badge>
+        )}
+        {pages !== undefined && (
+          <span className="text-muted-foreground">
+            {pages} {pages === 1 ? "page" : "pages"}
+            {partial && ` (first ${document.pages_processed} parsed)`}
+          </span>
+        )}
+        <span className="text-muted-foreground">· {formatBytes(document.bytes)}</span>
+        {document.has_tables && (
+          <Badge variant="outline" className="text-xs">
+            Tables
+          </Badge>
+        )}
+        <span className="ml-auto font-mono text-[11px] text-muted-foreground">
+          {document.parser}
+        </span>
+      </div>
+
+      {ocr && ocr.pages_processed > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <ScanText className="h-3.5 w-3.5 text-primary" />
+          <span>
+            OCR&apos;d {ocr.pages_processed} {ocr.pages_processed === 1 ? "page" : "pages"}
+            {ocr.pages.length > 0 && ` (${pageList(ocr.pages)})`}
+          </span>
+          {ocr.backend && (
+            <span className="font-mono text-[11px] text-muted-foreground">{ocr.backend}</span>
+          )}
+          {ocr.pages_cached > 0 && (
+            <Badge variant="outline" className="text-xs">
+              {ocr.pages_cached} cached
+            </Badge>
+          )}
+        </div>
+      )}
+
+      {needing.length > 0 && (
+        <div
+          className={cn(
+            "flex items-center gap-1.5 text-xs",
+            "text-yellow-700 dark:text-yellow-400",
+          )}
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          {needing.length === 1 ? "Page" : "Pages"} {pageList(needing)}{" "}
+          {needing.length === 1 ? "has" : "have"} no text
+          {ocr ? " (not OCR'd: page cap, budget or failure)" : ". Turn on OCR to read them."}
+        </div>
+      )}
     </div>
   );
 }
