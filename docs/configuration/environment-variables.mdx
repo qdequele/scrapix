@@ -19,6 +19,8 @@ All Scrapix services are configured through environment variables. When running 
 | `JWT_SECRET` | `dev-jwt-secret-change-in-production` | JWT signing secret |
 | `DATABASE_URL` | — | PostgreSQL URL for auth (optional) |
 | `MAX_JOBS` | `10000` | Maximum tracked jobs |
+| `JOB_STALL_TIMEOUT_SECS` | `1800` | Seconds without progress before a job is finalized as `FailStalled` (stalled jobs are still billed for pages crawled) |
+| `JOB_COMPLETION_GRACE_MS` | `3000` | Grace period after exact work accounting says a job is done, before finalizing it, to absorb straggler events |
 
 ## Message Queue
 
@@ -71,8 +73,9 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `CONCURRENT_PER_DOMAIN` | `4` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
 | `REQUEST_TIMEOUT` | `30` | Crawler request timeout (s); a politeness slot without feedback expires after 2× this |
 | `ROBOTS_DELAY_MULTIPLIER` | `1.0` | Multiplier applied to robots.txt `Crawl-delay` |
-| `REDIS_URL` | — | When set, frontier state and per-domain politeness state are shared in Redis across instances |
+| `REDIS_URL` | — | When set, frontier state (dedup/queue via `FrontierStore`) and per-domain politeness state are shared in Redis across instances, so more than one frontier instance can run at once |
 | `INSTANCE_ID` | — | Instance identifier for multi-instance frontier |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health` |
 
 ### Link Graph (optional)
 
@@ -106,6 +109,8 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `RESPECT_ROBOTS` | `true` | Respect robots.txt directives |
 | `WORKER_ID` | — | Worker identifier |
 | `ROCKSDB_PATH` | `./data/crawler-rocksdb` | RocksDB storage path |
+| `REDIS_URL` | — | Optional; when set, enables incremental-crawl header lookups shared across crawler instances (without it, incremental crawling uses in-message headers only) |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` (Prometheus text) and `GET /health`, and used by Fly's proxy to autostart a suspended machine |
 
 ### DNS Cache
 
@@ -125,7 +130,7 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LINK_GRAPH` | `true` | Track link relationships locally |
+| `LINK_GRAPH` | `false` | Track link relationships locally (off by default — it only feeds internal logging today, per spec R9) |
 | `LINK_GRAPH_INTERVAL` | `1000` | Links before sending batch update |
 | `PUBLISH_LINKS` | `false` | Publish link graph to Kafka topic |
 | `INCREMENTAL_CRAWL` | `true` | Track ETags/Last-Modified for incremental crawls |
@@ -204,5 +209,14 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info,scrapix=debug` | Log level filter |
-| `METRICS_PORT` | `9090` | Prometheus metrics endpoint port |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OpenTelemetry OTLP collector endpoint |
+
+<Note>
+There is no separate `METRICS_PORT`. The engine (`scrapix-api`) serves
+`GET /metrics` (Prometheus text format, unauthenticated) on its normal HTTP
+port (`PORT`, default `8080`). Every worker (`scrapix-worker-crawler`,
+`scrapix-worker-content`, `scrapix-frontier-service`) serves the same
+`GET /metrics` and `GET /health` on its `WAKE_PORT` (default `8081`) — the
+same bare-TCP listener Fly's proxy connects to for autostart. Metric names
+are a contract with `qdq-server/monitoring`; see `crates/scrapix-core/src/metrics.rs`.
+</Note>

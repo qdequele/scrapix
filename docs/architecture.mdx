@@ -32,11 +32,17 @@ graph LR
 
 | Service | Binary | Purpose | Stateful? |
 |---------|--------|---------|-----------|
-| API Server | `scrapix api` | REST API, WebSocket, job management | No |
-| Frontier | `scrapix frontier` | URL deduplication, priority scheduling, rate limiting | In-memory (bloom filters) |
+| API Server | `scrapix api` | REST API, WebSocket, job management | No (accounting persists to Postgres when the Rails `accounting` migration has run) |
+| Frontier | `scrapix frontier` | URL deduplication, priority scheduling, rate limiting, politeness | `FrontierStore`: Redis in production (`REDIS_URL`), in-memory for tests and `scrapix all` |
 | Crawler | `scrapix crawler` | HTTP fetching, link extraction, robots.txt | RocksDB (URL cache, DNS, robots) |
 | Content | `scrapix content` | HTML parsing, extraction, Meilisearch indexing | No |
-| All-in-One | `scrapix all` | All services in a single process | RocksDB |
+| All-in-One | `scrapix all` | All services in a single process | RocksDB; in-process channel bus (no redelivery, so at-least-once delivery only holds over Kafka) |
+
+With `REDIS_URL` set, the frontier's admission/dedup state and its
+per-domain politeness state are both shared in Redis, so more than one
+frontier instance can run at once — each instance holds a per-job dispatch
+lease rather than the frontier being a single-writer bottleneck. Without
+`REDIS_URL`, frontier state is in-memory and a restart loses it.
 
 ## Message Topics
 
@@ -104,7 +110,7 @@ The frontier uses dual locality-sensitive hashing to avoid crawling near-duplica
 |---------|---------|-----------|
 | **Meilisearch** | Document indexing, full-text search | Yes |
 | **RocksDB** | Per-worker URL cache, robots.txt, DNS cache | Auto-managed |
-| **Redis/DragonflyDB** | Rate limiting, real-time counters | Optional |
+| **Redis/DragonflyDB** | Frontier `FrontierStore` (dedup, queue, politeness), shared across frontier instances | Optional (required for durable/multi-instance frontier) |
 | **ClickHouse** | Analytics, time-series metrics | Optional |
 | **S3-compatible** | Raw HTML archival | Optional |
 | **PostgreSQL** | User accounts, API keys | Optional |

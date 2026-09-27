@@ -38,7 +38,8 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
   "eta_seconds": 240,
   "start_urls": ["https://docs.example.com"],
   "max_pages": 500,
-  "config": { "...original crawl config..." }
+  "config": { "...original crawl config..." },
+  "warnings": []
 }
 ```
 
@@ -62,6 +63,7 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 | `start_urls` | string[] | Original seed URLs |
 | `max_pages` | integer | Page limit from configuration |
 | `config` | object | Original crawl configuration |
+| `warnings` | string[] | Non-fatal notices: config fields accepted but not fully honorable per job (see [Crawl Configs](/configuration/crawl-configs)), plus any warnings raised by workers while the job ran |
 
 ### Job Status Lifecycle
 

@@ -24,108 +24,76 @@ docker compose up -d
 
 ## Metrics Endpoint
 
-Every Scrapix service exposes Prometheus metrics at `/metrics` on the metrics port (default `9090`):
+The engine (`scrapix-api`) exposes unauthenticated Prometheus text-format
+metrics at `GET /metrics` on its normal HTTP port (`PORT`, default `8080`):
 
 ```bash
-curl http://localhost:9090/metrics
+curl http://localhost:8080/metrics
 ```
 
-Configure the port with `METRICS_PORT`.
+Every worker (`scrapix-worker-crawler`, `scrapix-worker-content`,
+`scrapix-frontier-service`) exposes the same `GET /metrics` (and `GET
+/health`) on its `WAKE_PORT` (default `8081`) — the same bare-TCP listener
+Fly's proxy connects to for autostart:
+
+```bash
+curl http://localhost:8081/metrics
+```
+
+There is no `METRICS_PORT` variable; each service's metrics live on its own
+HTTP/wake port as above.
 
 ## Key Metrics
 
-### Fetch Metrics
+All metrics are defined once in `crates/scrapix-core/src/metrics.rs` and
+registered against a single process-wide registry (so `scrapix all` exposes
+every metric from one `/metrics` call). Metric names are a contract with
+`qdq-server/monitoring` — don't rename without updating the scrape config
+there.
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_pages_fetched_total` | Counter | domain, status | Total pages fetched |
-| `scrapix_bytes_downloaded_total` | Counter | — | Total bytes downloaded |
-| `scrapix_fetch_duration_seconds` | Histogram | domain | HTTP fetch latency |
-| `scrapix_fetch_errors_total` | Counter | error_type, domain | Fetch errors |
+| Metric | Type | Labels | Emitted by | Description |
+|--------|------|--------|------------|-------------|
+| `scrapix_crawler_fetches_total` | Counter | `outcome` (`crawled`/`not_modified`/`retry`/`failed`) | crawler worker | Total URL fetches handled |
+| `scrapix_crawler_fetch_duration_seconds` | Histogram | — | crawler worker | Wall time of one fetch attempt |
+| `scrapix_crawler_bytes_total` | Counter | — | crawler worker | Bytes downloaded by successful fetches |
+| `scrapix_frontier_admissions_total` | Counter | `result` (`admitted`/`duplicate`/`error`) | frontier | Total URL admission attempts |
+| `scrapix_frontier_queued` | Gauge | `job` | frontier | Queued URL count, top 50 jobs by queue size only |
+| `scrapix_frontier_dispatched_total` | Counter | — | frontier | URLs dispatched to the crawl topic |
+| `scrapix_content_documents_total` | Counter | `outcome` (`success`/`failure`/`skipped`/`duplicate`) | content worker | Pages handled |
+| `scrapix_content_flush_duration_seconds` | Histogram | — | content worker | Time to flush one storage backend |
+| `scrapix_api_jobs` | Gauge | `status` | engine | In-memory job count by status |
+| `scrapix_consumer_uncommitted` | Gauge | `topic` | every Kafka consumer | In-flight (unacked) message count per topic, sampled once per commit tick |
 
-### Processing Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_pages_processed_total` | Counter | domain | Pages processed by content workers |
-| `scrapix_documents_extracted_total` | Counter | type | Documents extracted |
-| `scrapix_processing_duration_seconds` | Histogram | stage | Processing time per stage |
-
-### Queue Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_queue_size` | Gauge | priority | Frontier queue depth |
-| `scrapix_active_fetches` | Gauge | — | Currently active HTTP requests |
-| `scrapix_urls_discovered_total` | Counter | source | URLs discovered |
-| `scrapix_urls_filtered_total` | Counter | reason | URLs filtered out |
-
-### Robots.txt Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_robots_checks_total` | Counter | allowed, domain | Robots.txt check results |
-| `scrapix_robots_blocks_total` | Counter | domain | URLs blocked by robots.txt |
-| `scrapix_robots_fetch_duration_seconds` | Histogram | domain | Robots.txt fetch time |
-
-### DNS Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_dns_lookups_total` | Counter | — | Total DNS lookups |
-| `scrapix_dns_cache_hits_total` | Counter | — | DNS cache hits |
-| `scrapix_dns_lookup_duration_seconds` | Histogram | — | DNS resolution time |
-
-### AI/LLM Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_ai_requests_total` | Counter | model, success | AI API calls |
-| `scrapix_ai_tokens_used_total` | Counter | type, model | Token usage (input/output) |
-| `scrapix_ai_request_duration_seconds` | Histogram | model | AI request latency |
-
-### Storage Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_storage_writes_total` | Counter | backend | Storage write operations |
-| `scrapix_storage_bytes_written_total` | Counter | backend | Bytes written to storage |
-| `scrapix_storage_write_duration_seconds` | Histogram | backend | Write latency |
-
-### Browser Rendering Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `scrapix_browser_renders_total` | Counter | success, renderer | Browser render operations |
-| `scrapix_browser_render_duration_seconds` | Histogram | renderer | Render time |
-| `scrapix_browser_instances_active` | Gauge | renderer | Active browser instances |
+<Note>
+  Metric names and labels below this table (fetch/processing/robots/DNS/AI/storage/browser
+  metrics with a `scrapix_*` prefix not in the table above) do not exist in
+  the running services — they were an earlier design's aspirational list.
+  Only the metrics in the table above are actually registered and served.
+</Note>
 
 ## Prometheus Scrape Configuration
 
-The included `prometheus.yml` scrapes all services:
+Point Prometheus at the engine's HTTP port and each worker's `WAKE_PORT`:
 
 ```yaml
 scrape_configs:
   - job_name: scrapix-api
     static_configs:
-      - targets: ["host.docker.internal:9090"]
+      - targets: ["host.docker.internal:8080"]
 
   - job_name: scrapix-crawler-workers
     static_configs:
       - targets:
-          - "host.docker.internal:9091"
-          - "host.docker.internal:9092"
-          - "host.docker.internal:9093"
+          - "host.docker.internal:8081" # WAKE_PORT, one per crawler machine
 
   - job_name: scrapix-content-workers
     static_configs:
       - targets:
-          - "host.docker.internal:9094"
-          - "host.docker.internal:9095"
+          - "host.docker.internal:8081" # WAKE_PORT, one per content-worker machine
 
   - job_name: scrapix-frontier
     static_configs:
-      - targets: ["host.docker.internal:9096"]
+      - targets: ["host.docker.internal:8081"] # WAKE_PORT
 
   - job_name: redpanda
     static_configs:
@@ -137,6 +105,10 @@ scrape_configs:
       - targets: ["host.docker.internal:7700"]
     metrics_path: /metrics
 ```
+
+In a multi-machine deployment (Fly, Kubernetes), each worker machine listens
+on the same `WAKE_PORT` (8081 by default), so scrape targets need one entry
+per machine/pod, not per logical service.
 
 ## Alert Rules
 

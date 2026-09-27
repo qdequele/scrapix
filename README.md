@@ -207,6 +207,21 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data));
 DELETE /job/{job_id}
 ```
 
+Stops the frontier and every worker for that job and bills the pages crawled
+so far. Only a pending, running or paused job can be cancelled; a terminal
+job returns `409`.
+
+### Pause / Resume Job
+
+```bash
+POST /job/{job_id}/pause   # Running -> Paused; 409 otherwise
+POST /job/{job_id}/resume  # Paused -> Running; 409 otherwise
+```
+
+A paused job stops dispatching new URLs (pages already in flight finish, and
+their discovered links keep being queued); it is never auto-completed or
+failed as stalled while paused. Resuming restarts the stall-timeout clock.
+
 ### List Jobs
 
 ```bash
@@ -437,17 +452,24 @@ docker compose up -d
 
 ### Prometheus Metrics
 
-The `scrapix-telemetry` crate exports metrics:
+`crates/scrapix-core/src/metrics.rs` registers the metrics every service
+exposes at `GET /metrics` — on the API's HTTP port (8080) and on each
+worker's `WAKE_PORT` (8081 by default):
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `scrapix_pages_crawled_total` | Counter | Total pages crawled |
-| `scrapix_pages_indexed_total` | Counter | Total pages indexed |
-| `scrapix_crawl_errors_total` | Counter | Crawl errors by type |
-| `scrapix_crawl_latency_seconds` | Histogram | Page fetch latency |
-| `scrapix_index_latency_seconds` | Histogram | Indexing latency |
-| `scrapix_queue_depth` | Gauge | URLs pending in queue |
-| `scrapix_active_crawls` | Gauge | Currently active crawls |
+| `scrapix_crawler_fetches_total{outcome}` | Counter | Fetches by outcome (`crawled`/`not_modified`/`retry`/`failed`) |
+| `scrapix_crawler_fetch_duration_seconds` | Histogram | Wall time of one fetch attempt |
+| `scrapix_crawler_bytes_total` | Counter | Bytes downloaded |
+| `scrapix_frontier_admissions_total{result}` | Counter | Admission attempts (`admitted`/`duplicate`/`error`) |
+| `scrapix_frontier_queued{job}` | Gauge | Queued URL count, top 50 jobs by size |
+| `scrapix_frontier_dispatched_total` | Counter | URLs dispatched to the crawl topic |
+| `scrapix_content_documents_total{outcome}` | Counter | Pages handled (`success`/`failure`/`skipped`/`duplicate`) |
+| `scrapix_content_flush_duration_seconds` | Histogram | Time to flush one storage backend |
+| `scrapix_api_jobs{status}` | Gauge | In-memory job count by status |
+| `scrapix_consumer_uncommitted{topic}` | Gauge | In-flight (unacked) messages per Kafka topic |
+
+See [Monitoring](docs/operations/monitoring.mdx) for scrape config.
 
 ### Grafana Dashboards
 

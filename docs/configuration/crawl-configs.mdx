@@ -72,6 +72,11 @@ Control which URLs are crawled and indexed:
 }
 ```
 
+`sitemap.enabled` defaults to **`true`**. Sitemap discovery is per-job (not
+shared across workers/domains), uses the same URL-pattern matcher as link
+extraction, keeps PDFs when the job's PDF feature is enabled, and runs off
+the hot path so it never blocks the first fetch.
+
 ### Concurrency
 
 ```json
@@ -83,6 +88,13 @@ Control which URLs are crawled and indexed:
   }
 }
 ```
+
+`concurrency.max_concurrent_requests` is honored per job. `browser_pool_size`
+and `dns_concurrency` are **worker-level settings** — they're fixed at
+process startup (by the crawler worker's own env vars) and can't vary per
+job, so setting them to a non-default value in a job config produces a
+non-fatal warning in the crawl-creation response and in `GET
+/job/{id}/status`'s `warnings` array, rather than silently doing nothing.
 
 ### Rate Limiting
 
@@ -113,6 +125,19 @@ Control which URLs are crawled and indexed:
 ```
 
 Rotation strategies: `round_robin`, `random`, `least_used`.
+
+Only `http`/`https` proxy URLs are accepted — `socks5`/`socks5h` proxies are
+rejected at job creation (`validation_error`), since the crawler cannot use
+them. A raw-IP proxy host must resolve to a public address (non-public hosts
+are refused as an SSRF guard); hostnames are re-checked by the crawler at
+fetch time.
+
+<Warning>
+  `proxy` is not supported together with `"crawler_type": "browser"`. The
+  shared headless browser has a single worker-level proxy, so a browser job
+  that also sets `proxy` gets a warning at creation and its browser-rendered
+  pages **fail closed** instead of silently connecting without the proxy.
+</Warning>
 
 For tiered fallback (try cheaper proxies first):
 
@@ -225,10 +250,33 @@ Receive notifications for crawl events:
 
 Available events: `crawl_started`, `crawl_completed`, `crawl_failed`, `progress_update`, `page_crawled`, `page_indexed`, `page_error`, `batch_sent`.
 
+<Note>
+  `batch_sent` is accepted in `events` but never actually fires — there is no
+  "batch flushed to the store" event in the engine today. `progress_update`
+  is throttled to at most one delivery per job every 5 seconds, regardless of
+  how many internal progress events arrive in that window. Cancelling a job
+  (`DELETE /job/{id}`) is delivered as `crawl_failed` with `data.error ==
+  "cancelled"` rather than a separate event.
+</Note>
+
+Every delivery POST carries `X-Scrapix-Event` (the event name) and
+`X-Scrapix-Delivery` (a UUID that's stable across that delivery's retries —
+dedupe on this header, and order by the payload's `timestamp`, since
+deliveries for different jobs/hooks run concurrently and can arrive out of
+order). A delivery gets up to 3 attempts total, with 1s then 5s backoff
+between them; a 4xx response is terminal (no retry), a network error or 5xx
+retries. `timeout_ms` is clamped to the 1000–30000ms range.
+
+**Known limitation:** webhook configs are kept in the API process's memory
+only (not persisted to Postgres). A job whose webhooks were registered before
+an API restart stops receiving webhook deliveries after that restart.
+
 Auth methods:
-- `bearer` — Bearer token in Authorization header
-- `hmac` — HMAC signature in custom header
-- `headers` — Custom headers
+- `bearer` — sends `Authorization: Bearer <token>`
+- `hmac` — only `algorithm: "sha256"` is supported (rejected at job creation
+  otherwise); sends `<header>: sha256=<hex hmac-sha256 of the raw JSON body>`
+- `headers` — custom headers, validated at job creation to reject anything
+  that collides with `Content-Type`, `Host`, or any `X-Scrapix-*` header
 
 ## Example Configurations
 

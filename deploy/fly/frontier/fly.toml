@@ -1,6 +1,9 @@
-# scrapix-frontier — URL frontier singleton (bloom filter owns in-memory state).
-# DO NOT scale beyond 1 machine: the bloom filter is per-process state and
-# parallel instances would skip dedup for URLs the other has already seen.
+# scrapix-frontier — URL frontier.
+# With REDIS_URL set (see the `flyctl secrets set` step in ../README.md),
+# frontier admission/dedup state and per-domain politeness state are shared
+# in Redis (FrontierStore), and multiple instances can run at once — each
+# holds a per-job dispatch lease. Without REDIS_URL, state is in-memory and
+# per-process, so DO NOT scale beyond 1 machine in that case.
 
 app = "scrapix-frontier"
 primary_region = "cdg"

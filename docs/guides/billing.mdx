@@ -130,38 +130,58 @@ Flat **2 credits** per call, regardless of the number of URLs discovered.
 
 ### `/crawl`
 
-Credits are deducted at job completion based on the number of pages crawled and the job configuration.
+Credits are deducted at job completion (or, for a cancelled or stalled job,
+at finalization) based on **what was actually delivered** — not on the job's
+configuration alone. A job billed from `pages_http` HTTP pages, `pages_browser`
+browser-rendered pages, and `pages_ai` AI-enriched pages (a subset of the
+first two) is charged:
 
-**Per-page base cost:**
+```
+total = pages_http × (1 + feature_credits)
+      + pages_browser × (2 + feature_credits)
+      + pages_ai × ai_surcharge_per_page
+```
 
-| Crawler type | Base cost per page |
-|-------------|-------------------|
-| `http` (default) | 1 |
-| `browser` (JS rendering) | 2 |
+- **Base cost per page** — `1` for an HTTP page, `2` for a browser-rendered
+  (JS) page. The browser surcharge applies only to pages that were *actually*
+  rendered in a browser, not to every page of a job just because
+  `"crawler_type": "browser"` was requested (a job can render only some pages
+  in a browser via `browser_render` patterns).
+- **`feature_credits`** — `+1` per enabled non-AI feature, added once per
+  page regardless of crawler type: `metadata`, `markdown`, `block_split`,
+  `schema`, `custom_selectors`.
+- **`ai_surcharge_per_page`** — `+5` for `ai_extraction` enabled, `+5` for
+  `ai_summary` enabled — applied **only to the pages that were actually
+  AI-enriched** (`pages_ai`), not to every page of the job just because an AI
+  feature was turned on.
 
-**Per-page feature cost (additive):**
+Source of truth: `crawl_credits` / `crawl_credits_per_page` in
+`crates/scrapix-billing/src/credits.rs`.
 
-| Feature | Additional cost per page |
-|---------|------------------------|
-| `metadata` | +1 |
-| `markdown` | +1 |
-| `block_split` | +1 |
-| `schema` | +1 |
-| `custom_selectors` | +1 |
-| `ai_extraction` | +5 |
-| `ai_summary` | +5 |
+<Note>
+  A **cancelled** or **stalled** job is billed for the pages it actually
+  crawled before it stopped — the same formula, using the pages it delivered.
+  A job with **zero crawled pages** is not billed (it's marked `Failed`
+  rather than `Completed`, and there's nothing to charge for). A **Replace**
+  strategy job's stale-document cleanup running after completion is not a
+  billable event on its own.
+</Note>
 
-**Formula:** `total = pages_crawled × (base + feature_costs)`
+**Worked example:** a job that crawls 8 HTTP pages, 2 browser-rendered
+pages, and has `ai_summary` enabled, with 1 of the 10 pages actually
+AI-enriched (e.g. the other 9 were skipped by `ai_summary.include_pages`
+filtering, or failed enrichment) and no other features:
 
-**Examples:**
+| Component | Pages | Rate | Credits |
+|-----------|-------|------|---------|
+| HTTP pages | 8 | 1 | 8 |
+| Browser pages | 2 | 2 | 4 |
+| AI surcharge | 1 | 5 | 5 |
+| **Total** | | | **17** |
 
-| Configuration | Cost per page | 100 pages |
-|--------------|--------------|-----------|
-| HTTP, no features | 1 | 100 |
-| HTTP + metadata + markdown | 3 | 300 |
-| Browser + metadata + markdown | 4 | 400 |
-| HTTP + AI summary | 6 | 600 |
-| Browser + all features + AI summary + AI extraction | 17 | 1,700 |
+If instead all 10 pages had been AI-enriched, the AI surcharge would be
+`10 × 5 = 50`, for a total of `8 + 4 + 50 = 62` — the point being that the AI
+surcharge tracks pages actually enriched, not pages merely eligible.
 
 ### Insufficient Credits
 

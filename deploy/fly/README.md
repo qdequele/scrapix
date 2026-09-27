@@ -11,7 +11,7 @@ in GitHub Actions, pushes them to GHCR, and deploys via `flyctl deploy --image`.
 | `scrapix-redpanda` | Kafka broker (port 9092, `*.internal` only) | singleton | no (data loss on suspend) |
 | `scrapix-api` | HTTP API | auto 1–N on HTTP requests | yes |
 | `scrapix-console` | Next.js | auto 1–N on HTTP requests | yes |
-| `scrapix-frontier` | Kafka consumer | **singleton** (bloom filter state) | yes, via wake ping |
+| `scrapix-frontier` | Kafka consumer | singleton unless `REDIS_URL` is set (state is in-memory otherwise) | yes, via wake ping |
 | `scrapix-worker-crawler` | Kafka consumer | horizontal, `flyctl scale count N` | yes, via wake ping |
 | `scrapix-worker-content` | Kafka consumer | horizontal, `flyctl scale count N` | yes, via wake ping |
 
@@ -154,8 +154,12 @@ commits are manual (`enable.auto.commit = false`), so in-flight messages either
 finish and commit, or get reprocessed by another machine after the 30 s
 `kill_timeout`.
 
-**Do not** scale `scrapix-frontier` beyond 1 — the bloom filter is per-process
-state.
+**Do not** scale `scrapix-frontier` beyond 1 unless `REDIS_URL` is set — without
+it, frontier state (dedup, queue, politeness) is per-process and parallel
+instances would skip dedup for URLs another instance has already seen. With
+`REDIS_URL` set, frontier state is shared via `FrontierStore` (Redis) and
+each instance holds a per-job dispatch lease, so more than one instance can
+run safely.
 
 ## Debugging
 
