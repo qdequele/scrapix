@@ -214,21 +214,40 @@ impl WorkerMetrics {
         self.urls_processed.fetch_add(1, Ordering::Relaxed);
         self.urls_succeeded.fetch_add(1, Ordering::Relaxed);
         self.bytes_downloaded.fetch_add(bytes, Ordering::Relaxed);
+        scrapix_core::metrics::crawler_fetches_total()
+            .with_label_values(&["crawled"])
+            .inc();
+        scrapix_core::metrics::crawler_bytes_total().inc_by(bytes as f64);
     }
 
     fn record_failure(&self) {
         self.urls_processed.fetch_add(1, Ordering::Relaxed);
         self.urls_failed.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::crawler_fetches_total()
+            .with_label_values(&["failed"])
+            .inc();
     }
 
     fn record_not_modified(&self) {
         self.urls_processed.fetch_add(1, Ordering::Relaxed);
         self.urls_not_modified.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::crawler_fetches_total()
+            .with_label_values(&["not_modified"])
+            .inc();
     }
 
     fn record_retry(&self) {
         self.urls_processed.fetch_add(1, Ordering::Relaxed);
         self.urls_retried.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::crawler_fetches_total()
+            .with_label_values(&["retry"])
+            .inc();
+    }
+
+    /// Record the wall-clock duration of one fetch attempt, regardless of
+    /// outcome (`scrapix_crawler_fetch_duration_seconds`).
+    fn observe_fetch_duration(&self, elapsed: Duration) {
+        scrapix_core::metrics::crawler_fetch_duration_seconds().observe(elapsed.as_secs_f64());
     }
 
     fn record_discovered(&self, count: u64) {

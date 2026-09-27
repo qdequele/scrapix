@@ -81,6 +81,17 @@ impl OffsetTracker {
         self.parts.remove(&(topic.to_string(), partition));
     }
 
+    /// In-flight (begun but not yet completed) message count, summed across
+    /// partitions, per topic — the sample source for
+    /// `scrapix_consumer_uncommitted{topic}`.
+    pub fn in_flight_by_topic(&self) -> HashMap<String, usize> {
+        let mut out: HashMap<String, usize> = HashMap::new();
+        for ((topic, _partition), st) in &self.parts {
+            *out.entry(topic.clone()).or_insert(0) += st.in_flight.len();
+        }
+        out
+    }
+
     /// Offsets that advanced since the last call: `(topic, partition, next_offset)`.
     pub fn take_commits(&mut self) -> Vec<(String, i32, i64)> {
         let now = Instant::now();
@@ -254,6 +265,26 @@ mod tests {
             ),
             vec![("t".to_string(), 0, 5)]
         );
+    }
+
+    #[test]
+    fn in_flight_by_topic_sums_across_partitions() {
+        let mut t = OffsetTracker::default();
+        t.begin("topic-a", 0, 1);
+        t.begin("topic-a", 0, 2);
+        t.begin("topic-a", 1, 5);
+        t.begin("topic-b", 0, 9);
+        t.complete("topic-a", 0, 1); // one of topic-a's three completes
+
+        let counts = t.in_flight_by_topic();
+        assert_eq!(counts.get("topic-a"), Some(&2));
+        assert_eq!(counts.get("topic-b"), Some(&1));
+    }
+
+    #[test]
+    fn in_flight_by_topic_is_empty_for_fresh_tracker() {
+        let t = OffsetTracker::default();
+        assert!(t.in_flight_by_topic().is_empty());
     }
 
     #[test]

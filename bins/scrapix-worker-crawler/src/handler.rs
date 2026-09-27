@@ -133,6 +133,7 @@ impl CrawlerWorker {
         };
         self.metrics.fetch_completed();
         let elapsed = start.elapsed();
+        self.metrics.observe_fetch_duration(elapsed);
 
         // Release the frontier's politeness slot for this dispatch (every
         // handled message, including fail-closed ones that made no request).

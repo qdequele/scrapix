@@ -2727,6 +2727,55 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
+/// Prometheus metrics endpoint — unauthenticated, next to `/health`. Kept out
+/// of the OpenAPI spec: it's a scrape target for `qdq-server/monitoring`, not
+/// a product/product-management API surface, and its response isn't JSON.
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    // `scrapix_api_jobs{status}` is computed from the in-memory job map at
+    // scrape time rather than kept as a running counter, since job status
+    // transitions (not just increments) and the gauge only needs to be
+    // right at the moment something scrapes it.
+    let mut counts: HashMap<&'static str, i64> = HashMap::new();
+    {
+        let jobs = state.crawl.jobs.read();
+        for job in jobs.values() {
+            let label = match job.status {
+                JobStatus::Pending => "pending",
+                JobStatus::Running => "running",
+                JobStatus::Completed => "completed",
+                JobStatus::Failed => "failed",
+                JobStatus::Cancelled => "cancelled",
+                JobStatus::Paused => "paused",
+            };
+            *counts.entry(label).or_insert(0) += 1;
+        }
+    }
+    let gauge = scrapix_core::metrics::api_jobs();
+    for status in [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "paused",
+    ] {
+        gauge
+            .with_label_values(&[status])
+            .set(*counts.get(status).unwrap_or(&0) as f64);
+    }
+
+    let body = scrapix_core::metrics::encode();
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            scrapix_core::metrics::CONTENT_TYPE,
+        )],
+        body,
+    )
+        .into_response()
+}
+
 /// Service health status for each component
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ServiceStatus {
@@ -6248,6 +6297,7 @@ pub async fn run_with_bus(
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/health/services", get(health_services))
+        .route("/metrics", get(metrics))
         .route("/stats", get(handle_stats))
         .route("/errors", get(handle_errors))
         .route("/domains", get(handle_domains))
@@ -7042,6 +7092,45 @@ mod lifecycle_tests {
             .accounting
             .write()
             .insert(job_id.to_string(), acc);
+    }
+
+    /// R10/SCR-22: `/metrics` reports `scrapix_api_jobs{status}` computed
+    /// from the in-memory job map at scrape time.
+    #[tokio::test]
+    async fn metrics_route_reports_job_counts_by_status() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "job-running", 3);
+        let mut done = JobState::new("job-done", "idx");
+        done.status = JobStatus::Completed;
+        state.insert_job(done);
+
+        let response = metrics(State(Arc::new(state))).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(scrapix_core::metrics::CONTENT_TYPE)
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("scrapix_api_jobs"),
+            "response must contain the scrapix_api_jobs gauge: {text}"
+        );
+        assert!(
+            text.contains("status=\"running\"") && text.contains("} 1"),
+            "expected a running=1 sample: {text}"
+        );
+        assert!(
+            text.contains("status=\"completed\""),
+            "expected a completed sample: {text}"
+        );
     }
 
     /// Bounded poll for a wiremock server's request log to reach `expected`

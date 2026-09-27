@@ -245,6 +245,11 @@ impl KafkaConsumer {
                     assigned = now;
                     self.commit_offsets(tracker.take_commits(), CommitMode::Async);
                     warn_stuck_partitions(&mut tracker);
+                    for (topic, count) in tracker.in_flight_by_topic() {
+                        scrapix_core::metrics::consumer_uncommitted()
+                            .with_label_values(&[&topic])
+                            .set(count as f64);
+                    }
                 }
                 Some((t, p, o)) = done_rx.recv() => tracker.complete(&t, p, o),
                 next = stream.next() => match next {

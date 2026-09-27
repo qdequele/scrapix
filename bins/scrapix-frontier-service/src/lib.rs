@@ -432,6 +432,9 @@ struct FrontierService {
     recrawl_scheduler: Option<Arc<RecrawlScheduler>>,
     url_history: Option<Arc<UrlHistory>>,
     metrics: Arc<ServiceMetrics>,
+    /// Job ids currently set on `scrapix_frontier_queued`, so the next tick
+    /// can clear any that fell out of the top-50 (bounded label cardinality).
+    queued_gauge_labels: Mutex<HashSet<String>>,
     shutdown: Arc<AtomicBool>,
     instance_id: String,
     queue_cap: usize,
@@ -695,6 +698,7 @@ impl FrontierService {
             recrawl_scheduler: extras.recrawl_scheduler,
             url_history: extras.url_history,
             metrics: Arc::new(ServiceMetrics::new()),
+            queued_gauge_labels: Mutex::new(HashSet::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             instance_id,
             queue_cap: args.max_pending_per_job,
@@ -839,9 +843,15 @@ impl FrontierService {
                 Ok(admission) => {
                     if admission == Admission::Admitted {
                         self.metrics.urls_new.fetch_add(1, Ordering::Relaxed);
+                        scrapix_core::metrics::frontier_admissions_total()
+                            .with_label_values(&["admitted"])
+                            .inc();
                         debug!(url = %url.url, job_id = %msg.job_id, "URL admitted");
                     } else {
                         self.metrics.urls_duplicate.fetch_add(1, Ordering::Relaxed);
+                        scrapix_core::metrics::frontier_admissions_total()
+                            .with_label_values(&["duplicate"])
+                            .inc();
                         debug!(
                             url = %url.url,
                             job_id = %msg.job_id,
@@ -854,6 +864,9 @@ impl FrontierService {
                 }
                 Err(e) => {
                     self.metrics.admit_errors.fetch_add(1, Ordering::Relaxed);
+                    scrapix_core::metrics::frontier_admissions_total()
+                        .with_label_values(&["error"])
+                        .inc();
                     warn!(
                         url = %url.url,
                         job_id = %msg.job_id,
@@ -1239,6 +1252,7 @@ impl FrontierService {
                 Ok(_) => {
                     dispatched += 1;
                     self.metrics.urls_dispatched.fetch_add(1, Ordering::Relaxed);
+                    scrapix_core::metrics::frontier_dispatched_total().inc();
                     debug!(url = %msg.url.url, job_id = %job_id, "Dispatched URL for crawling");
                     // The slot stays taken until the crawler's FetchFeedback
                     // (or its expiry).
@@ -1327,6 +1341,26 @@ impl FrontierService {
     async fn publish_progress(&self, last: &mut HashMap<String, (JobCounters, u64)>) {
         let held: Vec<String> = self.held_leases.lock().iter().cloned().collect();
         last.retain(|job, _| held.contains(job));
+        // Collected regardless of whether a job's counters changed this
+        // tick, so the top-50 gauge (scrapix_frontier_queued) reflects
+        // every held job's current queue depth, not just the ones that
+        // happened to publish a FrontierProgress event this round.
+        let mut queued_by_job: Vec<(String, u64)> = Vec::with_capacity(held.len());
+        for job_id in &held {
+            if let Ok(q) = self.store.queued(job_id).await {
+                queued_by_job.push((job_id.clone(), q));
+            }
+        }
+        {
+            let mut labels = self.queued_gauge_labels.lock();
+            scrapix_core::metrics::update_top_n_gauge(
+                scrapix_core::metrics::frontier_queued(),
+                &queued_by_job,
+                50,
+                &mut labels,
+            );
+        }
+
         for job_id in held {
             let snapshot = match (
                 self.store.counters(&job_id).await,

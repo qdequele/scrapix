@@ -230,21 +230,33 @@ impl WorkerMetrics {
         self.bytes_processed.fetch_add(bytes, Ordering::Relaxed);
         self.documents_created
             .fetch_add(doc_count, Ordering::Relaxed);
+        scrapix_core::metrics::content_documents_total()
+            .with_label_values(&["success"])
+            .inc();
     }
 
     fn record_failure(&self) {
         self.pages_processed.fetch_add(1, Ordering::Relaxed);
         self.pages_failed.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::content_documents_total()
+            .with_label_values(&["failure"])
+            .inc();
     }
 
     fn record_skipped(&self) {
         self.pages_processed.fetch_add(1, Ordering::Relaxed);
         self.pages_skipped.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::content_documents_total()
+            .with_label_values(&["skipped"])
+            .inc();
     }
 
     fn record_duplicate(&self) {
         self.pages_processed.fetch_add(1, Ordering::Relaxed);
         self.pages_duplicate.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::content_documents_total()
+            .with_label_values(&["duplicate"])
+            .inc();
     }
 
     fn record_indexed(&self, count: u64) {
@@ -718,7 +730,11 @@ impl ContentWorker {
             .map(|(k, s)| (k.clone(), s.clone()))
             .collect();
         for (key, storage) in storages {
-            match storage.flush().await {
+            let flush_started = Instant::now();
+            let result = storage.flush().await;
+            scrapix_core::metrics::content_flush_duration_seconds()
+                .observe(flush_started.elapsed().as_secs_f64());
+            match result {
                 Ok(count) if count > 0 => {
                     debug!(count, index = %key.index_uid, "Flushed Meilisearch storage");
                 }
