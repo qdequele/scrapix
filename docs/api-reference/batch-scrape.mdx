@@ -1,0 +1,120 @@
+---
+title: Batch Scrape
+description: Scrape up to 1000 URLs as one job and page through the results
+---
+
+# Batch Scrape
+
+`POST /batch/scrape` runs the [`/scrape`](/api-reference/scrape) pipeline for a list of URLs as one job. It returns a `job_id` immediately; the engine scrapes the URLs in the background with bounded concurrency. The job behaves like any other job: track it with [`GET /job/{id}/status`](/api-reference/jobs#get-job-id-status), `GET /job/{id}/events` (SSE), the WebSocket or webhooks, list it with `GET /jobs`, pause, resume or cancel it, and read the pages with [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results).
+
+Unlike crawls, batch scrapes do not follow links, do not use the Kafka pipeline and do not write to Meilisearch: each URL's result is stored by the engine and served by the results endpoint.
+
+## POST /batch/scrape
+
+### Request Body
+
+```json
+{
+  "urls": [
+    "https://example.com/pricing",
+    "https://example.com/docs/getting-started"
+  ],
+  "formats": ["markdown", "metadata"],
+  "only_main_content": true,
+  "concurrency": 10
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `urls` | string[] | **required** | URLs to scrape, 1 to 1000 |
+| `concurrency` | integer | `10` | URLs scraped at once (max `25`) |
+| `webhooks` | object[] | `[]` | Webhook subscriptions, same format as a crawl's [`webhooks`](/configuration/crawl-configs). Events: `crawl_started`, `page_crawled`, `page_error`, `crawl_completed`, `crawl_failed` (a cancel is delivered as `crawl_failed` with `error: "cancelled"`) |
+| *any `/scrape` option* | | | `formats`, `only_main_content`, `include_links`, `render_js`, `timeout_ms`, `headers`, `exclude_selectors`, `include_selectors`, `extract`, `ai`, ... — applied to every URL |
+
+The options are validated up front (`400` for an invalid option). An invalid URL in `urls` does not reject the batch: it becomes a failed result item.
+
+### Response
+
+```json
+{
+  "job_id": "7d0c6a4e-2f4b-4a55-9b7e-51c0d9f8a1b2",
+  "status": "running",
+  "urls_count": 2,
+  "message": "Batch scrape started with 2 URLs"
+}
+```
+
+The status code is `200`, like `POST /crawl`.
+
+### Results
+
+`GET /job/{id}/results` returns one item per URL, in the order the URLs finished (append-only: paging with `next` never skips or repeats an item, even while the job runs). Each item is the `/scrape` response for that URL plus:
+
+| Field | Description |
+|-------|-------------|
+| `source_url` | The URL as submitted (`url` is the final URL after redirects) |
+| `index` | Its position in `urls` |
+| `error` | `{ "code", "message" }` when `success` is `false` |
+
+A failed URL never fails the batch. Error codes: `fetch_error` (network, DNS, TLS, blocked address), `http_error` (non-2xx response, `status_code` is set), `validation_error` (invalid URL), `timeout`, `insufficient_credits` (the account ran out of credits during the batch; the remaining URLs are skipped with this code).
+
+```json
+{
+  "job_id": "7d0c6a4e-2f4b-4a55-9b7e-51c0d9f8a1b2",
+  "job_type": "batch_scrape",
+  "status": "completed",
+  "total": 2,
+  "next": null,
+  "data": [
+    {
+      "success": true,
+      "url": "https://example.com/pricing",
+      "source_url": "https://example.com/pricing",
+      "index": 0,
+      "status_code": 200,
+      "markdown": "# Pricing\n...",
+      "metadata": { "title": "Pricing", "description": null, "author": null, "keywords": [] },
+      "scrape_duration_ms": 412
+    },
+    {
+      "success": false,
+      "url": "https://example.com/docs/getting-started",
+      "source_url": "https://example.com/docs/getting-started",
+      "index": 1,
+      "status_code": 404,
+      "error": { "code": "http_error", "message": "HTTP 404" },
+      "scrape_duration_ms": 120
+    }
+  ]
+}
+```
+
+### Job status
+
+`GET /job/{id}/status` reports the batch like a crawl, with `job_type: "batch_scrape"`: `pages_crawled` counts the URLs scraped successfully, `errors` the failed ones, `max_pages` and `start_urls` the submitted URLs. `index_uid` is empty.
+
+### Cancel, pause and resume
+
+- `DELETE /job/{id}` stops the batch: URLs not started yet are skipped, the ones in flight finish and are stored. Results scraped so far stay available.
+- `POST /job/{id}/pause` holds the remaining URLs until `POST /job/{id}/resume`.
+
+### Billing
+
+Each URL costs what the same `/scrape` request costs, deducted as it is scraped (a URL that fails before or during the fetch is not charged). The whole batch is pre-checked when it is created: the request is rejected with `402` if the balance cannot cover every URL. Batch jobs count towards your plan's concurrent job limit.
+
+### Durability
+
+Results are stored in Postgres (`job_results`) when the engine has a database, otherwise in memory (the last 50 batch/extract jobs). A batch that was running when the API restarted is marked `failed` ("Interrupted: the API restarted ...") at startup; the results it stored are kept.
+
+### Example
+
+```bash
+JOB=$(curl -s -X POST http://localhost:8080/batch/scrape \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
+  -d '{"urls": ["https://example.com", "https://example.org"], "formats": ["markdown"]}' | jq -r .job_id)
+
+curl -s http://localhost:8080/job/$JOB/status -H "X-API-Key: $SCRAPIX_API_KEY"
+curl -s "http://localhost:8080/job/$JOB/results?limit=50" -H "X-API-Key: $SCRAPIX_API_KEY"
+```

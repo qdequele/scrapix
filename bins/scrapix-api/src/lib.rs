@@ -42,15 +42,23 @@ use std::time::Duration;
 
 pub mod analytics;
 pub mod auth;
+pub(crate) mod batch;
 pub mod billing;
 pub mod completion;
 pub mod configs;
 pub mod documents;
 pub mod email_scheduler;
+pub(crate) mod engine_jobs;
+pub(crate) mod extract;
+pub(crate) mod job_kind;
 pub mod jobs_db;
 pub mod openapi;
+pub(crate) mod results;
 pub mod stripe;
 pub mod webhooks;
+
+#[cfg(test)]
+mod scrape_browser_tests;
 
 use axum::{
     extract::{
@@ -66,6 +74,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
 use futures::{stream::Stream, SinkExt, StreamExt as FuturesStreamExt};
 use parking_lot::RwLock;
@@ -79,13 +88,14 @@ use tower_http::{
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
+use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::{
     ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
     JobStatus,
 };
 use scrapix_crawler::{
-    is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, RobotsCache,
-    RobotsConfig, SitemapParser, WaitUntil,
+    is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, PageOptions,
+    RobotsCache, RobotsConfig, ScreenshotOptions, SitemapParser, WaitUntil,
 };
 use scrapix_extractor::{
     ContentBlock, ExtractedMetadata, ExtractedSchema, Extractor, SelectorDefinition,
@@ -306,6 +316,8 @@ struct AppState {
     control_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JobControl>>>,
     /// Controls queued but not yet published (or given up on).
     controls_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Job results layer (`GET /job/{id}/results`, SCR-71).
+    results: results::ResultsState,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +405,7 @@ impl AppState {
             control_tx,
             control_rx: parking_lot::Mutex::new(Some(control_rx)),
             controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            results: results::ResultsState::default(),
             db_pool,
             stripe_client,
             analytics_store,
@@ -458,6 +471,16 @@ impl AppState {
     /// Get a job by ID
     fn get_job(&self, job_id: &str) -> Option<JobState> {
         self.crawl.jobs.read().get(job_id).cloned()
+    }
+
+    /// Whether `job_id` is a pipeline (crawl) job, as opposed to a job the
+    /// API runs itself (batch scrape, extract). Unknown jobs count as crawls.
+    fn is_pipeline_job(&self, job_id: &str) -> bool {
+        self.crawl
+            .jobs
+            .read()
+            .get(job_id)
+            .is_none_or(|j| job_kind::JobKind::of(j).is_pipeline())
     }
 
     /// Update a job
@@ -556,7 +579,9 @@ impl AppState {
             .jobs
             .read()
             .iter()
-            .filter(|(_, j)| matches!(j.status, JobStatus::Running))
+            .filter(|(_, j)| {
+                matches!(j.status, JobStatus::Running) && job_kind::JobKind::of(j).is_pipeline()
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -631,7 +656,7 @@ impl AppState {
                         .job_last_activity
                         .read()
                         .get(job_id)
-                        .map_or(true, |last| {
+                        .is_none_or(|last| {
                             now.saturating_duration_since(*last) >= self.config.job_stall_timeout
                         })
             }
@@ -1005,7 +1030,7 @@ impl AppState {
         pages_ocr: u64,
     ) {
         let total_pages = pages_http + pages_browser;
-        if total_pages == 0 {
+        if total_pages == 0 || !self.is_pipeline_job(job_id) {
             return;
         }
         self.diagnostics
@@ -1481,8 +1506,16 @@ impl AppState {
             self.crawl.dirty_jobs.write().insert(job_id.to_string());
         }
 
+        // Terminal events of engine-run jobs (batch scrape, extract) get no
+        // crawl request event nor job email: their pages are billed and
+        // logged one by one as they run.
+        let pipeline_terminal = !matches!(
+            event,
+            CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. }
+        ) || self.is_pipeline_job(job_id);
+
         // Persist crawl completion to request_events (1 row per crawl job at completion)
-        if let Some(ref batcher) = self.analytics.request_batcher {
+        if let (Some(batcher), true) = (&self.analytics.request_batcher, pipeline_terminal) {
             if let CrawlEvent::JobCompleted {
                 account_id,
                 pages_crawled,
@@ -1657,7 +1690,7 @@ impl AppState {
                 // The only place a completion email is scheduled (R5).
                 self.request_job_email(
                     "job_completed",
-                    account_id.clone(),
+                    account_id.clone().filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
                         "index_uid": index_uid,
@@ -1699,7 +1732,7 @@ impl AppState {
                 // The only place a failure email is scheduled (R5).
                 self.request_job_email(
                     "job_failed",
-                    account_id,
+                    account_id.filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
                         "error_message": error,
@@ -1861,7 +1894,7 @@ trait ElapsedSince {
 
 impl ElapsedSince for Option<std::time::Instant> {
     fn is_none_or_elapsed(&self, every: Duration) -> bool {
-        self.map_or(true, |t| t.elapsed() >= every)
+        self.is_none_or(|t| t.elapsed() >= every)
     }
 }
 
@@ -2272,7 +2305,6 @@ impl ApiError {
         }
     }
 
-    #[allow(dead_code)]
     fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self
@@ -2291,6 +2323,7 @@ impl IntoResponse for ApiError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "conflict" => StatusCode::CONFLICT,
             "insufficient_credits" => StatusCode::PAYMENT_REQUIRED,
+            "action_error" => StatusCode::UNPROCESSABLE_ENTITY,
             "spend_limit_exceeded" => StatusCode::FORBIDDEN,
             "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2443,6 +2476,8 @@ struct BulkCrawlError {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct JobStatusResponse {
     job_id: String,
+    /// `crawl`, `batch_scrape` or `extract`
+    job_type: job_kind::JobKind,
     /// One of `pending`, `running`, `paused`, `completed`, `failed`,
     /// `cancelled`
     #[schema(value_type = JobStatus)]
@@ -2479,8 +2514,10 @@ struct JobStatusResponse {
 impl From<JobState> for JobStatusResponse {
     fn from(job: JobState) -> Self {
         let duration_seconds = job.duration_seconds();
+        let job_type = job_kind::JobKind::of(&job);
         Self {
             job_id: job.job_id,
+            job_type,
             status: format!("{:?}", job.status).to_lowercase(),
             index_uid: job.index_uid,
             pages_crawled: job.pages_crawled,
@@ -2572,10 +2609,68 @@ struct ScrapeRequest {
     #[serde(default)]
     ai: Option<AiOptions>,
 
+    /// Screenshot options, used when `formats` includes `"screenshot"`
+    #[serde(default)]
+    screenshot: Option<ScreenshotRequestOptions>,
+
+    /// Browser actions run after the page loads and before content (and
+    /// any screenshot) is captured: wait, click, scroll, write, press,
+    /// execute_javascript. Forces browser rendering. At most 50; all
+    /// actions together must finish within 30s.
+    #[serde(default)]
+    actions: Vec<Action>,
+
+    /// Emulate a phone (mobile viewport, touch, Android Chrome user agent)
+    /// to get the mobile layout of responsive sites. Forces browser
+    /// rendering.
+    #[serde(default)]
+    mobile: bool,
+
+    /// Cookies sent with the request (both the HTTP and the browser path),
+    /// scoped to the target site: a cookie's `domain` must be the target
+    /// host or a parent domain of it. At most 50.
+    #[serde(default)]
+    cookies: Vec<RequestCookie>,
+
     /// Document parsing options, used when the URL serves a PDF or an
     /// office document (OCR of scanned pages, page limits).
     #[serde(default)]
     parsers: documents::ParserOptions,
+}
+
+impl Default for ScrapeRequest {
+    /// The request the API would deserialize from `{"url": ""}`: every
+    /// field at its serde default. Lets internal callers (batch scrape,
+    /// extract) build requests with `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            formats: Vec::new(),
+            only_main_content: default_true_bool(),
+            include_links: false,
+            render_js: false,
+            timeout_ms: default_timeout(),
+            headers: HashMap::new(),
+            exclude_selectors: Vec::new(),
+            include_selectors: Vec::new(),
+            extract: HashMap::new(),
+            ai: None,
+            screenshot: None,
+            actions: Vec::new(),
+            mobile: false,
+            cookies: Vec::new(),
+            parsers: documents::ParserOptions::default(),
+        }
+    }
+}
+
+/// Screenshot options for /scrape
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+struct ScreenshotRequestOptions {
+    /// Capture the whole scrollable page (default) instead of only the
+    /// viewport. Very long pages are cropped to 16384 px.
+    #[serde(default = "default_true_bool")]
+    full_page: bool,
 }
 
 /// AI enrichment options for /scrape
@@ -2693,6 +2788,14 @@ struct ScrapeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     ai: Option<AiResult>,
 
+    /// Base64-encoded PNG screenshot (if format "screenshot" requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screenshot: Option<String>,
+
+    /// Results of the request's `actions` (present when actions were sent)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actions: Option<ScrapeActionsResult>,
+
     /// Warning message (e.g. "AI requires OPENAI_API_KEY")
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
@@ -2711,6 +2814,14 @@ struct ScrapeResponse {
 
     /// Time taken to scrape in milliseconds
     scrape_duration_ms: u64,
+}
+
+/// Results of the /scrape `actions`
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct ScrapeActionsResult {
+    /// Values of the `execute_javascript` actions, in order (JSON
+    /// round-tripped; `undefined` is `null`)
+    javascript_returns: Vec<serde_json::Value>,
 }
 
 /// AI enrichment results
@@ -3064,7 +3175,7 @@ fn preprocess_html(
 
 /// Scrape a single URL and return content immediately
 /// This bypasses the job queue for instant results
-#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError), (status = 422, description = "A browser action failed (`action_error`; `details` names the action)", body = ApiError)), security(("api_key" = [])))]
 async fn scrape_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
@@ -3074,7 +3185,22 @@ async fn scrape_url(
     let account_ctx =
         extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
+    perform_scrape(&state, &account_ctx, &request)
+        .await
+        .map(Json)
+}
 
+/// The full /scrape pipeline for one URL: credit pre-check, fetch (HTTP or
+/// browser), extraction, AI enrichment, analytics and credit deduction.
+///
+/// Shared by `POST /scrape` and the endpoints that scrape many URLs on the
+/// caller's behalf (batch scrape, extract). Permission checks are the
+/// caller's job; everything else, including per-URL billing, happens here.
+pub(crate) async fn perform_scrape(
+    state: &Arc<AppState>,
+    account_ctx: &Option<AccountContext>,
+    request: &ScrapeRequest,
+) -> Result<ScrapeResponse, ApiError> {
     if let Some(ref ctx) = account_ctx {
         debug!(account_id = %ctx.account_id, "Scrape request from account");
     }
@@ -3115,10 +3241,36 @@ async fn scrape_url(
         ));
     }
 
-    let use_browser = request.render_js;
+    scrapix_core::browser::validate_actions(&request.actions)
+        .map_err(|e| ApiError::new(e, "validation_error"))?;
+    scrapix_core::browser::validate_cookies(&request.cookies, &parsed_url)
+        .map_err(|e| ApiError::new(e, "validation_error"))?;
+
+    // Features that only the browser can provide force the browser path.
+    let screenshot_opts = request
+        .formats
+        .contains(&ScrapeFormat::Screenshot)
+        .then(|| ScreenshotOptions {
+            full_page: request.screenshot.as_ref().is_none_or(|s| s.full_page),
+        });
+    let use_browser = request.render_js
+        || screenshot_opts.is_some()
+        || !request.actions.is_empty()
+        || request.mobile;
     if use_browser && state.browser_renderer.is_none() {
+        let reason = if request.render_js {
+            "JS rendering"
+        } else if screenshot_opts.is_some() {
+            "The screenshot format"
+        } else if !request.actions.is_empty() {
+            "Page actions"
+        } else {
+            "Mobile emulation"
+        };
         return Err(ApiError::new(
-            "JS rendering is not available (Chrome/Chromium not found on this server)",
+            format!(
+                "{reason} requires a browser, which is not available on this server (Chrome/Chromium not found)"
+            ),
             "render_js_unavailable",
         ));
     }
@@ -3128,29 +3280,62 @@ async fn scrape_url(
     // (a) Fetch using browser renderer or HTTP fetcher
     let crawl_url = CrawlUrl::seed(&request.url);
 
-    let raw_page = if use_browser {
-        // Use browser renderer for JS rendering
-        state
-            .browser_renderer
-            .as_ref()
-            .unwrap()
-            .fetch(&crawl_url)
+    let mut screenshot_png: Option<Vec<u8>> = None;
+    let mut actions_result: Option<ScrapeActionsResult> = None;
+    let raw_page = if let Some(renderer) = state.browser_renderer.as_ref().filter(|_| use_browser) {
+        let page_options = PageOptions {
+            screenshot: screenshot_opts,
+            actions: request.actions.clone(),
+            // Caller-supplied actions and scripts must not be able to reach
+            // internal addresses: every request the page makes is checked.
+            guard_requests: true,
+            mobile: request.mobile,
+            cookies: request.cookies.clone(),
+            // A fresh browser context per request: cookies (supplied or set
+            // by the site) and storage never reach another request on the
+            // shared browser.
+            isolate: true,
+            ..Default::default()
+        };
+        let mut rendered = renderer
+            .render_page(&request.url, &page_options)
             .await
-            .map_err(|e| {
-                ApiError::new(
-                    format!("Failed to render URL with browser: {}", e),
-                    "fetch_error",
+            .map_err(|e| match e {
+                scrapix_core::ScrapixError::Action {
+                    index,
+                    action,
+                    message,
+                } => ApiError::new(
+                    format!("actions[{index}] ({action}) failed: {message}"),
+                    "action_error",
                 )
-            })?
-    } else if request.headers.is_empty() {
-        // Use the shared fetcher (connection pooling, DNS cache, retries)
+                .with_details(serde_json::json!({
+                    "action_index": index,
+                    "action_type": action,
+                    "message": message,
+                })),
+                other => ApiError::new(
+                    format!("Failed to render URL with browser: {}", other),
+                    "fetch_error",
+                ),
+            })?;
+        screenshot_png = rendered.screenshot.take();
+        if !request.actions.is_empty() {
+            actions_result = Some(ScrapeActionsResult {
+                javascript_returns: std::mem::take(&mut rendered.javascript_returns),
+            });
+        }
+        CdpRenderer::raw_page(&crawl_url, rendered)
+    } else if request.headers.is_empty() && request.cookies.is_empty() {
+        // Use the shared fetcher (connection pooling, DNS cache, retries).
+        // It has no cookie store, so nothing carries over between requests.
         state
             .fetcher
             .fetch_with_options(&crawl_url, document_fetch_options())
             .await
             .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     } else {
-        // Build a one-off fetcher with custom headers
+        // Build a one-off fetcher with custom headers and/or cookies
         let robots_config = RobotsConfig {
             respect_robots: false,
             ..Default::default()
@@ -3162,8 +3347,16 @@ async fn scrape_url(
             )
         })?);
 
-        let mut builder =
-            HttpFetcherBuilder::new().timeout(Duration::from_millis(request.timeout_ms));
+        // Its cookie store (seeded with the request's cookies) lives only
+        // for this request, so session cookies set along a redirect or login
+        // flow are kept within the fetch and never shared.
+        let mut builder = HttpFetcherBuilder::new()
+            .timeout(Duration::from_millis(request.timeout_ms))
+            .allow_private_ips(state.fetcher.allows_private_ips())
+            .cookie_store(true);
+        for cookie in &request.cookies {
+            builder = builder.cookie(cookie.to_set_cookie_string(), parsed_url.clone());
+        }
 
         // Add custom headers (block sensitive headers to prevent injection attacks)
         const BLOCKED_HEADERS: &[&str] = &[
@@ -3233,7 +3426,7 @@ async fn scrape_url(
             );
         }
 
-        return Ok(Json(ScrapeResponse {
+        return Ok(ScrapeResponse {
             success: false,
             url: final_url,
             markdown: None,
@@ -3247,12 +3440,14 @@ async fn scrape_url(
             blocks: None,
             extract: None,
             ai: None,
+            screenshot: None,
+            actions: actions_result,
             warning: None,
             document: None,
             ocr: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
-        }));
+        });
     }
 
     // A PDF or office document: parse it (and OCR it on request) instead of
@@ -3267,8 +3462,8 @@ async fn scrape_url(
             .decode(raw_page.html.as_bytes())
             .map_err(|e| ApiError::new(format!("Invalid document body: {e}"), "fetch_error"))?;
         let response = documents::document_response(
-            &state,
-            &account_ctx,
+            state,
+            account_ctx,
             documents::DocumentJob {
                 operation: "scrape",
                 label: final_url.clone(),
@@ -3287,7 +3482,7 @@ async fn scrape_url(
             start_time,
         )
         .await?;
-        return Ok(Json(response));
+        return Ok(response);
     }
 
     let original_html = raw_page.html;
@@ -3409,7 +3604,7 @@ async fn scrape_url(
 
     // (e) AI enrichment (optional)
     let ai_text = content.as_deref().or(markdown.as_deref()).unwrap_or("");
-    let ai_run = run_ai_enrichment(&state, request.ai.as_ref(), ai_text).await;
+    let ai_run = run_ai_enrichment(state, request.ai.as_ref(), ai_text).await;
     let AiRun {
         result: ai_result,
         warning,
@@ -3473,7 +3668,7 @@ async fn scrape_url(
         "Scrape completed"
     );
 
-    Ok(Json(ScrapeResponse {
+    Ok(ScrapeResponse {
         success: true,
         url: final_url,
         markdown,
@@ -3487,12 +3682,14 @@ async fn scrape_url(
         blocks,
         extract: custom_extract,
         ai: ai_result,
+        screenshot: screenshot_png.map(|png| BASE64.encode(png)),
+        actions: actions_result,
         warning,
         document: None,
         ocr: None,
         status_code,
         scrape_duration_ms,
-    }))
+    })
 }
 
 /// Outcome of optional AI enrichment for `/scrape` and `/parse`.
@@ -4234,6 +4431,13 @@ pub(crate) async fn do_create_crawl(
         j.swap_meilisearch_url = replace_url;
         j.swap_meilisearch_api_key = replace_key;
     });
+
+    // Remember where the job's documents go (`GET /job/{id}/results`).
+    state.results.remember_crawl_target(
+        &job_id,
+        &config.meilisearch.url,
+        &config.meilisearch.api_key,
+    );
 
     // Persist new job to Postgres
     if let (Some(ref pool), Some(snapshot)) = (&state.db_pool, snapshot) {
@@ -5139,13 +5343,17 @@ async fn create_crawl(
 }
 
 /// Create a sync crawl job (waits for completion)
-#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, responses((status = 200, body = CreateCrawlResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+///
+/// With `include_results=true`, the response also carries the first page of
+/// the job's results (`GET /job/{id}/results`).
+#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, params(results::CrawlSyncQuery), responses((status = 200, body = results::CrawlSyncResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
 async fn create_crawl_sync(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     user_ext: Option<Extension<AuthenticatedUser>>,
+    Query(sync_query): Query<results::CrawlSyncQuery>,
     Json(config): Json<CrawlConfig>,
-) -> Result<Json<JobStatusResponse>, ApiError> {
+) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
     let account_ctx =
         extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
@@ -5169,7 +5377,9 @@ async fn create_crawl_sync(
         if let Some(job) = state.get_job(&job_id) {
             match job.status {
                 JobStatus::Completed => {
-                    return Ok(Json(job.into()));
+                    return Ok(Json(
+                        results::crawl_sync_response(&state, job, &sync_query).await,
+                    ));
                 }
                 JobStatus::Failed | JobStatus::Cancelled => {
                     return Err(ApiError::new(
@@ -5189,7 +5399,9 @@ async fn create_crawl_sync(
                     if let CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. } = event {
                         // Job finished, get final status
                         if let Some(job) = state.get_job(&job_id) {
-                            return Ok(Json(job.into()));
+                            return Ok(Json(
+                                results::crawl_sync_response(&state, job, &sync_query).await,
+                            ));
                         }
                     }
                 }
@@ -6351,6 +6563,9 @@ pub async fn run_with_bus(
     // Recover active jobs from Postgres on startup
     if let Some(ref pool) = state.db_pool {
         let recovered = jobs_db::load_active_jobs(pool).await;
+        // Engine-run jobs (batch scrape, extract) died with the previous
+        // process: mark them failed instead of recovering them as running.
+        let recovered = engine_jobs::fail_interrupted(pool, recovered).await;
         if !recovered.is_empty() {
             let now = std::time::Instant::now();
             let mut jobs = state.crawl.jobs.write();
@@ -6589,6 +6804,9 @@ pub async fn run_with_bus(
     // Product routes — revenue-generating API endpoints
     let product_routes = Router::new()
         .route("/scrape", post(scrape_url))
+        .route("/batch/scrape", post(batch::batch_scrape))
+        .route("/extract", post(extract::create_extract))
+        .route("/extract/{id}", get(extract::get_extract))
         .route("/map", post(map_url))
         .route("/search", post(search_url))
         .route("/crawl", post(create_crawl))
@@ -6601,6 +6819,7 @@ pub async fn run_with_bus(
         .route("/job/{id}/status", get(job_status))
         .route("/job/{id}/events", get(job_events))
         .route("/job/{id}/events/history", get(get_job_events_history))
+        .route("/job/{id}/results", get(results::job_results))
         .route("/job/{id}", delete(cancel_job))
         .route("/job/{id}/pause", post(pause_job))
         .route("/job/{id}/resume", post(resume_job));
@@ -8912,7 +9131,7 @@ mod lifecycle_tests {
         control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
         let state = test_state(&bus);
         let action = |i: usize| {
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 JobAction::Pause
             } else {
                 JobAction::Resume

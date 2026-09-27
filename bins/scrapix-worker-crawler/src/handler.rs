@@ -436,7 +436,7 @@ impl CrawlerWorker {
             let target_refs: Vec<&str> = target_urls.iter().map(|s| s.as_str()).collect();
             graph.record_links(&url.url, target_refs);
             let processed = self.metrics.urls_processed.load(Ordering::Relaxed);
-            if processed > 0 && processed % self.link_graph_interval == 0 {
+            if processed > 0 && processed.is_multiple_of(self.link_graph_interval) {
                 graph.compute_scores_if_dirty();
                 debug!(processed, "Recomputed link graph scores");
             }

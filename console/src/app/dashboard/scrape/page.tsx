@@ -1,17 +1,25 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { FileUp, Link2 } from "lucide-react";
 import { toast } from "sonner";
-import { submitParse, submitScrape } from "@/lib/api";
-import type { ParserOptions, ScrapeResult } from "@/lib/api-types";
+import {
+  ApiRequestError,
+  submitParse,
+  submitScrape,
+  type ScrapeOptions as ScrapeRequestOptions,
+} from "@/lib/api";
+import type { ActionErrorDetails, ParserOptions, ScrapeResult } from "@/lib/api-types";
 import { UrlBar } from "../playground/url-bar";
 import { FileDrop } from "../playground/file-drop";
 import {
   DOCUMENT_FORMATS,
   ScrapeOptions,
+  buildCookies,
+  cookieRowError,
+  parseActions,
   type ScrapeSource,
   type ScrapeState,
 } from "../playground/scrape-options";
@@ -33,6 +41,16 @@ function parserOptions(state: ScrapeState): ParserOptions | undefined {
   return Object.keys(parsers).length > 0 ? parsers : undefined;
 }
 
+function isActionErrorDetails(value: unknown): value is ActionErrorDetails {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.action_index === "number" &&
+    typeof v.action_type === "string" &&
+    typeof v.message === "string"
+  );
+}
+
 export default function ScrapePage() {
   const [source, setSource] = useState<ScrapeSource>("url");
   const [file, setFile] = useState<File | null>(null);
@@ -40,12 +58,21 @@ export default function ScrapePage() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ScrapeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [runs, setRuns] = useState<RunEntry[]>([]);
+  const [actionError, setActionError] = useState<ActionErrorDetails | null>(null);
+  // History renders inside a popover (client only), so reading storage here is safe.
+  const [runs, setRuns] = useState<RunEntry[]>(loadRuns);
   const [scrapeState, setScrapeState] = useState<ScrapeState>({
     formats: ["markdown", "metadata"],
     only_main_content: true,
     include_links: false,
     timeout_ms: "30000",
+    screenshot_full_page: true,
+    render_js: false,
+    mobile: false,
+    feat_actions: false,
+    actions_json: "",
+    feat_cookies: false,
+    cookies: [],
     ai_summary: false,
     feat_schema: false,
     feat_block_split: false,
@@ -58,10 +85,6 @@ export default function ScrapePage() {
     max_pages: "",
   });
 
-  useEffect(() => {
-    setRuns(loadRuns());
-  }, []);
-
   const handleScrape = useCallback(async () => {
     if (!url.trim()) {
       toast.error("Please enter a URL");
@@ -72,9 +95,33 @@ export default function ScrapePage() {
       return;
     }
 
+    // Browser options: validate before sending
+    let actions: ScrapeRequestOptions["actions"];
+    if (scrapeState.feat_actions && scrapeState.actions_json.trim()) {
+      const parsed = parseActions(scrapeState.actions_json);
+      if (!parsed.ok) {
+        toast.error("Fix the page actions first", { description: parsed.errors[0] });
+        return;
+      }
+      actions = parsed.actions;
+    }
+    let cookies: ScrapeRequestOptions["cookies"];
+    if (scrapeState.feat_cookies) {
+      const cookieError = scrapeState.cookies
+        .map((row) => cookieRowError(row, url))
+        .find((e) => e !== null);
+      if (cookieError) {
+        toast.error("Fix the cookies first", { description: cookieError });
+        return;
+      }
+      const built = buildCookies(scrapeState.cookies);
+      if (built.length > 0) cookies = built;
+    }
+
     setLoading(true);
     setResult(null);
     setError(null);
+    setActionError(null);
 
     try {
       // Build formats list, adding schema/blocks if their features are enabled
@@ -115,8 +162,18 @@ export default function ScrapePage() {
         extract,
         ai,
         parsers: parserOptions(scrapeState),
+        // Screenshot, actions and mobile make the engine use the browser on
+        // its own; only send the explicit choice (keeps its error messages precise).
+        render_js: scrapeState.render_js || undefined,
+        screenshot: formats.includes("screenshot")
+          ? { full_page: scrapeState.screenshot_full_page }
+          : undefined,
+        mobile: scrapeState.mobile || undefined,
+        actions,
+        cookies,
       });
       setResult(data);
+      // History keeps a summary only: never the response body or screenshot.
       const newRuns = saveRun({
         id: Math.random().toString(36).slice(2) + Date.now().toString(36),
         type: "scrape",
@@ -127,11 +184,16 @@ export default function ScrapePage() {
       });
       setRuns(newRuns);
     } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : "Failed to fetch. Is the API running?";
-      setError(msg);
+      if (err instanceof ApiRequestError && err.body) {
+        if (err.body.code === "action_error" && isActionErrorDetails(err.body.details)) {
+          setActionError(err.body.details);
+        }
+        setError(err.body.error);
+      } else {
+        setError(
+          err instanceof Error ? err.message : "Failed to fetch. Is the API running?",
+        );
+      }
     }
 
     setLoading(false);
@@ -151,6 +213,7 @@ export default function ScrapePage() {
     setLoading(true);
     setResult(null);
     setError(null);
+    setActionError(null);
 
     let ai: { summary?: boolean; extract?: { prompt: string } } | undefined;
     if (scrapeState.ai_summary || scrapeState.feat_ai_extraction) {
@@ -256,6 +319,7 @@ export default function ScrapePage() {
               state={scrapeState}
               onChange={setScrapeState}
               source={source}
+              targetUrl={url}
             />
           </CardContent>
         </Card>
@@ -268,6 +332,7 @@ export default function ScrapePage() {
               mode={source === "file" ? "parse" : "scrape"}
               loading={loading}
               error={error}
+              actionError={actionError}
             />
           </CardContent>
         </Card>

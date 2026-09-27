@@ -196,6 +196,7 @@ export const RODAUTH_ERROR: Spec = {
 /** Engine job status (JobStatusResponse); optional keys are omitted when empty. */
 export const JOB_STATUS: Spec = {
   job_id: "string",
+  job_type: "string",
   status: "string",
   index_uid: "string",
   pages_crawled: "number",
@@ -212,4 +213,38 @@ export const JOB_STATUS: Spec = {
   max_pages: "number?",
   config: "any?",
   warnings: "any?",
+};
+
+/** Engine job results page (GET /job/{id}/results, SCR-71). */
+export const JOB_RESULTS: Spec = {
+  job_id: "string",
+  job_type: "string",
+  status: "string",
+  total: "number",
+  next: "string|null",
+  data: "any",
+};
+
+/** POST /batch/scrape response (SCR-74). */
+export const BATCH_SCRAPE_CREATED: Spec = {
+  job_id: "string",
+  status: "string",
+  urls_count: "number",
+  message: "string",
+};
+
+/** POST /extract response (SCR-73). */
+export const EXTRACT_CREATED: Spec = {
+  job_id: "string",
+  status: "string",
+};
+
+/** GET /extract/{id} response (SCR-73). */
+export const EXTRACT_STATUS: Spec = {
+  job_id: "string",
+  status: "string",
+  data: "any",
+  sources: "any",
+  warning: "string?",
+  error: "string?",
 };

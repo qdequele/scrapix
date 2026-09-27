@@ -1200,7 +1200,29 @@
           "crawl"
         ],
         "summary": "Create a sync crawl job (waits for completion)",
+        "description": "With `include_results=true`, the response also carries the first page of\nthe job's results (`GET /job/{id}/results`).",
         "operationId": "create_crawl_sync",
+        "parameters": [
+          {
+            "name": "include_results",
+            "in": "query",
+            "description": "Also return the first page of the job's results (default false)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "results_limit",
+            "in": "query",
+            "description": "Page size of the included results (default 20, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1217,7 +1239,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CreateCrawlResponse"
+                  "$ref": "#/components/schemas/CrawlSyncResponse"
                 }
               }
             }
@@ -2065,6 +2087,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A browser action failed (`action_error`; `details` names the action)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3123,6 +3155,264 @@
           }
         }
       }
+    },
+    "/job/{id}/results": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get the results of a job",
+        "description": "Paginated documents produced by a crawl, batch scrape or extract job,\neach shaped like a `/scrape` response. Works while the job is running\n(partial results) and after it finished. Follow `next` until it is\n`null`; while the job runs, `next` stays set so it can be polled.",
+        "operationId": "job_results",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 20, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous response's `next`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResultsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The job's result store is unreachable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/batch/scrape": {
+      "post": {
+        "tags": [
+          "scrape"
+        ],
+        "summary": "Scrape many URLs as one job",
+        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Credits: same as `/scrape`, per URL scraped.",
+        "operationId": "batch_scrape",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchScrapeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchScrapeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Not enough credits for the whole batch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/extract": {
+      "post": {
+        "tags": [
+          "extract"
+        ],
+        "summary": "Extract structured data from web pages",
+        "description": "Starts a job that fetches every URL (globs such as\n`https://example.com/blog/*` are resolved first, 50 URLs max), then runs\none AI extraction over their content following `prompt` and/or `schema`.\nPoll `GET /extract/{id}` for the result; the fetched pages are available\nfrom `GET /job/{id}/results`. Requires an AI provider on the server.",
+        "operationId": "create_extract",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateExtractResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Not enough credits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No AI provider is configured on the server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/extract/{id}": {
+      "get": {
+        "tags": [
+          "extract"
+        ],
+        "summary": "Get an extraction's status and result",
+        "operationId": "get_extract",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Extract job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -3158,6 +3448,142 @@
             "type": "string"
           }
         }
+      },
+      "Action": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Wait a fixed time (`ms`) or until an element matching `selector`\nexists. Exactly one of the two must be set.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "selector": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "wait"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Click the first element matching `selector` (waits for it to exist).",
+            "required": [
+              "selector",
+              "type"
+            ],
+            "properties": {
+              "selector": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "click"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Scroll the page by `amount` viewport heights (default 1).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "amount": {
+                "type": "number",
+                "format": "double"
+              },
+              "direction": {
+                "$ref": "#/components/schemas/ScrollDirection"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "scroll"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Focus the first element matching `selector` and type `text` into it.",
+            "required": [
+              "selector",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "selector": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "write"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Press a key (e.g. `Enter`, `Tab`, `ArrowDown`, `Escape`, `a`) on the\nfocused element.",
+            "required": [
+              "key",
+              "type"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "press"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Run JavaScript in the page. The value of the script (or of its\n`return` statement; `await` is allowed) is returned in\n`actions.javascript_returns`, JSON-serialized.",
+            "required": [
+              "script",
+              "type"
+            ],
+            "properties": {
+              "script": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "execute_javascript"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A browser interaction run on the page after it loads and before content\n(and any screenshot) is captured. Actions run in order; the first one to\nfail stops the sequence and fails the request."
       },
       "AiExtractOptions": {
         "type": "object",
@@ -3336,6 +3762,198 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "BatchScrapeRequest": {
+        "type": "object",
+        "description": "Request body for `POST /batch/scrape`. Every field besides `urls`,\n`concurrency` and `webhooks` is a `POST /scrape` option applied to each\nURL (the most common ones are listed; any `/scrape` option is accepted).",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "actions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Browser actions run on each page before capture (forces browser rendering)"
+          },
+          "ai": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AiOptions",
+                "description": "AI enrichment, per URL"
+              }
+            ]
+          },
+          "concurrency": {
+            "type": "integer",
+            "description": "URLs scraped at once (default 10, max 25)",
+            "minimum": 0
+          },
+          "cookies": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RequestCookie"
+            },
+            "description": "Cookies sent with each request. A cookie without `domain` goes to each\nURL's own host; one with `domain` must be that URL's host or a parent\nof it, otherwise that URL fails with a per-item error."
+          },
+          "exclude_selectors": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "CSS selectors to remove before extraction"
+          },
+          "extract": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom CSS selector extraction (field_name -> selector definition)",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SelectorDefinition"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "formats": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ScrapeFormat"
+            },
+            "description": "Formats to return for each URL (default: markdown, content, metadata)"
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom request headers",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "include_links": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Include links found on each page"
+          },
+          "include_selectors": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "CSS selectors to keep (only extract from these)"
+          },
+          "mobile": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Emulate a phone (forces browser rendering)"
+          },
+          "only_main_content": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Only the main content (default true)"
+          },
+          "render_js": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Render JavaScript (requires Chrome/Chromium on the server)"
+          },
+          "screenshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenshotRequestOptions",
+                "description": "Screenshot options, used when `formats` includes `\"screenshot\"`"
+              }
+            ]
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-URL timeout in milliseconds (default 30000)",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URLs to scrape (1 to 1000)"
+          },
+          "webhooks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/WebhookConfig"
+            },
+            "description": "Webhook subscriptions (same as a crawl's `webhooks`): `crawl_started`,\n`page_crawled`, `page_error`, `crawl_completed`, `crawl_failed`"
+          }
+        }
+      },
+      "BatchScrapeResponse": {
+        "type": "object",
+        "description": "Response of `POST /batch/scrape`",
+        "required": [
+          "job_id",
+          "status",
+          "urls_count",
+          "message"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "urls_count": {
+            "type": "integer",
+            "description": "Number of URLs accepted",
+            "minimum": 0
           }
         }
       },
@@ -3722,6 +4340,37 @@
           }
         }
       },
+      "CrawlSyncResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/JobStatusResponse"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "results": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JobResultsResponse",
+                    "description": "First page of results (`include_results=true`). Follow `results.next`\nwith `GET /job/{id}/results`. Meilisearch indexes asynchronously, so\nthe very last pages of a just-finished crawl can take a moment to\nappear."
+                  }
+                ]
+              },
+              "results_error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the results could not be read (`include_results=true`)"
+              }
+            }
+          }
+        ],
+        "description": "`POST /crawl/sync` response: the final job status, plus the first page\nof results when `include_results=true`"
+      },
       "CrawlerType": {
         "type": "string",
         "description": "Type of crawler to use",
@@ -3830,6 +4479,22 @@
             "type": "string"
           },
           "url": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateExtractResponse": {
+        "type": "object",
+        "description": "Response of `POST /extract`",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
             "type": "string"
           }
         }
@@ -4164,6 +4829,149 @@
           }
         }
       },
+      "ExtractRequest": {
+        "type": "object",
+        "description": "Request body for `POST /extract`",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "headers": {
+            "type": "object",
+            "description": "Custom request headers for the page fetches",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "only_main_content": {
+            "type": "boolean",
+            "description": "Only use each page's main content (default true)"
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to extract, in natural language"
+          },
+          "render_js": {
+            "type": "boolean",
+            "description": "Render JavaScript when fetching pages (requires Chrome/Chromium)"
+          },
+          "schema": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Expected output: a JSON Schema object, or a list of field\ndefinitions `[{ \"name\", \"description\", \"field_type\", \"required\" }]`\n(the `/scrape` `ai.extract.schema` form)"
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-page fetch timeout in milliseconds (default 30000)",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URLs to extract from (max 50 in total after glob resolution). A URL\ncontaining `*` is a glob resolved from the site's sitemaps and the\nlinks of its base page: `https://example.com/blog/*`."
+          },
+          "webhooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookConfig"
+            },
+            "description": "Webhook subscriptions (same as a crawl's `webhooks`)"
+          }
+        }
+      },
+      "ExtractSource": {
+        "type": "object",
+        "description": "One URL an extraction used",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the page could not be fetched"
+          },
+          "from_glob": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The glob this URL was resolved from, if any"
+          },
+          "success": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the page was fetched (`null` until it was tried)"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "ExtractStatusResponse": {
+        "type": "object",
+        "description": "`GET /extract/{id}` response",
+        "required": [
+          "job_id",
+          "status",
+          "sources"
+        ],
+        "properties": {
+          "data": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The extracted data (`null` until the job completed)"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job failed"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractSource"
+            },
+            "description": "URLs used, including those resolved from globs"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "`running`, `completed`, `failed`, `cancelled` or `paused`"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Non-fatal issues: truncated context, failed pages, capped globs, ..."
+          }
+        }
+      },
       "ExtractedSchema": {
         "type": "object",
         "description": "Extracted schema data from an HTML document",
@@ -4442,6 +5250,248 @@
           "replace"
         ]
       },
+      "JobKind": {
+        "type": "string",
+        "description": "The kind of a job.",
+        "enum": [
+          "crawl",
+          "batch_scrape",
+          "extract"
+        ]
+      },
+      "JobResultError": {
+        "type": "object",
+        "description": "Error of a failed result item",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Machine-readable code (`fetch_error`, `http_error`, `validation_error`, ...)"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "JobResultItem": {
+        "type": "object",
+        "description": "A single job result, shaped like a `/scrape` response. Fields a job did\nnot produce (formats/features it did not request) are omitted.",
+        "required": [
+          "success",
+          "url"
+        ],
+        "properties": {
+          "ai": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "AI enrichment results (`summary`, `extract`)"
+          },
+          "block_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL of the block (with its anchor), when the crawl split pages into blocks"
+          },
+          "blocks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            }
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "crawled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the page was crawled (crawl jobs)"
+          },
+          "document_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Meilisearch document id (crawl jobs)"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobResultError",
+                "description": "Why this page failed (`success: false`)"
+              }
+            ]
+          },
+          "extract": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom selector extraction results"
+          },
+          "html": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Position of `source_url` in the submitted `urls` (batch scrape / extract)",
+            "minimum": 0
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "markdown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Page metadata (same shape as `ScrapeResponse.metadata`)"
+          },
+          "page_block": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Block index within the page, when the crawl split pages into blocks",
+            "minimum": 0
+          },
+          "raw_html": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "JSON-LD / structured data"
+          },
+          "scrape_duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL as submitted (batch scrape / extract)"
+          },
+          "status_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Whether this page was scraped successfully"
+          },
+          "url": {
+            "type": "string",
+            "description": "Page URL (after redirects)"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "JobResultsResponse": {
+        "type": "object",
+        "description": "One page of a job's results",
+        "required": [
+          "job_id",
+          "job_type",
+          "status",
+          "total",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobResultItem"
+            },
+            "description": "Results, each shaped like a `/scrape` response"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "job_type": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`crawl`, `batch_scrape` or `extract`"
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor of the next page; `null` once the job is terminal and every\nresult was returned. Always set while the job runs."
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "Job status at the time of the read"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of results available so far",
+            "minimum": 0
+          }
+        }
+      },
       "JobStatus": {
         "type": "string",
         "description": "Crawl job status",
@@ -4459,6 +5509,7 @@
         "description": "Job status response",
         "required": [
           "job_id",
+          "job_type",
           "status",
           "index_uid",
           "pages_crawled",
@@ -4515,6 +5566,10 @@
           },
           "job_id": {
             "type": "string"
+          },
+          "job_type": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`crawl`, `batch_scrape` or `extract`"
           },
           "max_pages": {
             "type": [
@@ -4991,6 +6046,48 @@
           }
         }
       },
+      "RequestCookie": {
+        "type": "object",
+        "description": "A cookie to send with a one-off fetch (HTTP or browser).",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cookie domain. Defaults to the target URL's host (host-only cookie).\nMust be the target host or a parent domain of it."
+          },
+          "http_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cookie path (default `/`)."
+          },
+          "secure": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "SchemaFeatureConfig": {
         "type": "object",
         "description": "Schema.org extraction settings",
@@ -5046,6 +6143,20 @@
           }
         ],
         "description": "A single schema.org item"
+      },
+      "ScrapeActionsResult": {
+        "type": "object",
+        "description": "Results of the /scrape `actions`",
+        "required": [
+          "javascript_returns"
+        ],
+        "properties": {
+          "javascript_returns": {
+            "type": "array",
+            "items": {},
+            "description": "Values of the `execute_javascript` actions, in order (JSON\nround-tripped; `undefined` is `null`)"
+          }
+        }
       },
       "ScrapeFormat": {
         "type": "string",
@@ -5132,6 +6243,13 @@
           "url"
         ],
         "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Browser actions run after the page loads and before content (and\nany screenshot) is captured: wait, click, scroll, write, press,\nexecute_javascript. Forces browser rendering. At most 50; all\nactions together must finish within 30s."
+          },
           "ai": {
             "oneOf": [
               {
@@ -5142,6 +6260,13 @@
                 "description": "AI enrichment options"
               }
             ]
+          },
+          "cookies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestCookie"
+            },
+            "description": "Cookies sent with the request (both the HTTP and the browser path),\nscoped to the target site: a cookie's `domain` must be the target\nhost or a parent domain of it. At most 50."
           },
           "exclude_selectors": {
             "type": "array",
@@ -5188,13 +6313,32 @@
             },
             "description": "CSS selectors to keep (only extract from these)"
           },
+          "mobile": {
+            "type": "boolean",
+            "description": "Emulate a phone (mobile viewport, touch, Android Chrome user agent)\nto get the mobile layout of responsive sites. Forces browser\nrendering."
+          },
           "only_main_content": {
             "type": "boolean",
             "description": "Whether to only return the main content (excludes nav, footer, etc.)"
           },
+          "parsers": {
+            "$ref": "#/components/schemas/ParserOptions",
+            "description": "Document parsing options, used when the URL serves a PDF or an\noffice document (OCR of scanned pages, page limits)."
+          },
           "render_js": {
             "type": "boolean",
             "description": "Render JavaScript before extracting content (requires Chrome/Chromium)"
+          },
+          "screenshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenshotRequestOptions",
+                "description": "Screenshot options, used when `formats` includes `\"screenshot\"`"
+              }
+            ]
           },
           "timeout_ms": {
             "type": "integer",
@@ -5218,6 +6362,17 @@
           "scrape_duration_ms"
         ],
         "properties": {
+          "actions": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScrapeActionsResult",
+                "description": "Results of the request's `actions` (present when actions were sent)"
+              }
+            ]
+          },
           "ai": {
             "oneOf": [
               {
@@ -5245,6 +6400,17 @@
               "null"
             ],
             "description": "Extracted main content text (if requested)"
+          },
+          "document": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DocumentInfo",
+                "description": "Document details, when the URL served (or the upload is) a PDF or an\noffice document: format, pages, and which pages still need OCR."
+              }
+            ]
           },
           "extract": {
             "type": [
@@ -5299,6 +6465,17 @@
               }
             ]
           },
+          "ocr": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OcrInfo",
+                "description": "What OCR did, when `parsers.ocr` requested it."
+              }
+            ]
+          },
           "raw_html": {
             "type": [
               "string",
@@ -5323,6 +6500,13 @@
             "description": "Time taken to scrape in milliseconds",
             "minimum": 0
           },
+          "screenshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64-encoded PNG screenshot (if format \"screenshot\" requested)"
+          },
           "status_code": {
             "type": "integer",
             "format": "int32",
@@ -5345,6 +6529,24 @@
             "description": "Warning message (e.g. \"AI requires OPENAI_API_KEY\")"
           }
         }
+      },
+      "ScreenshotRequestOptions": {
+        "type": "object",
+        "description": "Screenshot options for /scrape",
+        "properties": {
+          "full_page": {
+            "type": "boolean",
+            "description": "Capture the whole scrollable page (default) instead of only the\nviewport. Very long pages are cropped to 16384 px."
+          }
+        }
+      },
+      "ScrollDirection": {
+        "type": "string",
+        "description": "Scroll direction for a [`Action::Scroll`].",
+        "enum": [
+          "up",
+          "down"
+        ]
       },
       "SearchRequest": {
         "type": "object",
@@ -6153,6 +7355,187 @@
           "page_error",
           "batch_sent"
         ]
+      },
+      "OcrInfo": {
+        "type": "object",
+        "description": "What OCR did (present when `parsers.ocr` is not `off`).",
+        "required": [
+          "mode",
+          "pages_processed",
+          "pages_cached",
+          "pages_skipped",
+          "pages_capped",
+          "pages_failed",
+          "pages"
+        ],
+        "properties": {
+          "backend": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Backend that recognized pages (`vision:<provider>/<model>`,\n`tesseract:<lang>`)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/OcrMode"
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "1-indexed pages that were OCR'd."
+          },
+          "pages_cached": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Of `pages_processed`, pages served from the OCR cache (not billed).",
+            "minimum": 0
+          },
+          "pages_capped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages that needed OCR but exceeded the page cap or daily budget.",
+            "minimum": 0
+          },
+          "pages_failed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages whose recognition failed.",
+            "minimum": 0
+          },
+          "pages_processed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages whose text now comes from OCR.",
+            "minimum": 0
+          },
+          "pages_skipped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pages left on the native text-extraction path.",
+            "minimum": 0
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "OcrMode": {
+        "type": "string",
+        "description": "When to run OCR on a document.",
+        "enum": [
+          "off",
+          "auto",
+          "force"
+        ]
+      },
+      "DocumentInfo": {
+        "type": "object",
+        "description": "What the document parser found.",
+        "required": [
+          "format",
+          "content_type",
+          "parser",
+          "bytes",
+          "needs_ocr",
+          "has_tables"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Document size in bytes.",
+            "minimum": 0
+          },
+          "content_type": {
+            "type": "string",
+            "description": "Canonical media type of the format."
+          },
+          "format": {
+            "type": "string",
+            "description": "Detected format: `pdf`, `docx`, `xlsx`, `pptx`, `doc`, `ppt`, `odt`,\n`ods`, `odp`, `rtf`, `epub`, `csv`, `image`."
+          },
+          "has_tables": {
+            "type": "boolean",
+            "description": "Tables were detected and rendered as Markdown tables."
+          },
+          "needs_ocr": {
+            "type": "boolean",
+            "description": "Whether some pages still have no text (not OCR'd)."
+          },
+          "page_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Pages in the document (PDF, image).",
+            "minimum": 0
+          },
+          "pages_needing_ocr": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "1-indexed pages that still need OCR."
+          },
+          "pages_processed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Pages actually parsed (\u2264 `page_count` with `parsers.max_pages`).",
+            "minimum": 0
+          },
+          "parser": {
+            "type": "string",
+            "description": "Parser backend (`pdf-inspector`, `anydoc`, `image`)."
+          },
+          "pdf_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PDF classification: `text_based`, `scanned`, `image_based`, `mixed`."
+          }
+        }
+      },
+      "ParserOptions": {
+        "type": "object",
+        "description": "Document parsing options for `/scrape` and `/parse`.",
+        "properties": {
+          "max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Parse at most this many PDF pages (the first N).",
+            "minimum": 0
+          },
+          "ocr": {
+            "$ref": "#/components/schemas/OcrMode",
+            "description": "OCR for scanned / image-only pages: `off` (default \u2014 scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\nbilled at a higher per-page rate."
+          },
+          "ocr_max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Per-document OCR page cap. Can only lower the server cap\n(`OCR_MAX_PAGES_PER_DOCUMENT`, default 50).",
+            "minimum": 0
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -6204,6 +7587,10 @@
     {
       "name": "auth",
       "description": "Authentication and account management"
+    },
+    {
+      "name": "extract",
+      "description": "Structured extraction over one or many pages"
     }
   ]
 }

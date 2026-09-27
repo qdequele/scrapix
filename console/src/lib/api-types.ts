@@ -25,6 +25,8 @@ export interface SystemStats {
 // Also used by GET /job/{id}/status
 export interface Job {
   job_id: string;
+  /** `crawl`, `batch_scrape` or `extract` (absent from older engines) */
+  job_type?: "crawl" | "batch_scrape" | "extract";
   status: string;
   index_uid: string;
   pages_crawled: number;
@@ -162,6 +164,10 @@ export interface ScrapeResult {
   blocks?: ContentBlock[];
   extract?: Record<string, unknown>;
   ai?: AiResult;
+  /** Base64-encoded PNG (format `screenshot`) */
+  screenshot?: string;
+  /** Results of the request's `actions` (present when actions were sent) */
+  actions?: ScrapeActionsResult;
   warning?: string;
   /** Present when the URL served (or the upload is) a PDF or office document. */
   document?: DocumentInfo;
@@ -204,6 +210,45 @@ export interface OcrInfo {
   pages_failed: number;
   pages: number[];
   warning?: string;
+}
+
+export interface ScrapeActionsResult {
+  /** Values of the `execute_javascript` actions, in order (`undefined` is `null`) */
+  javascript_returns: unknown[];
+}
+
+/** A browser interaction run after the page loads (POST /scrape `actions`). */
+export type ScrapeAction =
+  | { type: "wait"; ms?: number; selector?: string }
+  | { type: "click"; selector: string }
+  | { type: "scroll"; direction?: "up" | "down"; amount?: number }
+  | { type: "write"; selector: string; text: string }
+  | { type: "press"; key: string }
+  | { type: "execute_javascript"; script: string };
+
+/** A cookie sent with a scrape (POST /scrape `cookies`). */
+export interface RequestCookie {
+  name: string;
+  value: string;
+  /** Target host or a parent domain of it; defaults to the target host */
+  domain?: string;
+  path?: string;
+  secure?: boolean;
+  http_only?: boolean;
+}
+
+/** Error body returned by the engine (`ApiError`). */
+export interface ApiErrorBody {
+  error: string;
+  code: string;
+  details?: unknown;
+}
+
+/** `details` of a 422 `action_error`. */
+export interface ActionErrorDetails {
+  action_index: number;
+  action_type: string;
+  message: string;
 }
 
 export interface ContentBlock {
@@ -516,4 +561,89 @@ export interface JobEventsHistoryResponse {
   returned: number;
   limit: number;
   offset: number;
+}
+
+// ============================================================================
+// Job results (GET /job/{id}/results), batch scrape, extract
+// ============================================================================
+
+export type JobType = "crawl" | "batch_scrape" | "extract";
+
+export interface JobResultError {
+  code: string;
+  message: string;
+}
+
+/** One job result: a `/scrape` response plus job-specific fields. */
+export interface JobResultItem extends Partial<Omit<ScrapeResult, "success" | "url">> {
+  success: boolean;
+  url: string;
+  source_url?: string;
+  index?: number;
+  error?: JobResultError;
+  document_id?: string;
+  crawled_at?: string;
+  page_block?: number;
+  block_url?: string;
+}
+
+export interface JobResultsPage {
+  job_id: string;
+  job_type: JobType;
+  status: string;
+  total: number;
+  next: string | null;
+  data: JobResultItem[];
+}
+
+/** POST /batch/scrape. Any other `/scrape` option is also accepted. */
+export interface BatchScrapeRequest {
+  urls: string[];
+  /** URLs scraped at once (default 10, max 25) */
+  concurrency?: number;
+  formats?: string[];
+  only_main_content?: boolean;
+  include_links?: boolean;
+  render_js?: boolean;
+  timeout_ms?: number;
+}
+
+export interface BatchScrapeResponse {
+  job_id: string;
+  status: string;
+  urls_count: number;
+  message: string;
+}
+
+export interface ExtractFieldDefinition {
+  name: string;
+  description?: string;
+  field_type?: string;
+  required?: boolean;
+}
+
+export interface ExtractRequest {
+  urls: string[];
+  prompt?: string;
+  schema?: Record<string, unknown> | ExtractFieldDefinition[];
+  render_js?: boolean;
+  only_main_content?: boolean;
+  timeout_ms?: number;
+  headers?: Record<string, string>;
+}
+
+export interface ExtractSource {
+  url: string;
+  from_glob?: string;
+  success: boolean | null;
+  error?: string;
+}
+
+export interface ExtractStatus {
+  job_id: string;
+  status: string;
+  data: unknown;
+  sources: ExtractSource[];
+  warning?: string;
+  error?: string;
 }

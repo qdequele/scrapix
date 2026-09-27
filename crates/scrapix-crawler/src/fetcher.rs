@@ -179,6 +179,15 @@ pub struct FetcherConfig {
     /// hostnames whose DNS results are private; raw-IP hosts (seed URLs and
     /// redirect targets) are always refused regardless of this flag.
     pub allow_private_ips: bool,
+    /// Keep a cookie store for this fetcher: cookies set by responses
+    /// (e.g. along a redirect or login flow) are sent on later requests.
+    /// The store lives as long as the fetcher, so only enable it on a
+    /// one-off fetcher built for a single request — on a shared fetcher it
+    /// would leak cookies between unrelated requests.
+    pub cookie_store: bool,
+    /// Cookies seeding the store, as `(Set-Cookie value, URL it applies
+    /// to)`. Non-empty implies `cookie_store`.
+    pub initial_cookies: Vec<(String, Url)>,
 }
 
 impl Default for FetcherConfig {
@@ -195,6 +204,8 @@ impl Default for FetcherConfig {
             custom_headers: HashMap::new(),
             retry_config: RetryConfig::default(),
             allow_private_ips: false,
+            cookie_store: false,
+            initial_cookies: Vec::new(),
         }
     }
 }
@@ -248,6 +259,9 @@ pub struct HttpFetcher {
     /// Per-proxy clients (keyed by proxy URL), built lazily with the same
     /// settings as `client` plus `.proxy(..)`.
     proxy_clients: dashmap::DashMap<String, Client>,
+    /// This fetcher's cookie store (`FetcherConfig::cookie_store`), shared by
+    /// its clients.
+    cookie_jar: Option<Arc<reqwest::cookie::Jar>>,
 }
 
 /// Upper bound on cached per-proxy clients. Past it the cache is cleared
@@ -266,7 +280,14 @@ impl HttpFetcher {
         robots_cache: Arc<RobotsCache>,
         dns_resolver: Option<Arc<CachingDnsResolver>>,
     ) -> Result<Self> {
-        let client = Self::build_client(&config, dns_resolver.clone(), None)?;
+        let cookie_jar = (config.cookie_store || !config.initial_cookies.is_empty()).then(|| {
+            let jar = reqwest::cookie::Jar::default();
+            for (cookie, url) in &config.initial_cookies {
+                jar.add_cookie_str(cookie, url);
+            }
+            Arc::new(jar)
+        });
+        let client = Self::build_client(&config, dns_resolver.clone(), None, cookie_jar.clone())?;
 
         Ok(Self {
             client,
@@ -274,6 +295,7 @@ impl HttpFetcher {
             robots_cache,
             dns_resolver,
             proxy_clients: dashmap::DashMap::new(),
+            cookie_jar,
         })
     }
 
@@ -285,6 +307,7 @@ impl HttpFetcher {
         config: &FetcherConfig,
         dns_resolver: Option<Arc<CachingDnsResolver>>,
         proxy: Option<&str>,
+        cookie_jar: Option<Arc<reqwest::cookie::Jar>>,
     ) -> Result<Client> {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
@@ -328,6 +351,9 @@ impl HttpFetcher {
                 .map_err(|e| ScrapixError::Config(format!("Invalid proxy URL: {e}")))?;
             builder = builder.proxy(proxy);
         }
+        if let Some(jar) = cookie_jar {
+            builder = builder.cookie_provider(jar);
+        }
         builder
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
@@ -367,12 +393,23 @@ impl HttpFetcher {
         if let Some(client) = self.proxy_clients.get(proxy) {
             return Ok(client.clone());
         }
-        let client = Self::build_client(&self.config, self.dns_resolver.clone(), Some(proxy))?;
+        let client = Self::build_client(
+            &self.config,
+            self.dns_resolver.clone(),
+            Some(proxy),
+            self.cookie_jar.clone(),
+        )?;
         if self.proxy_clients.len() >= MAX_PROXY_CLIENTS {
             self.proxy_clients.clear();
         }
         self.proxy_clients.insert(proxy.to_string(), client.clone());
         Ok(client)
+    }
+
+    /// Whether this fetcher may fetch hosts resolving to private addresses
+    /// (so one-off fetchers built for a request can inherit the setting).
+    pub fn allows_private_ips(&self) -> bool {
+        self.config.allow_private_ips
     }
 
     /// Create a new HTTP fetcher with default configuration
@@ -1005,6 +1042,20 @@ impl HttpFetcherBuilder {
     pub fn dns_max_cache_size(mut self, size: usize) -> Self {
         let config = self.dns_config.get_or_insert_with(DnsConfig::default);
         config.max_cache_size = size;
+        self
+    }
+
+    /// Keep a cookie store for this fetcher (see
+    /// [`FetcherConfig::cookie_store`]; one-off fetchers only).
+    pub fn cookie_store(mut self, enabled: bool) -> Self {
+        self.config.cookie_store = enabled;
+        self
+    }
+
+    /// Seed the cookie store with `set_cookie` (a `Set-Cookie` value) for
+    /// `url`. Enables the store.
+    pub fn cookie(mut self, set_cookie: impl Into<String>, url: Url) -> Self {
+        self.config.initial_cookies.push((set_cookie.into(), url));
         self
     }
 

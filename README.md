@@ -168,6 +168,37 @@ GET /job/{job_id}/status
 }
 ```
 
+### Get Job Results
+
+```bash
+GET /job/{job_id}/results?limit=50&cursor=<next>
+
+# Paginated documents from any job (crawl, batch scrape, extract),
+# each shaped like a /scrape response
+```
+
+### Batch Scrape
+
+```bash
+POST /batch/scrape
+Content-Type: application/json
+
+{ "urls": ["https://a.com/x", "https://b.com/y"], "formats": ["markdown"] }
+
+# Response: { "job_id": "..." } — read pages via /job/{job_id}/results
+```
+
+### Extract
+
+```bash
+POST /extract
+Content-Type: application/json
+
+{ "urls": ["https://example.com/blog/*"], "prompt": "Titles and authors of the posts" }
+
+# Poll GET /extract/{job_id} for { "status", "data", "sources" }
+```
+
 ### Stream Job Events (SSE)
 
 ```bash
@@ -235,6 +266,15 @@ GET /jobs?limit=10&offset=0
 ```bash
 GET /health
 ```
+
+## SDKs
+
+Official clients generated from [`contracts/openapi.json`](contracts/openapi.json), with retries and a job watcher (`crawl_and_wait` / `crawlAndWait`):
+
+- Python: [`sdks/python`](sdks/python) (`pip install scrapix`)
+- TypeScript: [`sdks/typescript`](sdks/typescript) (`npm install scrapix`)
+
+After changing the spec, run `just sdk-generate` (CI fails on stale generated code via `just sdk-check`). See [`sdks/README.md`](sdks/README.md).
 
 ## CLI Usage
 

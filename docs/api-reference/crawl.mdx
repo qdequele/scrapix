@@ -113,7 +113,9 @@ This ensures zero-downtime re-indexing — the target index always contains eith
 
 ### Example
 
-```bash
+<CodeGroup>
+
+```bash curl
 curl -X POST http://localhost:8080/crawl \
   -H "Content-Type: application/json" \
   -d '{
@@ -127,6 +129,50 @@ curl -X POST http://localhost:8080/crawl \
     }
   }'
 ```
+
+```python Python
+from scrapix import Scrapix
+
+client = Scrapix(base_url="http://localhost:8080")
+
+# Start the crawl, poll its status until it ends, then read every document
+result = client.crawl_and_wait(
+    "https://docs.meilisearch.com",
+    index_uid="meilisearch-docs",
+    max_depth=5,
+    max_pages=1000,
+    meilisearch={"url": "http://localhost:7700", "api_key": "masterKey"},
+    on_progress=lambda job: print(job.status.value, job.pages_crawled),
+)
+print(result.status, len(result.documents))
+
+# Or only start it: client.crawl(...) returns the job id immediately
+```
+
+```ts TypeScript
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix({ baseUrl: "http://localhost:8080" });
+
+// Start the crawl, poll its status until it ends, then read every document
+const { job, documents } = await scrapix.crawlAndWait(
+  {
+    start_urls: ["https://docs.meilisearch.com"],
+    index_uid: "meilisearch-docs",
+    max_depth: 5,
+    max_pages: 1000,
+    meilisearch: { url: "http://localhost:7700", api_key: "masterKey" },
+  },
+  { onProgress: (s) => console.log(s.status, s.pages_crawled) },
+);
+console.log(job.status, documents.length);
+
+// Or only start it: scrapix.crawl(...) resolves with the job id immediately
+```
+
+</CodeGroup>
+
+See the [Python](/sdks/python) and [TypeScript](/sdks/typescript) SDKs.
 
 ---
 
@@ -165,6 +211,28 @@ If the job fails, the endpoint returns an error:
 }
 ```
 
+### Including results
+
+Add `?include_results=true` to also get the first page of the job's documents (the same payload as [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results)) under `results`. `results_limit` sets its page size (default 20, max 100). Follow `results.next` with `GET /job/{id}/results` for the rest.
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "...": "...",
+  "results": {
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "job_type": "crawl",
+    "status": "completed",
+    "total": 245,
+    "next": "76313a3230",
+    "data": [{ "success": true, "url": "https://docs.example.com/", "markdown": "# Docs", "metadata": { "title": "Docs" } }]
+  }
+}
+```
+
+If the results cannot be read (for example the job's Meilisearch instance is unreachable), the job status is still returned, with `results_error` explaining why.
+
 ### Use Cases
 
 - **CI/CD pipelines** — crawl documentation as part of a deployment
@@ -177,7 +245,9 @@ If the job fails, the endpoint returns an error:
 
 ### Example
 
-```bash
+<CodeGroup>
+
+```bash curl
 curl -X POST http://localhost:8080/crawl/sync \
   -H "Content-Type: application/json" \
   -d '{
@@ -191,6 +261,33 @@ curl -X POST http://localhost:8080/crawl/sync \
     }
   }'
 ```
+
+```python Python
+from scrapix import Scrapix
+
+client = Scrapix(base_url="http://localhost:8080")
+job = client.crawl_sync(
+    "https://example.com",
+    index_uid="test",
+    max_depth=2,
+    max_pages=50,
+    include_results=True,
+)
+print(job.status, job.pages_crawled, job.results.total if job.results else 0)
+```
+
+```ts TypeScript
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix({ baseUrl: "http://localhost:8080" });
+const job = await scrapix.crawlSync(
+  { start_urls: ["https://example.com"], index_uid: "test", max_depth: 2, max_pages: 50 },
+  { include_results: true },
+);
+console.log(job.status, job.pages_crawled, job.results?.total);
+```
+
+</CodeGroup>
 
 ---
 

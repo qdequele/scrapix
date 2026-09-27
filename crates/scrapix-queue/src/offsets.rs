@@ -98,7 +98,7 @@ impl OffsetTracker {
         let mut out = Vec::new();
         for ((topic, partition), st) in self.parts.iter_mut() {
             if let Some(c) = st.committable() {
-                if st.last_committed.map_or(true, |prev| c > prev) {
+                if st.last_committed.is_none_or(|prev| c > prev) {
                     st.last_committed = Some(c);
                     st.last_progress_at = Some(now);
                     out.push((topic.clone(), *partition, c));

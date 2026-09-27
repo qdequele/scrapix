@@ -2,7 +2,6 @@ import type {
   SystemStats,
   Job,
   JobStatus,
-  CrawlConfig,
   RecentErrors,
   ScrapeResult,
   ParserOptions,
@@ -36,6 +35,14 @@ import type {
   MemberInfo,
   InviteInfo,
   JobEventsHistoryResponse,
+  JobResultsPage,
+  ExtractRequest,
+  ExtractStatus,
+  ApiErrorBody,
+  ScrapeAction,
+  RequestCookie,
+  BatchScrapeRequest,
+  BatchScrapeResponse,
 } from "./api-types";
 import { useAccountStore } from "./account-store";
 
@@ -68,6 +75,29 @@ function getWsBase(): string {
   return "ws://localhost:8080";
 }
 
+function isApiErrorBody(value: unknown): value is ApiErrorBody {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.error === "string" && typeof v.code === "string";
+}
+
+/**
+ * A non-2xx API response. `message` is the raw response body (as before);
+ * `body` is the parsed engine error (`{ error, code, details? }`) when the
+ * response was one.
+ */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly body: ApiErrorBody | null;
+
+  constructor(status: number, message: string, body: ApiErrorBody | null) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const accountId = useAccountStore.getState().selectedAccountId;
@@ -81,8 +111,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(
-      body || `API error: ${res.status} ${res.statusText}`
+    let parsed: ApiErrorBody | null = null;
+    try {
+      const json: unknown = JSON.parse(body);
+      if (isApiErrorBody(json)) parsed = json;
+    } catch {
+      // not JSON
+    }
+    throw new ApiRequestError(
+      res.status,
+      body || `API error: ${res.status} ${res.statusText}`,
+      parsed
     );
   }
   return res.json();
@@ -154,6 +193,12 @@ export interface ScrapeOptions {
   };
   /** Used when the URL serves a PDF or office document. */
   parsers?: ParserOptions;
+  render_js?: boolean;
+  /** Used when `formats` includes `screenshot` */
+  screenshot?: { full_page: boolean };
+  actions?: ScrapeAction[];
+  mobile?: boolean;
+  cookies?: RequestCookie[];
 }
 
 export async function submitScrape(opts: ScrapeOptions): Promise<ScrapeResult> {
@@ -203,6 +248,49 @@ export async function submitMap(opts: MapOptions): Promise<MapResult> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(opts),
   });
+}
+
+// ============================================================================
+// Job results, batch scrape, extract
+// ============================================================================
+
+export async function fetchJobResults(
+  id: string,
+  cursor?: string | null,
+  limit = 20
+): Promise<JobResultsPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  return request(`/job/${encodeURIComponent(id)}/results?${params}`);
+}
+
+export async function submitBatchScrape(
+  req: BatchScrapeRequest
+): Promise<BatchScrapeResponse> {
+  return request("/batch/scrape", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+/** Cancel a running job (`DELETE /job/{id}`); throws on 404/409. */
+export async function cancelJob(id: string): Promise<JobStatus> {
+  return request(`/job/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function submitExtract(
+  req: ExtractRequest
+): Promise<{ job_id: string; status: string }> {
+  return request("/extract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export async function fetchExtract(id: string): Promise<ExtractStatus> {
+  return request(`/extract/${encodeURIComponent(id)}`);
 }
 
 // ============================================================================

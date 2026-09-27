@@ -146,7 +146,7 @@ pub fn encode_rgba_as_png(
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
     for y in 0..height as usize {
         let line = &pixels[y * stride..y * stride + row];
-        for px in line.chunks_exact(4) {
+        for px in line.as_chunks::<4>().0 {
             rgb.extend_from_slice(&px[..3]);
         }
     }

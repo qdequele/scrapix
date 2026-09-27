@@ -1,0 +1,109 @@
+---
+title: Extract
+description: Structured data extraction over one or many pages, with URL globs
+---
+
+# Extract
+
+`POST /extract` turns one or more web pages into a single structured result. You describe what you want with a `prompt`, a `schema`, or both; the engine fetches every page through the [`/scrape`](/api-reference/scrape) pipeline, then runs one AI extraction over their combined content. URL globs such as `https://example.com/blog/*` are resolved to concrete URLs first.
+
+Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET /extract/{id}` for the result. The job also shows up in `GET /jobs`, streams events (`GET /job/{id}/events`), delivers webhooks and can be cancelled with `DELETE /job/{id}`. The fetched pages are available from [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results).
+
+<Note>
+  Extraction requires an AI provider on the server (`AI_PROVIDER` and the matching API key, see [AI enrichment](/guides/ai-enrichment)). Without one, `POST /extract` fails with `503` and code `service_unavailable`.
+</Note>
+
+## POST /extract
+
+### Request Body
+
+```json
+{
+  "urls": ["https://example.com/pricing", "https://example.com/blog/*"],
+  "prompt": "List the plans with their monthly price, and the titles of the blog posts",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "plans": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": { "name": { "type": "string" }, "monthly_price": { "type": "number" } }
+        }
+      },
+      "blog_posts": { "type": "array", "items": { "type": "string" } }
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `urls` | string[] | **required** | URLs and URL globs, 50 URLs max in total after glob resolution |
+| `prompt` | string | — | What to extract, in natural language. Required when there is no `schema` |
+| `schema` | object \| array | — | A JSON Schema object, or a list of fields `[{ "name", "description", "field_type", "required" }]` (the `/scrape` `ai.extract.schema` form) |
+| `render_js` | boolean | `false` | Render JavaScript when fetching pages (requires Chrome/Chromium) |
+| `only_main_content` | boolean | `true` | Only use each page's main content |
+| `timeout_ms` | integer | `30000` | Per-page fetch timeout |
+| `headers` | object | `{}` | Custom HTTP headers for the page fetches |
+| `webhooks` | object[] | `[]` | Webhook subscriptions, same format as a crawl's |
+
+### Response
+
+```json
+{ "job_id": "0f7f3c8e-5a0d-4c0e-9f64-3f5c2a8b9d11", "status": "running" }
+```
+
+## GET /extract/{id}
+
+```json
+{
+  "job_id": "0f7f3c8e-5a0d-4c0e-9f64-3f5c2a8b9d11",
+  "status": "completed",
+  "data": {
+    "plans": [{ "name": "Pro", "monthly_price": 30 }],
+    "blog_posts": ["Announcing v2", "How we index 1B documents"]
+  },
+  "sources": [
+    { "url": "https://example.com/pricing", "success": true },
+    { "url": "https://example.com/blog/announcing-v2", "from_glob": "https://example.com/blog/*", "success": true },
+    { "url": "https://example.com/blog/old-post", "from_glob": "https://example.com/blog/*", "success": false, "error": "http_error: HTTP 404" }
+  ],
+  "warning": "1 of 3 pages could not be fetched"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status` | `running`, `completed`, `failed`, `cancelled` or `paused` |
+| `data` | The extracted JSON, `null` until the job completed |
+| `sources` | Every URL used, including those resolved from globs (`from_glob`), with whether it could be fetched (`success` is `null` until it was tried) |
+| `warning` | Non-fatal issues: pages that failed, truncated context, globs that matched nothing or more than the cap |
+| `error` | Why the job failed (no URL resolved, no page could be fetched, AI error, out of credits) |
+
+`sources` is filled as soon as the URLs are resolved, so a running job already shows what it is working on.
+
+## How it works
+
+1. **Resolve.** A URL containing `*` is a glob (a single `*` also matches `/` at the end of a pattern; `**` matches anything). It must start with a fixed scheme and hostname. The engine discovers candidates like [`/map`](/api-reference/map) does — the site's sitemaps (via `robots.txt`), then the links of the glob's base page (`https://example.com/blog/` for `https://example.com/blog/*`) — and keeps the same-host page URLs that match. Explicit URLs and resolved ones are capped at **50** in total.
+2. **Fetch.** Each URL is scraped as markdown (5 at a time), exactly as `POST /scrape` would.
+3. **Extract.** When all pages fit the AI context budget (24,000 tokens by default, `EXTRACT_CONTEXT_TOKENS` on the server), a single extraction runs over the combined content, each page headed by its URL. Otherwise the engine extracts from each page separately (each truncated to the budget), then runs a merge pass that combines the partial results into one — deduplicating lists and preferring non-null values.
+
+## Billing
+
+- each page fetched: what the same `/scrape` request costs (markdown: 1 credit);
+- each glob resolved: a `/map` (2 credits);
+- each AI call: an AI extraction (5 credits). A single-pass extraction makes one call; a large one makes one call per page plus one merge call.
+
+The request is rejected with `402` when the balance cannot cover the minimum (the explicit URLs, the globs and one AI call).
+
+### Example
+
+```bash
+JOB=$(curl -s -X POST http://localhost:8080/extract \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
+  -d '{"urls": ["https://example.com"], "prompt": "What is this site about? Return {\"summary\": string}"}' | jq -r .job_id)
+
+curl -s http://localhost:8080/extract/$JOB -H "X-API-Key: $SCRAPIX_API_KEY"
+```

@@ -181,6 +181,42 @@ CREATE TABLE public.crawl_configs (
 
 
 --
+-- Name: job_results; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_results (
+    id bigint NOT NULL,
+    job_id text NOT NULL,
+    seq integer NOT NULL,
+    kind text DEFAULT 'page'::text NOT NULL,
+    url text,
+    success boolean DEFAULT true NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT job_results_kind_check CHECK ((kind = ANY (ARRAY['page'::text, 'extract'::text])))
+);
+
+
+--
+-- Name: job_results_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.job_results_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: job_results_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.job_results_id_seq OWNED BY public.job_results.id;
+
+
+--
 -- Name: jobs; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -816,6 +852,13 @@ CREATE TABLE public.users (
 
 
 --
+-- Name: job_results id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_results ALTER COLUMN id SET DEFAULT nextval('public.job_results_id_seq'::regclass);
+
+
+--
 -- Name: solid_queue_blocked_executions id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -938,6 +981,14 @@ ALTER TABLE ONLY public.ar_internal_metadata
 
 ALTER TABLE ONLY public.crawl_configs
     ADD CONSTRAINT crawl_configs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: job_results job_results_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_results
+    ADD CONSTRAINT job_results_pkey PRIMARY KEY (id);
 
 
 --
@@ -1247,6 +1298,13 @@ CREATE UNIQUE INDEX index_crawl_configs_on_account_id_and_name ON public.crawl_c
 --
 
 CREATE INDEX index_crawl_configs_on_next_run_at_due ON public.crawl_configs USING btree (next_run_at) WHERE ((cron_enabled = true) AND (cron_expression IS NOT NULL));
+
+
+--
+-- Name: index_job_results_on_job_id_and_seq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_job_results_on_job_id_and_seq ON public.job_results USING btree (job_id, seq);
 
 
 --
@@ -1596,6 +1654,14 @@ ALTER TABLE ONLY public.user_recovery_codes
 
 
 --
+-- Name: job_results fk_rails_1d3e7a3160; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_results
+    ADD CONSTRAINT fk_rails_1d3e7a3160 FOREIGN KEY (job_id) REFERENCES public.jobs(job_id) ON DELETE CASCADE;
+
+
+--
 -- Name: oauth_authorization_codes fk_rails_234c3254d2; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1818,6 +1884,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260927000001'),
 ('20260926000001'),
 ('20260817160001'),
 ('20260817131333'),

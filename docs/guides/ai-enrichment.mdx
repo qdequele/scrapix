@@ -148,6 +148,12 @@ curl -X POST http://localhost:8080/scrape \
 | `boolean` | True/false |
 | `array` | List of values |
 
+## Extract: One Result From Many Pages
+
+`POST /extract` runs one AI extraction over several pages at once (URL globs such as
+`https://example.com/blog/*` allowed) and returns a single structured result. See
+[Batch scrape and extract](/guides/batch-and-extract#extract).
+
 ## Crawl Jobs: AI Configuration
 
 ### Summarization on Every Page

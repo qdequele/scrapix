@@ -453,6 +453,8 @@ pub(crate) async fn document_response(
         blocks: None,
         extract: None,
         ai: ai_result,
+        screenshot: None,
+        actions: None,
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         document: Some(DocumentInfo::new(&parsed, bytes_len)),
         ocr: ocr_report.as_ref().map(OcrInfo::from),

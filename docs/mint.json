@@ -37,6 +37,13 @@
       ]
     },
     {
+      "group": "SDKs",
+      "pages": [
+        "sdks/python",
+        "sdks/typescript"
+      ]
+    },
+    {
       "group": "Configuration",
       "pages": [
         "configuration/environment-variables",
@@ -75,6 +82,8 @@
       "pages": [
         "api-reference/overview",
         "api-reference/scrape",
+        "api-reference/batch-scrape",
+        "api-reference/extract",
         "api-reference/parse",
         "api-reference/map",
         "api-reference/search",
@@ -93,6 +102,7 @@
       "group": "Guides",
       "pages": [
         "guides/scraping",
+        "guides/batch-and-extract",
         "guides/documents",
         "guides/crawling",
         "guides/authentication",

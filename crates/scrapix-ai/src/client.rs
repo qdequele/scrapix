@@ -384,8 +384,10 @@ impl AiClient {
 
         let mut attempt = 0;
         let mut last_error: Option<AiClientError> = None;
+        // `max_retries` counts total attempts; 0 still makes one call.
+        let max_attempts = self.config.max_retries.max(1);
 
-        while attempt < self.config.max_retries {
+        while attempt < max_attempts {
             attempt += 1;
 
             match call().await {
@@ -426,6 +428,9 @@ impl AiClient {
                     }
 
                     last_error = Some(e);
+                    if attempt == max_attempts {
+                        break;
+                    }
 
                     let delay = self.config.retry_delay_ms * 2u64.pow(attempt - 1);
                     debug!(delay_ms = delay, "Retrying after delay");
@@ -542,6 +547,34 @@ mod tests {
             let result = AiClient::new(config);
             assert!(result.is_ok(), "Failed to create provider: {}", provider);
         }
+    }
+
+    #[tokio::test]
+    async fn test_zero_retries_still_calls_provider() {
+        // Nothing listens on port 1, so the one attempt fails with a transport
+        // error; before the fix no attempt was made at all.
+        let client = AiClient::new(AiClientConfig {
+            api_key: "test-key".to_string(),
+            provider: "openai".to_string(),
+            base_url: Some("http://127.0.0.1:1".to_string()),
+            max_retries: 0,
+            timeout_ms: 2000,
+            ..Default::default()
+        })
+        .unwrap();
+        let result = client
+            .chat(
+                vec![Message {
+                    role: crate::providers::MessageRole::User,
+                    content: "hi".to_string(),
+                }],
+                "gpt-4",
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(AiClientError::MaxRetriesExceeded(_))));
     }
 
     #[test]

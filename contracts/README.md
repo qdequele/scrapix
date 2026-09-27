@@ -17,7 +17,9 @@ diagnostics). The engine no longer serves any SaaS route.
   routes). It is the contract the Rails app implements and the source the
   Rails MCP server generates its tools from. Hand-frozen — no generator
   regenerates it anymore; edit only on an intentional, reviewed contract
-  change.
+  change. The Python and TypeScript SDKs (`sdks/`) are generated from it:
+  after editing it, run `just sdk-generate` and commit the result (CI's
+  `just sdk-check` fails on stale SDK code).
 - `openapi.engine.json` — the engine-only spec served by the Rust API at
   `/openapi.json`, pinned by `cargo test -p scrapix-api --test
   openapi_snapshot`. Regenerate after an intentional engine API change with

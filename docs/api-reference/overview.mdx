@@ -74,6 +74,9 @@ All responses return JSON. Successful responses return the data directly. Errors
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/scrape` | [Scrape a single URL](/api-reference/scrape) |
+| `POST` | `/batch/scrape` | [Scrape many URLs as one job](/api-reference/batch-scrape) |
+| `POST` | `/extract` | [Structured extraction over pages and globs](/api-reference/extract) |
+| `GET` | `/extract/{id}` | [Extraction status and result](/api-reference/extract#get-extract-id) |
 | `POST` | `/parse` | [Parse an uploaded document](/api-reference/parse) |
 | `POST` | `/map` | [Discover URLs on a website](/api-reference/map) |
 | `POST` | `/search` | [Search indexed documents](/api-reference/search) |
@@ -81,6 +84,7 @@ All responses return JSON. Successful responses return the data directly. Errors
 | `POST` | `/crawl/sync` | [Create sync crawl job](/api-reference/crawl#create-sync-crawl) |
 | `GET` | `/jobs` | [List all jobs](/api-reference/jobs#list-jobs) |
 | `GET` | `/job/{id}/status` | [Get job status](/api-reference/jobs#get-job-status) |
+| `GET` | `/job/{id}/results` | [Paginated job results](/api-reference/jobs#get-job-id-results) |
 | `GET` | `/job/{id}/events` | [SSE event stream](/api-reference/jobs#job-events-sse) |
 | `DELETE` | `/job/{id}` | [Cancel a job](/api-reference/jobs#cancel-job) |
 | `POST` | `/job/{id}/pause` | [Pause a job](/api-reference/jobs#post-job-id-pause) |

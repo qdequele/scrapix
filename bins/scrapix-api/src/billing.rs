@@ -207,6 +207,12 @@ pub(crate) fn scrape_credits(
     scrapix_billing::scrape_credits(feature_count, has_ai_summary, has_ai_extraction)
 }
 
+/// Credits of one AI call made by `POST /extract` (the price of an AI
+/// extraction on `/scrape`).
+pub(crate) fn extract_ai_call_credits() -> i64 {
+    scrapix_billing::scrape_credits(0, false, true)
+}
+
 /// Re-export crawl credit calculation directly.
 pub fn crawl_credits_per_page(crawler_type: &CrawlerType, features: &FeaturesConfig) -> i64 {
     scrapix_billing::crawl_credits_per_page(crawler_type, features)
@@ -360,6 +366,11 @@ mod tests {
         );
         let credits = crawl_credits_per_page(&CrawlerType::Browser, &features);
         assert_eq!(credits, 16);
+    }
+
+    #[test]
+    fn test_extract_ai_call_credits() {
+        assert_eq!(extract_ai_call_credits(), 5);
     }
 
     #[test]

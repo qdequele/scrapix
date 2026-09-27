@@ -124,6 +124,28 @@ fmt:
     cargo fmt --all
 
 # ---------------------------------------------------------------------------
+# SDKs (sdks/typescript, sdks/python) — generated from contracts/openapi.json
+# ---------------------------------------------------------------------------
+
+# Regenerate the SDKs' types/models from contracts/openapi.json (run after any spec change)
+sdk-generate:
+    sdks/generate.sh
+
+# Fail if the committed generated SDK code is out of date with the spec
+sdk-check:
+    sdks/generate.sh --check
+
+# Typecheck, lint and test both SDKs (mocked HTTP, no live services)
+sdk-test:
+    cd sdks/typescript && npm ci --no-audit --no-fund && npm run typecheck && npm test
+    cd sdks/python && uv run --group dev ruff check . && uv run --group dev ruff format --check . && uv run --group dev mypy && uv run --group dev pytest
+
+# Build both SDK packages locally (npm tarball + Python sdist/wheel); never publishes
+sdk-build:
+    cd sdks/typescript && npm ci --no-audit --no-fund && npm run build && npm pack --pack-destination dist
+    cd sdks/python && uv build
+
+# ---------------------------------------------------------------------------
 # Stop everything
 # ---------------------------------------------------------------------------
 
