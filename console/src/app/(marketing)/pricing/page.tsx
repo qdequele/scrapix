@@ -1,6 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   ArrowRight,
   Check,
@@ -8,7 +9,7 @@ import {
   Layers,
   Network,
   Brain,
-  Code,
+  Files,
   Zap,
   HelpCircle,
 } from "lucide-react";
@@ -26,23 +27,41 @@ const creditPacks = [
   { amount: "50,000", price: 250, perCredit: "0.005", badge: "Save 50%" },
 ];
 
-const endpoints = [
+// Source of truth: bins/scrapix-api/src/billing.rs (scrape_credits,
+// extract_ai_call_credits), crates/scrapix-billing/src/credits.rs and
+// docs/guides/billing.mdx. `credits` is a number of credits, or a note.
+const endpoints: {
+  name: string;
+  icon: typeof Globe;
+  description: string;
+  extras: { label: string; credits: number | string }[];
+}[] = [
   {
     name: "Scrape",
     icon: Globe,
-    base: 1,
     description: "Extract content from a single URL",
     extras: [
       { label: "Base scrape", credits: 1 },
       { label: "+ each feature format (markdown, schema...)", credits: 1 },
+      { label: "+ screenshot", credits: 1 },
       { label: "+ AI extraction", credits: 5 },
       { label: "+ AI summary", credits: 5 },
+      { label: "Browser rendering, page actions, mobile, cookies", credits: 0 },
+    ],
+  },
+  {
+    name: "Batch scrape",
+    icon: Files,
+    description: "Scrape up to 1,000 URLs as one job",
+    extras: [
+      { label: "Per URL", credits: "same as Scrape" },
+      { label: "e.g. markdown + metadata, per URL", credits: 2 },
+      { label: "URLs that fail to fetch", credits: 0 },
     ],
   },
   {
     name: "Map",
     icon: Network,
-    base: 2,
     description: "Discover all URLs on a website",
     extras: [
       { label: "Flat rate per call", credits: 2 },
@@ -51,7 +70,6 @@ const endpoints = [
   {
     name: "Crawl",
     icon: Layers,
-    base: 1,
     description: "Crawl a site and index to Meilisearch",
     extras: [
       { label: "Per page (HTTP)", credits: 1 },
@@ -60,6 +78,16 @@ const endpoints = [
       { label: "+ AI extraction (per page)", credits: 5 },
       { label: "+ AI summary (per page)", credits: 5 },
       { label: "Search indexing included", credits: 0 },
+    ],
+  },
+  {
+    name: "Extract",
+    icon: Brain,
+    description: "Structured data from one or many pages",
+    extras: [
+      { label: "Per page fetched (markdown scrape)", credits: 1 },
+      { label: "Per URL glob resolved (a map)", credits: 2 },
+      { label: "Per AI call", credits: 5 },
     ],
   },
 ];
@@ -87,7 +115,11 @@ const faqs = [
   },
   {
     q: "How does JS rendering work?",
-    a: "When a page requires JavaScript to load content (SPAs, dynamic sites), enable the JS rendering option. It uses a headless browser and costs 1 additional credit per page.",
+    a: "When a page requires JavaScript to load content (SPAs, dynamic sites), enable the JS rendering option. It uses a headless browser. On crawls, a page rendered in the browser costs 1 additional credit. On scrape and batch scrape, browser rendering costs nothing extra, including when a screenshot, page actions or mobile emulation turn it on.",
+  },
+  {
+    q: "How are batch scrape and extract billed?",
+    a: "A batch scrape costs what the same scrape request costs, for each URL, charged as each URL is scraped. URLs that fail to fetch are not charged. An extraction costs one scrape (1 credit) per page fetched, 2 credits per URL glob it resolves, and 5 credits per AI call.",
   },
 ];
 
@@ -193,7 +225,7 @@ export default function PricingPage() {
             Each endpoint has a base cost. Premium features add extra credits.
           </p>
 
-          <div className="mx-auto grid max-w-5xl gap-6 md:grid-cols-3">
+          <div className="mx-auto grid max-w-5xl gap-6 md:grid-cols-2 lg:grid-cols-3">
             {endpoints.map(({ name, icon: Icon, description, extras }) => (
               <div
                 key={name}
@@ -212,17 +244,24 @@ export default function PricingPage() {
                   {extras.map(({ label, credits }) => (
                     <div
                       key={label}
-                      className="flex items-center justify-between text-sm"
+                      className="flex items-center justify-between gap-4 text-sm"
                     >
                       <span className="text-zinc-400">{label}</span>
                       <span
-                        className={
+                        className={cn(
+                          "shrink-0",
                           credits === 0
                             ? "text-emerald-400 text-xs"
-                            : "font-mono text-white"
-                        }
+                            : typeof credits === "string"
+                              ? "text-zinc-300 text-xs"
+                              : "font-mono text-white",
+                        )}
                       >
-                        {credits === 0 ? "Free" : `${credits} cr`}
+                        {credits === 0
+                          ? "Free"
+                          : typeof credits === "string"
+                            ? credits
+                            : `${credits} cr`}
                       </span>
                     </div>
                   ))}
@@ -281,6 +320,8 @@ export default function PricingPage() {
               "Unlimited API keys",
               "All output formats (markdown, HTML, metadata, JSON-LD)",
               "JavaScript rendering",
+              "Screenshots, page actions & mobile emulation",
+              "Batch scrape & multi-page extraction",
               "AI extraction & summarization",
               "Real-time crawl monitoring",
               "Meilisearch search indexing",

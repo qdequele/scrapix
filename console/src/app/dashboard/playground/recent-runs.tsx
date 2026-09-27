@@ -28,9 +28,33 @@ export function loadRuns(): RunEntry[] {
   }
 }
 
+const MAX_URL_LENGTH = 2048;
+
+/**
+ * Keep only the summary fields of a run. History never stores response
+ * bodies (markdown, HTML, base64 screenshots): an entry is a few hundred
+ * bytes, so 10 of them stay far below the localStorage quota.
+ */
+function summarize(run: RunEntry): RunEntry {
+  return {
+    id: run.id,
+    type: run.type,
+    // Entries read back from storage are untrusted: tolerate a missing url.
+    url: typeof run.url === "string" ? run.url.slice(0, MAX_URL_LENGTH) : "",
+    status_code: run.status_code,
+    duration_ms: run.duration_ms,
+    total_links: run.total_links,
+    timestamp: run.timestamp,
+  };
+}
+
 export function saveRun(run: RunEntry): RunEntry[] {
-  const runs = [run, ...loadRuns()].slice(0, MAX_RUNS);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(runs));
+  const runs = [summarize(run), ...loadRuns().map(summarize)].slice(0, MAX_RUNS);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(runs));
+  } catch {
+    // Storage full or unavailable (private mode): keep the in-memory list.
+  }
   return runs;
 }
 

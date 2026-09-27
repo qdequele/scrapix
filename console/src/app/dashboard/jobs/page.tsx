@@ -29,6 +29,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import { JobTypeBadge } from "./job-type-badge";
 import {
   Pagination,
   PaginationContent,
@@ -304,9 +305,15 @@ export default function JobsPage() {
                           >
                             {jobLabel(job)}
                           </Link>
-                          <p className="font-mono text-[11px] text-muted-foreground">
-                            {job.job_id.slice(0, 8)}
-                          </p>
+                          <div className="flex items-center gap-1.5">
+                            <JobTypeBadge
+                              type={job.job_type}
+                              className="text-[10px] px-1.5 py-0"
+                            />
+                            <span className="font-mono text-[11px] text-muted-foreground">
+                              {job.job_id.slice(0, 8)}
+                            </span>
+                          </div>
                         </TableCell>
                         <TableCell>
                           <Badge

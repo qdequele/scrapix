@@ -1,18 +1,40 @@
 "use client";
 
 import { useState } from "react";
+import { z } from "zod";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, X } from "lucide-react";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import type { RequestCookie, ScrapeAction } from "@/lib/api-types";
+import { MonitorSmartphone, Plus, X } from "lucide-react";
+
+export interface CookieRow {
+  name: string;
+  value: string;
+  domain: string;
+}
 
 export interface ScrapeState {
   formats: string[];
   only_main_content: boolean;
   include_links: boolean;
   timeout_ms: string;
+  /** Screenshot the whole scrollable page (true) or only the viewport */
+  screenshot_full_page: boolean;
+  /** Render JavaScript (forced on by screenshot, actions and mobile) */
+  render_js: boolean;
+  /** Emulate a phone */
+  mobile: boolean;
+  // Page actions (JSON array)
+  feat_actions: boolean;
+  actions_json: string;
+  // Cookies
+  feat_cookies: boolean;
+  cookies: CookieRow[];
   ai_summary: boolean;
   // Schema extraction
   feat_schema: boolean;
@@ -29,12 +51,226 @@ export interface ScrapeState {
 interface ScrapeOptionsProps {
   state: ScrapeState;
   onChange: (state: ScrapeState) => void;
+  /** URL being scraped, to check cookie domains against its host */
+  targetUrl?: string;
+}
+
+// ============================================================================
+// Browser-only features
+// ============================================================================
+
+/** The enabled features that make the engine render the page in a browser. */
+export function browserReasons(state: ScrapeState): string[] {
+  const reasons: string[] = [];
+  if (state.formats.includes("screenshot")) reasons.push("screenshot");
+  if (state.feat_actions && state.actions_json.trim()) reasons.push("actions");
+  if (state.mobile) reasons.push("mobile");
+  return reasons;
+}
+
+// ============================================================================
+// Page actions: validated JSON (mirrors scrapix_core::browser::Action)
+// ============================================================================
+
+const MAX_ACTIONS = 50;
+const ACTION_TYPES = [
+  "wait",
+  "click",
+  "scroll",
+  "write",
+  "press",
+  "execute_javascript",
+] as const;
+type ActionType = (typeof ACTION_TYPES)[number];
+
+export const ACTIONS_EXAMPLE = `[
+  { "type": "wait", "selector": "main" },
+  { "type": "click", "selector": "button.accept-cookies" },
+  { "type": "scroll", "direction": "down", "amount": 2 },
+  { "type": "wait", "ms": 500 },
+  { "type": "execute_javascript", "script": "return document.title" }
+]`;
+
+/** A string field, with "is required" when it is missing. */
+function stringField(field: string) {
+  return z.string({
+    error: (issue) =>
+      issue.input === undefined
+        ? `\`${field}\` is required`
+        : `\`${field}\` must be a string`,
+  });
+}
+
+const selectorSchema = stringField("selector")
+  .trim()
+  .min(1, "selector must not be empty")
+  .max(1024, "selector is too long (max 1024 characters)");
+
+const actionSchemas: Record<ActionType, z.ZodType<ScrapeAction>> = {
+  wait: z
+    .object({
+      type: z.literal("wait"),
+      ms: z
+        .number({ error: "ms must be a number" })
+        .int("ms must be an integer")
+        .min(0, "ms must not be negative")
+        .max(30_000, "ms must be at most 30000")
+        .optional(),
+      selector: selectorSchema.optional(),
+    })
+    .refine((a) => (a.ms === undefined) !== (a.selector === undefined), {
+      message: "exactly one of `ms` or `selector` must be set",
+    }),
+  click: z.object({ type: z.literal("click"), selector: selectorSchema }),
+  scroll: z.object({
+    type: z.literal("scroll"),
+    direction: z
+      .enum(["up", "down"], { error: "direction must be `up` or `down`" })
+      .optional(),
+    amount: z
+      .number({ error: "amount must be a number" })
+      .gt(0, "amount must be a number of screens in (0, 100]")
+      .max(100, "amount must be a number of screens in (0, 100]")
+      .optional(),
+  }),
+  write: z.object({
+    type: z.literal("write"),
+    selector: selectorSchema,
+    text: stringField("text").max(10 * 1024, "text is too long (max 10 KB)"),
+  }),
+  press: z.object({
+    type: z.literal("press"),
+    key: stringField("key")
+      .min(1, "key must be a key name such as `Enter` or `a`")
+      .max(32, "key must be a key name such as `Enter` or `a`"),
+  }),
+  execute_javascript: z.object({
+    type: z.literal("execute_javascript"),
+    script: stringField("script")
+      .trim()
+      .min(1, "script must not be empty")
+      .max(100 * 1024, "script is too long (max 100 KB)"),
+  }),
+};
+
+function isActionType(value: unknown): value is ActionType {
+  return (
+    typeof value === "string" &&
+    (ACTION_TYPES as readonly string[]).includes(value)
+  );
+}
+
+export type ParsedActions =
+  | { ok: true; actions: ScrapeAction[] }
+  | { ok: false; errors: string[] };
+
+/** Parse and validate the actions JSON. Errors name the action's index and type. */
+export function parseActions(text: string): ParsedActions {
+  if (!text.trim()) return { ok: true, actions: [] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    return {
+      ok: false,
+      errors: [`Invalid JSON: ${e instanceof Error ? e.message : String(e)}`],
+    };
+  }
+  if (!Array.isArray(raw)) {
+    return { ok: false, errors: ["Actions must be a JSON array"] };
+  }
+  if (raw.length > MAX_ACTIONS) {
+    return {
+      ok: false,
+      errors: [`Too many actions (${raw.length}); at most ${MAX_ACTIONS}`],
+    };
+  }
+  const actions: ScrapeAction[] = [];
+  const errors: string[] = [];
+  raw.forEach((item: unknown, index) => {
+    const type =
+      typeof item === "object" && item !== null
+        ? (item as Record<string, unknown>).type
+        : undefined;
+    if (!isActionType(type)) {
+      errors.push(
+        `actions[${index}]: unknown type ${JSON.stringify(type ?? null)} (expected ${ACTION_TYPES.join(", ")})`,
+      );
+      return;
+    }
+    const result = actionSchemas[type].safeParse(item);
+    if (result.success) {
+      actions.push(result.data);
+    } else {
+      const issue = result.error.issues[0];
+      errors.push(`actions[${index}] (${type}): ${issue?.message ?? "invalid"}`);
+    }
+  });
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, actions };
+}
+
+// ============================================================================
+// Cookies (mirrors RequestCookie::validate_for)
+// ============================================================================
+
+const COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// RFC 6265 cookie-octet plus space: no control chars, quotes, commas, semicolons or backslashes
+const COOKIE_VALUE_RE = /^[\x20\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]*$/;
+
+function hostOf(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isEmptyCookieRow(row: CookieRow): boolean {
+  return !row.name.trim() && !row.value.trim() && !row.domain.trim();
+}
+
+/** Why a cookie row is invalid for `targetUrl`, or null. Empty rows are ignored. */
+export function cookieRowError(row: CookieRow, targetUrl?: string): string | null {
+  if (isEmptyCookieRow(row)) return null;
+  const name = row.name.trim();
+  if (!name) return "Name is required";
+  if (!COOKIE_NAME_RE.test(name)) return `Invalid cookie name "${name}"`;
+  if (!COOKIE_VALUE_RE.test(row.value)) {
+    return "Value can't contain quotes, commas, semicolons, backslashes or control characters";
+  }
+  if (name.length + row.value.length > 4096) {
+    return "Cookie is too large (max 4096 bytes)";
+  }
+  const domain = row.domain.trim().replace(/^\./, "").toLowerCase();
+  if (domain) {
+    if (!domain.includes(".")) return `"${domain}" is not a valid cookie domain`;
+    const host = hostOf(targetUrl);
+    if (host && host !== domain && !host.endsWith(`.${domain}`)) {
+      return `Domain "${domain}" does not match the target host "${host}"`;
+    }
+  }
+  return null;
+}
+
+/** The non-empty rows as API cookies. */
+export function buildCookies(rows: CookieRow[]): RequestCookie[] {
+  return rows
+    .filter((r) => !isEmptyCookieRow(r))
+    .map((r) => {
+      const cookie: RequestCookie = { name: r.name.trim(), value: r.value };
+      const domain = r.domain.trim();
+      if (domain) cookie.domain = domain;
+      return cookie;
+    });
 }
 
 const FORMAT_OPTIONS: {
   value: string;
   label: string;
   description: string;
+  /** Needs a browser (turns on JS rendering) */
+  browser?: boolean;
 }[] = [
   { value: "markdown", label: "Markdown", description: "Clean, readable text with formatting" },
   { value: "html", label: "HTML", description: "Cleaned HTML with main content" },
@@ -42,7 +278,20 @@ const FORMAT_OPTIONS: {
   { value: "content", label: "Content", description: "Plain text without any markup" },
   { value: "links", label: "Links", description: "All hyperlinks found on the page" },
   { value: "metadata", label: "Metadata", description: "Title, description, OG tags, etc." },
+  { value: "screenshot", label: "Screenshot", description: "PNG of the rendered page", browser: true },
 ];
+
+function BrowserBadge() {
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px] px-1.5 py-0 font-normal text-muted-foreground"
+      title="Renders the page in a browser (turns on JS rendering)"
+    >
+      JS
+    </Badge>
+  );
+}
 
 function SwitchRow({
   id,
@@ -50,24 +299,37 @@ function SwitchRow({
   description,
   checked,
   onCheckedChange,
+  browser,
+  disabled,
 }: {
   id: string;
   label: string;
   description?: string;
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
+  /** Show the "JS" badge: this option renders the page in a browser */
+  browser?: boolean;
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between">
+    <div className="flex items-center justify-between gap-3">
       <div>
-        <Label htmlFor={id} className="text-sm font-medium">
-          {label}
-        </Label>
+        <div className="flex items-center gap-1.5">
+          <Label htmlFor={id} className="text-sm font-medium">
+            {label}
+          </Label>
+          {browser && <BrowserBadge />}
+        </div>
         {description && (
           <p className="text-xs text-muted-foreground">{description}</p>
         )}
       </div>
-      <Switch id={id} checked={checked} onCheckedChange={onCheckedChange} />
+      <Switch
+        id={id}
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+        disabled={disabled}
+      />
     </div>
   );
 }
@@ -188,7 +450,159 @@ function KeyValueList({
   );
 }
 
-export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
+function ActionsEditor({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const parsed = parseActions(value);
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="actions-json" className="text-sm font-medium">
+          Actions (JSON)
+        </Label>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-6 px-2 text-xs"
+          onClick={() => onChange(ACTIONS_EXAMPLE)}
+        >
+          Insert example
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Run in order before capture: <code className="font-mono">wait</code>,{" "}
+        <code className="font-mono">click</code>,{" "}
+        <code className="font-mono">scroll</code>,{" "}
+        <code className="font-mono">write</code>,{" "}
+        <code className="font-mono">press</code>,{" "}
+        <code className="font-mono">execute_javascript</code>. Max 50, 30s in
+        total.
+      </p>
+      <Textarea
+        id="actions-json"
+        rows={7}
+        spellCheck={false}
+        className="font-mono text-xs"
+        placeholder={'[\n  { "type": "click", "selector": "#load-more" },\n  { "type": "wait", "ms": 1000 }\n]'}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-invalid={!parsed.ok ? true : undefined}
+      />
+      {parsed.ok ? (
+        parsed.actions.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            {parsed.actions.length} valid action
+            {parsed.actions.length === 1 ? "" : "s"}
+          </p>
+        )
+      ) : (
+        <ul className="space-y-0.5">
+          {parsed.errors.slice(0, 5).map((err) => (
+            <li
+              key={err}
+              className="text-xs text-destructive font-mono break-words"
+            >
+              {err}
+            </li>
+          ))}
+          {parsed.errors.length > 5 && (
+            <li className="text-xs text-destructive">
+              and {parsed.errors.length - 5} more
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function CookiesEditor({
+  rows,
+  onChange,
+  targetUrl,
+}: {
+  rows: CookieRow[];
+  onChange: (rows: CookieRow[]) => void;
+  targetUrl?: string;
+}) {
+  const update = (index: number, patch: Partial<CookieRow>) =>
+    onChange(rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
+  const remove = (index: number) =>
+    onChange(rows.filter((_, i) => i !== index));
+
+  return (
+    <div className="space-y-2">
+      <div>
+        <Label className="text-sm font-medium">Cookies</Label>
+        <p className="text-xs text-muted-foreground">
+          Domain is optional (defaults to the target host). Max 50.
+        </p>
+      </div>
+      {rows.map((row, i) => {
+        const error = cookieRowError(row, targetUrl);
+        return (
+          <div key={i} className="space-y-1">
+            <div className="flex gap-1.5">
+              <Input
+                placeholder="name"
+                aria-label={`Cookie ${i + 1} name`}
+                value={row.name}
+                onChange={(e) => update(i, { name: e.target.value })}
+                aria-invalid={error ? true : undefined}
+                className="flex-1 min-w-0 font-mono text-xs"
+              />
+              <Input
+                placeholder="value"
+                aria-label={`Cookie ${i + 1} value`}
+                value={row.value}
+                onChange={(e) => update(i, { value: e.target.value })}
+                aria-invalid={error ? true : undefined}
+                className="flex-1 min-w-0 font-mono text-xs"
+              />
+              <Input
+                placeholder="domain"
+                aria-label={`Cookie ${i + 1} domain`}
+                value={row.domain}
+                onChange={(e) => update(i, { domain: e.target.value })}
+                aria-invalid={error ? true : undefined}
+                className="flex-1 min-w-0 font-mono text-xs"
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-9 w-9 shrink-0"
+                aria-label={`Remove cookie ${i + 1}`}
+                onClick={() => remove(i)}
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+          </div>
+        );
+      })}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-8 text-xs"
+        disabled={rows.length >= 50}
+        onClick={() => onChange([...rows, { name: "", value: "", domain: "" }])}
+      >
+        <Plus className="mr-1 h-3.5 w-3.5" />
+        Add cookie
+      </Button>
+    </div>
+  );
+}
+
+export function ScrapeOptions({ state, onChange, targetUrl }: ScrapeOptionsProps) {
   const set = <K extends keyof ScrapeState>(key: K, value: ScrapeState[K]) =>
     onChange({ ...state, [key]: value });
 
@@ -199,6 +613,9 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
     onChange({ ...state, formats });
   };
 
+  const forcedBy = browserReasons(state);
+  const jsForced = forcedBy.length > 0;
+
   return (
     <div className="space-y-5">
       <div className="space-y-3">
@@ -206,17 +623,119 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
           Output Formats
         </Label>
         <div className="space-y-1">
-          {FORMAT_OPTIONS.map(({ value, label, description }) => (
+          {FORMAT_OPTIONS.map(({ value, label, description, browser }) => (
             <SwitchRow
               key={value}
               id={`fmt-${value}`}
               label={label}
               description={description}
+              browser={browser}
               checked={state.formats.includes(value)}
               onCheckedChange={() => toggle(value)}
             />
           ))}
         </div>
+        {state.formats.includes("screenshot") && (
+          <div className="flex items-center justify-between gap-3 pl-2 border-l-2 border-primary/20 ml-1">
+            <Label className="text-sm font-medium">Screenshot area</Label>
+            <ToggleGroup
+              type="single"
+              variant="outline"
+              size="sm"
+              value={state.screenshot_full_page ? "full" : "viewport"}
+              onValueChange={(v) => {
+                if (v) set("screenshot_full_page", v === "full");
+              }}
+            >
+              <ToggleGroupItem value="full" className="text-xs px-2.5">
+                Full page
+              </ToggleGroupItem>
+              <ToggleGroupItem value="viewport" className="text-xs px-2.5">
+                Viewport
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+        )}
+      </div>
+
+      {/* ── Browser ── */}
+      <div className="space-y-3 border-t pt-4">
+        <Label className="text-xs text-muted-foreground uppercase tracking-wide">
+          Browser
+        </Label>
+
+        <div className="space-y-1">
+          <SwitchRow
+            id="render-js"
+            label="Render JavaScript"
+            description={
+              jsForced
+                ? `Turned on by ${forcedBy.join(", ")}`
+                : "Load the page in a headless browser"
+            }
+            checked={state.render_js || jsForced}
+            disabled={jsForced}
+            onCheckedChange={(v) => set("render_js", v)}
+          />
+          {jsForced && (
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <MonitorSmartphone className="h-3 w-3 shrink-0" />
+              Options marked JS always render in a browser.
+            </p>
+          )}
+        </div>
+
+        <SwitchRow
+          id="mobile"
+          label="Mobile"
+          description="Phone viewport, touch and mobile user agent"
+          browser
+          checked={state.mobile}
+          onCheckedChange={(v) => set("mobile", v)}
+        />
+
+        <SwitchRow
+          id="feat-actions"
+          label="Page actions"
+          description="Click, type, scroll or run JS before capture"
+          browser
+          checked={state.feat_actions}
+          onCheckedChange={(v) => set("feat_actions", v)}
+        />
+        {state.feat_actions && (
+          <div className="pl-2 border-l-2 border-primary/20 ml-1">
+            <ActionsEditor
+              value={state.actions_json}
+              onChange={(v) => set("actions_json", v)}
+            />
+          </div>
+        )}
+
+        <SwitchRow
+          id="feat-cookies"
+          label="Cookies"
+          description="Send cookies with the request"
+          checked={state.feat_cookies}
+          onCheckedChange={(v) =>
+            onChange({
+              ...state,
+              feat_cookies: v,
+              cookies:
+                v && state.cookies.length === 0
+                  ? [{ name: "", value: "", domain: "" }]
+                  : state.cookies,
+            })
+          }
+        />
+        {state.feat_cookies && (
+          <div className="pl-2 border-l-2 border-primary/20 ml-1">
+            <CookiesEditor
+              rows={state.cookies}
+              onChange={(rows) => set("cookies", rows)}
+              targetUrl={targetUrl}
+            />
+          </div>
+        )}
       </div>
 
       {/* ── Features ── */}

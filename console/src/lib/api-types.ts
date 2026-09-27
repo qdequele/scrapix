@@ -164,7 +164,50 @@ export interface ScrapeResult {
   blocks?: ContentBlock[];
   extract?: Record<string, unknown>;
   ai?: AiResult;
+  /** Base64-encoded PNG (format `screenshot`) */
+  screenshot?: string;
+  /** Results of the request's `actions` (present when actions were sent) */
+  actions?: ScrapeActionsResult;
   warning?: string;
+}
+
+export interface ScrapeActionsResult {
+  /** Values of the `execute_javascript` actions, in order (`undefined` is `null`) */
+  javascript_returns: unknown[];
+}
+
+/** A browser interaction run after the page loads (POST /scrape `actions`). */
+export type ScrapeAction =
+  | { type: "wait"; ms?: number; selector?: string }
+  | { type: "click"; selector: string }
+  | { type: "scroll"; direction?: "up" | "down"; amount?: number }
+  | { type: "write"; selector: string; text: string }
+  | { type: "press"; key: string }
+  | { type: "execute_javascript"; script: string };
+
+/** A cookie sent with a scrape (POST /scrape `cookies`). */
+export interface RequestCookie {
+  name: string;
+  value: string;
+  /** Target host or a parent domain of it; defaults to the target host */
+  domain?: string;
+  path?: string;
+  secure?: boolean;
+  http_only?: boolean;
+}
+
+/** Error body returned by the engine (`ApiError`). */
+export interface ApiErrorBody {
+  error: string;
+  code: string;
+  details?: unknown;
+}
+
+/** `details` of a 422 `action_error`. */
+export interface ActionErrorDetails {
+  action_index: number;
+  action_type: string;
+  message: string;
 }
 
 export interface ContentBlock {
@@ -510,6 +553,25 @@ export interface JobResultsPage {
   total: number;
   next: string | null;
   data: JobResultItem[];
+}
+
+/** POST /batch/scrape. Any other `/scrape` option is also accepted. */
+export interface BatchScrapeRequest {
+  urls: string[];
+  /** URLs scraped at once (default 10, max 25) */
+  concurrency?: number;
+  formats?: string[];
+  only_main_content?: boolean;
+  include_links?: boolean;
+  render_js?: boolean;
+  timeout_ms?: number;
+}
+
+export interface BatchScrapeResponse {
+  job_id: string;
+  status: string;
+  urls_count: number;
+  message: string;
 }
 
 export interface ExtractFieldDefinition {
