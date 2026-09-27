@@ -276,6 +276,29 @@ For structured output with typed fields:
 }
 ```
 
+## Documents (PDF, Word, Excel, PowerPoint, ...)
+
+When the URL serves a PDF or an office document, `/scrape` converts it to
+Markdown instead of running the HTML pipeline — tables included — and adds a
+`document` object to the response (format, page count, pages that still need
+OCR). Scanned pages are flagged rather than returned as empty text; set
+`parsers.ocr` to recognize them:
+
+```bash
+curl -X POST http://localhost:8080/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/reports/q3.pdf", "formats": ["markdown"], "parsers": {"ocr": "auto"}}'
+```
+
+For a file you already have, upload it to [`POST /parse`](/api-reference/parse):
+
+```bash
+curl -X POST http://localhost:8080/parse -F file=@report.docx
+```
+
+See [Documents & OCR](/guides/documents) for supported formats, OCR backends
+and cost controls.
+
 ## Custom Headers
 
 Send custom headers with the request (useful for authenticated pages or specific Accept headers):

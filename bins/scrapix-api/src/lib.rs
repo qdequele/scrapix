@@ -45,6 +45,7 @@ pub mod auth;
 pub mod billing;
 pub mod completion;
 pub mod configs;
+pub mod documents;
 pub mod email_scheduler;
 pub mod jobs_db;
 pub mod openapi;
@@ -80,7 +81,7 @@ use tracing::{debug, error, info, warn};
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
 use scrapix_core::{
     ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
-    JobStatus, PdfConfig,
+    JobStatus,
 };
 use scrapix_crawler::{
     is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, RobotsCache,
@@ -279,6 +280,9 @@ struct AppState {
     browser_renderer: Option<Arc<CdpRenderer>>,
     /// Optional AI service for /scrape enrichment
     ai_service: Option<Arc<AiService>>,
+    /// OCR engine for scanned documents on /scrape and /parse (opt-in per
+    /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
+    ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
     /// PostgreSQL connection pool (for saved configs, cron scheduling)
     db_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
@@ -383,6 +387,7 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
+            ocr: None,
             accounting_persisted: std::sync::atomic::AtomicBool::new(db_pool.is_some()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             control_tx,
@@ -692,6 +697,7 @@ impl AppState {
                 acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
                 acc.pages_browser,
                 acc.pages_ai,
+                acc.pages_ocr,
             );
         }
 
@@ -877,14 +883,15 @@ impl AppState {
             j.completed_at = Some(chrono::Utc::now());
             j.clone()
         };
-        let (pages_http, pages_browser, pages_ai) =
+        let (pages_http, pages_browser, pages_ai, pages_ocr) =
             self.crawl.accounting.read().get(job_id).map_or(
-                (snapshot.pages_crawled, 0, 0),
+                (snapshot.pages_crawled, 0, 0, 0),
                 |acc| {
                     (
                         acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
                         acc.pages_browser,
                         acc.pages_ai,
+                        acc.pages_ocr,
                     )
                 },
             );
@@ -894,6 +901,7 @@ impl AppState {
             pages_http,
             pages_browser,
             pages_ai,
+            pages_ocr,
         );
         // Terminal: free the accounting so the completion loop never
         // finalizes it, and persist it (checked by the next flush before
@@ -985,6 +993,8 @@ impl AppState {
     /// with a browser (`PageCrawled.js_rendered`), and `pages_ai` counts
     /// only pages that were actually AI-enriched (`DocumentIndexed.ai_enriched`),
     /// regardless of whether the job merely had AI features enabled.
+    /// `pages_ocr` (OCR'd document pages, `DocumentIndexed.ocr_pages`) adds
+    /// the OCR page surcharge.
     fn bill_job(
         &self,
         job_id: &str,
@@ -992,6 +1002,7 @@ impl AppState {
         pages_http: u64,
         pages_browser: u64,
         pages_ai: u64,
+        pages_ocr: u64,
     ) {
         let total_pages = pages_http + pages_browser;
         if total_pages == 0 {
@@ -1017,7 +1028,8 @@ impl AppState {
                 })
                 .unwrap_or_default()
         };
-        let credits = billing::crawl_credits(pages_http, pages_browser, pages_ai, &features);
+        let credits = billing::crawl_credits(pages_http, pages_browser, pages_ai, &features)
+            + scrapix_billing::ocr_credits(pages_ocr);
         self.diagnostics
             .credits_billed
             .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
@@ -1025,10 +1037,17 @@ impl AppState {
         let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
             return;
         };
-        let description = format!(
-            "Job {} ({} http + {} browser pages, {} AI-enriched)",
-            job_id, pages_http, pages_browser, pages_ai
-        );
+        let description = if pages_ocr > 0 {
+            format!(
+                "Job {} ({} http + {} browser pages, {} AI-enriched, {} OCR pages)",
+                job_id, pages_http, pages_browser, pages_ai, pages_ocr
+            )
+        } else {
+            format!(
+                "Job {} ({} http + {} browser pages, {} AI-enriched)",
+                job_id, pages_http, pages_browser, pages_ai
+            )
+        };
         let job_id = job_id.to_string();
         let stripe_cl = self.stripe_client.clone();
         tokio::spawn(async move {
@@ -1493,10 +1512,10 @@ impl AppState {
                 // treating all pages as plain HTTP/no-AI if the accounting
                 // entry was already freed (shouldn't happen: `accounted` is
                 // captured above, before `on_terminal` runs).
-                let (pages_browser, pages_ai) = accounted
+                let (pages_browser, pages_ai, pages_ocr) = accounted
                     .as_ref()
-                    .map(|c| (c.pages_browser, c.pages_ai))
-                    .unwrap_or((0, 0));
+                    .map(|c| (c.pages_browser, c.pages_ai, c.pages_ocr))
+                    .unwrap_or((0, 0, 0));
                 let is_js_rendered = pages_browser > 0;
                 let has_ai = pages_ai > 0;
 
@@ -1521,6 +1540,7 @@ impl AppState {
                     pages_fetched: *pages_crawled as u32,
                     search_query: String::new(),
                     results_count: 0,
+                    ocr_pages: u32::try_from(pages_ocr).unwrap_or(u32::MAX),
                     timestamp: time::OffsetDateTime::now_utc(),
                 };
                 let batcher = batcher.clone();
@@ -1651,10 +1671,10 @@ impl AppState {
                 // bill for what was actually delivered — `accounted` (folded
                 // above, before `on_terminal` frees the accounting entry)
                 // carries the browser/AI-enriched page counts.
-                let (pages_browser, pages_ai) = accounted
+                let (pages_browser, pages_ai, pages_ocr) = accounted
                     .as_ref()
-                    .map(|c| (c.pages_browser, c.pages_ai))
-                    .unwrap_or((0, 0));
+                    .map(|c| (c.pages_browser, c.pages_ai, c.pages_ocr))
+                    .unwrap_or((0, 0, 0));
                 let pages_http = pages_crawled.saturating_sub(pages_browser);
                 self.bill_job(
                     job_id,
@@ -1662,6 +1682,7 @@ impl AppState {
                     pages_http,
                     pages_browser,
                     pages_ai,
+                    pages_ocr,
                 );
             }
             CrawlEvent::JobFailed { error, .. } => {
@@ -1892,6 +1913,9 @@ struct AccountedCounters {
     /// Of the indexed documents, how many were actually AI-enriched
     /// (`DocumentIndexed.ai_enriched`) — see `pages_browser`.
     pages_ai: u64,
+    /// Pages recognized by OCR across indexed documents
+    /// (`DocumentIndexed.ocr_pages`), billed at the OCR page rate.
+    pages_ocr: u64,
 }
 
 impl From<&JobAccounting> for AccountedCounters {
@@ -1903,6 +1927,7 @@ impl From<&JobAccounting> for AccountedCounters {
             bytes_downloaded: acc.bytes_downloaded,
             pages_browser: acc.pages_browser,
             pages_ai: acc.pages_ai,
+            pages_ocr: acc.pages_ocr,
         }
     }
 }
@@ -2258,7 +2283,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self.code.as_str() {
             "not_found" => StatusCode::NOT_FOUND,
-            "bad_request" | "validation_error" => StatusCode::BAD_REQUEST,
+            "bad_request" | "validation_error" | "ocr_required" => StatusCode::BAD_REQUEST,
+            "unsupported_document" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "parse_error" => StatusCode::UNPROCESSABLE_ENTITY,
+            "file_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            "ocr_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "conflict" => StatusCode::CONFLICT,
             "insufficient_credits" => StatusCode::PAYMENT_REQUIRED,
@@ -2542,6 +2571,11 @@ struct ScrapeRequest {
     /// AI enrichment options
     #[serde(default)]
     ai: Option<AiOptions>,
+
+    /// Document parsing options, used when the URL serves a PDF or an
+    /// office document (OCR of scanned pages, page limits).
+    #[serde(default)]
+    parsers: documents::ParserOptions,
 }
 
 /// AI enrichment options for /scrape
@@ -2662,6 +2696,15 @@ struct ScrapeResponse {
     /// Warning message (e.g. "AI requires OPENAI_API_KEY")
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
+
+    /// Document details, when the URL served (or the upload is) a PDF or an
+    /// office document: format, pages, and which pages still need OCR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<documents::DocumentInfo>,
+
+    /// What OCR did, when `parsers.ocr` requested it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ocr: Option<documents::OcrInfo>,
 
     /// HTTP status code
     status_code: u16,
@@ -2951,6 +2994,12 @@ async fn health_services(State(state): State<Arc<AppState>>) -> Json<ServiceHeal
     Json(ServiceHealthResponse { services })
 }
 
+/// `/scrape` accepts PDFs and office documents (up to
+/// `DOCUMENT_MAX_SIZE_MB`) on top of HTML and markdown.
+fn document_fetch_options() -> scrapix_crawler::FetchOptions {
+    scrapix_crawler::FetchOptions::with_all_documents(Some(documents::max_document_bytes()))
+}
+
 /// Preprocess HTML by applying include/exclude CSS selectors.
 /// - `include_selectors`: if non-empty, only keep HTML from matching elements
 /// - `exclude_selectors`: if non-empty, remove matching elements from the HTML
@@ -3097,7 +3146,7 @@ async fn scrape_url(
         // Use the shared fetcher (connection pooling, DNS cache, retries)
         state
             .fetcher
-            .fetch(&crawl_url)
+            .fetch_with_options(&crawl_url, document_fetch_options())
             .await
             .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     } else {
@@ -3145,7 +3194,7 @@ async fn scrape_url(
         })?;
 
         fetcher
-            .fetch(&crawl_url)
+            .fetch_with_options(&crawl_url, document_fetch_options())
             .await
             .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     };
@@ -3199,9 +3248,46 @@ async fn scrape_url(
             extract: None,
             ai: None,
             warning: None,
+            document: None,
+            ocr: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
         }));
+    }
+
+    // A PDF or office document: parse it (and OCR it on request) instead of
+    // running the HTML pipeline. The fetcher carried its bytes base64.
+    if let Some(ct) = raw_page
+        .content_type
+        .as_deref()
+        .filter(|ct| scrapix_core::content_types::is_binary_document(ct))
+    {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let bytes = BASE64
+            .decode(raw_page.html.as_bytes())
+            .map_err(|e| ApiError::new(format!("Invalid document body: {e}"), "fetch_error"))?;
+        let response = documents::document_response(
+            &state,
+            &account_ctx,
+            documents::DocumentJob {
+                operation: "scrape",
+                label: final_url.clone(),
+                base_url: Some(final_url.clone()),
+                fallback_title: scrapix_parser::pdf::title_from_url(&final_url),
+                bytes,
+                content_type: Some(ct.to_string()),
+                formats: request.formats.clone(),
+                include_links: request.include_links,
+                parsers: request.parsers.clone(),
+                ai: request.ai.as_ref(),
+                status_code,
+                js_rendered,
+                base_cost: scrape_cost,
+            },
+            start_time,
+        )
+        .await?;
+        return Ok(Json(response));
     }
 
     let original_html = raw_page.html;
@@ -3322,87 +3408,15 @@ async fn scrape_url(
         .map(|info| info.code);
 
     // (e) AI enrichment (optional)
-    let mut ai_result = None;
-    let mut warning = None;
-    let mut total_prompt_tokens: u32 = 0;
-    let mut total_completion_tokens: u32 = 0;
-    let mut ai_model_name = String::new();
-
-    if let Some(ref ai_opts) = request.ai {
-        if let Some(ref ai_service) = state.ai_service {
-            // Use content or markdown as input text for AI
-            let ai_text = content.as_deref().or(markdown.as_deref()).unwrap_or("");
-
-            if !ai_text.is_empty() {
-                // Run AI operations concurrently
-                let summary_fut = async {
-                    if ai_opts.summary {
-                        ai_service.summarize(ai_text).await.ok()
-                    } else {
-                        None
-                    }
-                };
-
-                let extract_fut = async {
-                    if let Some(ref extract_opts) = ai_opts.extract {
-                        if let Some(ref schema_fields) = extract_opts.schema {
-                            // Schema-based extraction
-                            let mut builder = SchemaBuilder::new();
-                            for field in schema_fields {
-                                builder = builder.field(AiFieldDefinition {
-                                    name: field.name.clone(),
-                                    description: field.description.clone(),
-                                    field_type: field.field_type.clone(),
-                                    required: field.required,
-                                    default: None,
-                                    example: None,
-                                });
-                            }
-                            let schema = builder.build();
-                            ai_service.extract_schema(ai_text, &schema).await.ok()
-                        } else if !extract_opts.prompt.is_empty() {
-                            // Prompt-based extraction
-                            ai_service.extract(ai_text, &extract_opts.prompt).await.ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                let (ai_summary_result, ai_extract_result) = tokio::join!(summary_fut, extract_fut);
-
-                // Accumulate AI token usage
-                if let Some(ref summary) = ai_summary_result {
-                    total_prompt_tokens += summary.prompt_tokens;
-                    total_completion_tokens += summary.completion_tokens;
-                    if ai_model_name.is_empty() {
-                        ai_model_name = summary.model.clone();
-                    }
-                }
-                if let Some(ref extraction) = ai_extract_result {
-                    total_prompt_tokens += extraction.prompt_tokens;
-                    total_completion_tokens += extraction.completion_tokens;
-                    if ai_model_name.is_empty() {
-                        ai_model_name = extraction.model.clone();
-                    }
-                }
-
-                let ai_summary_text = ai_summary_result.map(|r| r.summary);
-                let ai_extract_data = ai_extract_result.map(|r| r.data);
-
-                if ai_summary_text.is_some() || ai_extract_data.is_some() {
-                    ai_result = Some(AiResult {
-                        summary: ai_summary_text,
-                        extract: ai_extract_data,
-                    });
-                }
-            }
-        } else {
-            warning = Some("AI features require a provider API key (set AI_PROVIDER and corresponding key env var)".to_string());
-        }
-    }
+    let ai_text = content.as_deref().or(markdown.as_deref()).unwrap_or("");
+    let ai_run = run_ai_enrichment(&state, request.ai.as_ref(), ai_text).await;
+    let AiRun {
+        result: ai_result,
+        warning,
+        prompt_tokens: total_prompt_tokens,
+        completion_tokens: total_completion_tokens,
+        model: ai_model_name,
+    } = ai_run;
 
     let scrape_duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -3474,9 +3488,111 @@ async fn scrape_url(
         extract: custom_extract,
         ai: ai_result,
         warning,
+        document: None,
+        ocr: None,
         status_code,
         scrape_duration_ms,
     }))
+}
+
+/// Outcome of optional AI enrichment for `/scrape` and `/parse`.
+#[derive(Default)]
+struct AiRun {
+    result: Option<AiResult>,
+    warning: Option<String>,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    model: String,
+}
+
+/// Run the requested AI summary/extraction on `ai_text`.
+async fn run_ai_enrichment(state: &AppState, ai: Option<&AiOptions>, ai_text: &str) -> AiRun {
+    let mut ai_result = None;
+    let mut warning = None;
+    let mut total_prompt_tokens: u32 = 0;
+    let mut total_completion_tokens: u32 = 0;
+    let mut ai_model_name = String::new();
+
+    if let Some(ai_opts) = ai {
+        if let Some(ref ai_service) = state.ai_service {
+            if !ai_text.is_empty() {
+                // Run AI operations concurrently
+                let summary_fut = async {
+                    if ai_opts.summary {
+                        ai_service.summarize(ai_text).await.ok()
+                    } else {
+                        None
+                    }
+                };
+
+                let extract_fut = async {
+                    if let Some(ref extract_opts) = ai_opts.extract {
+                        if let Some(ref schema_fields) = extract_opts.schema {
+                            // Schema-based extraction
+                            let mut builder = SchemaBuilder::new();
+                            for field in schema_fields {
+                                builder = builder.field(AiFieldDefinition {
+                                    name: field.name.clone(),
+                                    description: field.description.clone(),
+                                    field_type: field.field_type.clone(),
+                                    required: field.required,
+                                    default: None,
+                                    example: None,
+                                });
+                            }
+                            let schema = builder.build();
+                            ai_service.extract_schema(ai_text, &schema).await.ok()
+                        } else if !extract_opts.prompt.is_empty() {
+                            // Prompt-based extraction
+                            ai_service.extract(ai_text, &extract_opts.prompt).await.ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let (ai_summary_result, ai_extract_result) = tokio::join!(summary_fut, extract_fut);
+
+                // Accumulate AI token usage
+                if let Some(ref summary) = ai_summary_result {
+                    total_prompt_tokens += summary.prompt_tokens;
+                    total_completion_tokens += summary.completion_tokens;
+                    if ai_model_name.is_empty() {
+                        ai_model_name = summary.model.clone();
+                    }
+                }
+                if let Some(ref extraction) = ai_extract_result {
+                    total_prompt_tokens += extraction.prompt_tokens;
+                    total_completion_tokens += extraction.completion_tokens;
+                    if ai_model_name.is_empty() {
+                        ai_model_name = extraction.model.clone();
+                    }
+                }
+
+                let ai_summary_text = ai_summary_result.map(|r| r.summary);
+                let ai_extract_data = ai_extract_result.map(|r| r.data);
+
+                if ai_summary_text.is_some() || ai_extract_data.is_some() {
+                    ai_result = Some(AiResult {
+                        summary: ai_summary_text,
+                        extract: ai_extract_data,
+                    });
+                }
+            }
+        } else {
+            warning = Some("AI features require a provider API key (set AI_PROVIDER and corresponding key env var)".to_string());
+        }
+    }
+
+    AiRun {
+        result: ai_result,
+        warning,
+        prompt_tokens: total_prompt_tokens,
+        completion_tokens: total_completion_tokens,
+        model: ai_model_name,
+    }
 }
 
 /// Log a scrape request to ClickHouse request_events (fire-and-forget).
@@ -3519,6 +3635,7 @@ fn log_scrape_request(
         pages_fetched: 1,
         search_query: String::new(),
         results_count: 0,
+        ocr_pages: 0,
         timestamp: time::OffsetDateTime::now_utc(),
     };
     let batcher = batcher.clone();
@@ -3717,9 +3834,11 @@ fn validate_proxy_config(proxy: &scrapix_core::ProxyConfig) -> Result<(), String
 }
 
 /// Warn about config fields that are accepted but cannot be honored per-job
-/// (worker-level settings): `concurrency.browser_pool_size`,
-/// `concurrency.dns_concurrency`, `features.pdf.extract_links`. A warning is
-/// emitted only when the field differs from its default.
+/// (worker-level settings: `concurrency.browser_pool_size`,
+/// `concurrency.dns_concurrency`) or have no effect as configured
+/// (`features.pdf.extract_links` / `features.ocr` without the document
+/// feature they act on). A warning is emitted only when the field differs
+/// from its default.
 pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
     let mut warnings = Vec::new();
     let default_concurrency = ConcurrencyConfig::default();
@@ -3750,12 +3869,20 @@ pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
     }
 
     if let Some(pdf) = &config.features.pdf {
-        if pdf.extract_links != PdfConfig::default().extract_links {
+        if pdf.extract_links && !pdf.enabled {
             warnings.push(
-                "features.pdf.extract_links is a reserved no-op flag and currently has no effect"
+                "features.pdf.extract_links has no effect unless features.pdf.enabled is true"
                     .to_string(),
             );
         }
+    }
+
+    if !config.features.ocr_mode().is_off() && !config.features.is_pdf_enabled() {
+        warnings.push(
+            "features.ocr only applies to PDFs: it has no effect unless features.pdf.enabled \
+             is true"
+                .to_string(),
+        );
     }
 
     warnings
@@ -4735,6 +4862,7 @@ async fn map_url(
             pages_fetched: visited.len() as u32,
             search_query: String::new(),
             results_count: 0,
+            ocr_pages: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         };
         let batcher = batcher.clone();
@@ -4964,6 +5092,7 @@ async fn search_url(
             pages_fetched: 0,
             search_query: request.q.clone(),
             results_count,
+            ocr_pages: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         };
         let batcher = batcher.clone();
@@ -6196,7 +6325,12 @@ pub async fn run_with_bus(
         .expect("failed to build webhook delivery HTTP client");
     let webhook_dispatcher =
         webhooks::WebhookDispatcher::new(webhook_client, args.webhook_max_concurrent_deliveries);
-    let state = Arc::new(AppState::new(
+    // OCR for /scrape and /parse (SCR-86). The vision backend reuses the
+    // AI client, so its calls land in ai_usage_events with operation `ocr`.
+    let ocr = scrapix_ocr::OcrEngine::from_env(ai_service.as_ref().map(|s| s.client().clone()))
+        .await
+        .map(Arc::new);
+    let mut state = AppState::new(
         producer,
         config,
         request_batcher.clone(),
@@ -6210,7 +6344,9 @@ pub async fn run_with_bus(
         stripe_client,
         analytics_state.clone(),
         webhook_dispatcher,
-    ));
+    );
+    state.ocr = ocr;
+    let state = Arc::new(state);
 
     // Recover active jobs from Postgres on startup
     if let Some(ref pool) = state.db_pool {
@@ -6276,17 +6412,21 @@ pub async fn run_with_bus(
             let batcher = batcher.clone();
             let handle = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
+                    // Calls made inside `AI_USAGE_CONTEXT` (e.g. OCR on
+                    // /scrape and /parse) carry their attribution; plain
+                    // /scrape AI calls have none.
+                    let ctx = event.context.unwrap_or_default();
                     let ch_event = ClickHouseAiUsageEvent {
                         provider: event.provider,
                         model: event.model,
-                        operation: String::new(), // API /scrape doesn't have operation context
+                        operation: ctx.feature,
                         prompt_tokens: event.prompt_tokens,
                         completion_tokens: event.completion_tokens,
                         total_tokens: event.total_tokens,
                         duration_ms: event.duration_ms as u32,
-                        job_id: String::new(),
-                        account_id: String::new(),
-                        url: String::new(),
+                        job_id: ctx.job_id,
+                        account_id: ctx.account_id.unwrap_or_default(),
+                        url: ctx.url,
                         timestamp: time::OffsetDateTime::now_utc(),
                     };
                     if let Err(e) = batcher.add(ch_event).await {
@@ -6540,6 +6680,30 @@ pub async fn run_with_bus(
     app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
         2 * 1024 * 1024,
     ));
+
+    // POST /parse (document upload) is merged after the 2 MB layer — layers
+    // only wrap routes that already exist — with its own cap
+    // (DOCUMENT_MAX_SIZE_MB + multipart overhead) and the same auth.
+    {
+        let upload_limit = documents::max_document_bytes() as usize + 1024 * 1024;
+        let parse_routes = Router::new()
+            .route("/parse", post(documents::parse_upload))
+            .layer(axum::extract::DefaultBodyLimit::max(upload_limit))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(upload_limit));
+        let parse_routes = if let Some(ref auth) = auth_state {
+            parse_routes.route_layer(middleware::from_fn_with_state(
+                auth.clone(),
+                auth::validate_api_key_or_session,
+            ))
+        } else {
+            parse_routes
+        };
+        app = app.merge(
+            parse_routes
+                .layer(TraceLayer::new_for_http())
+                .with_state(state.clone()),
+        );
+    }
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.
@@ -7010,15 +7174,34 @@ mod tests {
     }
 
     #[test]
-    fn warnings_flag_pdf_extract_links() {
+    fn pdf_extract_links_warns_only_without_pdf() {
         let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
             "start_urls": ["https://a.test"], "index_uid": "a",
             "features": {"pdf": {"enabled": true, "extract_links": true}}
         }))
         .unwrap();
+        assert!(crawl_config_warnings(&cfg).is_empty(), "implemented now");
+
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "features": {"pdf": {"enabled": false, "extract_links": true}}
+        }))
+        .unwrap();
         let w = crawl_config_warnings(&cfg);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("extract_links"));
+    }
+
+    #[test]
+    fn ocr_without_pdf_warns() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "features": {"ocr": {"mode": "auto"}}
+        }))
+        .unwrap();
+        let w = crawl_config_warnings(&cfg);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("features.ocr"));
     }
 
     #[test]
@@ -7402,6 +7585,7 @@ mod lifecycle_tests {
             timestamp: 0,
             url_message_id: id.into(),
             ai_enriched: false,
+            ocr_pages: 0,
         }
     }
 
@@ -8277,6 +8461,7 @@ mod lifecycle_tests {
                     timestamp: 0,
                     url_message_id: id.into(),
                     ai_enriched,
+                    ocr_pages: 0,
                 },
             );
         }

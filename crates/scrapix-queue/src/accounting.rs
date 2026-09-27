@@ -168,6 +168,9 @@ pub struct JobAccounting {
     pub content_outcomes: u64,
     pub documents_indexed: u64,
     pub pages_ai: u64,
+    /// OCR'd pages across indexed documents (`DocumentIndexed.ocr_pages`),
+    /// billed at the OCR page rate.
+    pub pages_ocr: u64,
     /// `url_message_id`s of `PageCrawled` messages that spawned a
     /// first-time sitemap discovery for their `(job, domain)`
     /// (`PageCrawled.sitemap_pending`, R-18). `is_balanced` requires this
@@ -258,6 +261,7 @@ impl JobAccounting {
             CrawlEvent::DocumentIndexed {
                 url_message_id,
                 ai_enriched,
+                ocr_pages,
                 ..
             } => {
                 if Self::first_time(&mut self.seen_content, url_message_id) {
@@ -266,6 +270,7 @@ impl JobAccounting {
                     if *ai_enriched {
                         self.pages_ai += 1;
                     }
+                    self.pages_ocr += *ocr_pages as u64;
                 }
             }
             CrawlEvent::DocumentSkipped { url_message_id, .. } => {
@@ -419,6 +424,7 @@ mod tests {
             timestamp: 0,
             url_message_id: id.into(),
             ai_enriched: false,
+            ocr_pages: 0,
         }
     }
 

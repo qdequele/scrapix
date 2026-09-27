@@ -13,6 +13,7 @@ members = [
     "crates/scrapix-billing",
     "crates/scrapix-auth",
     "crates/scrapix-lifecycle",
+    "crates/scrapix-ocr",
 
     "bins/scrapix-api",
     "bins/scrapix-worker-crawler",
@@ -28,7 +29,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/quentindequelen/scrapix"
 authors = ["Quentin de Quelen"]
@@ -141,6 +142,18 @@ whatlang = "0.16"
 
 # Markdown conversion
 html2md = "0.2"
+
+# Document parsing (SCR-81). Both crates are pre-1.0-style fast movers from
+# Firecrawl: pin exact versions and upgrade deliberately. anydoc routes its
+# own PDF path through pdf-inspector, so the two share one PDF engine.
+pdf-inspector = "=1.25.0"
+anydoc = "=0.2.4"
+# PDFium binding used to rasterize pages for OCR (SCR-86). PDFium is loaded
+# at runtime (libloading) — no build-time native dependency. Used directly
+# rather than through pdf-inspector's `render-pdfium` feature, which does
+# not compile without its ONNX-based `ocr` feature in 1.25.
+firecrawl-pdfium = "=0.1.0"
+png = "0.17"
 
 # Testing
 mockall = "0.13"

@@ -1,6 +1,8 @@
 //! # Scrapix Parser
 //!
-//! HTML parsing and content extraction.
+//! HTML parsing, content extraction, and binary document parsing (PDF via
+//! pdf-inspector; Word/PowerPoint/Excel/OpenDocument/RTF/EPUB/CSV via
+//! anydoc — see [`document`]).
 //!
 //! ## Features
 //!
@@ -44,14 +46,20 @@
 //! println!("Content: {:?}", doc.content);
 //! ```
 
+pub mod document;
 pub mod html;
 pub mod language;
 pub mod markdown;
 pub mod minihtml;
+pub mod office;
 pub mod pdf;
 pub mod readability;
 
 // Re-exports for convenience
+pub use document::{
+    build_document, detect_kind, parse_document, DocumentDispatch, DocumentKind, DocumentParser,
+    ParseOptions, ParsedDocument,
+};
 pub use html::{HtmlParser, HtmlParserBuilder, HtmlParserConfig};
 pub use language::{
     detect_language, detect_language_info, detect_language_with_threshold, LanguageInfo,

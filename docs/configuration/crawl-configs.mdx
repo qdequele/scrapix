@@ -188,6 +188,33 @@ Toggle individual extraction features:
 }
 ```
 
+#### Documents (PDF, office formats) and OCR
+
+```json
+{
+  "features": {
+    "pdf": { "enabled": true, "max_size_mb": 50, "max_pages": 200, "extract_links": false },
+    "documents": { "enabled": true, "max_size_mb": 50 },
+    "ocr": { "mode": "off", "max_pages": 20 }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `pdf.enabled` | `false` | Fetch and index PDFs (layout-aware Markdown with tables) |
+| `pdf.max_size_mb` | `50` | Reject larger PDFs before buffering them |
+| `pdf.max_pages` | all | Parse only the first N pages |
+| `pdf.extract_links` | `false` | Follow hyperlinks found inside PDFs (same domain/pattern/depth rules as HTML links) |
+| `documents.enabled` | `false` | Fetch and index Word, PowerPoint, Excel, OpenDocument, RTF, EPUB and CSV files |
+| `documents.max_size_mb` | `50` | Reject larger documents before buffering them |
+| `ocr.mode` | `off` | `off` (scanned pages flagged with `metadata.needs_ocr`), `auto` (OCR pages that need it), `force` (OCR every page) |
+| `ocr.max_pages` | server cap (50) | Per-document OCR page cap (only lowers `OCR_MAX_PAGES_PER_DOCUMENT`) |
+
+With `pdf` / `documents` enabled, links to those files are followed instead
+of being skipped as non-page resources. OCR pages are billed at a higher rate.
+See [Documents & OCR](/guides/documents).
+
 Each feature supports page-level filtering:
 
 ```json

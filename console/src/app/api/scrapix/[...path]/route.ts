@@ -68,7 +68,9 @@ async function proxy(req: NextRequest, { params }: { params: Promise<{ path: str
   const res = await fetch(target, {
     method: req.method,
     headers,
-    body: req.method !== "GET" && req.method !== "HEAD" ? await req.text() : undefined,
+    // Forward the raw bytes: `req.text()` would UTF-8-decode binary bodies
+    // and corrupt multipart uploads (POST /parse).
+    body: req.method !== "GET" && req.method !== "HEAD" ? await req.arrayBuffer() : undefined,
   });
 
   // Build response headers, forwarding set-cookie from backend

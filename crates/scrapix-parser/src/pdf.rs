@@ -1,163 +1,237 @@
-//! PDF text + metadata extraction.
+//! PDF parsing via [pdf-inspector]: classification + layout-aware Markdown.
 //!
-//! Entry point for the opt-in PDF scraping feature (`features.pdf.enabled`).
-//! Uses the pure-Rust `pdf-extract` crate — no native dependencies.
+//! Entry point for the opt-in PDF feature (`features.pdf.enabled`) and for
+//! PDFs uploaded to `POST /parse`. pdf-inspector is pure Rust (built on
+//! `lopdf`, no ML models) and gives us, beyond plain text:
 //!
-//! This module is intentionally narrow: given raw PDF bytes it returns extracted
-//! text, an optional title (from the PDF Info dictionary), and an optional
-//! language hint (via whatlang on the extracted text). Scanned image PDFs
-//! yield empty text and trigger a warn-level log so operators can spot the
-//! quality gap without failing the crawl.
+//! - Markdown with headings, lists, **tables** (rectangle- and
+//!   heuristic-based, with multi-page continuation) and multi-column
+//!   reading order, RTL and CID/ToUnicode font decoding;
+//! - a document classification (text-based / scanned / image-based /
+//!   mixed) with **per-page OCR recommendations** and reason codes. A
+//!   scanned document is therefore reported as needing OCR instead of
+//!   silently yielding empty text.
 //!
-//! Link extraction *from inside* PDFs is deliberately out of scope — see
-//! the `extract_links` flag on `PdfConfig`, reserved for a follow-up issue.
+//! PDFs go to pdf-inspector directly rather than through anydoc: anydoc
+//! refuses any document with a scanned page (`ConvertError::NeedsOcr`),
+//! while the crawl path and the OCR pipeline (SCR-86) need the text-based
+//! pages plus the list of pages to OCR. anydoc uses pdf-inspector for its
+//! own PDF path, so this is the same engine either way.
 //!
-//! # Example
-//!
-//! ```rust,no_run
-//! use scrapix_parser::pdf::{parse_pdf_bytes, PdfParseResult};
-//!
-//! let bytes: &[u8] = &[]; // raw PDF bytes from the fetcher
-//! let result: PdfParseResult = parse_pdf_bytes(bytes, "https://example.com/doc.pdf")?;
-//! assert!(!result.text.is_empty() || result.likely_scanned());
-//! # Ok::<(), scrapix_core::ScrapixError>(())
-//! ```
+//! [pdf-inspector]: https://github.com/firecrawl/pdf-inspector
 
-use scrapix_core::{Document, Result, ScrapixError};
+use std::collections::HashSet;
+
+use pdf_inspector::{DetectionConfig, PdfError, PdfOptions, PdfType, ScanStrategy};
+use scrapix_core::{Result, ScrapixError};
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::document::{DocumentKind, DocumentParser, ParseOptions, ParsedDocument};
 use crate::language::detect_language;
 
-/// Result of parsing a PDF's raw bytes.
-#[derive(Debug, Clone)]
-pub struct PdfParseResult {
-    /// Extracted plain text, concatenated across pages.
-    pub text: String,
-    /// Title pulled from the PDF's Info dictionary, if present.
-    pub title: Option<String>,
-    /// Detected language (ISO 639-1), derived from the extracted text.
-    pub language: Option<String>,
-}
+/// The pdf-inspector backend of the document dispatch.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PdfInspectorParser;
 
-impl PdfParseResult {
-    /// Heuristic: a PDF whose text extraction produced nothing is likely a
-    /// scanned-image PDF (no OCR in v1). Callers can log a quality warning
-    /// or skip the document entirely.
-    pub fn likely_scanned(&self) -> bool {
-        self.text.trim().is_empty()
+impl DocumentParser for PdfInspectorParser {
+    fn name(&self) -> &'static str {
+        "pdf-inspector"
+    }
+
+    fn supports(&self, kind: DocumentKind) -> bool {
+        kind == DocumentKind::Pdf
+    }
+
+    fn parse(
+        &self,
+        bytes: &[u8],
+        kind: DocumentKind,
+        opts: &ParseOptions,
+    ) -> Result<ParsedDocument> {
+        debug_assert_eq!(kind, DocumentKind::Pdf);
+        parse_pdf(bytes, opts)
     }
 }
 
-/// Parse raw PDF bytes into text + metadata.
+/// Parse raw PDF bytes into Markdown, metadata and an OCR assessment.
 ///
-/// Returns `ScrapixError::Parse` for unparseable or encrypted PDFs, allowing
-/// the content worker's existing failure path to publish a `PageFailed` event.
-pub fn parse_pdf_bytes(bytes: &[u8], url: &str) -> Result<PdfParseResult> {
+/// Returns `ScrapixError::Parse` for empty, unparseable or encrypted PDFs.
+/// A scanned PDF is *not* an error: it comes back with empty (or partial)
+/// Markdown and `pages_needing_ocr` listing the pages to OCR.
+pub fn parse_pdf(bytes: &[u8], opts: &ParseOptions) -> Result<ParsedDocument> {
     if bytes.is_empty() {
         return Err(ScrapixError::Parse("Empty PDF body".to_string()));
     }
 
-    // pdf-extract returns its own error type; map it into our domain error
-    // so callers can treat PDF failures uniformly with HTML parse failures.
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| ScrapixError::Parse(format!("PDF text extraction failed: {}", e)))?;
+    let mut options = PdfOptions::new().detection(DetectionConfig {
+        // Every page is classified, so the OCR recommendation is per page
+        // rather than extrapolated from a sample.
+        strategy: ScanStrategy::Full,
+        ..DetectionConfig::default()
+    });
+    if let Some(max) = opts.max_pages.filter(|m| *m > 0) {
+        options = options.pages(1..=max);
+    }
 
-    let text = normalize_pdf_text(&text);
+    let result = pdf_inspector::process_pdf_mem_with_options(bytes, options).map_err(map_error)?;
+    let page_count = result.page_count;
+    let pages_processed = opts
+        .max_pages
+        .filter(|m| *m > 0)
+        .map_or(page_count, |m| m.min(page_count));
 
-    if text.trim().is_empty() {
+    // Detection samples content streams and over-reports short or
+    // image-heavy text pages; extraction knows which of them actually
+    // yielded no text (the same refinement anydoc applies).
+    let mut pages_needing_ocr: Vec<u32> = result
+        .pages_needing_ocr
+        .iter()
+        .copied()
+        .filter(|p| *p <= pages_processed)
+        .collect();
+    if !pages_needing_ocr.is_empty() {
+        let flagged: Vec<u32> = pages_needing_ocr.iter().map(|p| p - 1).collect();
+        match pdf_inspector::extract_pages_markdown_mem(bytes, Some(&flagged)) {
+            Ok(extraction) => {
+                let confirmed: HashSet<u32> = extraction
+                    .pages
+                    .iter()
+                    .filter(|p| p.needs_ocr)
+                    .map(|p| p.page + 1)
+                    .chain(extraction.pages_needing_ocr.iter().copied())
+                    .collect();
+                pages_needing_ocr.retain(|p| confirmed.contains(p));
+            }
+            Err(e) => debug!(error = %e, "PDF per-page refinement failed; keeping detector pages"),
+        }
+    }
+    let ocr_reasons = result
+        .ocr_reasons_by_page
+        .iter()
+        .filter(|r| pages_needing_ocr.contains(&r.page))
+        .map(|r| (r.page, r.reasons.clone()))
+        .collect();
+
+    let markdown = result
+        .markdown
+        .map(|m| m.trim().to_string())
+        .unwrap_or_default();
+
+    if markdown.is_empty() {
         warn!(
-            url = %url,
             bytes = bytes.len(),
-            "PDF yielded no extractable text (likely scanned image); indexing with empty content"
+            pages = page_count,
+            pdf_type = ?result.pdf_type,
+            "PDF yielded no extractable text; flagged as needing OCR"
         );
-    } else {
-        debug!(
-            url = %url,
-            bytes = bytes.len(),
-            chars = text.len(),
-            "Extracted text from PDF"
+    } else if result.has_encoding_issues {
+        warn!(
+            "PDF has broken font encodings; extracted text may be garbled (ocr=force re-reads it)"
         );
     }
 
-    let language = if text.trim().is_empty() {
+    let text_for_language = crate::markdown_to_text(&markdown);
+    let language = if text_for_language.trim().is_empty() {
         None
     } else {
-        detect_language(&text)
+        detect_language(&text_for_language)
     };
 
-    Ok(PdfParseResult {
-        text,
-        title: None, // pdf-extract doesn't expose the Info dict; title is derived by the worker
+    Ok(ParsedDocument {
+        kind: DocumentKind::Pdf,
+        parser: "pdf-inspector",
+        markdown,
+        title: non_empty(result.title),
+        author: non_empty(result.author),
+        subject: non_empty(result.subject),
+        keywords: non_empty(result.keywords),
         language,
+        page_count: Some(page_count),
+        pages_processed: Some(pages_processed),
+        pdf_type: Some(pdf_type_str(result.pdf_type)),
+        pages_needing_ocr,
+        ocr_reasons,
+        has_encoding_issues: result.has_encoding_issues,
+        has_tables: !result.layout.pages_with_tables.is_empty(),
     })
 }
 
-/// Build a ready-to-index `Document` from parsed PDF bytes.
-///
-/// Handles the PDF-specific indexing contract:
-/// - `content` / `markdown` are set to the extracted text (PDFs have no
-///   semantic heading hierarchy, so both fields hold the same plain text)
-/// - `metadata.content_type = "application/pdf"` tags the doc so users can
-///   `filter = "metadata.content_type = \"application/pdf\""` in Meilisearch
-/// - `metadata.pdf_bytes` records the original byte size for debugging
-/// - URL tags (path segments) follow the same convention as HTML/markdown pages
-///
-/// The `fallback_title` argument is used when the PDF itself carries no title;
-/// the content worker typically passes the basename of the PDF URL.
-pub fn build_pdf_document(
-    url: &str,
-    bytes_len: usize,
-    parsed: PdfParseResult,
-    fallback_title: Option<String>,
-) -> Result<Document> {
-    let parsed_url = Url::parse(url)?;
-    let domain = parsed_url
-        .host_str()
-        .ok_or_else(|| ScrapixError::Parse("URL has no host".to_string()))?;
-
-    let mut doc = Document::new(url, domain);
-
-    // Title precedence: embedded PDF Info dict > fallback (URL basename) > None.
-    doc.title = parsed.title.or(fallback_title);
-
-    if !parsed.text.is_empty() {
-        doc.content = Some(parsed.text.clone());
-        doc.markdown = Some(parsed.text);
-    }
-
-    doc.language = parsed.language;
-
-    // URL tags — mirrors parse_markdown_page so PDFs integrate with
-    // hierarchical faceting the same way HTML pages do.
-    let path = parsed_url.path();
-    let mut tags = Vec::new();
-    let mut current = String::new();
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        if !current.is_empty() {
-            current.push('/');
+/// Per-page Markdown (0-indexed position = page − 1), for merging OCR'd
+/// pages back into a document in page order. Pages beyond `max_pages` are
+/// not extracted.
+pub fn page_markdown(bytes: &[u8], max_pages: Option<u32>) -> Result<Vec<String>> {
+    let pages: Option<Vec<u32>> = max_pages.filter(|m| *m > 0).map(|m| (0..m).collect());
+    let extraction = match pdf_inspector::extract_pages_markdown_mem(bytes, pages.as_deref()) {
+        Ok(extraction) => extraction,
+        // A `max_pages` beyond the document length: retry with every page.
+        Err(_) if pages.is_some() => {
+            pdf_inspector::extract_pages_markdown_mem(bytes, None).map_err(map_error)?
         }
-        current.push_str(segment);
-        tags.push(format!("/{}", current));
-    }
-    doc.urls_tags = Some(tags);
-
-    // Stamp content_type so downstream consumers (Meilisearch filters,
-    // analytics) can distinguish PDFs from HTML without reparsing.
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("content_type".to_string(), "application/pdf".to_string());
-    metadata.insert("pdf_bytes".to_string(), bytes_len.to_string());
-    doc.metadata = Some(metadata);
-
-    Ok(doc)
+        Err(e) => return Err(map_error(e)),
+    };
+    let mut out: Vec<(u32, String)> = extraction
+        .pages
+        .into_iter()
+        .map(|p| (p.page, p.markdown.trim().to_string()))
+        .collect();
+    out.sort_by_key(|(page, _)| *page);
+    Ok(out.into_iter().map(|(_, md)| md).collect())
 }
 
-/// Derive a title from a PDF URL's basename.
-/// Returns `None` if no meaningful name can be extracted.
+/// Absolute `http(s)` URLs from a PDF's link annotations and URLs its text
+/// layer spells out, deduplicated in document order, resolved against
+/// `base_url`, fragments dropped. Powers `features.pdf.extract_links`.
+pub fn extract_links(bytes: &[u8], base_url: &str) -> Result<Vec<String>> {
+    static SPELLED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let spelled = SPELLED.get_or_init(|| {
+        regex::Regex::new(r#"https?://[^\s<>"'()\[\]{}]+"#).expect("valid URL regex")
+    });
+
+    let items = pdf_inspector::extract_text_with_positions_mem(bytes).map_err(map_error)?;
+    let base = Url::parse(base_url).ok();
+    let mut seen = HashSet::new();
+    let mut links = Vec::new();
+    let mut push = |target: &str| {
+        let target = target.trim().trim_end_matches(['.', ',', ';', ':']);
+        let resolved = match &base {
+            Some(base) => base.join(target).ok(),
+            None => Url::parse(target).ok(),
+        };
+        let Some(mut url) = resolved else { return };
+        if !matches!(url.scheme(), "http" | "https") {
+            return;
+        }
+        url.set_fragment(None);
+        let url = url.to_string();
+        if seen.insert(url.clone()) {
+            links.push(url);
+        }
+    };
+    for item in &items {
+        match &item.item_type {
+            pdf_inspector::types::ItemType::Link(target) => push(target),
+            pdf_inspector::types::ItemType::Text => {
+                for m in spelled.find_iter(&item.text) {
+                    push(m.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(links)
+}
+
+/// Derive a title from a document URL's basename (`/files/q3-report.pdf` →
+/// `q3 report`). Returns `None` if no meaningful name can be extracted.
 pub fn title_from_url(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     let last = parsed.path_segments()?.rfind(|s| !s.is_empty())?;
-    let title = last.strip_suffix(".pdf").unwrap_or(last);
+    let last = percent_decode(last);
+    let title = match last.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && (1..=5).contains(&ext.len()) => stem,
+        _ => last.as_str(),
+    };
     let title = title.replace(['-', '_'], " ");
     let title = title.trim();
     if title.is_empty() {
@@ -167,49 +241,45 @@ pub fn title_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Collapse excessive whitespace from pdf-extract output.
-///
-/// `pdf-extract` preserves layout whitespace (multiple spaces between
-/// columns, stray newlines between wrapped lines). For indexing we want
-/// compact text: keep paragraph breaks but normalize runs of whitespace.
-fn normalize_pdf_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last_was_newline = false;
-    let mut prev_char_was_space = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            // Treat blank line as paragraph break (but collapse runs)
-            if !last_was_newline && !out.is_empty() {
-                out.push('\n');
-                out.push('\n');
-                last_was_newline = true;
-            }
-            prev_char_was_space = false;
-            continue;
-        }
-
-        if !out.is_empty() && !last_was_newline {
-            out.push(' ');
-        }
-
-        for c in trimmed.chars() {
-            if c.is_whitespace() {
-                if !prev_char_was_space {
-                    out.push(' ');
-                    prev_char_was_space = true;
-                }
-            } else {
-                out.push(c);
-                prev_char_was_space = false;
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
             }
         }
-
-        last_was_newline = false;
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
-    out.trim().to_string()
+fn pdf_type_str(t: PdfType) -> &'static str {
+    match t {
+        PdfType::TextBased => "text_based",
+        PdfType::Scanned => "scanned",
+        PdfType::ImageBased => "image_based",
+        PdfType::Mixed => "mixed",
+    }
+}
+
+fn non_empty(s: Option<String>) -> Option<String> {
+    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn map_error(e: PdfError) -> ScrapixError {
+    match e {
+        PdfError::Encrypted => ScrapixError::Parse("PDF is encrypted".to_string()),
+        PdfError::NotAPdf(detail) => ScrapixError::Parse(format!("Not a PDF: {detail}")),
+        PdfError::InvalidStructure => ScrapixError::Parse("Invalid PDF structure".to_string()),
+        PdfError::Parse(detail) => ScrapixError::Parse(format!("PDF parsing error: {detail}")),
+        PdfError::Io(e) => ScrapixError::Parse(format!("PDF read error: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +291,14 @@ mod tests {
         assert_eq!(
             title_from_url("https://example.com/spec-v2.pdf"),
             Some("spec v2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_title_from_url_other_extensions_and_encoding() {
+        assert_eq!(
+            title_from_url("https://example.com/files/Q3%20report.docx"),
+            Some("Q3 report".to_string())
         );
     }
 
@@ -243,70 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_pdf_text_collapses_whitespace() {
-        let raw = "Hello    world\n\n\n\nNext paragraph\nwith wrap";
-        let normalized = normalize_pdf_text(raw);
-        assert_eq!(normalized, "Hello world\n\nNext paragraph with wrap");
+    fn test_parse_pdf_empty_input() {
+        assert!(parse_pdf(&[], &ParseOptions::default()).is_err());
     }
 
     #[test]
-    fn test_parse_pdf_bytes_empty_input() {
-        let result = parse_pdf_bytes(&[], "https://example.com/doc.pdf");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_pdf_bytes_invalid_input() {
-        let result = parse_pdf_bytes(b"not a pdf", "https://example.com/doc.pdf");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_likely_scanned_is_true_for_empty_text() {
-        let r = PdfParseResult {
-            text: String::new(),
-            title: None,
-            language: None,
-        };
-        assert!(r.likely_scanned());
-    }
-
-    #[test]
-    fn test_build_pdf_document_sets_content_type_metadata() {
-        let parsed = PdfParseResult {
-            text: "Some extracted text".to_string(),
-            title: Some("My PDF".to_string()),
-            language: Some("en".to_string()),
-        };
-        let doc =
-            build_pdf_document("https://example.com/docs/spec.pdf", 1024, parsed, None).unwrap();
-        assert_eq!(doc.title.as_deref(), Some("My PDF"));
-        assert_eq!(doc.content.as_deref(), Some("Some extracted text"));
-        assert_eq!(doc.language.as_deref(), Some("en"));
-        let meta = doc.metadata.expect("metadata must be set for PDFs");
-        assert_eq!(
-            meta.get("content_type").map(String::as_str),
-            Some("application/pdf")
-        );
-        assert_eq!(meta.get("pdf_bytes").map(String::as_str), Some("1024"));
-        let tags = doc.urls_tags.expect("urls_tags must be populated");
-        assert!(tags.contains(&"/docs".to_string()));
-    }
-
-    #[test]
-    fn test_build_pdf_document_uses_fallback_title() {
-        let parsed = PdfParseResult {
-            text: "hi".to_string(),
-            title: None,
-            language: None,
-        };
-        let doc = build_pdf_document(
-            "https://example.com/a.pdf",
-            10,
-            parsed,
-            Some("Fallback".to_string()),
-        )
-        .unwrap();
-        assert_eq!(doc.title.as_deref(), Some("Fallback"));
+    fn test_parse_pdf_invalid_input() {
+        assert!(parse_pdf(b"not a pdf", &ParseOptions::default()).is_err());
     }
 }

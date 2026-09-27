@@ -24,6 +24,7 @@ scrapix-parser = { path = "../../crates/scrapix-parser" }
 scrapix-extractor = { path = "../../crates/scrapix-extractor" }
 scrapix-crawler = { path = "../../crates/scrapix-crawler", features = ["browser-cdp"] }
 scrapix-ai = { path = "../../crates/scrapix-ai" }
+scrapix-ocr = { path = "../../crates/scrapix-ocr" }
 
 # Config validation (CrawlConfig::validate())
 validator = { workspace = true }
@@ -38,11 +39,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 
-# Web framework
-axum = { workspace = true }
+# Web framework (multipart: POST /parse uploads)
+axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true }
 
 # Utilities
+base64 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
@@ -84,3 +86,4 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+tower = { workspace = true }

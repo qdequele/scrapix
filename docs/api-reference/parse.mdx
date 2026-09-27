@@ -1,0 +1,111 @@
+---
+title: Parse
+description: Upload a document (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV) and get Markdown back
+---
+
+# Parse
+
+`POST /parse` converts a file you already have into Markdown, with the same
+parsers the crawler uses. It returns the [`/scrape`](/api-reference/scrape)
+response shape, plus a `document` object describing the file.
+
+<Tip>
+  Try it from the console: **Scrape → Upload file**.
+</Tip>
+
+## POST /parse
+
+`multipart/form-data` with:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `file` | yes | The document. Max **50 MB** by default (`DOCUMENT_MAX_SIZE_MB`). |
+| `options` | no | JSON options (below) |
+| `formats` | no | Shorthand for `options.formats`: `markdown,links` or `["markdown","links"]` |
+
+```bash
+curl -X POST https://scrapix.meilisearch.dev/parse \
+  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -F file=@report.xlsx \
+  -F 'options={"formats": ["markdown", "metadata"]}'
+```
+
+### Options
+
+```json
+{
+  "formats": ["markdown", "content", "metadata"],
+  "include_links": false,
+  "parsers": {
+    "ocr": "off",
+    "ocr_max_pages": 20,
+    "max_pages": 100
+  },
+  "ai": { "summary": true }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `formats` | string[] | `markdown`, `content`, `metadata` | `markdown`, `content`, `metadata`, `links`. (`html`, `rawhtml`, `schema`, `blocks`, `screenshot` do not apply to documents and return a warning.) |
+| `include_links` | boolean | `false` | Include the links found in the document |
+| `parsers.ocr` | string | `off` | `off`, `auto` or `force` — see [Documents & OCR](/guides/documents#ocr) |
+| `parsers.ocr_max_pages` | integer | server cap (50) | Per-document OCR page cap (only lowers the server cap) |
+| `parsers.max_pages` | integer | all | Parse only the first N PDF pages |
+| `ai` | object | `null` | Same as [`/scrape` AI options](/api-reference/scrape) |
+
+The format is detected from the file part's `Content-Type`, then from the
+file's bytes. The filename is not trusted (it only serves as a title
+fallback). Images (PNG, JPEG, GIF, WebP, TIFF) are accepted with
+`parsers.ocr` set to `auto` or `force`.
+
+### Response
+
+```json
+{
+  "success": true,
+  "url": "upload://report.pdf",
+  "markdown": "# Quarterly Report\n\n|Region|Q1|Q2|\n|---|---|---|\n|North|120|135|",
+  "content": "Quarterly Report ...",
+  "metadata": { "title": "Quarterly Report", "author": "Finance", "keywords": [] },
+  "language": "en",
+  "document": {
+    "format": "pdf",
+    "content_type": "application/pdf",
+    "parser": "pdf-inspector",
+    "bytes": 184233,
+    "page_count": 12,
+    "pages_processed": 12,
+    "pdf_type": "mixed",
+    "needs_ocr": true,
+    "pages_needing_ocr": [7],
+    "has_tables": true
+  },
+  "warning": "1 page(s) have no text layer (scanned); set parsers.ocr to \"auto\" to recognize them",
+  "status_code": 200,
+  "scrape_duration_ms": 41
+}
+```
+
+With `parsers.ocr` set, the response also carries an `ocr` object
+(`mode`, `backend`, `pages_processed`, `pages_cached`, `pages_skipped`,
+`pages_capped`, `pages_failed`, `pages`).
+
+### Errors
+
+| Status | `code` | When |
+|--------|--------|------|
+| 400 | `validation_error` | Missing `file`, empty file, invalid `options` JSON |
+| 400 | `ocr_required` | An image was uploaded without `parsers.ocr` |
+| 402 | `insufficient_credits` | Not enough credits (including planned OCR pages) |
+| 413 | `file_too_large` | File larger than `DOCUMENT_MAX_SIZE_MB` |
+| 415 | `unsupported_document` | Unrecognized format |
+| 422 | `parse_error` | The file is corrupt, encrypted or otherwise unreadable |
+| 503 | `ocr_unavailable` | An image was uploaded but OCR is disabled on the server |
+
+### Billing
+
+Billed **per document** like `/scrape` (1 credit minimum, +1 per feature
+format, +5 per AI option), plus **5 credits per page recognized by OCR**
+(recorded as a separate `ocr` ledger entry; cached pages are free). See
+[Billing](/guides/billing#ocr).

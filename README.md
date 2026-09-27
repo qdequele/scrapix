@@ -43,6 +43,8 @@ Scrapix aims to be an internet-scale web crawler capable of:
 | Local State | RocksDB |
 | Cache | DragonflyDB (Redis-compatible) |
 | Object Storage | S3/MinIO/RustFS |
+| Documents | pdf-inspector (PDF), anydoc (Word/Excel/PowerPoint/OpenDocument/RTF/EPUB/CSV) |
+| OCR | PDFium rasterization + vision LLM or Tesseract (opt-in) |
 
 ## Quick Start
 
@@ -320,6 +322,9 @@ See [examples/](examples/) for configuration examples:
       "model": "gpt-4"
     },
     "ai_summary": { "enabled": true },
+    "pdf": { "enabled": true, "extract_links": true },
+    "documents": { "enabled": true },
+    "ocr": { "mode": "auto" },
     "embeddings": {
       "enabled": true,
       "model": "text-embedding-3-small"
@@ -377,6 +382,9 @@ kubectl apply -k deploy/kubernetes/overlays/prod
 | `MAX_DEPTH` | Max crawl depth | `100` |
 | `RESPECT_ROBOTS` | Respect robots.txt | `true` |
 | `OPENAI_API_KEY` | OpenAI API key (for AI features) | - |
+| `OCR_BACKEND` | OCR backend: `auto`, `vision`, `tesseract`, `off` | `auto` |
+| `PDFIUM_LIB_PATH` | PDFium library for OCR page rasterization | system loader |
+| `DOCUMENT_MAX_SIZE_MB` | Max document size for `/scrape` and `/parse` | `50` |
 
 ## Near-Duplicate Detection
 

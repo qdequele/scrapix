@@ -74,6 +74,16 @@ docker build --target scrapix-worker-content -t scrapix-content .
 
 Pre-built images are available at `ghcr.io/quentindequelen/scrapix:latest`.
 
+<Note>
+  The `scrapix-api`, `scrapix-worker-content` and single-binary images include
+  what [OCR of scanned documents](/guides/documents#ocr) needs: Tesseract and a
+  pinned PDFium build (`PDFIUM_LIB_PATH=/opt/pdfium/lib`). For native
+  deployments (systemd, no Docker), install `tesseract-ocr` and a PDFium
+  library from [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
+  on the API and content-worker hosts and set `PDFIUM_LIB_PATH`. Without
+  them, documents still parse; only OCR reports itself as unavailable.
+</Note>
+
 ## Required Infrastructure
 
 Every deployment needs Meilisearch. Everything else is optional:

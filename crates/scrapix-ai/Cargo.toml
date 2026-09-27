@@ -24,6 +24,9 @@ reqwest = { workspace = true }
 # Token counting
 tiktoken-rs = { workspace = true }
 
+# Base64 image payloads for vision requests
+base64 = { workspace = true }
+
 # Time
 chrono = { workspace = true }
 

@@ -23,6 +23,7 @@ scrapix-storage = { path = "../../crates/scrapix-storage" }
 scrapix-queue = { path = "../../crates/scrapix-queue" }
 scrapix-lifecycle = { path = "../../crates/scrapix-lifecycle" }
 scrapix-ai = { path = "../../crates/scrapix-ai" }
+scrapix-ocr = { path = "../../crates/scrapix-ocr" }
 
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -34,10 +35,11 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-# Base64 decode for PDF bodies carried through RawPageMessage.html
+# Base64 decode for document bodies carried through RawPageMessage.html
 base64 = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }

@@ -4,14 +4,16 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ImageDetail, ImageUrl,
     },
     Client as OpenAIClient,
 };
 use async_trait::async_trait;
 
-use super::{ChatResponse, LlmProvider, Message, MessageRole};
+use super::{ChatResponse, ImageInput, LlmProvider, Message, MessageRole};
 use crate::client::AiClientError;
 
 /// OpenAI provider backed by async-openai
@@ -84,6 +86,63 @@ impl LlmProvider for OpenAiProvider {
             .build()
             .map_err(|e| AiClientError::Config(e.to_string()))?;
 
+        self.send(request).await
+    }
+
+    async fn vision(
+        &self,
+        system: &str,
+        prompt: &str,
+        image: &ImageInput,
+        model: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, AiClientError> {
+        let config_err = |e: async_openai::error::OpenAIError| AiClientError::Config(e.to_string());
+        let messages = vec![
+            ChatCompletionRequestMessage::System(
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(system)
+                    .build()
+                    .map_err(config_err)?,
+            ),
+            ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                            ChatCompletionRequestMessageContentPartImage {
+                                image_url: ImageUrl {
+                                    url: image.data_url(),
+                                    detail: Some(ImageDetail::High),
+                                },
+                            },
+                        ),
+                        ChatCompletionRequestUserMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText {
+                                text: prompt.to_string(),
+                            },
+                        ),
+                    ]))
+                    .build()
+                    .map_err(config_err)?,
+            ),
+        ];
+
+        let mut request_builder = CreateChatCompletionRequestArgs::default();
+        request_builder.model(model).messages(messages);
+        if let Some(tokens) = max_tokens {
+            // `max_tokens` is rejected by current reasoning models.
+            request_builder.max_completion_tokens(tokens);
+        }
+        let request = request_builder.build().map_err(config_err)?;
+        self.send(request).await
+    }
+}
+
+impl OpenAiProvider {
+    async fn send(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<ChatResponse, AiClientError> {
         let response = self.client.chat().create(request).await?;
 
         let choice = response

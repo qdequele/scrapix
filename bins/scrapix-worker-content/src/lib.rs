@@ -41,11 +41,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, AiUsageContext, AiUsageEvent, AI_USAGE_CONTEXT};
+use scrapix_core::content_types;
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage};
 use scrapix_extractor::{
     BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor, SelectorExtractor,
 };
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
+use scrapix_ocr::{OcrEngine, OcrRequest};
+use scrapix_parser::ParseOptions;
 use scrapix_parser::{HtmlParser, HtmlParserConfig};
 use scrapix_queue::{
     control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
@@ -57,6 +60,25 @@ use scrapix_storage::{DocAck, MeilisearchStorage, MeilisearchStorageBuilder};
 /// AI provider.
 pub const WARN_AI_NO_PROVIDER: &str =
     "AI enrichment requested but no AI provider configured on content workers";
+/// Metadata keys describing a parsed document, kept on indexed documents
+/// even when `features.metadata` is off.
+const DOCUMENT_DESCRIPTOR_KEYS: &[&str] = &[
+    "content_type",
+    "document_format",
+    "document_bytes",
+    "pdf_bytes",
+    "page_count",
+    "pdf_type",
+    "needs_ocr",
+    "pages_needing_ocr",
+    "ocr_pages",
+    "ocr_backend",
+];
+
+/// `JobWarning` when a job asks for OCR (`features.ocr.mode` ≠ `off`) but
+/// this worker has no OCR backend (`OCR_BACKEND=off`).
+pub const WARN_OCR_UNAVAILABLE: &str =
+    "features.ocr is set but OCR is disabled on this worker (OCR_BACKEND=off); scanned pages are flagged (metadata.needs_ocr) but not recognized";
 /// `JobWarning` when a job asks for AI enrichment together with block
 /// splitting (AI only runs on whole pages).
 pub const WARN_AI_BLOCK_SPLIT: &str =
@@ -311,6 +333,8 @@ enum PageOutcome {
         /// `document_id` reported in `DocumentIndexed`
         document_id: String,
         ai_enriched: bool,
+        /// Freshly OCR'd pages (billed), reported in `DocumentIndexed`.
+        ocr_pages: u32,
     },
     /// Nothing to index (reason goes into `DocumentSkipped`).
     Skipped(String),
@@ -410,6 +434,9 @@ struct ContentWorker {
     /// settings applied unless `keep_settings`) when it is first created.
     storage_cache: tokio::sync::Mutex<HashMap<StorageKey, Arc<MeilisearchStorage>>>,
     ai_service: Option<Arc<AiService>>,
+    /// OCR for scanned PDF pages (opt-in per job via `features.ocr`);
+    /// `None` with `OCR_BACKEND=off`.
+    ocr: Option<Arc<OcrEngine>>,
     ai_config: AiConfig,
     ai_usage_rx: parking_lot::Mutex<Option<scrapix_ai::AiUsageReceiver>>,
     dedup_detector: Option<Arc<NearDuplicateDetector>>,
@@ -488,6 +515,7 @@ impl ContentWorker {
             !args.skip_meilisearch,
         );
         worker.control_consumer = Some(Arc::new(control.into()));
+        worker.init_ocr().await;
         Ok(worker)
     }
 
@@ -507,7 +535,16 @@ impl ContentWorker {
         startup_check(args).await;
         let mut worker = Self::build(args, worker_id, consumer, producer, !args.skip_meilisearch);
         worker.control_consumer = control;
+        worker.init_ocr().await;
         Ok(worker)
+    }
+
+    /// Build the OCR engine (`OCR_BACKEND`, see `scrapix_ocr::OcrEngine`).
+    /// The vision backend reuses the AI client, so its calls are tracked as
+    /// `AiUsage` events with feature `ocr`.
+    async fn init_ocr(&mut self) {
+        let client = self.ai_service.as_ref().map(|s| s.client().clone());
+        self.ocr = OcrEngine::from_env(client).await.map(Arc::new);
     }
 
     /// Shared construction once the bus exists.
@@ -620,6 +657,7 @@ impl ContentWorker {
             default_meilisearch_key: args.meilisearch_key.clone().unwrap_or_default(),
             storage_cache: tokio::sync::Mutex::new(HashMap::new()),
             ai_service,
+            ocr: None,
             ai_config,
             ai_usage_rx: parking_lot::Mutex::new(ai_usage_rx),
             dedup_detector,
@@ -1015,8 +1053,9 @@ impl ContentWorker {
                 docs,
                 document_id,
                 ai_enriched,
+                ocr_pages,
             } => {
-                self.index_page(&msg, docs, document_id, ai_enriched, ack)
+                self.index_page(&msg, docs, document_id, ai_enriched, ocr_pages, ack)
                     .await;
             }
         }
@@ -1042,6 +1081,7 @@ impl ContentWorker {
         docs: Vec<Document>,
         document_id: String,
         ai_enriched: bool,
+        ocr_pages: u32,
         ack: Ack,
     ) {
         // Resolve the target first: a page that cannot be indexed must not
@@ -1109,6 +1149,7 @@ impl ContentWorker {
                     timestamp: now_ms(),
                     url_message_id: msg.url_message_id.clone(),
                     ai_enriched,
+                    ocr_pages,
                 },
                 docs: docs.len() as u64,
                 ack,
@@ -1210,11 +1251,12 @@ impl ContentWorker {
             return PageOutcome::Skipped("index_only".to_string());
         }
 
-        // Route by content type: PDFs and markdown each get their own path,
-        // other non-HTML is skipped.
+        // Route by content type: binary documents (PDF, office formats,
+        // generic downloads — base64 bodies) and markdown each get their own
+        // path, other non-HTML is skipped.
         if let Some(ref content_type) = msg.content_type {
-            if content_type.contains("application/pdf") {
-                return self.process_pdf_page(msg).await;
+            if content_types::is_binary_document(content_type) {
+                return self.process_document_page(msg, content_type).await;
             }
             if content_type.contains("text/markdown") {
                 return self.process_markdown_page(msg).await;
@@ -1308,6 +1350,7 @@ impl ContentWorker {
                         docs,
                         document_id: format!("{}-blocks", document.uid),
                         ai_enriched: false,
+                        ocr_pages: 0,
                     };
                 }
                 Ok(_) => {
@@ -1360,53 +1403,139 @@ impl ContentWorker {
         single(document, ai_enriched)
     }
 
-    /// Process a page whose Content-Type is `application/pdf`.
+    /// Process a binary document: PDF (pdf-inspector) or an office/other
+    /// format (anydoc), with opt-in OCR of scanned PDF pages.
     ///
-    /// The upstream fetcher base64-encodes PDF bytes into `msg.html` so they
-    /// survive the JSON Kafka payload. Empty PDFs (scanned images without
-    /// OCR) are indexed with empty content so operators see the URL.
-    async fn process_pdf_page(&self, msg: &RawPageMessage) -> PageOutcome {
+    /// The upstream fetcher base64-encodes document bytes into `msg.html`
+    /// so they survive the JSON Kafka payload. The format is decided from
+    /// the `Content-Type` header, then the bytes (never the URL extension),
+    /// and must be enabled by the job (`features.pdf` / `features.documents`).
+    /// A scanned document that is not OCR'd is still indexed, flagged with
+    /// `metadata.needs_ocr`, so operators see it instead of a silent blank.
+    async fn process_document_page(&self, msg: &RawPageMessage, content_type: &str) -> PageOutcome {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let bytes = match BASE64.decode(msg.html.as_bytes()) {
             Ok(b) => b,
             Err(e) => {
-                return PageOutcome::Failed(format!("Failed to base64-decode PDF payload: {}", e))
+                return PageOutcome::Failed(format!(
+                    "Failed to base64-decode document payload: {}",
+                    e
+                ))
             }
         };
-        let pdf_bytes_len = bytes.len();
+        let bytes_len = bytes.len();
 
-        let parsed = match scrapix_parser::pdf::parse_pdf_bytes(&bytes, &msg.url) {
-            Ok(p) => p,
-            Err(e) => return PageOutcome::Failed(format!("PDF parse error: {}", e)),
+        let job_features = self.resolve_features(msg);
+        let Some(kind) = scrapix_parser::detect_kind(Some(content_type), &bytes) else {
+            self.metrics.record_skipped();
+            return PageOutcome::Skipped(format!("unrecognized document ({content_type})"));
+        };
+        if !kind.allowed_by(&job_features) {
+            self.metrics.record_skipped();
+            return PageOutcome::Skipped(format!("{} documents not enabled", kind.as_str()));
+        }
+
+        // Parsing is CPU-bound (a large PDF can take a while): keep it off
+        // the async runtime.
+        let opts = ParseOptions {
+            max_pages: job_features.pdf_max_pages(),
+        };
+        let parse_bytes = bytes.clone();
+        let parsed = tokio::task::spawn_blocking(move || {
+            scrapix_parser::document::default_dispatch().parse(&parse_bytes, kind, &opts)
+        })
+        .await;
+        let mut parsed = match parsed {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return PageOutcome::Failed(format!("Document parse error: {}", e)),
+            Err(e) => return PageOutcome::Failed(format!("Document parse task failed: {}", e)),
         };
 
+        let ocr_mode = job_features.ocr_mode();
+        let mut ocr_report = None;
+        if !ocr_mode.is_off() {
+            match self.ocr.as_ref() {
+                Some(engine) => {
+                    let request = OcrRequest {
+                        mode: ocr_mode,
+                        max_pages: job_features.ocr_max_pages(),
+                        account_id: msg.account_id.clone(),
+                        usage_context: Some(AiUsageContext {
+                            job_id: msg.job_id.clone(),
+                            account_id: msg.account_id.clone(),
+                            feature: "ocr".to_string(),
+                            url: msg.url.clone(),
+                        }),
+                    };
+                    let report = engine.apply(&bytes, &mut parsed, &request).await;
+                    if let Some(ref warning) = report.warning {
+                        self.warn_job_once(&msg.job_id, warning).await;
+                    }
+                    ocr_report = Some(report);
+                }
+                None => self.warn_job_once(&msg.job_id, WARN_OCR_UNAVAILABLE).await,
+            }
+        }
+
         let fallback_title = scrapix_parser::pdf::title_from_url(&msg.final_url);
-        let mut document = match scrapix_parser::pdf::build_pdf_document(
+        let mut document = match scrapix_parser::build_document(
             &msg.final_url,
-            pdf_bytes_len,
-            parsed,
+            bytes_len,
+            &parsed,
             fallback_title,
         ) {
             Ok(doc) => doc,
-            Err(e) => return PageOutcome::Failed(format!("PDF document build error: {}", e)),
+            Err(e) => return PageOutcome::Failed(format!("Document build error: {}", e)),
         };
+        if let (Some(report), Some(meta)) = (ocr_report.as_ref(), document.metadata.as_mut()) {
+            if report.pages_processed > 0 {
+                meta.insert("ocr_pages".to_string(), report.pages_processed.to_string());
+                if let Some(ref backend) = report.backend {
+                    meta.insert("ocr_backend".to_string(), backend.clone());
+                }
+            }
+        }
 
-        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        let features = features::page_features(&job_features, &msg.url);
         self.stamp(&mut document, msg);
+        let descriptor = document.metadata.clone();
         Self::filter_document(&mut document, &features);
+        // The document descriptor (format, pages, OCR flags) describes the
+        // document itself rather than extracted meta tags: it is kept even
+        // without `features.metadata`, so a scanned document is always
+        // visibly flagged instead of indexed as a silent blank.
+        if document.metadata.is_none() {
+            document.metadata = descriptor.map(|mut m| {
+                m.retain(|k, _| DOCUMENT_DESCRIPTOR_KEYS.contains(&k.as_str()));
+                m
+            });
+        }
+
+        if let Some(reason) = self.near_duplicate(&document, msg) {
+            return PageOutcome::Skipped(reason);
+        }
 
         info!(
             url = %msg.url,
+            format = kind.as_str(),
             title = ?document.title,
-            pdf_bytes = pdf_bytes_len,
-            "PDF page parsed successfully"
+            bytes = bytes_len,
+            pages = ?parsed.page_count,
+            needs_ocr = parsed.needs_ocr(),
+            ocr_pages = ocr_report.as_ref().map_or(0, |r| r.pages_processed),
+            "Document parsed successfully"
         );
 
-        // PDFs have no heading tree: no block splitting.
+        // Documents have no HTML heading tree: no block splitting.
         let (document, ai_enriched) = self.enrich_with_ai(document, &features, msg).await;
-        self.metrics.record_success(pdf_bytes_len as u64, 1);
-        single(document, ai_enriched)
+        self.metrics.record_success(bytes_len as u64, 1);
+        PageOutcome::Index {
+            document_id: document.uid.clone(),
+            docs: vec![document],
+            ai_enriched,
+            ocr_pages: ocr_report.map_or(0, |r| r.billable_pages()),
+        }
     }
 
     /// Stamp job id (Replace strategy stale cleanup) and source
@@ -1705,6 +1834,7 @@ fn single(document: Document, ai_enriched: bool) -> PageOutcome {
         document_id: document.uid.clone(),
         docs: vec![document],
         ai_enriched,
+        ocr_pages: 0,
     }
 }
 
@@ -2473,5 +2603,269 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(drain::<CrawlEvent>(&events).await.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Binary documents (SCR-81) and OCR (SCR-86)
+    // ---------------------------------------------------------------------
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/scrapix-parser/tests/fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// A crawled document as the fetcher forwards it: base64 body.
+    fn doc_page(
+        url: &str,
+        content_type: &str,
+        bytes: &[u8],
+        features: FeaturesConfig,
+    ) -> RawPageMessage {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let mut msg = page(url, 200, None);
+        msg.html = BASE64.encode(bytes);
+        msg.content_type = Some(content_type.to_string());
+        msg.features = Some(features);
+        msg
+    }
+
+    /// Markdown on, `features.metadata` off: the document descriptor
+    /// metadata must survive regardless.
+    fn markdown_on() -> Option<FeatureToggle> {
+        Some(FeatureToggle {
+            enabled: true,
+            include_pages: vec![],
+            exclude_pages: vec![],
+        })
+    }
+
+    fn documents_on() -> FeaturesConfig {
+        FeaturesConfig {
+            markdown: markdown_on(),
+            documents: Some(scrapix_core::DocumentsConfig {
+                enabled: true,
+                max_size_mb: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn pdf_on(ocr: scrapix_core::OcrMode) -> FeaturesConfig {
+        FeaturesConfig {
+            markdown: markdown_on(),
+            pdf: Some(scrapix_core::PdfConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ocr: Some(scrapix_core::OcrConfig {
+                mode: ocr,
+                max_pages: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn indexed_doc(outcome: PageOutcome) -> (Document, u32) {
+        match outcome {
+            PageOutcome::Index {
+                mut docs,
+                ocr_pages,
+                ..
+            } => (docs.remove(0), ocr_pages),
+            PageOutcome::Skipped(r) => panic!("skipped: {r}"),
+            PageOutcome::Failed(e) => panic!("failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn crawled_office_documents_are_indexed_as_markdown() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        for (file, content_type, format) in [
+            (
+                "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "docx",
+            ),
+            ("report.xlsx", "application/octet-stream", "xlsx"),
+            (
+                "report.pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "pptx",
+            ),
+            ("report.epub", "application/epub+zip", "epub"),
+        ] {
+            let msg = doc_page(
+                &format!("https://a.test/files/{file}"),
+                content_type,
+                &fixture(file),
+                documents_on(),
+            );
+            let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+            let md = doc.markdown.as_deref().unwrap_or_default();
+            assert!(
+                md.contains("North") || md.contains("Revenue grew"),
+                "{file}: {md}"
+            );
+            assert!(
+                doc.content.as_deref().is_some_and(|c| !c.is_empty()),
+                "{file}"
+            );
+            let meta = doc.metadata.expect("metadata");
+            assert_eq!(meta["document_format"], format, "{file}");
+            assert_eq!(meta["needs_ocr"], "false", "{file}");
+            assert_eq!(ocr_pages, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn documents_the_job_did_not_enable_are_skipped() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        // Only PDFs enabled: a DOCX behind a generic download type is skipped.
+        let msg = doc_page(
+            "https://a.test/download",
+            "application/octet-stream",
+            &fixture("report.docx"),
+            pdf_on(scrapix_core::OcrMode::Off),
+        );
+        match w.process_page(&msg).await {
+            PageOutcome::Skipped(reason) => assert!(reason.contains("docx"), "{reason}"),
+            _ => panic!("expected a skip"),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_pdf_keeps_its_table() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let msg = doc_page(
+            "https://a.test/report.pdf",
+            "application/pdf",
+            &fixture("text-table.pdf"),
+            pdf_on(scrapix_core::OcrMode::Off),
+        );
+        let (doc, _) = indexed_doc(w.process_page(&msg).await);
+        assert!(doc.markdown.as_deref().unwrap().contains("|North|120|135|"));
+        assert_eq!(doc.title.as_deref(), Some("Quarterly Report"));
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_without_ocr_is_indexed_flagged() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let msg = doc_page(
+            "https://a.test/scan.pdf",
+            "application/pdf",
+            &fixture("scanned.pdf"),
+            pdf_on(scrapix_core::OcrMode::Off),
+        );
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert!(doc.content.is_none());
+        let meta = doc.metadata.unwrap();
+        assert_eq!(meta["needs_ocr"], "true");
+        assert_eq!(meta["pages_needing_ocr"], "1");
+        assert_eq!(ocr_pages, 0);
+    }
+
+    struct FakeRaster;
+    impl scrapix_ocr::PageRasterizer for FakeRaster {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn render_png(
+            &self,
+            _: &[u8],
+            pages: &[u32],
+            _: f32,
+        ) -> Result<Vec<Vec<u8>>, scrapix_ocr::OcrError> {
+            Ok(pages
+                .iter()
+                .map(|p| format!("png-{p}").into_bytes())
+                .collect())
+        }
+    }
+
+    struct FakeOcr;
+    #[async_trait::async_trait]
+    impl scrapix_ocr::OcrBackend for FakeOcr {
+        fn name(&self) -> &str {
+            "fake-ocr"
+        }
+        async fn recognize(&self, _: &[u8], _: &str) -> Result<String, scrapix_ocr::OcrError> {
+            Ok("Invoice number 4821".to_string())
+        }
+    }
+
+    fn fake_ocr_engine() -> Arc<OcrEngine> {
+        Arc::new(OcrEngine::new(
+            Arc::new(FakeRaster),
+            Arc::new(FakeOcr),
+            Arc::new(scrapix_ocr::MemoryOcrCache::new(10)),
+            Arc::new(scrapix_ocr::MemoryOcrBudget::new(0)),
+            scrapix_ocr::OcrSettings::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn ocr_auto_recognizes_only_the_scanned_page_of_a_mixed_pdf() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let mut w = build_worker(&bus, &ms, &[]);
+        w.ocr = Some(fake_ocr_engine());
+        let w = started(w);
+        let msg = doc_page(
+            "https://a.test/mixed.pdf",
+            "application/pdf",
+            &fixture("mixed.pdf"),
+            pdf_on(scrapix_core::OcrMode::Auto),
+        );
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 1, "only page 2 was OCR'd (and billed)");
+        let md = doc.markdown.unwrap();
+        assert!(md.contains("Quarterly Report"), "native page kept: {md}");
+        assert!(
+            md.contains("Invoice number 4821"),
+            "OCR'd page merged: {md}"
+        );
+        assert!(
+            md.find("Quarterly Report") < md.find("Invoice number"),
+            "page order"
+        );
+        let meta = doc.metadata.unwrap();
+        assert_eq!(meta["needs_ocr"], "false");
+        assert_eq!(meta["ocr_pages"], "1");
+        assert_eq!(meta["ocr_backend"], "fake-ocr");
+
+        // Re-crawling the same document hits the OCR cache: nothing billed.
+        let (_, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 0);
+    }
+
+    #[tokio::test]
+    async fn ocr_requested_on_a_worker_without_ocr_warns_and_flags() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = worker(&bus, &ms); // `ocr: None`
+        let msg = doc_page(
+            "https://a.test/scan.pdf",
+            "application/pdf",
+            &fixture("scanned.pdf"),
+            pdf_on(scrapix_core::OcrMode::Auto),
+        );
+        let (doc, _) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(doc.metadata.unwrap()["needs_ocr"], "true");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CrawlEvent::JobWarning { message, .. } if message == WARN_OCR_UNAVAILABLE
+        )));
     }
 }

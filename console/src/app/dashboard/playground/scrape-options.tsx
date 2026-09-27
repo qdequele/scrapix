@@ -6,7 +6,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Plus, X } from "lucide-react";
+import type { OcrMode } from "@/lib/api-types";
 
 export interface ScrapeState {
   formats: string[];
@@ -24,12 +26,41 @@ export interface ScrapeState {
   // AI extraction
   feat_ai_extraction: boolean;
   ai_extraction_prompt: string;
+  // Documents (PDF, office formats) and OCR
+  ocr_mode: OcrMode;
+  ocr_max_pages: string;
+  max_pages: string;
 }
+
+/** Where the content comes from: a URL (`/scrape`) or an uploaded file (`/parse`). */
+export type ScrapeSource = "url" | "file";
 
 interface ScrapeOptionsProps {
   state: ScrapeState;
   onChange: (state: ScrapeState) => void;
+  source: ScrapeSource;
 }
+
+/** Formats that apply to documents; the rest only exist for HTML pages. */
+export const DOCUMENT_FORMATS = ["markdown", "content", "links", "metadata"];
+
+const OCR_MODES: { value: OcrMode; label: string; description: string }[] = [
+  {
+    value: "off",
+    label: "Off",
+    description: "Scanned pages are flagged, not read",
+  },
+  {
+    value: "auto",
+    label: "Auto",
+    description: "OCR only the pages with no text layer",
+  },
+  {
+    value: "force",
+    label: "Force",
+    description: "OCR every page (for garbled text)",
+  },
+];
 
 const FORMAT_OPTIONS: {
   value: string;
@@ -188,7 +219,11 @@ function KeyValueList({
   );
 }
 
-export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
+export function ScrapeOptions({ state, onChange, source }: ScrapeOptionsProps) {
+  const isFile = source === "file";
+  const formatOptions = isFile
+    ? FORMAT_OPTIONS.filter((f) => DOCUMENT_FORMATS.includes(f.value))
+    : FORMAT_OPTIONS;
   const set = <K extends keyof ScrapeState>(key: K, value: ScrapeState[K]) =>
     onChange({ ...state, [key]: value });
 
@@ -206,7 +241,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
           Output Formats
         </Label>
         <div className="space-y-1">
-          {FORMAT_OPTIONS.map(({ value, label, description }) => (
+          {formatOptions.map(({ value, label, description }) => (
             <SwitchRow
               key={value}
               id={`fmt-${value}`}
@@ -219,7 +254,80 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
         </div>
       </div>
 
+      {/* ── Documents ── */}
+      <div className="space-y-3 border-t pt-4">
+        <div>
+          <Label className="text-xs text-muted-foreground uppercase tracking-wide">
+            Documents
+          </Label>
+          <p className="text-xs text-muted-foreground mt-1">
+            {isFile
+              ? "PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV, or an image with OCR."
+              : "Applies when the URL serves a PDF or an office document (Word, Excel, PowerPoint, ...)."}
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label className="text-sm font-medium">OCR</Label>
+          <ToggleGroup
+            type="single"
+            variant="outline"
+            value={state.ocr_mode}
+            onValueChange={(v) => {
+              if (v) set("ocr_mode", v as OcrMode);
+            }}
+            className="w-full"
+          >
+            {OCR_MODES.map((m) => (
+              <ToggleGroupItem
+                key={m.value}
+                value={m.value}
+                className="flex-1 data-[state=on]:bg-primary/10 data-[state=on]:text-primary data-[state=on]:border-primary/30"
+              >
+                {m.label}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
+          <p className="text-xs text-muted-foreground">
+            {OCR_MODES.find((m) => m.value === state.ocr_mode)?.description}
+            {state.ocr_mode !== "off" && " · 5 credits per OCR'd page"}
+          </p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          {state.ocr_mode !== "off" && (
+            <div className="space-y-1.5">
+              <Label htmlFor="ocr-max-pages" className="text-sm font-medium">
+                OCR page cap
+              </Label>
+              <Input
+                id="ocr-max-pages"
+                type="number"
+                min="1"
+                placeholder="50"
+                value={state.ocr_max_pages}
+                onChange={(e) => set("ocr_max_pages", e.target.value)}
+              />
+            </div>
+          )}
+          <div className="space-y-1.5">
+            <Label htmlFor="max-pages" className="text-sm font-medium">
+              Max PDF pages
+            </Label>
+            <Input
+              id="max-pages"
+              type="number"
+              min="1"
+              placeholder="All"
+              value={state.max_pages}
+              onChange={(e) => set("max_pages", e.target.value)}
+            />
+          </div>
+        </div>
+      </div>
+
       {/* ── Features ── */}
+      {!isFile && (
       <div className="space-y-3 border-t pt-4">
         <Label className="text-xs text-muted-foreground uppercase tracking-wide">
           Features
@@ -264,6 +372,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
           </div>
         )}
       </div>
+      )}
 
       {/* ── AI ── */}
       <div className="space-y-3 border-t pt-4">
@@ -311,6 +420,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
           Options
         </Label>
 
+        {!isFile && (
         <div className="flex items-center justify-between">
           <div>
             <Label htmlFor="main-content" className="text-sm font-medium">
@@ -326,6 +436,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
             onCheckedChange={(v) => set("only_main_content", v)}
           />
         </div>
+        )}
 
         <div className="flex items-center justify-between">
           <div>
@@ -333,7 +444,9 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
               Include links
             </Label>
             <p className="text-xs text-muted-foreground">
-              Extract all links found on the page
+              {isFile
+                ? "Extract all links found in the document"
+                : "Extract all links found on the page"}
             </p>
           </div>
           <Switch
@@ -343,6 +456,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
           />
         </div>
 
+        {!isFile && (
         <div className="space-y-2">
           <Label htmlFor="timeout" className="text-sm font-medium">
             Timeout (ms)
@@ -357,6 +471,7 @@ export function ScrapeOptions({ state, onChange }: ScrapeOptionsProps) {
             className="w-full"
           />
         </div>
+        )}
       </div>
     </div>
   );

@@ -31,12 +31,13 @@ const endpoints = [
     name: "Scrape",
     icon: Globe,
     base: 1,
-    description: "Extract content from a single URL",
+    description: "Extract content from a URL or an uploaded file",
     extras: [
       { label: "Base scrape", credits: 1 },
       { label: "+ each feature format (markdown, schema...)", credits: 1 },
       { label: "+ AI extraction", credits: 5 },
       { label: "+ AI summary", credits: 5 },
+      { label: "+ OCR (per scanned page)", credits: 5 },
     ],
   },
   {
@@ -59,6 +60,7 @@ const endpoints = [
       { label: "+ each feature (metadata, schema...)", credits: 1 },
       { label: "+ AI extraction (per page)", credits: 5 },
       { label: "+ AI summary (per page)", credits: 5 },
+      { label: "+ OCR (per scanned PDF page)", credits: 5 },
       { label: "Search indexing included", credits: 0 },
     ],
   },
@@ -88,6 +90,10 @@ const faqs = [
   {
     q: "How does JS rendering work?",
     a: "When a page requires JavaScript to load content (SPAs, dynamic sites), enable the JS rendering option. It uses a headless browser and costs 1 additional credit per page.",
+  },
+  {
+    q: "How does OCR work?",
+    a: "PDFs, Word, Excel and PowerPoint files are converted to markdown at the normal price. Scanned pages have no text, so they are flagged instead of indexed blank. Turn on OCR to read them: only the pages that need it are recognized, at 5 additional credits per page. A page already recognized once is never billed again.",
   },
 ];
 

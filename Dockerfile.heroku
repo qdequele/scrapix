@@ -82,18 +82,50 @@ COPY deploy/ deploy/
 RUN cargo build --release --workspace --features browser
 
 # -----------------------------------------------------------------------------
+# PDFium — rasterizes scanned PDF pages for OCR (SCR-86). Loaded at runtime by
+# scrapix-ocr (PDFIUM_LIB_PATH); never linked at build time. Pinned to the
+# bblanchon/pdfium-binaries release firecrawl-pdfium 0.1.0 is tested against;
+# the checksums come from its pdfium.lock.json and must change with the tag.
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS pdfium
+ARG TARGETARCH
+ARG PDFIUM_RELEASE=chromium/7988
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) asset=pdfium-linux-x64.tgz; sha=7358c15e26a746cd67854887ea11b3b807c436056788eee9294fb972b8f8e0be ;; \
+      arm64) asset=pdfium-linux-arm64.tgz; sha=a2926203456881efa8feca7e0e409de78a4471b9b72e62a74c820faebb3e4551 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/pdfium.tgz \
+      "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/${asset}"; \
+    echo "${sha}  /tmp/pdfium.tgz" | sha256sum -c -; \
+    mkdir -p /opt/pdfium; \
+    tar -xzf /tmp/pdfium.tgz -C /opt/pdfium; \
+    rm /tmp/pdfium.tgz; \
+    test -f /opt/pdfium/lib/libpdfium.so
+
+# -----------------------------------------------------------------------------
 # Stage 2: Runtime
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-# Install runtime dependencies + Chromium for browser rendering
+# Install runtime dependencies + Chromium for browser rendering + Tesseract
+# (local OCR backend)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libsasl2-2 \
     libcurl4 \
     chromium \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
+
+# PDFium for OCR page rasterization (loaded at runtime)
+COPY --from=pdfium /opt/pdfium /opt/pdfium
+ENV PDFIUM_LIB_PATH=/opt/pdfium/lib
 
 # Create non-root user
 RUN useradd -m -u 1000 -s /bin/bash scrapix
