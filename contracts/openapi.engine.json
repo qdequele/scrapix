@@ -1263,6 +1263,16 @@
           "urls"
         ],
         "properties": {
+          "actions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "description": "Browser actions run on each page before capture (forces browser rendering)"
+          },
           "ai": {
             "oneOf": [
               {
@@ -1278,6 +1288,16 @@
             "type": "integer",
             "description": "URLs scraped at once (default 10, max 25)",
             "minimum": 0
+          },
+          "cookies": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RequestCookie"
+            },
+            "description": "Cookies sent with each request. A cookie without `domain` goes to each\nURL's own host; one with `domain` must be that URL's host or a parent\nof it, otherwise that URL fails with a per-item error."
           },
           "exclude_selectors": {
             "type": [
@@ -1342,6 +1362,13 @@
             },
             "description": "CSS selectors to keep (only extract from these)"
           },
+          "mobile": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Emulate a phone (forces browser rendering)"
+          },
           "only_main_content": {
             "type": [
               "boolean",
@@ -1355,6 +1382,17 @@
               "null"
             ],
             "description": "Render JavaScript (requires Chrome/Chromium on the server)"
+          },
+          "screenshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenshotRequestOptions",
+                "description": "Screenshot options, used when `formats` includes `\"screenshot\"`"
+              }
+            ]
           },
           "timeout_ms": {
             "type": [

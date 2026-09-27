@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
+use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::config::WebhookConfig;
 use scrapix_extractor::SelectorDefinition;
 
@@ -35,7 +36,7 @@ use crate::job_kind::JobKind;
 use crate::results::{JobResultError, JobResultItem};
 use crate::{
     billing, check_write_permission, extract_account_context, perform_scrape, AccountContext,
-    AiOptions, ApiError, AppState, ScrapeFormat, ScrapeRequest,
+    AiOptions, ApiError, AppState, ScrapeFormat, ScrapeRequest, ScreenshotRequestOptions,
 };
 
 /// Maximum number of URLs in one batch.
@@ -82,6 +83,16 @@ pub(crate) struct BatchScrapeRequest {
     extract: Option<HashMap<String, SelectorDefinition>>,
     /// AI enrichment, per URL
     ai: Option<AiOptions>,
+    /// Screenshot options, used when `formats` includes `"screenshot"`
+    screenshot: Option<ScreenshotRequestOptions>,
+    /// Browser actions run on each page before capture (forces browser rendering)
+    actions: Option<Vec<Action>>,
+    /// Emulate a phone (forces browser rendering)
+    mobile: Option<bool>,
+    /// Cookies sent with each request. A cookie without `domain` goes to each
+    /// URL's own host; one with `domain` must be that URL's host or a parent
+    /// of it, otherwise that URL fails with a per-item error.
+    cookies: Option<Vec<RequestCookie>>,
 }
 
 /// Response of `POST /batch/scrape`
