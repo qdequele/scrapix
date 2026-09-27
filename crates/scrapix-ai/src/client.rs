@@ -8,7 +8,7 @@
 
 use crate::providers::{
     anthropic::AnthropicProvider, gemini::GeminiProvider, mistral::MistralProvider,
-    openai::OpenAiProvider, ChatResponse as ProviderChatResponse, LlmProvider, Message,
+    openai::OpenAiProvider, ChatResponse as ProviderChatResponse, ImageInput, LlmProvider, Message,
     MessageRole,
 };
 use serde::{Deserialize, Serialize};
@@ -283,6 +283,17 @@ impl AiClient {
         Ok((client, rx))
     }
 
+    /// A vision-capable default model for a provider, used by OCR when no
+    /// model is configured (`OCR_MODEL`).
+    pub fn default_vision_model(provider: &str) -> &'static str {
+        match provider {
+            "openai" => "gpt-5-mini",
+            "gemini" => "gemini-2.5-flash",
+            "mistral" => "mistral-small-latest",
+            _ => "claude-haiku-4-5-20251001",
+        }
+    }
+
     /// Get a tokenizer for a specific model.
     /// Uses gpt-4 tokenizer as a reasonable approximation for all models.
     pub fn get_tokenizer(model: &str) -> Result<CoreBPE, AiClientError> {
@@ -328,6 +339,44 @@ impl AiClient {
         max_tokens: Option<u32>,
         temperature: Option<f32>,
     ) -> Result<ChatResponse, AiClientError> {
+        self.call_with_retries(|| {
+            self.provider
+                .chat(messages.clone(), model, max_tokens, temperature)
+        })
+        .await
+    }
+
+    /// Send a single-turn vision request (one image plus a text prompt)
+    /// with the same rate limiting, retries and usage tracking as
+    /// [`Self::chat`]. `model` must accept image input.
+    #[instrument(skip(self, system, prompt, image), fields(model = %model, image_bytes = image.data.len()))]
+    pub async fn vision_chat(
+        &self,
+        system: &str,
+        prompt: &str,
+        image: &ImageInput,
+        model: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, AiClientError> {
+        self.call_with_retries(|| {
+            self.provider
+                .vision(system, prompt, image, model, max_tokens)
+        })
+        .await
+    }
+
+    /// The configured provider name (`anthropic`, `openai`, ...).
+    pub fn provider_name(&self) -> &str {
+        &self.config.provider
+    }
+
+    /// Rate limiting, exponential-backoff retries and usage tracking around
+    /// one provider call.
+    async fn call_with_retries<F, Fut>(&self, mut call: F) -> Result<ChatResponse, AiClientError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<ProviderChatResponse, AiClientError>>,
+    {
         let _permit = self.semaphore.acquire().await.map_err(|_| {
             AiClientError::Config("Semaphore closed, client is shutting down".to_string())
         })?;
@@ -339,11 +388,7 @@ impl AiClient {
         while attempt < self.config.max_retries {
             attempt += 1;
 
-            match self
-                .provider
-                .chat(messages.clone(), model, max_tokens, temperature)
-                .await
-            {
+            match call().await {
                 Ok(response) => {
                     let duration_ms = call_start.elapsed().as_millis() as u64;
                     info!(

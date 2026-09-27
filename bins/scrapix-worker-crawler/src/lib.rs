@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use scrapix_core::{CrawlUrl, UrlPatterns};
 use scrapix_crawler::{
-    is_non_page_url_with_pdf, url_allowed, ExtractorConfig, HttpFetcher, HttpFetcherBuilder,
+    is_non_page_url_for, url_allowed, ExtractorConfig, HttpFetcher, HttpFetcherBuilder,
     RobotsCache, RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
 };
 #[cfg(feature = "browser")]
@@ -866,9 +866,9 @@ impl CrawlerWorker {
     /// hot path (R9).
     ///
     /// Entries are filtered by [`url_allowed`], the same URL-pattern matcher
-    /// link extraction uses, and by [`is_non_page_url_with_pdf`] honoring the
-    /// job's PDF opt-in, so a PDF sitemap entry is kept when the job enables
-    /// PDF scraping.
+    /// link extraction uses, and by [`is_non_page_url_for`] honoring the
+    /// job's PDF/document opt-ins, so a PDF (or `.docx`, ...) sitemap entry
+    /// is kept when the job enables that format.
     async fn maybe_discover_sitemaps(&self, domain: &str, parent: &UrlMessage) -> usize {
         let job_id = parent.job_id.as_str();
 
@@ -964,7 +964,10 @@ impl CrawlerWorker {
             "Discovered URLs from sitemaps"
         );
 
-        let pdf_enabled = parent.features.as_ref().is_some_and(|f| f.is_pdf_enabled());
+        let (pdf_enabled, documents_enabled) =
+            parent.features.as_ref().map_or((false, false), |f| {
+                (f.is_pdf_enabled(), f.is_documents_enabled())
+            });
 
         let mut discovered_count = 0;
         for sitemap_entry in sitemap_entries {
@@ -972,6 +975,7 @@ impl CrawlerWorker {
                 &sitemap_entry.loc,
                 parent.url_patterns.as_ref(),
                 pdf_enabled,
+                documents_enabled,
             ) {
                 continue;
             }
@@ -1013,15 +1017,20 @@ impl CrawlerWorker {
 }
 
 /// Whether a sitemap entry should be published to the frontier: not a
-/// non-page resource (respecting the job's PDF opt-in) and allowed by the
+/// non-page resource (respecting the job's PDF/document opt-ins) and allowed by the
 /// job's URL patterns — the same [`url_allowed`] matcher link extraction
 /// uses, so a sitemap entry and a discovered link are judged identically.
 ///
 /// `patterns` is `None` when the job set no `url_patterns` at all, in which
 /// case every non-filtered-extension URL is allowed (matching link
 /// extraction's behavior for a job without patterns).
-fn sitemap_entry_allowed(loc: &str, patterns: Option<&UrlPatterns>, pdf_enabled: bool) -> bool {
-    if is_non_page_url_with_pdf(loc, pdf_enabled) {
+fn sitemap_entry_allowed(
+    loc: &str,
+    patterns: Option<&UrlPatterns>,
+    pdf_enabled: bool,
+    documents_enabled: bool,
+) -> bool {
+    if is_non_page_url_for(loc, pdf_enabled, documents_enabled) {
         return false;
     }
     match patterns {
@@ -1168,11 +1177,13 @@ mod tests {
         assert!(sitemap_entry_allowed(
             "https://docs.a.test/guide/intro",
             Some(&patterns),
+            false,
             false
         ));
         assert!(!sitemap_entry_allowed(
             "https://docs.a.test/blog/post",
             Some(&patterns),
+            false,
             false
         ));
     }
@@ -1182,8 +1193,30 @@ mod tests {
         assert!(!sitemap_entry_allowed(
             "https://a.test/doc.pdf",
             None,
+            false,
             false
         ));
-        assert!(sitemap_entry_allowed("https://a.test/doc.pdf", None, true));
+        assert!(sitemap_entry_allowed(
+            "https://a.test/doc.pdf",
+            None,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn sitemap_entry_document_survives_filter_when_job_enables_documents() {
+        assert!(!sitemap_entry_allowed(
+            "https://a.test/r.docx",
+            None,
+            true,
+            false
+        ));
+        assert!(sitemap_entry_allowed(
+            "https://a.test/r.docx",
+            None,
+            false,
+            true
+        ));
     }
 }

@@ -438,6 +438,10 @@ pub enum CrawlEvent {
         /// Whether AI enrichment actually ran on this page (AI billing)
         #[serde(default)]
         ai_enriched: bool,
+        /// Pages of this document freshly recognized by OCR (OCR billing;
+        /// cache hits are not counted). `0` for HTML pages.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        ocr_pages: u32,
     },
     /// The content worker processed a page but indexed nothing for it
     /// (non-2xx page from an old crawler, `index_only` mismatch, no content,
@@ -910,6 +914,10 @@ impl JobControl {
             timestamp: chrono::Utc::now().timestamp_millis(),
         }
     }
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]

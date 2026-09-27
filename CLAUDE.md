@@ -443,14 +443,36 @@ Per job: `headers`, `user_agents` (rotation), `proxy` (urls/rotation/tiered,
 `sitemap.enabled` (**default: `true`**, was `false`) / `sitemap.urls`,
 `url_patterns.index_only`, every feature's `include_pages`/`exclude_pages`,
 `schema.only_types`/`convert_dates`, `meilisearch.primary_key`/`batch_size`/
-`settings`/`keep_settings`, `webhooks`. A browser job (`crawler_type:
+`settings`/`keep_settings`, `webhooks`, `features.pdf.*` (incl. `max_pages`,
+`extract_links`), `features.documents`, `features.ocr`. A browser job (`crawler_type:
 "browser"`) that also sets `proxy` fails closed — its warning says the shared
 browser only has one worker-level proxy, so browser-rendered pages of that
 job fail rather than silently connect unproxied.
 
 Fields accepted but **worker-level only** (ignored per job, warned about when
 set to a non-default value): `concurrency.browser_pool_size`,
-`concurrency.dns_concurrency`, `features.pdf.extract_links` (reserved no-op).
+`concurrency.dns_concurrency`.
+
+### Documents & OCR (SCR-81, SCR-86)
+
+Binary documents go through one format dispatch in `scrapix-parser`
+(`document.rs`): Content-Type first, magic bytes as fallback (never the URL
+extension). PDFs → `pdf-inspector` (classification + per-page OCR
+recommendation + layout-aware Markdown with tables); Word/PowerPoint/Excel/
+OpenDocument/RTF/EPUB/CSV → `anydoc`. Both pinned exactly (fast-moving).
+The crawl path (fetcher base64 transport, gated by `features.pdf` /
+`features.documents`, predicate `scrapix_core::content_types::is_binary_document`
+on both sides of Kafka), `POST /scrape` of a document URL and
+`POST /parse` (multipart upload, `bins/scrapix-api/src/documents.rs`) all
+share it. Scanned pages are flagged (`metadata.needs_ocr`), never silently
+blank. OCR (`scrapix-ocr`) is opt-in (`off`/`auto`/`force`): PDFium
+rasterization (runtime-loaded, `PDFIUM_LIB_PATH`), vision-LLM (via
+`scrapix-ai`, usage tracked as feature `ocr`) or Tesseract backend, page cap,
+per-account daily budget, page-image-hash cache (hits not billed). OCR pages
+cost `OCR_PAGE_CREDITS` (5) each — separate `ocr` ledger entry on
+scrape/parse, `pages_ocr` in crawl accounting (`DocumentIndexed.ocr_pages`),
+`request_events.ocr_pages` in ClickHouse. Fixtures + generator:
+`crates/scrapix-parser/tests/fixtures/`. Guide: `docs/guides/documents.mdx`.
 
 ### `scrapix all` limitation
 
@@ -554,6 +576,10 @@ GROUP BY date ORDER BY date;
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |
 | `JOB_RETENTION_HOURS` | Frontier: how long a finished/cancelled job's state stays queryable after release (default `168`) |
 | `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` and triggering Fly autostart (default `8081`) |
+| `DOCUMENT_MAX_SIZE_MB` | API: max document size for `/scrape` of a document and `/parse` uploads (default `50`) |
+| `OCR_BACKEND` | API + content workers: `auto` (vision if an AI provider is set, else tesseract), `vision`, `tesseract`, `off` |
+| `PDFIUM_LIB_PATH` | API + content workers: PDFium library used to rasterize pages for OCR (`/opt/pdfium/lib` in the images) |
+| `OCR_MAX_PAGES_PER_DOCUMENT` / `OCR_DAILY_PAGE_BUDGET` | OCR cost controls (defaults `50` / `1000` per account per UTC day, `0` = unlimited) |
 
 `BLOOM_CAPACITY`/`BLOOM_FP_RATE` on the frontier are now deprecated and
 ignored — dedup lives in the `FrontierStore` (Redis or in-memory), not a

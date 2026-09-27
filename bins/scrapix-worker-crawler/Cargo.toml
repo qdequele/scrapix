@@ -21,6 +21,8 @@ browser = ["scrapix-crawler/browser-cdp"]
 [dependencies]
 scrapix-core = { path = "../../crates/scrapix-core" }
 scrapix-crawler = { path = "../../crates/scrapix-crawler" }
+# PDF link extraction (`features.pdf.extract_links`)
+scrapix-parser = { path = "../../crates/scrapix-parser" }
 scrapix-frontier = { path = "../../crates/scrapix-frontier" }
 scrapix-lifecycle = { path = "../../crates/scrapix-lifecycle" }
 scrapix-queue = { path = "../../crates/scrapix-queue" }
@@ -37,6 +39,8 @@ chrono = { workspace = true }
 regex = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
+
+base64 = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

@@ -1,0 +1,68 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 896 >>
+stream
+BT /F2 20 Tf 72 720 Td (Quarterly Report) Tj ET
+BT /F1 11 Tf 72 692 Td (Revenue grew in every region this quarter, led by the West.) Tj ET
+0.8 w
+72 638 150 22 re S
+BT /F2 11 Tf 78 645 Td (Region) Tj ET
+222 638 150 22 re S
+BT /F2 11 Tf 228 645 Td (Q1) Tj ET
+372 638 150 22 re S
+BT /F2 11 Tf 378 645 Td (Q2) Tj ET
+72 616 150 22 re S
+BT /F1 11 Tf 78 623 Td (North) Tj ET
+222 616 150 22 re S
+BT /F1 11 Tf 228 623 Td (120) Tj ET
+372 616 150 22 re S
+BT /F1 11 Tf 378 623 Td (135) Tj ET
+72 594 150 22 re S
+BT /F1 11 Tf 78 601 Td (South) Tj ET
+222 594 150 22 re S
+BT /F1 11 Tf 228 601 Td (98) Tj ET
+372 594 150 22 re S
+BT /F1 11 Tf 378 601 Td (110) Tj ET
+72 572 150 22 re S
+BT /F1 11 Tf 78 579 Td (West) Tj ET
+222 572 150 22 re S
+BT /F1 11 Tf 228 579 Td (143) Tj ET
+372 572 150 22 re S
+BT /F1 11 Tf 378 579 Td (150) Tj ET
+BT /F1 11 Tf 72 540 Td (See https://example.com/methodology for the method.) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Title (Quarterly Report) /Producer (scrapix fixtures) >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000218 00000 n 
+0000000320 00000 n 
+0000000456 00000 n 
+0000001403 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R /Info 7 0 R >>
+startxref
+1479
+%%EOF

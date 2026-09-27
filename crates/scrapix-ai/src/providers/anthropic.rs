@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{ChatResponse, LlmProvider, Message, MessageRole};
+use super::{ChatResponse, ImageInput, LlmProvider, Message, MessageRole};
 use crate::client::AiClientError;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -23,6 +23,53 @@ impl AnthropicProvider {
             api_key: api_key.to_string(),
         }
     }
+
+    async fn send<T: Serialize + ?Sized>(
+        &self,
+        request_body: &T,
+    ) -> Result<ChatResponse, AiClientError> {
+        let response = self
+            .client
+            .post(ANTHROPIC_API_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(request_body)
+            .send()
+            .await
+            .map_err(|e| AiClientError::Config(format!("Anthropic request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let error_msg = serde_json::from_str::<AnthropicError>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or(body);
+            return Err(AiClientError::Config(format!(
+                "Anthropic API error ({}): {}",
+                status, error_msg
+            )));
+        }
+
+        let resp: AnthropicResponse = response.json().await.map_err(|e| {
+            AiClientError::Config(format!("Failed to parse Anthropic response: {}", e))
+        })?;
+
+        let content = resp
+            .content
+            .first()
+            .map(|c| c.text.clone())
+            .ok_or(AiClientError::EmptyResponse)?;
+
+        Ok(ChatResponse {
+            content,
+            model: resp.model,
+            prompt_tokens: resp.usage.input_tokens,
+            completion_tokens: resp.usage.output_tokens,
+            total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+            finish_reason: resp.stop_reason,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -40,6 +87,35 @@ struct AnthropicRequest<'a> {
 struct AnthropicMessage {
     role: String,
     content: String,
+}
+
+#[derive(Serialize)]
+struct AnthropicVisionRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: Vec<AnthropicVisionMessage<'a>>,
+}
+
+#[derive(Serialize)]
+struct AnthropicVisionMessage<'a> {
+    role: &'static str,
+    content: Vec<AnthropicContentBlock<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlock<'a> {
+    Image { source: AnthropicImageSource<'a> },
+    Text { text: &'a str },
+}
+
+#[derive(Serialize)]
+struct AnthropicImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'a str,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -111,46 +187,35 @@ impl LlmProvider for AnthropicProvider {
             temperature,
         };
 
-        let response = self
-            .client
-            .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| AiClientError::Config(format!("Anthropic request failed: {}", e)))?;
+        self.send(&request_body).await
+    }
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let error_msg = serde_json::from_str::<AnthropicError>(&body)
-                .map(|e| e.error.message)
-                .unwrap_or(body);
-            return Err(AiClientError::Config(format!(
-                "Anthropic API error ({}): {}",
-                status, error_msg
-            )));
-        }
-
-        let resp: AnthropicResponse = response.json().await.map_err(|e| {
-            AiClientError::Config(format!("Failed to parse Anthropic response: {}", e))
-        })?;
-
-        let content = resp
-            .content
-            .first()
-            .map(|c| c.text.clone())
-            .ok_or(AiClientError::EmptyResponse)?;
-
-        Ok(ChatResponse {
-            content,
-            model: resp.model,
-            prompt_tokens: resp.usage.input_tokens,
-            completion_tokens: resp.usage.output_tokens,
-            total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
-            finish_reason: resp.stop_reason,
-        })
+    async fn vision(
+        &self,
+        system: &str,
+        prompt: &str,
+        image: &ImageInput,
+        model: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, AiClientError> {
+        let request_body = AnthropicVisionRequest {
+            model,
+            max_tokens: max_tokens.unwrap_or(4096),
+            system,
+            messages: vec![AnthropicVisionMessage {
+                role: "user",
+                content: vec![
+                    AnthropicContentBlock::Image {
+                        source: AnthropicImageSource {
+                            kind: "base64",
+                            media_type: &image.media_type,
+                            data: image.base64(),
+                        },
+                    },
+                    AnthropicContentBlock::Text { text: prompt },
+                ],
+            }],
+        };
+        self.send(&request_body).await
     }
 }

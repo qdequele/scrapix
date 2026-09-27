@@ -42,6 +42,7 @@ Scrape a single URL and return extracted content in the requested formats.
 | `include_selectors` | string[] | `[]` | CSS selectors to keep (extract only from these) |
 | `extract` | object | `{}` | Custom CSS selector extraction (see below) |
 | `ai` | object | `null` | AI enrichment options (see below) |
+| `parsers` | object | `{}` | Document parsing options when the URL serves a document (see below) |
 
 ### Output Formats
 
@@ -125,6 +126,37 @@ Requires `OPENAI_API_KEY` environment variable.
 | `ai.summary` | boolean | Generate a TL;DR summary |
 | `ai.extract.prompt` | string | Natural language extraction prompt |
 | `ai.extract.schema` | array | Structured field definitions for typed extraction |
+
+### Documents (PDF, Word, Excel, PowerPoint, ...)
+
+When the URL serves a **PDF** or an **office document** (Word, PowerPoint,
+Excel, OpenDocument, RTF, EPUB, CSV — also behind a generic
+`application/octet-stream` download), `/scrape` parses it with the same
+parsers as [`POST /parse`](/api-reference/parse) and the crawler, instead
+of rejecting the content type. Documents up to `DOCUMENT_MAX_SIZE_MB`
+(default 50 MB) are accepted.
+
+```json
+{
+  "url": "https://example.com/reports/q3.pdf",
+  "formats": ["markdown", "metadata"],
+  "parsers": { "ocr": "auto", "ocr_max_pages": 20, "max_pages": 100 }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `parsers.ocr` | string | `off` | `off` (scanned pages flagged, not recognized), `auto` (OCR only pages that need it), `force` (OCR every page) |
+| `parsers.ocr_max_pages` | integer | server cap (50) | Per-document OCR page cap (only lowers the server cap) |
+| `parsers.max_pages` | integer | all | Parse only the first N PDF pages |
+
+The response adds a `document` object (`format`, `content_type`, `parser`,
+`bytes`, `page_count`, `pdf_type`, `needs_ocr`, `pages_needing_ocr`,
+`has_tables`) and, when OCR was requested, an `ocr` object (`mode`,
+`backend`, `pages_processed`, `pages_cached`, `pages_skipped`,
+`pages_capped`, `pages_failed`, `pages`). `html`, `rawhtml`, `schema` and
+`blocks` do not apply to documents. OCR pages cost 5 credits each on top of
+the scrape. See [Documents & OCR](/guides/documents).
 
 ### Response
 

@@ -1,0 +1,34 @@
+[package]
+name = "scrapix-ocr"
+description = "OCR for scanned PDF pages and images: rasterization, OCR backends, caching and budgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+scrapix-core = { path = "../scrapix-core" }
+scrapix-parser = { path = "../scrapix-parser" }
+scrapix-ai = { path = "../scrapix-ai" }
+
+# Page rasterization with PDFium, loaded at runtime (PDFIUM_LIB_PATH or the
+# system loader), never linked at build time. pdf-inspector repairs
+# degenerate form XObjects before rendering.
+firecrawl-pdfium = { workspace = true }
+pdf-inspector = { workspace = true }
+png = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+redis = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

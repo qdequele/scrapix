@@ -28,6 +28,7 @@ use utoipa::OpenApi;
     tags(
         (name = "health", description = "Health and diagnostics"),
         (name = "scrape", description = "Single-page scraping"),
+        (name = "parse", description = "Document upload parsing"),
         (name = "map", description = "Website URL discovery"),
         (name = "search", description = "Search indexed content"),
         (name = "crawl", description = "Distributed crawl jobs"),
@@ -42,6 +43,7 @@ use utoipa::OpenApi;
         crate::handle_domains,
         // Core endpoints
         crate::scrape_url,
+        crate::documents::parse_upload,
         crate::map_url,
         crate::search_url,
         crate::create_crawl,
@@ -67,6 +69,12 @@ use utoipa::OpenApi;
         crate::AiExtractOptions,
         crate::AiFieldDef,
         crate::AiResult,
+        crate::documents::ParserOptions,
+        crate::documents::DocumentInfo,
+        crate::documents::OcrInfo,
+        crate::documents::ParseRequestOptions,
+        crate::documents::ParseUpload,
+        scrapix_core::OcrMode,
         crate::MapRequest,
         crate::MapResponse,
         crate::MapLink,

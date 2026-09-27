@@ -75,6 +75,7 @@
       "pages": [
         "api-reference/overview",
         "api-reference/scrape",
+        "api-reference/parse",
         "api-reference/map",
         "api-reference/search",
         "api-reference/crawl",
@@ -92,6 +93,7 @@
       "group": "Guides",
       "pages": [
         "guides/scraping",
+        "guides/documents",
         "guides/crawling",
         "guides/authentication",
         "guides/oauth",

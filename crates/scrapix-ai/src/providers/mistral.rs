@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{ChatResponse, LlmProvider, Message, MessageRole};
+use super::{ChatResponse, ImageInput, LlmProvider, Message, MessageRole};
 use crate::client::AiClientError;
 
 const MISTRAL_API_URL: &str = "https://api.mistral.ai/v1/chat/completions";
@@ -99,12 +99,43 @@ impl LlmProvider for MistralProvider {
             temperature,
         };
 
+        self.send(&request_body).await
+    }
+
+    async fn vision(
+        &self,
+        system: &str,
+        prompt: &str,
+        image: &ImageInput,
+        model: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<ChatResponse, AiClientError> {
+        let request_body = serde_json::json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": [
+                    { "type": "image_url", "image_url": image.data_url() },
+                    { "type": "text", "text": prompt },
+                ]},
+            ],
+        });
+        self.send(&request_body).await
+    }
+}
+
+impl MistralProvider {
+    async fn send<T: Serialize + ?Sized>(
+        &self,
+        request_body: &T,
+    ) -> Result<ChatResponse, AiClientError> {
         let response = self
             .client
             .post(MISTRAL_API_URL)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
-            .json(&request_body)
+            .json(request_body)
             .send()
             .await
             .map_err(|e| AiClientError::Config(format!("Mistral request failed: {}", e)))?;
