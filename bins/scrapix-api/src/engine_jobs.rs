@@ -27,7 +27,7 @@ use std::time::Duration;
 use scrapix_core::{config::WebhookConfig, JobState, JobStatus};
 use scrapix_queue::CrawlEvent;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::job_kind::{JobKind, JOB_TYPE_KEY};
 use crate::{billing, is_terminal, jobs_db, webhooks, AccountContext, ApiError, AppState};
@@ -227,6 +227,21 @@ pub(crate) fn complete_job(
     if state.process_event(job_id, &event).applied {
         state.broadcast_event(job_id, event);
         info!(job_id = %job_id, succeeded, failed, "Engine job completed");
+    }
+}
+
+/// Fail the job (unless it was cancelled meanwhile).
+pub(crate) fn fail_job(state: &AppState, job_id: &str, error: &str) {
+    let account_id = state.get_job(job_id).and_then(|j| j.account_id);
+    let event = CrawlEvent::JobFailed {
+        job_id: job_id.to_string(),
+        account_id,
+        error: error.to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+    if state.process_event(job_id, &event).applied {
+        state.broadcast_event(job_id, event);
+        warn!(job_id = %job_id, error = %error, "Engine job failed");
     }
 }
 

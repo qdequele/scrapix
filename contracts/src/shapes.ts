@@ -232,3 +232,19 @@ export const BATCH_SCRAPE_CREATED: Spec = {
   urls_count: "number",
   message: "string",
 };
+
+/** POST /extract response (SCR-73). */
+export const EXTRACT_CREATED: Spec = {
+  job_id: "string",
+  status: "string",
+};
+
+/** GET /extract/{id} response (SCR-73). */
+export const EXTRACT_STATUS: Spec = {
+  job_id: "string",
+  status: "string",
+  data: "any",
+  sources: "any",
+  warning: "string?",
+  error: "string?",
+};

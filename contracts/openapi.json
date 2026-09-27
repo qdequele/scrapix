@@ -3289,6 +3289,120 @@
           }
         ]
       }
+    },
+    "/extract": {
+      "post": {
+        "tags": [
+          "extract"
+        ],
+        "summary": "Extract structured data from web pages",
+        "description": "Starts a job that fetches every URL (globs such as\n`https://example.com/blog/*` are resolved first, 50 URLs max), then runs\none AI extraction over their content following `prompt` and/or `schema`.\nPoll `GET /extract/{id}` for the result; the fetched pages are available\nfrom `GET /job/{id}/results`. Requires an AI provider on the server.",
+        "operationId": "create_extract",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateExtractResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Not enough credits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No AI provider is configured on the server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/extract/{id}": {
+      "get": {
+        "tags": [
+          "extract"
+        ],
+        "summary": "Get an extraction's status and result",
+        "operationId": "get_extract",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Extract job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -4185,6 +4299,22 @@
           }
         }
       },
+      "CreateExtractResponse": {
+        "type": "object",
+        "description": "Response of `POST /extract`",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "CreatedApiKeyResponse": {
         "type": "object",
         "required": [
@@ -4512,6 +4642,149 @@
           "total_count": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "ExtractRequest": {
+        "type": "object",
+        "description": "Request body for `POST /extract`",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "headers": {
+            "type": "object",
+            "description": "Custom request headers for the page fetches",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "only_main_content": {
+            "type": "boolean",
+            "description": "Only use each page's main content (default true)"
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to extract, in natural language"
+          },
+          "render_js": {
+            "type": "boolean",
+            "description": "Render JavaScript when fetching pages (requires Chrome/Chromium)"
+          },
+          "schema": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Expected output: a JSON Schema object, or a list of field\ndefinitions `[{ \"name\", \"description\", \"field_type\", \"required\" }]`\n(the `/scrape` `ai.extract.schema` form)"
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-page fetch timeout in milliseconds (default 30000)",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "URLs to extract from (max 50 in total after glob resolution). A URL\ncontaining `*` is a glob resolved from the site's sitemaps and the\nlinks of its base page: `https://example.com/blog/*`."
+          },
+          "webhooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookConfig"
+            },
+            "description": "Webhook subscriptions (same as a crawl's `webhooks`)"
+          }
+        }
+      },
+      "ExtractSource": {
+        "type": "object",
+        "description": "One URL an extraction used",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the page could not be fetched"
+          },
+          "from_glob": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The glob this URL was resolved from, if any"
+          },
+          "success": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the page was fetched (`null` until it was tried)"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "ExtractStatusResponse": {
+        "type": "object",
+        "description": "`GET /extract/{id}` response",
+        "required": [
+          "job_id",
+          "status",
+          "sources"
+        ],
+        "properties": {
+          "data": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The extracted data (`null` until the job completed)"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job failed"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractSource"
+            },
+            "description": "URLs used, including those resolved from globs"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "`running`, `completed`, `failed`, `cancelled` or `paused`"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Non-fatal issues: truncated context, failed pages, capped globs, ..."
           }
         }
       },
@@ -6802,6 +7075,10 @@
     {
       "name": "auth",
       "description": "Authentication and account management"
+    },
+    {
+      "name": "extract",
+      "description": "Structured extraction over one or many pages"
     }
   ]
 }

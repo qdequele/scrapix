@@ -478,3 +478,69 @@ export interface JobEventsHistoryResponse {
   limit: number;
   offset: number;
 }
+
+// ============================================================================
+// Job results (GET /job/{id}/results), batch scrape, extract
+// ============================================================================
+
+export type JobType = "crawl" | "batch_scrape" | "extract";
+
+export interface JobResultError {
+  code: string;
+  message: string;
+}
+
+/** One job result: a `/scrape` response plus job-specific fields. */
+export interface JobResultItem extends Partial<Omit<ScrapeResult, "success" | "url">> {
+  success: boolean;
+  url: string;
+  source_url?: string;
+  index?: number;
+  error?: JobResultError;
+  document_id?: string;
+  crawled_at?: string;
+  page_block?: number;
+  block_url?: string;
+}
+
+export interface JobResultsPage {
+  job_id: string;
+  job_type: JobType;
+  status: string;
+  total: number;
+  next: string | null;
+  data: JobResultItem[];
+}
+
+export interface ExtractFieldDefinition {
+  name: string;
+  description?: string;
+  field_type?: string;
+  required?: boolean;
+}
+
+export interface ExtractRequest {
+  urls: string[];
+  prompt?: string;
+  schema?: Record<string, unknown> | ExtractFieldDefinition[];
+  render_js?: boolean;
+  only_main_content?: boolean;
+  timeout_ms?: number;
+  headers?: Record<string, string>;
+}
+
+export interface ExtractSource {
+  url: string;
+  from_glob?: string;
+  success: boolean | null;
+  error?: string;
+}
+
+export interface ExtractStatus {
+  job_id: string;
+  status: string;
+  data: unknown;
+  sources: ExtractSource[];
+  warning?: string;
+  error?: string;
+}

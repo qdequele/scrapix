@@ -48,6 +48,7 @@ pub mod completion;
 pub mod configs;
 pub mod email_scheduler;
 pub(crate) mod engine_jobs;
+pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod jobs_db;
 pub mod openapi;
@@ -6514,6 +6515,8 @@ pub async fn run_with_bus(
     let product_routes = Router::new()
         .route("/scrape", post(scrape_url))
         .route("/batch/scrape", post(batch::batch_scrape))
+        .route("/extract", post(extract::create_extract))
+        .route("/extract/{id}", get(extract::get_extract))
         .route("/map", post(map_url))
         .route("/search", post(search_url))
         .route("/crawl", post(create_crawl))

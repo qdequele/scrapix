@@ -831,6 +831,49 @@ pub(crate) async fn store_page(
     });
 }
 
+/// Store (replace) the summary of an extract job.
+pub(crate) async fn store_summary(state: &AppState, job_id: &str, payload: Value) {
+    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+        let mut m = state.results.memory.write();
+        if m.pages.contains_key(job_id) {
+            m.summaries.insert(job_id.to_string(), payload);
+        }
+        return;
+    }
+    let Some(ref pool) = state.db_pool else {
+        return;
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
+         VALUES ($1, 0, 'extract', NULL, true, $2) \
+         ON CONFLICT (job_id, seq) DO UPDATE SET payload = EXCLUDED.payload",
+    )
+    .bind(job_id)
+    .bind(&payload)
+    .execute(pool)
+    .await
+    {
+        tracing::error!(job_id = %job_id, error = %e, "Failed to store an extract result");
+    }
+}
+
+/// The summary of an extract job, if stored.
+pub(crate) async fn load_summary(state: &AppState, job_id: &str) -> Option<Value> {
+    if state.results.in_memory(job_id) {
+        return state.results.memory.read().summaries.get(job_id).cloned();
+    }
+    let pool = state.db_pool.as_ref()?;
+    sqlx::query_scalar::<_, Value>(
+        "SELECT payload FROM job_results WHERE job_id = $1 AND kind = 'extract' LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| warn!(job_id = %job_id, error = %e, "Failed to load an extract result"))
+    .ok()
+    .flatten()
+}
+
 /// Stored results of an engine-run job after position `after` (the seq of
 /// the last item already read).
 async fn stored_results(
@@ -904,6 +947,14 @@ pub(crate) mod test_support {
     /// An `AppState` without Postgres/ClickHouse/AI whose fetcher may reach
     /// local test servers.
     pub(crate) fn test_state(bus: &ChannelBus) -> Arc<AppState> {
+        test_state_with_ai(bus, None)
+    }
+
+    /// Same, with an AI service (e.g. an OpenAI-compatible mock).
+    pub(crate) fn test_state_with_ai(
+        bus: &ChannelBus,
+        ai_service: Option<Arc<scrapix_ai::AiService>>,
+    ) -> Arc<AppState> {
         let robots = Arc::new(
             RobotsCache::new(RobotsConfig {
                 respect_robots: false,
@@ -933,7 +984,7 @@ pub(crate) mod test_support {
             None,
             fetcher,
             None,
-            None,
+            ai_service,
             None,
             None,
             None,

@@ -76,6 +76,7 @@
         "api-reference/overview",
         "api-reference/scrape",
         "api-reference/batch-scrape",
+        "api-reference/extract",
         "api-reference/map",
         "api-reference/search",
         "api-reference/crawl",

@@ -164,6 +164,8 @@ describe("MCP protocol", () => {
       "create_crawl",
       "job_results",
       "batch_scrape",
+      "create_extract",
+      "get_extract",
       "list_configs",
       "create_config",
       "list_engines",

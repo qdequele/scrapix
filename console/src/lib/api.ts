@@ -35,6 +35,9 @@ import type {
   MemberInfo,
   InviteInfo,
   JobEventsHistoryResponse,
+  JobResultsPage,
+  ExtractRequest,
+  ExtractStatus,
 } from "./api-types";
 import { useAccountStore } from "./account-store";
 
@@ -184,6 +187,34 @@ export async function submitMap(opts: MapOptions): Promise<MapResult> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(opts),
   });
+}
+
+// ============================================================================
+// Job results, batch scrape, extract
+// ============================================================================
+
+export async function fetchJobResults(
+  id: string,
+  cursor?: string | null,
+  limit = 20
+): Promise<JobResultsPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  return request(`/job/${encodeURIComponent(id)}/results?${params}`);
+}
+
+export async function submitExtract(
+  req: ExtractRequest
+): Promise<{ job_id: string; status: string }> {
+  return request("/extract", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export async function fetchExtract(id: string): Promise<ExtractStatus> {
+  return request(`/extract/${encodeURIComponent(id)}`);
 }
 
 // ============================================================================

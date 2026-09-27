@@ -27,6 +27,7 @@ import {
   Plus,
   Check,
   ChevronsUpDown,
+  Sparkles,
 } from "lucide-react";
 import { FeedbackDialog } from "@/components/dashboard/feedback-dialog";
 import { logout } from "@/lib/auth";
@@ -69,6 +70,7 @@ const navGroups = [
     items: [
       { name: "Scrape", href: "/dashboard/scrape", icon: Globe },
       { name: "Map", href: "/dashboard/map", icon: Network },
+      { name: "Extract", href: "/dashboard/extract", icon: Sparkles },
       { name: "Crawl", href: "/dashboard/crawl", icon: Layers },
       { name: "Search", href: "/dashboard/search", icon: Search },
     ],

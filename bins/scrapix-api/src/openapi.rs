@@ -30,6 +30,7 @@ use utoipa::OpenApi;
         (name = "scrape", description = "Single-page scraping"),
         (name = "map", description = "Website URL discovery"),
         (name = "search", description = "Search indexed content"),
+        (name = "extract", description = "Structured extraction over one or many pages"),
         (name = "crawl", description = "Distributed crawl jobs"),
         (name = "jobs", description = "Job management")
     ),
@@ -43,6 +44,8 @@ use utoipa::OpenApi;
         // Core endpoints
         crate::scrape_url,
         crate::batch::batch_scrape,
+        crate::extract::create_extract,
+        crate::extract::get_extract,
         crate::map_url,
         crate::search_url,
         crate::create_crawl,
@@ -64,6 +67,10 @@ use utoipa::OpenApi;
         crate::ScrapeRequest,
         crate::batch::BatchScrapeRequest,
         crate::batch::BatchScrapeResponse,
+        crate::extract::ExtractRequest,
+        crate::extract::CreateExtractResponse,
+        crate::extract::ExtractStatusResponse,
+        crate::extract::ExtractSource,
         crate::ScrapeResponse,
         crate::ScrapeFormat,
         crate::ScrapeMetadata,
