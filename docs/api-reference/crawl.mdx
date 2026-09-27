@@ -165,6 +165,28 @@ If the job fails, the endpoint returns an error:
 }
 ```
 
+### Including results
+
+Add `?include_results=true` to also get the first page of the job's documents (the same payload as [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results)) under `results`. `results_limit` sets its page size (default 20, max 100). Follow `results.next` with `GET /job/{id}/results` for the rest.
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "...": "...",
+  "results": {
+    "job_id": "550e8400-e29b-41d4-a716-446655440000",
+    "job_type": "crawl",
+    "status": "completed",
+    "total": 245,
+    "next": "76313a3230",
+    "data": [{ "success": true, "url": "https://docs.example.com/", "markdown": "# Docs", "metadata": { "title": "Docs" } }]
+  }
+}
+```
+
+If the results cannot be read (for example the job's Meilisearch instance is unreachable), the job status is still returned, with `results_error` explaining why.
+
 ### Use Cases
 
 - **CI/CD pipelines** — crawl documentation as part of a deployment

@@ -18,7 +18,7 @@ import { describe, expect, it } from "vitest";
 
 import { ApiResponse, Session, signupFresh } from "../src/client";
 import { assertShape } from "../src/shape";
-import { ERROR_BODY, JOB_STATUS } from "../src/shapes";
+import { ERROR_BODY, JOB_RESULTS, JOB_STATUS } from "../src/shapes";
 
 const TERMINAL = ["completed", "failed", "cancelled"];
 
@@ -126,6 +126,46 @@ describe("jobs contract", () => {
       const res = await other.session.post(path);
       expect(res.status).toBe(404);
       assertShape(res.body, ERROR_BODY);
+    }
+
+    await owner.session.delete(`/job/${jobId}`);
+  });
+
+  it("GET /job/{id}/results pages a job's documents (SCR-71)", async () => {
+    const owner = await signupFresh();
+    const other = await signupFresh();
+    const jobId = await startCrawl(owner.session);
+
+    const res = await owner.session.get(`/job/${jobId}/results?limit=5`);
+    // 503: the job's Meilisearch instance is unreachable from this engine.
+    if (res.status === 503) {
+      assertShape(res.body, ERROR_BODY);
+    } else {
+      expect(res.status).toBe(200);
+      assertShape(res.body, JOB_RESULTS);
+      expect(res.body.job_id).toBe(jobId);
+      expect(res.body.job_type).toBe("crawl");
+      expect(Array.isArray(res.body.data)).toBe(true);
+      expect(res.body.data.length).toBeLessThanOrEqual(5);
+      // Unfinished jobs always hand back a cursor to poll.
+      if (!TERMINAL.includes(res.body.status)) {
+        expect(typeof res.body.next).toBe("string");
+      }
+    }
+
+    const bad = await owner.session.get(
+      `/job/${jobId}/results?cursor=not-a-cursor`,
+    );
+    expect(bad.status).toBe(400);
+    assertShape(bad.body, ERROR_BODY);
+
+    for (const path of [
+      "/job/does-not-exist/results",
+      `/job/${jobId}/results`,
+    ]) {
+      const foreign = await other.session.get(path);
+      expect(foreign.status).toBe(404);
+      assertShape(foreign.body, ERROR_BODY);
     }
 
     await owner.session.delete(`/job/${jobId}`);

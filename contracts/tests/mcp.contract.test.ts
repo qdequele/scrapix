@@ -162,6 +162,7 @@ describe("MCP protocol", () => {
       "scrape_url",
       "map_url",
       "create_crawl",
+      "job_results",
       "list_configs",
       "create_config",
       "list_engines",

@@ -46,8 +46,10 @@ pub mod billing;
 pub mod completion;
 pub mod configs;
 pub mod email_scheduler;
+pub(crate) mod job_kind;
 pub mod jobs_db;
 pub mod openapi;
+pub(crate) mod results;
 pub mod stripe;
 pub mod webhooks;
 
@@ -302,6 +304,8 @@ struct AppState {
     control_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JobControl>>>,
     /// Controls queued but not yet published (or given up on).
     controls_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Job results layer (`GET /job/{id}/results`, SCR-71).
+    results: results::ResultsState,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +392,7 @@ impl AppState {
             control_tx,
             control_rx: parking_lot::Mutex::new(Some(control_rx)),
             controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            results: results::ResultsState::default(),
             db_pool,
             stripe_client,
             analytics_store,
@@ -4123,6 +4128,13 @@ pub(crate) async fn do_create_crawl(
         j.swap_meilisearch_api_key = replace_key;
     });
 
+    // Remember where the job's documents go (`GET /job/{id}/results`).
+    state.results.remember_crawl_target(
+        &job_id,
+        &config.meilisearch.url,
+        &config.meilisearch.api_key,
+    );
+
     // Persist new job to Postgres
     if let (Some(ref pool), Some(snapshot)) = (&state.db_pool, snapshot) {
         let pool = pool.clone();
@@ -5025,13 +5037,17 @@ async fn create_crawl(
 }
 
 /// Create a sync crawl job (waits for completion)
-#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, responses((status = 200, body = CreateCrawlResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+///
+/// With `include_results=true`, the response also carries the first page of
+/// the job's results (`GET /job/{id}/results`).
+#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, params(results::CrawlSyncQuery), responses((status = 200, body = results::CrawlSyncResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
 async fn create_crawl_sync(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     user_ext: Option<Extension<AuthenticatedUser>>,
+    Query(sync_query): Query<results::CrawlSyncQuery>,
     Json(config): Json<CrawlConfig>,
-) -> Result<Json<JobStatusResponse>, ApiError> {
+) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
     let account_ctx =
         extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
@@ -5055,7 +5071,9 @@ async fn create_crawl_sync(
         if let Some(job) = state.get_job(&job_id) {
             match job.status {
                 JobStatus::Completed => {
-                    return Ok(Json(job.into()));
+                    return Ok(Json(
+                        results::crawl_sync_response(&state, job, &sync_query).await,
+                    ));
                 }
                 JobStatus::Failed | JobStatus::Cancelled => {
                     return Err(ApiError::new(
@@ -5075,7 +5093,9 @@ async fn create_crawl_sync(
                     if let CrawlEvent::JobCompleted { .. } | CrawlEvent::JobFailed { .. } = event {
                         // Job finished, get final status
                         if let Some(job) = state.get_job(&job_id) {
-                            return Ok(Json(job.into()));
+                            return Ok(Json(
+                                results::crawl_sync_response(&state, job, &sync_query).await,
+                            ));
                         }
                     }
                 }
@@ -6476,6 +6496,7 @@ pub async fn run_with_bus(
         .route("/job/{id}/status", get(job_status))
         .route("/job/{id}/events", get(job_events))
         .route("/job/{id}/events/history", get(get_job_events_history))
+        .route("/job/{id}/results", get(results::job_results))
         .route("/job/{id}", delete(cancel_job))
         .route("/job/{id}/pause", post(pause_job))
         .route("/job/{id}/resume", post(resume_job));

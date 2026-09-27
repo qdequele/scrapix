@@ -50,6 +50,7 @@ use utoipa::OpenApi;
         // Job management
         crate::list_jobs,
         crate::job_status,
+        crate::results::job_results,
         crate::cancel_job,
         crate::pause_job,
         crate::resume_job,
@@ -75,6 +76,11 @@ use utoipa::OpenApi;
         crate::BulkCrawlResponse,
         crate::BulkCrawlError,
         crate::JobStatusResponse,
+        crate::results::JobResultsResponse,
+        crate::results::JobResultItem,
+        crate::results::JobResultError,
+        crate::results::CrawlSyncResponse,
+        crate::job_kind::JobKind,
         scrapix_core::JobStatus,
         crate::ApiError,
         // Diagnostic types

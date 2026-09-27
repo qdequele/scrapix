@@ -94,6 +94,77 @@ curl http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/status
 
 ---
 
+## GET /job/{id}/results
+
+Paginated documents a job produced, each shaped like a [`/scrape`](/api-reference/scrape) response. Works while the job is running (partial results) and after it finished, for every job type: crawls, [batch scrapes](/api-reference/batch-scrape) and [extractions](/api-reference/extract). Same authentication and ownership rules as `GET /job/{id}/status`.
+
+### Query Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | `20` | Page size (max `100`) |
+| `cursor` | string | — | Opaque cursor from a previous response's `next` |
+
+### Response
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_type": "crawl",
+  "status": "running",
+  "total": 138,
+  "next": "76313a3230",
+  "data": [
+    {
+      "success": true,
+      "url": "https://docs.example.com/getting-started",
+      "status_code": 200,
+      "markdown": "# Getting started\n...",
+      "content": "Getting started ...",
+      "metadata": {
+        "title": "Getting started",
+        "description": "Install and run in five minutes",
+        "author": null,
+        "keywords": []
+      },
+      "language": "en",
+      "document_id": "0b6e7c1e-...",
+      "crawled_at": "2024-01-15T10:30:12Z"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `job_type` | string | `crawl`, `batch_scrape` or `extract` |
+| `status` | string | Job status at the time of the read |
+| `total` | integer | Number of results available so far |
+| `next` | string \| null | Cursor of the next page. `null` only once the job is terminal **and** every result was returned; while the job runs it is always set (possibly to the same position), so you can keep polling it |
+| `data` | object[] | Results. Only the fields the job produced are present (a crawl without AI has no `ai`, etc.) |
+
+Item fields follow `POST /scrape` (`url`, `markdown`, `html`, `content`, `metadata`, `links`, `language`, `schema`, `blocks`, `extract`, `ai`, `status_code`, ...), plus:
+
+- crawl jobs: `document_id`, `crawled_at`, and `page_block` / `block_url` when the crawl split pages into blocks (one item per block);
+- batch scrape / extract jobs: `source_url` (the URL as submitted), `index` (its position in `urls`), and `error: { code, message }` with `success: false` for a URL that failed.
+
+### Ordering and consistency
+
+- **Crawl jobs** are read from the job's Meilisearch index, filtered on `_crawl_job_id`, in Meilisearch's internal document order (the index has no attribute that is guaranteed sortable). Once the job is finished, paging is exact. While it runs, newly indexed pages are normally appended; a new document can occasionally reuse an internal id freed by a deletion in the same index and land on a page you already read, so re-read from the start after completion if you need an exact snapshot. Meilisearch indexes asynchronously: the last pages of a crawl can appear a few seconds after it completes. Documents of a later crawl into the same index replace a URL's document (and its `_crawl_job_id`), so an older job's results shrink as newer crawls re-index its pages.
+- **Batch scrape and extract jobs** store results in the order URLs finished, append-only: following `next` never skips or repeats an item, even while the job runs.
+
+### Example
+
+```bash
+# First page
+curl "http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/results?limit=50"
+
+# Next page
+curl "http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/results?limit=50&cursor=76313a3530"
+```
+
+---
+
 ## GET /job/{id}/events
 
 Stream real-time crawl events via [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). The connection stays open and pushes events as they occur.

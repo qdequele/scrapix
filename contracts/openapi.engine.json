@@ -124,7 +124,29 @@
           "crawl"
         ],
         "summary": "Create a sync crawl job (waits for completion)",
+        "description": "With `include_results=true`, the response also carries the first page of\nthe job's results (`GET /job/{id}/results`).",
         "operationId": "create_crawl_sync",
+        "parameters": [
+          {
+            "name": "include_results",
+            "in": "query",
+            "description": "Also return the first page of the job's results (default false)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "results_limit",
+            "in": "query",
+            "description": "Page size of the included results (default 20, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -141,7 +163,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CreateCrawlResponse"
+                  "$ref": "#/components/schemas/CrawlSyncResponse"
                 }
               }
             }
@@ -392,6 +414,93 @@
           },
           "409": {
             "description": "The job is not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/job/{id}/results": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "summary": "Get the results of a job",
+        "description": "Paginated documents produced by a crawl, batch scrape or extract job,\neach shaped like a `/scrape` response. Works while the job is running\n(partial results) and after it finished. Follow `next` until it is\n`null`; while the job runs, `next` stays set so it can be polled.",
+        "operationId": "job_results",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (default 20, max 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous response's `next`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResultsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The job's result store is unreachable",
             "content": {
               "application/json": {
                 "schema": {
@@ -1107,6 +1216,37 @@
           }
         }
       },
+      "CrawlSyncResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/JobStatusResponse"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "results": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JobResultsResponse",
+                    "description": "First page of results (`include_results=true`). Follow `results.next`\nwith `GET /job/{id}/results`. Meilisearch indexes asynchronously, so\nthe very last pages of a just-finished crawl can take a moment to\nappear."
+                  }
+                ]
+              },
+              "results_error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the results could not be read (`include_results=true`)"
+              }
+            }
+          }
+        ],
+        "description": "`POST /crawl/sync` response: the final job status, plus the first page\nof results when `include_results=true`"
+      },
       "CrawlerType": {
         "type": "string",
         "description": "Type of crawler to use",
@@ -1656,6 +1796,248 @@
           "update",
           "replace"
         ]
+      },
+      "JobKind": {
+        "type": "string",
+        "description": "The kind of a job.",
+        "enum": [
+          "crawl",
+          "batch_scrape",
+          "extract"
+        ]
+      },
+      "JobResultError": {
+        "type": "object",
+        "description": "Error of a failed result item",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Machine-readable code (`fetch_error`, `http_error`, `validation_error`, ...)"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "JobResultItem": {
+        "type": "object",
+        "description": "A single job result, shaped like a `/scrape` response. Fields a job did\nnot produce (formats/features it did not request) are omitted.",
+        "required": [
+          "success",
+          "url"
+        ],
+        "properties": {
+          "ai": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "AI enrichment results (`summary`, `extract`)"
+          },
+          "block_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL of the block (with its anchor), when the crawl split pages into blocks"
+          },
+          "blocks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object"
+            }
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "crawled_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the page was crawled (crawl jobs)"
+          },
+          "document_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Meilisearch document id (crawl jobs)"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobResultError",
+                "description": "Why this page failed (`success: false`)"
+              }
+            ]
+          },
+          "extract": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Custom selector extraction results"
+          },
+          "html": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Position of `source_url` in the submitted `urls` (batch scrape / extract)",
+            "minimum": 0
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "markdown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Page metadata (same shape as `ScrapeResponse.metadata`)"
+          },
+          "page_block": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Block index within the page, when the crawl split pages into blocks",
+            "minimum": 0
+          },
+          "raw_html": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "JSON-LD / structured data"
+          },
+          "scrape_duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL as submitted (batch scrape / extract)"
+          },
+          "status_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Whether this page was scraped successfully"
+          },
+          "url": {
+            "type": "string",
+            "description": "Page URL (after redirects)"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "JobResultsResponse": {
+        "type": "object",
+        "description": "One page of a job's results",
+        "required": [
+          "job_id",
+          "job_type",
+          "status",
+          "total",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobResultItem"
+            },
+            "description": "Results, each shaped like a `/scrape` response"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "job_type": {
+            "$ref": "#/components/schemas/JobKind",
+            "description": "`crawl`, `batch_scrape` or `extract`"
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor of the next page; `null` once the job is terminal and every\nresult was returned. Always set while the job runs."
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "Job status at the time of the read"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of results available so far",
+            "minimum": 0
+          }
+        }
       },
       "JobStatus": {
         "type": "string",

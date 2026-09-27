@@ -213,3 +213,13 @@ export const JOB_STATUS: Spec = {
   config: "any?",
   warnings: "any?",
 };
+
+/** Engine job results page (GET /job/{id}/results, SCR-71). */
+export const JOB_RESULTS: Spec = {
+  job_id: "string",
+  job_type: "string",
+  status: "string",
+  total: "number",
+  next: "string|null",
+  data: "any",
+};

@@ -25,6 +25,7 @@ class McpTest < ActionDispatch::IntegrationTest
     names = response.parsed_body.dig("result", "tools").map { |t| t["name"] }
     assert_operator names.size, :>=, 40
     assert_includes names, "scrape_url"
+    assert_includes names, "job_results"
     assert_includes names, "list_configs"
   end
 end
