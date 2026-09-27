@@ -705,7 +705,7 @@ pub enum WebhookEvent {
 }
 
 /// Webhook authentication
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookAuth {
     /// Bearer token authentication
@@ -722,6 +722,33 @@ pub enum WebhookAuth {
 
     /// Custom headers
     Headers { headers: HashMap<String, String> },
+}
+
+/// Manual `Debug`: never print a real secret into logs, panic messages, or
+/// `{:?}` in an error report. Header *names* (in `Hmac::header` and the
+/// keys of `Headers::headers`) aren't secrets and are shown; the values
+/// that are secrets (`Bearer::token`, `Hmac::secret`, and every value in
+/// `Headers::headers`) are redacted.
+impl std::fmt::Debug for WebhookAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebhookAuth::Bearer { .. } => f.debug_struct("Bearer").field("token", &"***").finish(),
+            WebhookAuth::Hmac {
+                algorithm, header, ..
+            } => f
+                .debug_struct("Hmac")
+                .field("secret", &"***")
+                .field("algorithm", algorithm)
+                .field("header", header)
+                .finish(),
+            WebhookAuth::Headers { headers } => {
+                let redacted: HashMap<&String, &str> = headers.keys().map(|k| (k, "***")).collect();
+                f.debug_struct("Headers")
+                    .field("headers", &redacted)
+                    .finish()
+            }
+        }
+    }
 }
 
 fn default_hmac_algorithm() -> String {

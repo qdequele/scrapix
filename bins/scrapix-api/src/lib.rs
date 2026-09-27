@@ -163,6 +163,17 @@ pub struct Args {
     #[arg(long, env = "ALLOW_PRIVATE_IPS", default_value = "false")]
     pub allow_private_ips: bool,
 
+    /// Maximum number of webhook deliveries in flight at once, across all
+    /// jobs and hooks (SCR-72). Bounds resource use under load; does not
+    /// need to be large relative to hook count since a slow/blackholed
+    /// endpoint only ties up one slot regardless of how long it hangs.
+    #[arg(
+        long,
+        env = "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+        default_value_t = webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES
+    )]
+    pub webhook_max_concurrent_deliveries: usize,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -3431,7 +3442,7 @@ fn fan_out_worker_wakes() {
 ///
 /// Extracted from `do_create_crawl` so it can be unit-tested without the
 /// surrounding `AppState` (producer, DB pool, etc.) that job creation needs.
-pub(crate) fn validate_crawl_config(config: &CrawlConfig) -> Result<(), ApiError> {
+pub(crate) fn validate_crawl_config(config: &mut CrawlConfig) -> Result<(), ApiError> {
     use validator::Validate;
     config
         .validate()
@@ -3440,7 +3451,13 @@ pub(crate) fn validate_crawl_config(config: &CrawlConfig) -> Result<(), ApiError
         validate_proxy_config(proxy)
             .map_err(|msg| ApiError::new(format!("proxy: {msg}"), "validation_error"))?;
     }
-    for hook in &config.webhooks {
+    for hook in &mut config.webhooks {
+        // Clamp (never reject) an out-of-range timeout: a hook author
+        // asking for a 10-minute timeout is a config mistake, not
+        // something worth a 400 for — but an unbounded timeout is a shared
+        // resource risk (SCR-72 fix round 1), so it's silently brought into
+        // range instead.
+        hook.timeout_ms = webhooks::clamp_timeout_ms(hook.timeout_ms);
         webhooks::validate_webhook_config(hook)
             .map_err(|msg| ApiError::new(format!("webhooks: {msg}"), "validation_error"))?;
     }
@@ -3627,7 +3644,10 @@ pub(crate) async fn do_create_crawl(
     // Full validation (start_urls, index_uid length, and any future
     // #[validate] rules) — after index_uid auto-derivation and Meilisearch
     // engine resolution so both are populated before the length checks run.
-    validate_crawl_config(&config)?;
+    // `mut`: `validate_crawl_config` clamps out-of-range webhook
+    // `timeout_ms` values in place (SCR-72 fix round 1).
+    let mut config = config;
+    validate_crawl_config(&mut config)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
@@ -5984,7 +6004,8 @@ pub async fn run_with_bus(
     let webhook_client = scrapix_crawler::safe_client_builder(None, args.allow_private_ips)
         .build()
         .expect("failed to build webhook delivery HTTP client");
-    let webhook_dispatcher = webhooks::WebhookDispatcher::new(webhook_client);
+    let webhook_dispatcher =
+        webhooks::WebhookDispatcher::new(webhook_client, args.webhook_max_concurrent_deliveries);
     let state = Arc::new(AppState::new(
         producer,
         config,
@@ -6820,12 +6841,12 @@ mod tests {
     fn validate_crawl_config_rejects_invalid_config_with_validation_error() {
         // do_create_crawl needs a full AppState (producer, DB pool, fetcher, ...),
         // so we test the extracted validation step it calls instead.
-        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+        let mut cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
             "start_urls": [], "index_uid": "a"
         }))
         .unwrap();
 
-        let err = validate_crawl_config(&cfg).expect_err("empty start_urls must be rejected");
+        let err = validate_crawl_config(&mut cfg).expect_err("empty start_urls must be rejected");
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["code"], "validation_error");
         assert_eq!(
@@ -6854,7 +6875,7 @@ mod tests {
             serde_json::json!({"urls": []}),
             serde_json::json!({"urls": [], "tiered": [[]]}),
         ] {
-            let err = validate_crawl_config(&config_with_proxy(proxy.clone()))
+            let err = validate_crawl_config(&mut config_with_proxy(proxy.clone()))
                 .expect_err(&format!("{proxy} must be rejected"));
             let json = serde_json::to_value(&err).unwrap();
             assert_eq!(json["code"], "validation_error", "{proxy}");
@@ -6869,7 +6890,7 @@ mod tests {
             serde_json::json!({"urls": [], "tiered": [["http://p1.example.com:1"], ["http://p2.example.com:1"]]}),
         ] {
             assert!(
-                validate_crawl_config(&config_with_proxy(proxy.clone())).is_ok(),
+                validate_crawl_config(&mut config_with_proxy(proxy.clone())).is_ok(),
                 "{proxy}"
             );
         }
@@ -6886,11 +6907,11 @@ mod tests {
 
     #[test]
     fn validate_crawl_config_accepts_valid_config() {
-        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+        let mut cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
             "start_urls": ["https://a.test"], "index_uid": "a"
         }))
         .unwrap();
-        assert!(validate_crawl_config(&cfg).is_ok());
+        assert!(validate_crawl_config(&mut cfg).is_ok());
     }
 
     fn config_with_webhook(webhook: serde_json::Value) -> CrawlConfig {
@@ -6907,10 +6928,11 @@ mod tests {
             "http://10.0.0.5/hook",
             "http://169.254.169.254/hook",
         ] {
-            let cfg = config_with_webhook(serde_json::json!({
+            let mut cfg = config_with_webhook(serde_json::json!({
                 "url": url, "events": ["crawl_completed"]
             }));
-            let err = validate_crawl_config(&cfg).expect_err(&format!("{url} must be rejected"));
+            let err =
+                validate_crawl_config(&mut cfg).expect_err(&format!("{url} must be rejected"));
             let json = serde_json::to_value(&err).unwrap();
             assert_eq!(json["code"], "validation_error", "{url}");
         }
@@ -6918,20 +6940,35 @@ mod tests {
 
     #[test]
     fn accepts_public_webhook_url() {
-        let cfg = config_with_webhook(serde_json::json!({
+        let mut cfg = config_with_webhook(serde_json::json!({
             "url": "https://example.com/hook", "events": ["crawl_completed"]
         }));
-        assert!(validate_crawl_config(&cfg).is_ok());
+        assert!(validate_crawl_config(&mut cfg).is_ok());
     }
 
     #[test]
     fn rejects_non_sha256_hmac_webhook_algorithm() {
-        let cfg = config_with_webhook(serde_json::json!({
+        let mut cfg = config_with_webhook(serde_json::json!({
             "url": "https://example.com/hook",
             "events": ["crawl_completed"],
             "auth": {"hmac": {"secret": "s", "algorithm": "sha1", "header": "X-Sig"}}
         }));
-        assert!(validate_crawl_config(&cfg).is_err());
+        assert!(validate_crawl_config(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn clamps_out_of_range_webhook_timeout_at_validation() {
+        let mut too_short = config_with_webhook(serde_json::json!({
+            "url": "https://example.com/hook", "events": ["crawl_completed"], "timeout_ms": 10
+        }));
+        validate_crawl_config(&mut too_short).unwrap();
+        assert_eq!(too_short.webhooks[0].timeout_ms, webhooks::MIN_TIMEOUT_MS);
+
+        let mut too_long = config_with_webhook(serde_json::json!({
+            "url": "https://example.com/hook", "events": ["crawl_completed"], "timeout_ms": 600_000
+        }));
+        validate_crawl_config(&mut too_long).unwrap();
+        assert_eq!(too_long.webhooks[0].timeout_ms, webhooks::MAX_TIMEOUT_MS);
     }
 
     #[test]
@@ -6988,6 +7025,7 @@ mod lifecycle_tests {
                 scrapix_crawler::safe_client_builder(None, true)
                     .build()
                     .unwrap(),
+                webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES,
             ),
         )
     }
@@ -7004,6 +7042,22 @@ mod lifecycle_tests {
             .accounting
             .write()
             .insert(job_id.to_string(), acc);
+    }
+
+    /// Bounded poll for a wiremock server's request log to reach `expected`
+    /// entries, instead of a fixed `sleep` and hoping it was long enough
+    /// (SCR-72 fix round 1, item 6).
+    async fn wait_until_received(server: &wiremock::MockServer, expected: usize) {
+        for _ in 0..200 {
+            if server.received_requests().await.unwrap().len() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for {expected} requests, got {}",
+            server.received_requests().await.unwrap().len()
+        );
     }
 
     fn progress(job_id: &str, received: u64, dispatched: u64, queued: u64) -> CrawlEvent {
@@ -8067,7 +8121,9 @@ mod lifecycle_tests {
     /// SCR-72: cancelling a job doesn't go through the pipeline's
     /// `CrawlEvent` stream, so `cancel()` must fire a synthetic
     /// `crawl_failed` webhook (`data.error == "cancelled"`) itself for any
-    /// hook subscribed to `CrawlFailed`.
+    /// hook subscribed to `CrawlFailed`. Strengthened (fix round 1, item 6)
+    /// to assert the actual delivered payload/headers, not just that some
+    /// request arrived.
     #[tokio::test]
     async fn cancel_fires_crawl_failed_cancelled() {
         use wiremock::matchers::{method, path};
@@ -8097,8 +8153,77 @@ mod lifecycle_tests {
 
         state.cancel("j1").expect("running job cancels");
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // wiremock asserts `.expect(1)` was met when `server` drops.
+        wait_until_received(&server, 1).await;
+        let reqs = server.received_requests().await.unwrap();
+        let req = &reqs[0];
+        assert_eq!(
+            req.headers.get("X-Scrapix-Event").unwrap(),
+            "crawl_failed",
+            "cancellation must be delivered as a crawl_failed webhook"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["event"], "crawl_failed");
+        assert_eq!(body["job_id"], "j1");
+        assert_eq!(
+            body["data"]["error"], "cancelled",
+            "the synthetic JobFailed's error field must say why: cancellation"
+        );
+    }
+
+    /// SCR-72 fix round 1, item 6: a real `JobCompleted` delivered through
+    /// `process_event_at` (not `enqueue` called directly) reaches a
+    /// subscribed webhook — end-to-end coverage of the
+    /// `process_event_at` -> `webhook_dispatcher.enqueue` wiring itself,
+    /// which the other webhook tests don't exercise (they call `enqueue`
+    /// directly, or go through `cancel()` which also calls it directly).
+    #[tokio::test]
+    async fn job_completed_event_reaches_a_subscribed_webhook() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.update_job("j1", |j| {
+            j.webhooks = vec![scrapix_core::WebhookConfig {
+                url: format!("{}/hook", server.uri()),
+                events: vec![scrapix_core::WebhookEvent::CrawlCompleted],
+                auth: None,
+                enabled: true,
+                timeout_ms: 5_000,
+                name: None,
+            }];
+        });
+        state.process_event("j1", &progress("j1", 1, 1, 0));
+        state.process_event("j1", &crawled("j1", "m1"));
+        state.process_event("j1", &indexed("j1", "m1"));
+
+        let completed = CrawlEvent::JobCompleted {
+            job_id: "j1".to_string(),
+            account_id: None,
+            pages_crawled: 1,
+            documents_indexed: 1,
+            errors: 0,
+            bytes_downloaded: 10,
+            duration_secs: 1,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        assert!(state.process_event("j1", &completed).applied);
+
+        wait_until_received(&server, 1).await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs[0].headers.get("X-Scrapix-Event").unwrap(),
+            "crawl_completed"
+        );
     }
 
     /// Cancel after the job completed is rejected: the terminal status is

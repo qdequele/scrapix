@@ -428,7 +428,14 @@ pub struct JobState {
     /// always sets this to empty), so webhook delivery for a job recovered
     /// after a restart is a known gap — the job's `config.webhooks` still
     /// carries the URLs but its secrets read back as `"***"`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `#[serde(skip)]`, not just secret-redacted: `JobState` derives
+    /// `Serialize`/`Deserialize` and nothing about those derives should
+    /// ever be trusted to carry real webhook secrets across a process
+    /// boundary (a debug dump, a future serialization path, ...) — the only
+    /// sanctioned way this field's secrets leave the process is an actual
+    /// HTTP delivery. `Vec::default()` (empty) is used on deserialize.
+    #[serde(skip)]
     pub webhooks: Vec<crate::config::WebhookConfig>,
 }
 

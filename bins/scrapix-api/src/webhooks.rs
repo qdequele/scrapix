@@ -4,7 +4,8 @@
 //! `CrawlConfig.webhooks` can subscribe to, and delivers each matching,
 //! enabled subscription as a signed HTTP POST off the event-processing
 //! path: `enqueue` never awaits or touches the network, it only pushes onto
-//! a bounded in-memory queue that a background task drains.
+//! a bounded in-memory queue that a background task drains, spawning a
+//! bounded number of concurrent delivery tasks (see "Concurrency" below).
 //!
 //! ## Event mapping
 //!
@@ -30,7 +31,12 @@
 //!
 //! `ProgressUpdate` deliveries are throttled to at most one per job every
 //! [`PROGRESS_THROTTLE`], regardless of how many `FrontierProgress` events
-//! arrive in that window or how many hooks are subscribed.
+//! arrive in that window or how many hooks are subscribed. The throttle
+//! bookkeeping (`progress_last_sent`) is only written when at least one
+//! enabled hook is actually subscribed to `ProgressUpdate` (no point
+//! growing a map entry per job that has no such hook), and is dropped for a
+//! job the moment it reaches a terminal `CrawlCompleted`/`CrawlFailed`, so
+//! the map never accumulates entries for finished jobs.
 //!
 //! Job cancellation (`DELETE /job/:id`) does not go through the pipeline
 //! and so emits no `CrawlEvent` at all; `lib.rs`'s `cancel()` instead calls
@@ -46,13 +52,16 @@
 //! Body: `{"event": "<snake_case>", "job_id", "timestamp", "data": <the
 //! CrawlEvent as JSON>}`, plus headers `X-Scrapix-Event` (the same
 //! snake_case event name) and `X-Scrapix-Delivery` (a fresh UUID per
-//! attempt... note: per *delivery*, not per attempt — retries of the same
-//! delivery reuse one delivery id so a receiver can dedupe retried
-//! attempts).
+//! *delivery*, not per attempt — retries of the same delivery reuse one
+//! delivery id so a receiver can dedupe retried attempts).
 //!
 //! Auth (`WebhookConfig.auth`):
 //! - `Bearer { token }` sends `Authorization: Bearer <token>`.
-//! - `Headers { headers }` sends each header as-is.
+//! - `Headers { headers }` sends each header as-is. Header names/values are
+//!   validated at job creation (`validate_webhook_config`): must be
+//!   syntactically valid HTTP header names/values, and must not try to
+//!   override `Content-Type`, `Host`, or any `X-Scrapix-*` header this
+//!   module itself sets.
 //! - `Hmac { secret, algorithm, header }` sends `header: sha256=<hex hmac-sha256
 //!   of the raw JSON body>`. Only `algorithm == "sha256"` is supported;
 //!   anything else is rejected at job creation (`validate_crawl_config`), so
@@ -61,11 +70,49 @@
 //! A disabled hook (`enabled: false`) is skipped entirely, as is a hook not
 //! subscribed to the mapped event.
 //!
+//! `timeout_ms` is clamped to `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]` (1s..30s)
+//! both at job-creation validation (`validate_crawl_config` mutates the
+//! config in place) and again at delivery time (belt-and-braces, in case a
+//! `JobState.webhooks` entry ever bypasses that path — e.g. a future config
+//! source that skips `validate_crawl_config`).
+//!
 //! Each delivery gets up to 3 attempts (the first, plus 2 retries),
 //! separated by the backoff in [`DEFAULT_BACKOFF`] (1s, then 5s). A network
 //! error or 5xx response triggers a retry; a 4xx response is terminal
 //! (no retry: the receiver is telling us the request itself is wrong).
 //! Attempts beyond the 3rd are not made even if a 5xx keeps recurring.
+//!
+//! ## Concurrency (head-of-line blocking)
+//!
+//! A single background task drains the queue, but it does not deliver
+//! inline: each queued job is handed to its own `tokio::spawn`'ed task
+//! (all attempts/retries/backoff sleeps happen inside that task), bounded
+//! by a `Semaphore` with `max_concurrent_deliveries` permits (`enqueue`
+//! itself never touches the semaphore — only the drain loop does, right
+//! before spawning). This means:
+//! - A single slow/blackholed endpoint (e.g. `timeout_ms` at its 30s max)
+//!   only occupies one of the concurrent slots; every other job's
+//!   deliveries proceed independently rather than queueing up behind it.
+//! - The drain loop itself never sleeps: retry backoff sleeps happen
+//!   inside the spawned tasks, so popping the next queued job is never
+//!   delayed by another job's retry schedule (only by the semaphore
+//!   reaching its concurrency cap, which is deliberate backpressure).
+//!
+//! ## Drop-oldest under a full queue
+//!
+//! At [`QUEUE_CAPACITY`], `enqueue` must make room for a new delivery by
+//! dropping an old one. A naive drop-oldest (evict the front of the queue
+//! unconditionally) can starve a small number of tenants who happen to
+//! have `crawl_completed`/`crawl_failed` deliveries sitting behind a flood
+//! of `progress_update`/`page_*` deliveries from a noisy job. Instead:
+//! - `push` first looks for the oldest **prunable** queued delivery
+//!   (`progress_update`, `page_crawled`, `page_indexed`, `page_error` — see
+//!   [`is_prunable`]) and evicts that.
+//! - Only when the entire queue is non-prunable (every queued delivery is
+//!   `crawl_started`/`crawl_completed`/`crawl_failed`) does it fall back to
+//!   evicting the plain oldest entry.
+//!
+//! A warning is logged at most once a minute while the queue stays full.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -75,15 +122,14 @@ use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::Sha256;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 
 use scrapix_core::{WebhookAuth, WebhookConfig, WebhookEvent};
 use scrapix_queue::CrawlEvent;
 
-/// Delivery queue capacity. Past this, the oldest queued delivery is
-/// dropped (drop-oldest) to make room, with a warning logged at most once a
-/// minute.
+/// Delivery queue capacity. Past this, an old queued delivery is dropped to
+/// make room (see the module docs' "Drop-oldest" section).
 const QUEUE_CAPACITY: usize = 10_000;
 
 /// Minimum spacing between two delivered `ProgressUpdate` events for the
@@ -105,6 +151,23 @@ const DEFAULT_BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_s
 /// Total delivery attempts per queued webhook (see [`DEFAULT_BACKOFF`]).
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Default number of deliveries allowed to be in flight (across all jobs
+/// and hooks) at once. Configurable per `WebhookDispatcher::new`.
+pub const DEFAULT_MAX_CONCURRENT_DELIVERIES: usize = 64;
+
+/// Minimum allowed `timeout_ms` (clamped at validation and at delivery).
+pub(crate) const MIN_TIMEOUT_MS: u64 = 1_000;
+/// Maximum allowed `timeout_ms` (clamped at validation and at delivery).
+pub(crate) const MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// Clamp a hook's configured `timeout_ms` into `[MIN_TIMEOUT_MS,
+/// MAX_TIMEOUT_MS]` (1s..30s): long enough to be useless as a DoS vector
+/// against the shared delivery pool, short enough that a legitimate
+/// receiver still has room to respond.
+pub(crate) fn clamp_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
+}
+
 /// Delivers `CrawlEvent`s to a job's subscribed webhooks. Cheap to clone
 /// (an `Arc` around the shared queue/client); `enqueue` is non-blocking.
 #[derive(Clone)]
@@ -115,6 +178,8 @@ pub struct WebhookDispatcher {
 struct Inner {
     client: reqwest::Client,
     backoffs: [Duration; 2],
+    capacity: usize,
+    semaphore: Arc<Semaphore>,
     queue: Mutex<VecDeque<DeliveryJob>>,
     notify: Notify,
     queue_full_warned_at: Mutex<Option<Instant>>,
@@ -125,24 +190,82 @@ struct DeliveryJob {
     hook: WebhookConfig,
     job_id: String,
     event: CrawlEvent,
+    /// Precomputed by `enqueue` (which already had to compute it to decide
+    /// whether/where to deliver), so `push`'s drop-oldest scan and the
+    /// delivery task don't need to re-derive it from `event`.
+    mapped: WebhookEvent,
+}
+
+/// Events cheap to lose under sustained overload: high-frequency,
+/// non-terminal, and each one is superseded by the next (a receiver that
+/// missed a `page_crawled` still has an accurate picture of the job from
+/// the next one, or from `crawl_completed`'s final counts). Kept safe from
+/// eviction as long as any prunable delivery is still queued: `CrawlStarted`,
+/// `CrawlCompleted`, `CrawlFailed` (and `BatchSent`, though it's never
+/// actually enqueued — see module docs).
+fn is_prunable(event: &WebhookEvent) -> bool {
+    matches!(
+        event,
+        WebhookEvent::ProgressUpdate
+            | WebhookEvent::PageCrawled
+            | WebhookEvent::PageIndexed
+            | WebhookEvent::PageError
+    )
 }
 
 impl WebhookDispatcher {
     /// Build a dispatcher backed by `client` (build it with
     /// `scrapix_crawler::safe_client_builder(None, allow_private)` so
-    /// webhook targets go through the same SSRF protections as crawling)
-    /// and spawn its background delivery worker.
-    pub fn new(client: reqwest::Client) -> Self {
-        Self::new_with_backoff(client, DEFAULT_BACKOFF)
+    /// webhook targets go through the same SSRF protections as crawling),
+    /// allowing up to `max_concurrent_deliveries` deliveries in flight at
+    /// once, and spawn its background drain loop.
+    pub fn new(client: reqwest::Client, max_concurrent_deliveries: usize) -> Self {
+        Self::build(
+            client,
+            DEFAULT_BACKOFF,
+            max_concurrent_deliveries.max(1),
+            QUEUE_CAPACITY,
+        )
     }
 
     /// Same as [`Self::new`] but with a caller-supplied backoff sequence —
     /// used by tests so `retries_on_503_then_gives_up_after_3` doesn't
     /// actually wait 1s + 5s.
+    #[cfg(test)]
     pub(crate) fn new_with_backoff(client: reqwest::Client, backoffs: [Duration; 2]) -> Self {
+        Self::build(
+            client,
+            backoffs,
+            DEFAULT_MAX_CONCURRENT_DELIVERIES,
+            QUEUE_CAPACITY,
+        )
+    }
+
+    /// Full test constructor: shortened backoff, a small queue `capacity`
+    /// (so drop-oldest tests don't need to enqueue thousands of jobs to
+    /// fill it) and an explicit concurrency cap (so head-of-line-blocking
+    /// tests can prove one slow hook doesn't starve another).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        client: reqwest::Client,
+        backoffs: [Duration; 2],
+        max_concurrent_deliveries: usize,
+        capacity: usize,
+    ) -> Self {
+        Self::build(client, backoffs, max_concurrent_deliveries.max(1), capacity)
+    }
+
+    fn build(
+        client: reqwest::Client,
+        backoffs: [Duration; 2],
+        max_concurrent_deliveries: usize,
+        capacity: usize,
+    ) -> Self {
         let inner = Arc::new(Inner {
             client,
             backoffs,
+            capacity,
+            semaphore: Arc::new(Semaphore::new(max_concurrent_deliveries)),
             queue: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
             queue_full_warned_at: Mutex::new(None),
@@ -162,12 +285,31 @@ impl WebhookDispatcher {
     /// accessor across all 16 variants, so callers (which already have the
     /// job id in scope from `process_event`) pass it explicitly instead.
     pub fn enqueue(&self, hooks: &[WebhookConfig], job_id: &str, event: &CrawlEvent) {
-        if hooks.is_empty() {
-            return;
-        }
         let Some(mapped) = map_event(event) else {
             return;
         };
+
+        // Prune throttle bookkeeping the moment a job reaches a terminal
+        // state, regardless of whether it has any webhooks at all — this
+        // is the only place that ever removes an entry, so it must not be
+        // gated on `hooks` being non-empty.
+        if matches!(
+            mapped,
+            WebhookEvent::CrawlCompleted | WebhookEvent::CrawlFailed
+        ) {
+            self.inner.progress_last_sent.lock().remove(job_id);
+        }
+
+        if hooks.is_empty() {
+            return;
+        }
+        let matching: Vec<&WebhookConfig> = hooks
+            .iter()
+            .filter(|h| h.enabled && h.events.contains(&mapped))
+            .collect();
+        if matching.is_empty() {
+            return;
+        }
 
         if mapped == WebhookEvent::ProgressUpdate {
             let now = Instant::now();
@@ -180,22 +322,30 @@ impl WebhookDispatcher {
             last_sent.insert(job_id.to_string(), now);
         }
 
-        for hook in hooks {
-            if !hook.enabled || !hook.events.contains(&mapped) {
-                continue;
-            }
+        for hook in matching {
             self.push(DeliveryJob {
                 hook: hook.clone(),
                 job_id: job_id.to_string(),
                 event: event.clone(),
+                mapped: mapped.clone(),
             });
         }
     }
 
     fn push(&self, job: DeliveryJob) {
         let mut queue = self.inner.queue.lock();
-        if queue.len() >= QUEUE_CAPACITY {
-            queue.pop_front();
+        if queue.len() >= self.inner.capacity {
+            // Prefer evicting a prunable (high-frequency, non-terminal)
+            // delivery; only fall back to the plain oldest entry when the
+            // whole queue is terminal events.
+            match queue.iter().position(|j| is_prunable(&j.mapped)) {
+                Some(idx) => {
+                    queue.remove(idx);
+                }
+                None => {
+                    queue.pop_front();
+                }
+            }
             let now = Instant::now();
             let mut warned_at = self.inner.queue_full_warned_at.lock();
             let should_warn = match *warned_at {
@@ -204,8 +354,9 @@ impl WebhookDispatcher {
             };
             if should_warn {
                 warn!(
-                    capacity = QUEUE_CAPACITY,
-                    "webhook delivery queue is full; dropping the oldest queued delivery"
+                    capacity = self.inner.capacity,
+                    "webhook delivery queue is full; dropping a queued delivery \
+                     (prunable ones are dropped first)"
                 );
                 *warned_at = Some(now);
             }
@@ -216,10 +367,12 @@ impl WebhookDispatcher {
     }
 }
 
-/// Background loop: pop and deliver queued jobs one at a time, sleeping
-/// (via `Notify`) when the queue is empty. A single worker keeps delivery
-/// ordering roughly FIFO and simple; delivery latency does not affect event
-/// processing since `enqueue` never waits on this loop.
+/// Background loop: pop queued jobs and hand each to its own spawned task,
+/// bounded by `inner.semaphore`. Waiting for a permit is the only thing
+/// that can pause this loop between pops — it never sleeps for a retry
+/// backoff itself (those sleeps live inside the spawned tasks), so a job
+/// stuck retrying does not delay the next job from being picked up as long
+/// as a concurrency slot is free.
 async fn run_worker(inner: Arc<Inner>) {
     loop {
         let next = inner.queue.lock().pop_front();
@@ -227,7 +380,21 @@ async fn run_worker(inner: Arc<Inner>) {
             inner.notify.notified().await;
             continue;
         };
-        deliver_with_retry(&inner.client, &inner.backoffs, job).await;
+        // `acquire_owned` on an `Arc<Semaphore>` never returns `Err` unless
+        // the semaphore is explicitly closed, which this dispatcher never
+        // does.
+        let permit = inner
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("webhook delivery semaphore is never closed");
+        let client = inner.client.clone();
+        let backoffs = inner.backoffs;
+        tokio::spawn(async move {
+            deliver_with_retry(&client, &backoffs, job).await;
+            drop(permit);
+        });
     }
 }
 
@@ -240,11 +407,7 @@ struct WebhookPayload<'a> {
 }
 
 async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], job: DeliveryJob) {
-    let mapped = match map_event(&job.event) {
-        Some(m) => m,
-        None => return, // unreachable: enqueue already filtered this out
-    };
-    let wire_name = wire_name(&mapped);
+    let wire_name = wire_name(&job.mapped);
     let payload = WebhookPayload {
         event: wire_name,
         job_id: &job.job_id,
@@ -254,12 +417,20 @@ async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], 
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, url = %job.hook.url, "failed to serialize webhook payload; dropping delivery");
+            warn!(
+                error = %e,
+                webhook = %scheme_and_host(&job.hook.url),
+                "failed to serialize webhook payload; dropping delivery"
+            );
             return;
         }
     };
 
     let delivery_id = uuid::Uuid::new_v4().to_string();
+    // Defense in depth: `validate_crawl_config` already clamps this at job
+    // creation, but re-clamp here in case a `JobState.webhooks` entry ever
+    // reaches delivery through a path that skipped that validation.
+    let timeout_ms = clamp_timeout_ms(job.hook.timeout_ms);
 
     for attempt in 0..MAX_ATTEMPTS {
         let mut req = client
@@ -267,15 +438,21 @@ async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], 
             .header("Content-Type", "application/json")
             .header("X-Scrapix-Event", wire_name)
             .header("X-Scrapix-Delivery", delivery_id.as_str())
-            .timeout(Duration::from_millis(job.hook.timeout_ms));
+            .timeout(Duration::from_millis(timeout_ms));
         req = apply_auth(req, job.hook.auth.as_ref(), &body);
         req = req.body(body.clone());
+
+        // Only the URL's scheme+host is logged, never the full URL: a
+        // webhook URL can carry a capability token in its path or query
+        // (e.g. `https://hooks.example.com/t/SECRET-TOKEN`), which must
+        // never end up in logs.
+        let webhook = scheme_and_host(&job.hook.url);
 
         match req.send().await {
             Ok(resp) if resp.status().is_success() => return,
             Ok(resp) if resp.status().is_client_error() => {
                 warn!(
-                    url = %job.hook.url,
+                    webhook = %webhook,
                     status = %resp.status(),
                     job_id = %job.job_id,
                     "webhook delivery rejected (4xx); not retrying"
@@ -284,7 +461,7 @@ async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], 
             }
             Ok(resp) => {
                 warn!(
-                    url = %job.hook.url,
+                    webhook = %webhook,
                     status = %resp.status(),
                     attempt = attempt + 1,
                     job_id = %job.job_id,
@@ -293,7 +470,7 @@ async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], 
             }
             Err(e) => {
                 warn!(
-                    url = %job.hook.url,
+                    webhook = %webhook,
                     error = %e,
                     attempt = attempt + 1,
                     job_id = %job.job_id,
@@ -306,7 +483,26 @@ async fn deliver_with_retry(client: &reqwest::Client, backoffs: &[Duration; 2], 
             tokio::time::sleep(backoffs[attempt as usize]).await;
         }
     }
-    warn!(url = %job.hook.url, job_id = %job.job_id, attempts = MAX_ATTEMPTS, "webhook delivery exhausted all retries; giving up");
+    warn!(
+        webhook = %scheme_and_host(&job.hook.url),
+        job_id = %job.job_id,
+        attempts = MAX_ATTEMPTS,
+        "webhook delivery exhausted all retries; giving up"
+    );
+}
+
+/// `scheme://host[:port]` of a webhook URL, safe to log. A webhook URL's
+/// path or query can carry a capability token (many webhook providers put
+/// the secret there instead of, or in addition to, an auth header), so the
+/// full URL must never be logged.
+fn scheme_and_host(url_str: &str) -> String {
+    match url::Url::parse(url_str) {
+        Ok(u) => match u.port() {
+            Some(port) => format!("{}://{}:{port}", u.scheme(), u.host_str().unwrap_or("?")),
+            None => format!("{}://{}", u.scheme(), u.host_str().unwrap_or("?")),
+        },
+        Err(_) => "<invalid-url>".to_string(),
+    }
 }
 
 fn apply_auth(
@@ -404,18 +600,54 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Header names (case-insensitive) and prefixes this module itself sets on
+/// every delivery, or that would otherwise change the request in ways a
+/// webhook author shouldn't be able to (the body's content type, or the
+/// destination host). A custom `Headers` auth entry may not override any
+/// of these.
+fn is_reserved_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "content-type" || lower == "host" || lower.starts_with("x-scrapix-")
+}
+
+/// Validate one custom auth header's name and value are syntactically
+/// legal HTTP (so an invalid one fails job creation with a clear error,
+/// instead of silently failing — and burning 3 retries — at delivery
+/// time), and that it isn't one of [`is_reserved_header`]'s reserved names.
+fn validate_custom_header(name: &str, value: &str) -> Result<(), String> {
+    reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|e| format!("invalid webhook header name '{name}': {e}"))?;
+    reqwest::header::HeaderValue::from_str(value)
+        .map_err(|e| format!("invalid webhook header value for '{name}': {e}"))?;
+    if is_reserved_header(name) {
+        return Err(format!(
+            "webhook header '{name}' is reserved (set by the delivery itself) and cannot be overridden"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a single webhook config at job-creation time: the URL (see
-/// [`validate_webhook_url`]) and, for HMAC auth, that the algorithm is the
-/// only one this module implements.
+/// [`validate_webhook_url`]), that HMAC auth only ever requests the one
+/// algorithm this module implements, and that `Headers` auth doesn't try
+/// to smuggle in an invalid or reserved header. Does **not** validate
+/// `timeout_ms` — that's clamped, not rejected (see [`clamp_timeout_ms`]),
+/// by the caller (`lib.rs::validate_crawl_config`) before this runs.
 pub(crate) fn validate_webhook_config(hook: &WebhookConfig) -> Result<(), String> {
     validate_webhook_url(&hook.url)?;
-    if let Some(WebhookAuth::Hmac { algorithm, .. }) = &hook.auth {
-        if algorithm != "sha256" {
+    match &hook.auth {
+        Some(WebhookAuth::Hmac { algorithm, .. }) if algorithm != "sha256" => {
             return Err(format!(
                 "unsupported HMAC algorithm '{algorithm}' for webhook '{}' (only sha256 is supported)",
                 hook.url
             ));
         }
+        Some(WebhookAuth::Headers { headers }) => {
+            for (name, value) in headers {
+                validate_custom_header(name, value)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -492,7 +724,10 @@ mod tests {
         }
     }
 
-    async fn wait_for(count: impl Fn() -> usize, expected: usize) {
+    /// Poll `count()` until it reaches `expected`, bounded (2s total)
+    /// instead of a fixed sleep — used everywhere a test used to
+    /// `sleep(Duration::from_millis(N))` and hope N was enough.
+    async fn wait_for_count(count: impl Fn() -> usize, expected: usize) {
         for _ in 0..200 {
             if count() >= expected {
                 return;
@@ -502,6 +737,23 @@ mod tests {
         panic!(
             "timed out waiting for {expected} deliveries, got {}",
             count()
+        );
+    }
+
+    async fn received_count(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    async fn wait_until_received(server: &MockServer, expected: usize) {
+        for _ in 0..200 {
+            if received_count(server).await >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for {expected} requests, got {}",
+            received_count(server).await
         );
     }
 
@@ -541,9 +793,7 @@ mod tests {
 
         dispatcher.enqueue(&[h], "job-1", &completed_event("job-1"));
 
-        // wiremock verifies `.expect(1)` on drop; give the worker time to
-        // deliver before the server (and its expectation check) goes away.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_until_received(&server, 1).await;
     }
 
     #[tokio::test]
@@ -580,7 +830,7 @@ mod tests {
         });
 
         dispatcher.enqueue(&[h], "job-1", &completed_event("job-1"));
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_until_received(&server, 1).await;
     }
 
     #[tokio::test]
@@ -600,8 +850,7 @@ mod tests {
         );
         dispatcher.enqueue(&[h], "job-1", &completed_event("job-1"));
 
-        // 3 attempts, ~20ms backoff between each: plenty of margin.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_until_received(&server, 3).await;
     }
 
     #[tokio::test]
@@ -621,7 +870,11 @@ mod tests {
         );
         dispatcher.enqueue(&[h], "job-1", &completed_event("job-1"));
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_until_received(&server, 1).await;
+        // Give a would-be (wrong) retry a chance to show up before asserting
+        // there isn't one.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(received_count(&server).await, 1, "4xx must not be retried");
     }
 
     #[tokio::test]
@@ -648,7 +901,10 @@ mod tests {
             &completed_event("job-1"),
         );
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // There's nothing to wait for a positive signal on (nothing should
+        // ever arrive), so give the (nonexistent) delivery a window to show
+        // up before asserting it didn't.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             server.received_requests().await.unwrap().is_empty(),
             "disabled/unsubscribed hooks must not receive any request"
@@ -693,12 +949,156 @@ mod tests {
             dispatcher.enqueue(std::slice::from_ref(&h), "job-1", &progress("job-1"));
         }
 
-        wait_for(|| count.load(Ordering::SeqCst), 1).await;
+        wait_for_count(|| count.load(Ordering::SeqCst), 1).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             count.load(Ordering::SeqCst),
             1,
             "only the first ProgressUpdate in the throttle window should be delivered"
+        );
+    }
+
+    /// SCR-72 fix round 1, item 1: a hook that never responds must not
+    /// delay another job's delivery. Job A's hook sleeps far longer than
+    /// this test's window; job B's hook is instant. With per-delivery
+    /// spawned tasks (bounded by a semaphore well above 2), B must not wait
+    /// behind A.
+    #[tokio::test]
+    async fn slow_hook_does_not_delay_another_jobs_delivery() {
+        let slow_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&slow_server)
+            .await;
+
+        let fast_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&fast_server)
+            .await;
+
+        let dispatcher = WebhookDispatcher::new_for_test(
+            client(),
+            [Duration::from_millis(20), Duration::from_millis(20)],
+            8,
+            100,
+        );
+
+        let slow_hook = hook(
+            &format!("{}/hook", slow_server.uri()),
+            vec![WebhookEvent::CrawlCompleted],
+        );
+        let fast_hook = hook(
+            &format!("{}/hook", fast_server.uri()),
+            vec![WebhookEvent::CrawlCompleted],
+        );
+
+        dispatcher.enqueue(&[slow_hook], "job-slow", &completed_event("job-slow"));
+        dispatcher.enqueue(&[fast_hook], "job-fast", &completed_event("job-fast"));
+
+        // If delivery were still serial/inline, this would have to wait
+        // out job-slow's 5s delay first. Bounded well under that proves
+        // job-fast wasn't stuck behind it.
+        tokio::time::timeout(Duration::from_secs(2), wait_until_received(&fast_server, 1))
+            .await
+            .expect("job-fast's delivery must not be blocked by job-slow's slow hook");
+    }
+
+    /// SCR-72 fix round 1, item 1: under a full queue, `progress_update`
+    /// deliveries are dropped before `crawl_completed`/`crawl_failed` ones.
+    #[tokio::test]
+    async fn full_queue_keeps_terminal_events() {
+        // A tiny capacity so the test doesn't need to enqueue thousands of
+        // deliveries, and concurrency 0-ish (1, the minimum) so nothing
+        // actually drains while we fill the queue up — the dispatcher's
+        // client points at a server that never responds in time, keeping
+        // whatever *does* get picked up occupied rather than freeing a
+        // queue slot mid-test.
+        let stalling_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&stalling_server)
+            .await;
+
+        let dispatcher = WebhookDispatcher::new_for_test(
+            client(),
+            [Duration::from_millis(20), Duration::from_millis(20)],
+            1,
+            4,
+        );
+
+        let progress_hook = hook(
+            &format!("{}/hook", stalling_server.uri()),
+            vec![WebhookEvent::ProgressUpdate],
+        );
+        let terminal_hook = hook(
+            &format!("{}/hook", stalling_server.uri()),
+            vec![WebhookEvent::CrawlCompleted, WebhookEvent::CrawlFailed],
+        );
+
+        let progress = |job_id: &str| CrawlEvent::FrontierProgress {
+            job_id: job_id.to_string(),
+            instance_id: "i1".to_string(),
+            received: 1,
+            admitted: 1,
+            dispatched: 1,
+            rejected: 0,
+            dropped: 0,
+            queued: 0,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+
+        // Fill the 4-slot queue: 1 terminal event for job-a, then enough
+        // progress_update noise (from other jobs, so the throttle doesn't
+        // suppress them) to overflow past capacity.
+        dispatcher.enqueue(
+            &[terminal_hook],
+            "job-a",
+            &CrawlEvent::JobCompleted {
+                job_id: "job-a".to_string(),
+                account_id: None,
+                pages_crawled: 1,
+                documents_indexed: 1,
+                errors: 0,
+                bytes_downloaded: 1,
+                duration_secs: 1,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            },
+        );
+        for i in 0..10 {
+            dispatcher.enqueue(
+                std::slice::from_ref(&progress_hook),
+                &format!("job-noise-{i}"),
+                &progress(&format!("job-noise-{i}")),
+            );
+        }
+
+        // The queue held at most 4 at once and is fed faster than the
+        // single (stalled) worker can drain it, so by now it settled at
+        // capacity with progress_update entries evicted first. Assert the
+        // terminal job's delivery is still queued (or already picked up —
+        // either way it was never evicted) by checking the stalling
+        // server eventually receives job-a's request, not one of the
+        // later, higher-numbered noise jobs that should have been dropped
+        // to make room instead.
+        //
+        // A direct queue inspection isn't exposed publicly, so this is
+        // asserted behaviorally: give the single worker enough pops to get
+        // through the queue (it can only have room for a handful given
+        // capacity 4), then check job-a's request did arrive.
+        wait_until_received(&stalling_server, 1).await;
+        let reqs = stalling_server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().any(|r| {
+                r.headers
+                    .get("X-Scrapix-Event")
+                    .map(|v| v == "crawl_completed")
+                    .unwrap_or(false)
+            }),
+            "job-a's crawl_completed must have survived the full queue"
         );
     }
 
@@ -737,6 +1137,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_webhook_config_rejects_reserved_header_override() {
+        for name in ["Content-Type", "content-type", "Host", "X-Scrapix-Event"] {
+            let mut headers = HashMap::new();
+            headers.insert(name.to_string(), "whatever".to_string());
+            let mut h = hook(
+                "https://example.com/hook",
+                vec![WebhookEvent::CrawlCompleted],
+            );
+            h.auth = Some(WebhookAuth::Headers { headers });
+            assert!(
+                validate_webhook_config(&h).is_err(),
+                "{name} must be rejected as a reserved header"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_webhook_config_rejects_invalid_header_name() {
+        let mut headers = HashMap::new();
+        headers.insert("bad header\nname".to_string(), "v".to_string());
+        let mut h = hook(
+            "https://example.com/hook",
+            vec![WebhookEvent::CrawlCompleted],
+        );
+        h.auth = Some(WebhookAuth::Headers { headers });
+        assert!(validate_webhook_config(&h).is_err());
+    }
+
+    #[test]
+    fn validate_webhook_config_accepts_custom_non_reserved_header() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Api-Key".to_string(), "abc".to_string());
+        let mut h = hook(
+            "https://example.com/hook",
+            vec![WebhookEvent::CrawlCompleted],
+        );
+        h.auth = Some(WebhookAuth::Headers { headers });
+        assert!(validate_webhook_config(&h).is_ok());
+    }
+
+    #[test]
+    fn clamp_timeout_ms_bounds_both_directions() {
+        assert_eq!(clamp_timeout_ms(0), MIN_TIMEOUT_MS);
+        assert_eq!(clamp_timeout_ms(500), MIN_TIMEOUT_MS);
+        assert_eq!(clamp_timeout_ms(5_000), 5_000);
+        assert_eq!(clamp_timeout_ms(60_000), MAX_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn scheme_and_host_strips_path_and_query() {
+        assert_eq!(
+            scheme_and_host("https://hooks.example.com/t/SECRET-TOKEN?x=1"),
+            "https://hooks.example.com"
+        );
+        assert_eq!(
+            scheme_and_host("http://example.com:8080/hook?token=abc"),
+            "http://example.com:8080"
+        );
+    }
+
+    #[test]
     fn redact_webhooks_json_masks_all_auth_variants() {
         let mut v = serde_json::json!({
             "webhooks": [
@@ -753,5 +1214,32 @@ mod tests {
         assert_eq!(hooks[0]["auth"]["bearer"]["token"], "***");
         assert_eq!(hooks[1]["auth"]["hmac"]["secret"], "***");
         assert_eq!(hooks[2]["auth"]["headers"]["headers"]["X-Api-Key"], "***");
+    }
+
+    #[test]
+    fn webhook_auth_debug_redacts_secrets() {
+        let bearer = WebhookAuth::Bearer {
+            token: "top-secret".to_string(),
+        };
+        assert!(!format!("{bearer:?}").contains("top-secret"));
+
+        let hmac = WebhookAuth::Hmac {
+            secret: "top-secret".to_string(),
+            algorithm: "sha256".to_string(),
+            header: "X-Sig".to_string(),
+        };
+        let hmac_dbg = format!("{hmac:?}");
+        assert!(!hmac_dbg.contains("top-secret"));
+        assert!(hmac_dbg.contains("sha256"), "non-secret fields still show");
+
+        let mut headers = HashMap::new();
+        headers.insert("X-Api-Key".to_string(), "top-secret".to_string());
+        let headers_auth = WebhookAuth::Headers { headers };
+        let headers_dbg = format!("{headers_auth:?}");
+        assert!(!headers_dbg.contains("top-secret"));
+        assert!(
+            headers_dbg.contains("X-Api-Key"),
+            "header names aren't secret and still show"
+        );
     }
 }

@@ -148,6 +148,10 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
         verbose: args.verbose,
     };
 
@@ -448,6 +452,10 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
         verbose: args.verbose,
     };
 
