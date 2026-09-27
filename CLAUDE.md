@@ -352,10 +352,40 @@ durable flush). In this mode, jobs still running across an API restart end up
 `FailStalled` once the stall timeout elapses, since no state survives the
 restart to resume them from.
 
+### Durability, controls and rollout caveats
+
+- **Upgrade with no job running** (drain or cancel first): a job spanning
+  the upgrade loses the old in-memory frontier queue and has no restored
+  accounting, so it ends `FailStalled` (billed). Checklist:
+  `docs/operations/crawl-engine-rollout.mdx`.
+- `INSTANCE_ID` (frontier) / `WORKER_ID` (crawler, content) must be **stable
+  per instance**: they name the job-control consumer group; a random id
+  (default, warned at startup) misses controls sent while down and leaks a
+  group per restart.
+- On one box, give each service a distinct `WAKE_PORT` (default `8081`
+  collides with the Rails SaaS; a failed bind only warns and metrics go
+  missing), e.g. frontier 9101, crawler 9102, content 9103.
+- The `REDIS_URL` Redis needs persistence (AOF or RDB) for frontier
+  durability.
+- Graceful frontier shutdown requeues popped-but-unsent URLs
+  (`DISPATCH_SHUTDOWN_GRACE_MS`, 10 s); store calls are bounded at 5 s. A
+  **crash** between pop and send still loses that batch.
+- Accounting seen-sets are not persisted: a duplicate outcome whose original
+  landed before an API restart can be double-counted (rare).
+- The API publishes `JobControl`s in request order (one queue, one task);
+  a Running job silent and unbalanced for `RESUME_HEAL_AFTER_SECS` (60) gets
+  `Resume` re-published (no-op at the frontier for running jobs).
+- Stored/returned job configs mask proxy credentials and custom header
+  values (as well as the Meilisearch key and webhook secrets); the crawler
+  uses the in-memory values.
+
 ### Politeness
 
 Defaults: `CONCURRENT_PER_DOMAIN=4`, `DOMAIN_DELAY_MS=250`
-(`bins/scrapix-frontier-service/src/lib.rs`). The frontier holds a per-domain
+(`bins/scrapix-frontier-service/src/lib.rs`), down from 50 / 50: single-site
+crawls are roughly 5–12× slower unless the frontier env overrides them
+(e.g. `DOMAIN_DELAY_MS=50 CONCURRENT_PER_DOMAIN=16`; a job can only raise
+the delay, never lower it). The frontier holds a per-domain
 slot from dispatch until the crawler's `FetchFeedback` — topic
 `scrapix.fetch.feedback` — reports the fetch back (not at dispatch time); a
 slot without feedback expires after `2 × REQUEST_TIMEOUT` (default `30`s), so

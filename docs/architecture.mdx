@@ -44,6 +44,31 @@ frontier instance can run at once — each instance holds a per-job dispatch
 lease rather than the frontier being a single-writer bottleneck. Without
 `REDIS_URL`, frontier state is in-memory and a restart loses it.
 
+### Durability caveats
+
+- **Graceful frontier shutdown** stops popping, finishes the in-flight send
+  and requeues every popped-but-unsent URL (bounded by
+  `DISPATCH_SHUTDOWN_GRACE_MS`, 10 s; a send still stuck at 4/5 of it is
+  abandoned and its URL requeued — with Kafka it may still have been
+  delivered, which only means a duplicate crawl). Every store call is
+  bounded (5 s), so a hung Redis cannot block shutdown.
+- A frontier **crash** between popping a batch and sending it loses that
+  batch (counted dispatched, never crawled); the job then ends `FailStalled`.
+- The API's accounting seen-sets are not persisted: a duplicate outcome
+  whose original was accounted before an API restart can be double-counted
+  (rare).
+- `REDIS_URL` must point at a Redis with persistence (AOF or RDB) for the
+  frontier to survive a Redis restart.
+- Job controls (`scrapix.jobs.status`) are published in request order by one
+  task; each service reads them in its own consumer group named from
+  `INSTANCE_ID` / `WORKER_ID`, which must be stable per instance. A lost
+  Cancel/Finish/Pause is re-published on the job's next pipeline event; a
+  lost Resume after `RESUME_HEAL_AFTER_SECS` (60 s) of silence.
+- The browser renderer checks the requested URL and the URL it finally
+  landed on (redirects) against the SSRF rules; in-page subresources and
+  JS-issued requests are not intercepted yet (needs CDP `Fetch`
+  interception).
+
 ## Message Topics
 
 All inter-service communication flows through these topics:
