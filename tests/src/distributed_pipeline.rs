@@ -137,12 +137,28 @@ async fn error_pages_are_not_indexed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_context_reaches_every_document() {
     let site = Site::start().await;
-    serve_mesh(&site, 4, None).await;
+    let pages = links(&["/p0", "/p1", "/p2", "/p3"]);
+    let mut from_root = pages.clone();
+    from_root.extend(links(&["/missing", "/flaky"]));
+    site.page("/", page_html("Home", &from_root)).await;
+    for p in &pages {
+        site.page(p, page_html(p, &pages)).await;
+    }
+    site.respond("/missing", ResponseTemplate::new(404)).await;
+    site.respond(
+        "/flaky",
+        ResponseTemplate::new(503).insert_header("retry-after", "0"),
+    )
+    .await;
 
-    let p = Pipeline::start(PipelineConfig::default()).await;
+    let config = PipelineConfig::default();
+    let max_retries = config.max_retries as usize;
+    let p = Pipeline::start(config).await;
     p.submit(&[p.seed(&site.url("/"), "job-context")]).await;
 
-    let acc = p.wait_balanced(|a, _| a.documents_indexed == 5).await;
+    let acc = p
+        .wait_balanced(|a, _| a.documents_indexed == 5 && a.pages_failed == 2)
+        .await;
     assert_eq!(acc.pages_crawled_ok, 5, "{acc:#?}");
 
     // Every document (seed and discovered pages alike) carries the job's
@@ -153,10 +169,10 @@ async fn job_context_reaches_every_document() {
         assert_eq!(d["source"], "src-test", "{d:#}");
         assert_eq!(d["_crawl_job_id"], "job-context", "{d:#}");
     }
-    // Every page event carries the job's account (billing attribution).
+    // Every page event carries the job (and, where the event has one, the
+    // account: billing attribution), failures and retries included.
     let events = p.events();
-    let mut crawled = 0;
-    let mut indexed = 0;
+    let (mut crawled, mut indexed, mut failed, mut retried) = (0, 0, 0, 0);
     for e in &events {
         match e {
             CrawlEvent::PageCrawled {
@@ -166,15 +182,46 @@ async fn job_context_reaches_every_document() {
                 assert_eq!(account_id.as_deref(), Some("acct-test"), "{e:?}");
                 assert_eq!(job_id, "job-context");
             }
-            CrawlEvent::DocumentIndexed { account_id, .. } => {
+            CrawlEvent::DocumentIndexed {
+                account_id, job_id, ..
+            } => {
                 indexed += 1;
                 assert_eq!(account_id.as_deref(), Some("acct-test"), "{e:?}");
+                assert_eq!(job_id, "job-context");
+            }
+            CrawlEvent::PageFailed {
+                account_id, job_id, ..
+            } => {
+                failed += 1;
+                assert_eq!(account_id.as_deref(), Some("acct-test"), "{e:?}");
+                assert_eq!(job_id, "job-context");
+            }
+            CrawlEvent::PageRetried { job_id, .. } => {
+                retried += 1;
+                assert_eq!(job_id, "job-context");
             }
             _ => {}
         }
     }
-    assert_eq!(crawled, 5);
-    assert_eq!(indexed, 5);
+    assert_eq!((crawled, indexed, failed, retried), (5, 5, 2, max_retries));
+
+    // `PageRetried` has no account/source field: check the re-queued
+    // messages themselves. Every message the frontier dispatched (seed,
+    // discovered links, retries) carries the full job context.
+    let dispatched = p.acked_dispatches();
+    assert_eq!(dispatched.len(), 7 + max_retries, "{dispatched:#?}");
+    assert_eq!(
+        dispatched.iter().filter(|m| m.url.retry_count > 0).count(),
+        max_retries
+    );
+    for m in &dispatched {
+        assert_eq!(m.job_id, "job-context", "{m:?}");
+        assert_eq!(m.source.as_deref(), Some("src-test"), "{m:?}");
+        assert_eq!(m.account_id.as_deref(), Some("acct-test"), "{m:?}");
+        assert_eq!(m.meilisearch_url.as_deref(), Some(p.meili.uri().as_str()));
+        assert!(m.job.is_some(), "job spec lost: {m:?}");
+        assert!(m.url_patterns.is_some(), "url patterns lost: {m:?}");
+    }
 }
 
 // 4 -------------------------------------------------------------------------
@@ -256,6 +303,9 @@ async fn replace_job_never_sends_conditional_headers() {
 /// picks them up. Some of the crashed handlers may already have published
 /// their `PageCrawled`, so the second crawler redoes and re-reports them:
 /// accounting must still count one terminal outcome per dispatched URL.
+/// Since the crash usually aborts handlers before they publish, the test
+/// then forces a duplicate report deterministically by re-delivering an
+/// already completed dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crawler_redelivery_does_not_double_count() {
     let site = Site::start().await;
@@ -320,6 +370,39 @@ async fn crawler_redelivery_does_not_double_count() {
     }
     let expected: BTreeSet<String> = all.iter().map(|x| site.url(x)).collect();
     assert_eq!(p.meili.document_urls().await, expected);
+
+    // Deterministic duplicate: deliver an already completed dispatch once
+    // more (at-least-once delivery). It is fetched, reported and indexed a
+    // second time, but accounting still counts it once.
+    let payload = p
+        .with_crawler(1, |c| c.consumer.acked_payloads())
+        .into_iter()
+        .next()
+        .expect("crawler #2 completed at least one dispatch");
+    let dup: scrapix_queue::UrlMessage = serde_json::from_slice(&payload).unwrap();
+    let consumer = p.with_crawler(1, |c| c.consumer.clone());
+    assert!(
+        consumer
+            .redeliver(scrapix_queue::topic_names::URL_PROCESSING, payload)
+            .await
+    );
+    let dup_url = dup.url.url.clone();
+    p.wait_for("duplicate crawled and indexed", |_, e| {
+        let n_crawled = crawled_urls(e).iter().filter(|u| **u == dup_url).count();
+        let n_indexed = e
+            .iter()
+            .filter(|ev| matches!(ev, CrawlEvent::DocumentIndexed { url, .. } if *url == dup_url))
+            .count();
+        n_crawled >= 2 && n_indexed >= 2
+    })
+    .await;
+    let acc = p
+        .wait_balanced(|a, _| a.documents_indexed == n as u64)
+        .await;
+    assert_eq!(acc.pages_crawled_ok, n as u64, "{acc:#?}");
+    assert_eq!(acc.documents_indexed, n as u64, "{acc:#?}");
+    assert_eq!(acc.crawl_outcomes, acc.frontier.dispatched, "{acc:#?}");
+    assert_eq!(acc.frontier.dispatched, n as u64, "{acc:#?}");
 }
 
 // 7 -------------------------------------------------------------------------

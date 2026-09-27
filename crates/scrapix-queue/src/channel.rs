@@ -502,11 +502,14 @@ impl MessageConsumer for ChannelConsumer {
 }
 
 /// Test-only hooks simulating Kafka's un-acked redelivery on the channel
-/// bus (feature `test-hooks`): every message a `process_with_ack` consumer
-/// receives is recorded until its `Ack` fires; [`ChannelConsumer::crash`]
-/// kills the consumer and its in-flight handlers (their acks never fire),
-/// and [`ChannelConsumer::redeliver_unacked`] republishes what was never
-/// acked, like a consumer-group rebalance after a crash.
+/// bus (feature `test-hooks`, never enabled in normal builds): every message
+/// a `process_with_ack` consumer receives is recorded until its `Ack` fires
+/// (then kept in an acked log); [`ChannelConsumer::crash`] kills the
+/// consumer and its in-flight handlers (their acks never fire),
+/// [`ChannelConsumer::redeliver_unacked`] puts what was never acked back on
+/// the consumer's own queue, like a consumer-group rebalance after a crash,
+/// and [`ChannelConsumer::redeliver`] re-injects an arbitrary (e.g. already
+/// acked) payload, like a duplicate delivery.
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use std::collections::HashMap;
@@ -517,12 +520,15 @@ mod hooks {
 
     /// Un-acked messages by delivery token: `(topic, payload)`.
     type Unacked = Arc<Mutex<HashMap<u64, (String, Vec<u8>)>>>;
+    /// Acked messages, in ack order: `(topic, payload)`.
+    type Acked = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
     #[derive(Default)]
     pub(super) struct Hooks {
         next: AtomicU64,
         crashed: AtomicBool,
         pub(super) unacked: Unacked,
+        pub(super) acked: Acked,
         tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     }
 
@@ -536,9 +542,11 @@ mod hooks {
         }
 
         pub(super) fn ack_for(&self, token: u64) -> scrapix_core::Ack {
-            let unacked = self.unacked.clone();
+            let (unacked, acked) = (self.unacked.clone(), self.acked.clone());
             scrapix_core::Ack::from_fn(move || {
-                unacked.lock().remove(&token);
+                if let Some(m) = unacked.lock().remove(&token) {
+                    acked.lock().push(m);
+                }
             })
         }
 
@@ -574,9 +582,21 @@ impl ChannelConsumer {
         self.hooks.crash();
     }
 
-    /// Republish every un-acked message to its topic's shared queue (what a
-    /// Kafka rebalance does after a consumer died), returning how many.
-    /// Meant to be called after [`crash`](Self::crash).
+    /// Payloads of every message this consumer acked, in ack order.
+    pub fn acked_payloads(&self) -> Vec<Vec<u8>> {
+        self.hooks
+            .acked
+            .lock()
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+
+    /// Put every un-acked message back on this consumer's own queue (its
+    /// topic's shared queue, or its named group's queue) — what a Kafka
+    /// rebalance does after a consumer died — returning how many. Other
+    /// consumer groups of the topic are not affected: they already got
+    /// their copy. Meant to be called after [`crash`](Self::crash).
     pub async fn redeliver_unacked(&self) -> usize {
         let pending: Vec<(String, Vec<u8>)> = {
             let mut unacked = self.hooks.unacked.lock();
@@ -584,17 +604,36 @@ impl ChannelConsumer {
             entries.sort_by_key(|(token, _)| *token);
             entries.into_iter().map(|(_, m)| m).collect()
         };
-        let producer = ChannelProducer {
-            bus: self.bus.clone(),
-            capacity: self.capacity,
-        };
         let mut sent = 0;
         for (topic, bytes) in pending {
-            if producer.route(&topic).deliver(&topic, bytes).await.is_ok() {
+            if self.redeliver(&topic, bytes).await {
                 sent += 1;
             }
         }
         sent
+    }
+
+    /// Deliver `bytes` once more on this consumer's own queue for `topic`
+    /// (a duplicate delivery, as at-least-once Kafka can produce). Returns
+    /// whether it was queued.
+    pub async fn redeliver(&self, topic: &str, bytes: Vec<u8>) -> bool {
+        let sender = {
+            let mut topics = self.bus.write();
+            let tc = topics
+                .entry(topic.to_string())
+                .or_insert_with(|| TopicChannel::new(self.capacity));
+            match self.group {
+                None => tc.sender.clone(),
+                Some(ref group) => {
+                    tc.group_receiver(group, self.capacity);
+                    match tc.groups.iter().find(|g| &g.name == group) {
+                        Some(g) => g.sender.clone(),
+                        None => return false,
+                    }
+                }
+            }
+        };
+        sender.send(bytes).await.is_ok()
     }
 }
 
@@ -656,11 +695,28 @@ mod tests {
             .expect("crashed consumer stops")
             .unwrap()
             .unwrap();
+        assert_eq!(c.acked_payloads(), vec![serde_json::to_vec("ok").unwrap()]);
         assert_eq!(c.redeliver_unacked().await, 1);
         let next = bus.consumer();
         next.subscribe(&["t"]).unwrap();
         assert_eq!(poll(&next).await.as_deref(), Some("stuck"));
         assert_eq!(poll(&next).await, None);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn redelivery_only_reaches_the_consumers_own_queue() {
+        let bus = ChannelBus::new();
+        let a = bus.consumer_in_group("a");
+        a.subscribe(&["t"]).unwrap();
+        let b = bus.consumer_in_group("b");
+        b.subscribe(&["t"]).unwrap();
+        let shared = bus.consumer();
+        shared.subscribe(&["t"]).unwrap();
+        assert!(a.redeliver("t", serde_json::to_vec("again").unwrap()).await);
+        assert_eq!(poll(&a).await.as_deref(), Some("again"));
+        assert_eq!(poll(&b).await, None, "other group untouched");
+        assert_eq!(poll(&shared).await, None, "shared queue untouched");
     }
 
     #[tokio::test]

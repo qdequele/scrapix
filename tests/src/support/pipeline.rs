@@ -513,9 +513,18 @@ impl Pipeline {
     pub async fn wait_for(
         &self,
         what: &str,
+        cond: impl FnMut(&JobAccounting, &[CrawlEvent]) -> bool,
+    ) {
+        self.wait_until(Instant::now() + TIMEOUT, what, cond).await
+    }
+
+    /// [`wait_for`](Self::wait_for) with an explicit `deadline`.
+    async fn wait_until(
+        &self,
+        deadline: Instant,
+        what: &str,
         mut cond: impl FnMut(&JobAccounting, &[CrawlEvent]) -> bool,
     ) {
-        let deadline = Instant::now() + TIMEOUT;
         loop {
             {
                 let acc = self.accounting.lock();
@@ -542,15 +551,13 @@ impl Pipeline {
         &self,
         mut extra: impl FnMut(&JobAccounting, &[CrawlEvent]) -> bool,
     ) -> JobAccounting {
+        // One deadline for the whole wait, grace periods included.
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "accounting never stayed balanced: {:#?}",
-                self.accounting()
-            );
-            self.wait_for("balanced accounting", |a, e| a.is_balanced() && extra(a, e))
-                .await;
+            self.wait_until(deadline, "balanced accounting", |a, e| {
+                a.is_balanced() && extra(a, e)
+            })
+            .await;
             let mut stable = true;
             for _ in 0..6 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -563,6 +570,16 @@ impl Pipeline {
                 return self.accounting();
             }
         }
+    }
+
+    /// Every `URL_PROCESSING` message (frontier dispatch) any crawler acked.
+    pub fn acked_dispatches(&self) -> Vec<UrlMessage> {
+        self.crawlers
+            .lock()
+            .iter()
+            .flat_map(|c| c.consumer.acked_payloads())
+            .map(|b| serde_json::from_slice(&b).expect("UrlMessage"))
+            .collect()
     }
 
     pub async fn queued(&self, job_id: &str) -> u64 {
