@@ -22,6 +22,101 @@ class AccountResponse(BaseModel):
     tier: str
 
 
+class Type(str, Enum):
+    wait = "wait"
+
+
+class Action1(BaseModel):
+    """
+    Wait a fixed time (`ms`) or until an element matching `selector`
+    exists. Exactly one of the two must be set.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ms: Optional[int] = Field(None, ge=0)
+    selector: Optional[str] = None
+    type: Type
+
+
+class Type1(str, Enum):
+    click = "click"
+
+
+class Action2(BaseModel):
+    """
+    Click the first element matching `selector` (waits for it to exist).
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    selector: str
+    type: Type1
+
+
+class Type2(str, Enum):
+    scroll = "scroll"
+
+
+class Type3(str, Enum):
+    write = "write"
+
+
+class Action4(BaseModel):
+    """
+    Focus the first element matching `selector` and type `text` into it.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    selector: str
+    text: str
+    type: Type3
+
+
+class Type4(str, Enum):
+    press = "press"
+
+
+class Action5(BaseModel):
+    """
+    Press a key (e.g. `Enter`, `Tab`, `ArrowDown`, `Escape`, `a`) on the
+    focused element.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    key: str
+    type: Type4
+
+
+class Type5(str, Enum):
+    execute_javascript = "execute_javascript"
+
+
+class Action6(BaseModel):
+    """
+    Run JavaScript in the page. The value of the script (or of its
+    `return` statement; `await` is allowed) is returned in
+    `actions.javascript_returns`, JSON-serialized.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    script: str
+    type: Type5
+
+
 class AiExtractionConfig(BaseModel):
     """
     AI extraction configuration
@@ -970,6 +1065,30 @@ class RateLimitConfig(BaseModel):
     """
 
 
+class RequestCookie(BaseModel):
+    """
+    A cookie to send with a one-off fetch (HTTP or browser).
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    domain: Optional[str] = None
+    """
+    Cookie domain. Defaults to the target URL's host (host-only cookie).
+    Must be the target host or a parent domain of it.
+    """
+    http_only: Optional[bool] = None
+    name: str
+    path: Optional[str] = None
+    """
+    Cookie path (default `/`).
+    """
+    secure: Optional[bool] = None
+    value: str
+
+
 class SchemaFeatureConfig(BaseModel):
     """
     Schema.org extraction settings
@@ -1007,6 +1126,22 @@ class SchemaItem(BaseModel):
     """
 
 
+class ScrapeActionsResult(BaseModel):
+    """
+    Results of the /scrape `actions`
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    javascript_returns: list[Any]
+    """
+    Values of the `execute_javascript` actions, in order (JSON
+    round-tripped; `undefined` is `null`)
+    """
+
+
 class ScrapeFormat(str, Enum):
     """
     Output formats for scrape
@@ -1040,6 +1175,31 @@ class ScrapeMetadata(BaseModel):
     published_date: Optional[str] = None
     title: Optional[str] = None
     twitter: Optional[dict[str, str]] = None
+
+
+class ScreenshotRequestOptions(BaseModel):
+    """
+    Screenshot options for /scrape
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    full_page: Optional[bool] = None
+    """
+    Capture the whole scrollable page (default) instead of only the
+    viewport. Very long pages are cropped to 16384 px.
+    """
+
+
+class ScrollDirection(str, Enum):
+    """
+    Scroll direction for a [`Action::Scroll`].
+    """
+
+    up = "up"
+    down = "down"
 
 
 class SearchRequest(BaseModel):
@@ -1568,6 +1728,29 @@ class WebhookEvent(str, Enum):
     batch_sent = "batch_sent"
 
 
+class Action3(BaseModel):
+    """
+    Scroll the page by `amount` viewport heights (default 1).
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    amount: Optional[float] = None
+    direction: Optional[ScrollDirection] = None
+    type: Type2
+
+
+class Action(RootModel[Union[Action1, Action2, Action3, Action4, Action5, Action6]]):
+    root: Union[Action1, Action2, Action3, Action4, Action5, Action6]
+    """
+    A browser interaction run on the page after it loads and before content
+    (and any screenshot) is captured. Actions run in order; the first one to
+    fail stops the sequence and fails the request.
+    """
+
+
 class AiExtractOptions(BaseModel):
     """
     AI extraction options
@@ -1823,6 +2006,7 @@ class ScrapeResponse(BaseModel):
         extra="allow",
         populate_by_name=True,
     )
+    actions: Optional[ScrapeActionsResult] = None
     ai: Optional[AiResult] = None
     blocks: Optional[list[ContentBlock]] = None
     """
@@ -1861,6 +2045,10 @@ class ScrapeResponse(BaseModel):
     scrape_duration_ms: int = Field(..., ge=0)
     """
     Time taken to scrape in milliseconds
+    """
+    screenshot: Optional[str] = None
+    """
+    Base64-encoded PNG screenshot (if format "screenshot" requested)
     """
     status_code: int = Field(..., ge=0)
     """
@@ -1995,10 +2183,20 @@ class BatchScrapeRequest(BaseModel):
         extra="allow",
         populate_by_name=True,
     )
+    actions: Optional[list[Action]] = None
+    """
+    Browser actions run on each page before capture (forces browser rendering)
+    """
     ai: Optional[AiOptions] = None
     concurrency: Optional[int] = Field(None, ge=0)
     """
     URLs scraped at once (default 10, max 25)
+    """
+    cookies: Optional[list[RequestCookie]] = None
+    """
+    Cookies sent with each request. A cookie without `domain` goes to each
+    URL's own host; one with `domain` must be that URL's host or a parent
+    of it, otherwise that URL fails with a per-item error.
     """
     exclude_selectors: Optional[list[str]] = None
     """
@@ -2024,6 +2222,10 @@ class BatchScrapeRequest(BaseModel):
     """
     CSS selectors to keep (only extract from these)
     """
+    mobile: Optional[bool] = None
+    """
+    Emulate a phone (forces browser rendering)
+    """
     only_main_content: Optional[bool] = None
     """
     Only the main content (default true)
@@ -2032,6 +2234,7 @@ class BatchScrapeRequest(BaseModel):
     """
     Render JavaScript (requires Chrome/Chromium on the server)
     """
+    screenshot: Optional[ScreenshotRequestOptions] = None
     timeout_ms: Optional[int] = Field(None, ge=0)
     """
     Per-URL timeout in milliseconds (default 30000)
@@ -2222,7 +2425,20 @@ class ScrapeRequest(BaseModel):
         extra="allow",
         populate_by_name=True,
     )
+    actions: Optional[list[Action]] = None
+    """
+    Browser actions run after the page loads and before content (and
+    any screenshot) is captured: wait, click, scroll, write, press,
+    execute_javascript. Forces browser rendering. At most 50; all
+    actions together must finish within 30s.
+    """
     ai: Optional[AiOptions] = None
+    cookies: Optional[list[RequestCookie]] = None
+    """
+    Cookies sent with the request (both the HTTP and the browser path),
+    scoped to the target site: a cookie's `domain` must be the target
+    host or a parent domain of it. At most 50.
+    """
     exclude_selectors: Optional[list[str]] = None
     """
     CSS selectors to remove before extraction
@@ -2247,6 +2463,12 @@ class ScrapeRequest(BaseModel):
     """
     CSS selectors to keep (only extract from these)
     """
+    mobile: Optional[bool] = None
+    """
+    Emulate a phone (mobile viewport, touch, Android Chrome user agent)
+    to get the mobile layout of responsive sites. Forces browser
+    rendering.
+    """
     only_main_content: Optional[bool] = None
     """
     Whether to only return the main content (excludes nav, footer, etc.)
@@ -2255,6 +2477,7 @@ class ScrapeRequest(BaseModel):
     """
     Render JavaScript before extracting content (requires Chrome/Chromium)
     """
+    screenshot: Optional[ScreenshotRequestOptions] = None
     timeout_ms: Optional[int] = Field(None, ge=0)
     """
     Timeout in milliseconds (default: 30000)

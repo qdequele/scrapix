@@ -1499,6 +1499,41 @@ export interface components {
             role: string;
             tier: string;
         };
+        /**
+         * @description A browser interaction run on the page after it loads and before content
+         *     (and any screenshot) is captured. Actions run in order; the first one to
+         *     fail stops the sequence and fails the request.
+         */
+        Action: {
+            /** Format: int64 */
+            ms?: number | null;
+            selector?: string | null;
+            /** @enum {string} */
+            type: "wait";
+        } | {
+            selector: string;
+            /** @enum {string} */
+            type: "click";
+        } | {
+            /** Format: double */
+            amount?: number;
+            direction?: components["schemas"]["ScrollDirection"];
+            /** @enum {string} */
+            type: "scroll";
+        } | {
+            selector: string;
+            text: string;
+            /** @enum {string} */
+            type: "write";
+        } | {
+            key: string;
+            /** @enum {string} */
+            type: "press";
+        } | {
+            script: string;
+            /** @enum {string} */
+            type: "execute_javascript";
+        };
         /** @description AI extraction options */
         AiExtractOptions: {
             /** @description Natural language prompt for extraction */
@@ -1559,9 +1594,17 @@ export interface components {
          *     URL (the most common ones are listed; any `/scrape` option is accepted).
          */
         BatchScrapeRequest: {
+            /** @description Browser actions run on each page before capture (forces browser rendering) */
+            actions?: components["schemas"]["Action"][] | null;
             ai?: null | components["schemas"]["AiOptions"];
             /** @description URLs scraped at once (default 10, max 25) */
             concurrency?: number;
+            /**
+             * @description Cookies sent with each request. A cookie without `domain` goes to each
+             *     URL's own host; one with `domain` must be that URL's host or a parent
+             *     of it, otherwise that URL fails with a per-item error.
+             */
+            cookies?: components["schemas"]["RequestCookie"][] | null;
             /** @description CSS selectors to remove before extraction */
             exclude_selectors?: string[] | null;
             /** @description Custom CSS selector extraction (field_name -> selector definition) */
@@ -1578,10 +1621,13 @@ export interface components {
             include_links?: boolean | null;
             /** @description CSS selectors to keep (only extract from these) */
             include_selectors?: string[] | null;
+            /** @description Emulate a phone (forces browser rendering) */
+            mobile?: boolean | null;
             /** @description Only the main content (default true) */
             only_main_content?: boolean | null;
             /** @description Render JavaScript (requires Chrome/Chromium on the server) */
             render_js?: boolean | null;
+            screenshot?: null | components["schemas"]["ScreenshotRequestOptions"];
             /**
              * Format: int64
              * @description Per-URL timeout in milliseconds (default 30000)
@@ -2284,6 +2330,20 @@ export interface components {
             /** @description Whether to respect robots.txt */
             respect_robots_txt?: boolean;
         };
+        /** @description A cookie to send with a one-off fetch (HTTP or browser). */
+        RequestCookie: {
+            /**
+             * @description Cookie domain. Defaults to the target URL's host (host-only cookie).
+             *     Must be the target host or a parent domain of it.
+             */
+            domain?: string | null;
+            http_only?: boolean | null;
+            name: string;
+            /** @description Cookie path (default `/`). */
+            path?: string | null;
+            secure?: boolean | null;
+            value: string;
+        };
         /** @description Schema.org extraction settings */
         SchemaFeatureConfig: {
             /** @description Convert ISO dates to timestamps */
@@ -2298,6 +2358,14 @@ export interface components {
         SchemaItem: Record<string, never> & {
             /** @description Schema type (e.g., "Article", "Product", "Organization") */
             "@type": string;
+        };
+        /** @description Results of the /scrape `actions` */
+        ScrapeActionsResult: {
+            /**
+             * @description Values of the `execute_javascript` actions, in order (JSON
+             *     round-tripped; `undefined` is `null`)
+             */
+            javascript_returns: unknown[];
         };
         /**
          * @description Output formats for scrape
@@ -2321,7 +2389,20 @@ export interface components {
         };
         /** @description Request body for /scrape endpoint */
         ScrapeRequest: {
+            /**
+             * @description Browser actions run after the page loads and before content (and
+             *     any screenshot) is captured: wait, click, scroll, write, press,
+             *     execute_javascript. Forces browser rendering. At most 50; all
+             *     actions together must finish within 30s.
+             */
+            actions?: components["schemas"]["Action"][];
             ai?: null | components["schemas"]["AiOptions"];
+            /**
+             * @description Cookies sent with the request (both the HTTP and the browser path),
+             *     scoped to the target site: a cookie's `domain` must be the target
+             *     host or a parent domain of it. At most 50.
+             */
+            cookies?: components["schemas"]["RequestCookie"][];
             /** @description CSS selectors to remove before extraction */
             exclude_selectors?: string[];
             /** @description Custom CSS selector extraction (field_name -> selector definition) */
@@ -2338,10 +2419,17 @@ export interface components {
             include_links?: boolean;
             /** @description CSS selectors to keep (only extract from these) */
             include_selectors?: string[];
+            /**
+             * @description Emulate a phone (mobile viewport, touch, Android Chrome user agent)
+             *     to get the mobile layout of responsive sites. Forces browser
+             *     rendering.
+             */
+            mobile?: boolean;
             /** @description Whether to only return the main content (excludes nav, footer, etc.) */
             only_main_content?: boolean;
             /** @description Render JavaScript before extracting content (requires Chrome/Chromium) */
             render_js?: boolean;
+            screenshot?: null | components["schemas"]["ScreenshotRequestOptions"];
             /**
              * Format: int64
              * @description Timeout in milliseconds (default: 30000)
@@ -2352,6 +2440,7 @@ export interface components {
         };
         /** @description Response for /scrape endpoint */
         ScrapeResponse: {
+            actions?: null | components["schemas"]["ScrapeActionsResult"];
             ai?: null | components["schemas"]["AiResult"];
             /** @description Content blocks split by headings (if format "blocks" requested) */
             blocks?: components["schemas"]["ContentBlock"][] | null;
@@ -2378,6 +2467,8 @@ export interface components {
              * @description Time taken to scrape in milliseconds
              */
             scrape_duration_ms: number;
+            /** @description Base64-encoded PNG screenshot (if format "screenshot" requested) */
+            screenshot?: string | null;
             /**
              * Format: int32
              * @description HTTP status code
@@ -2390,6 +2481,19 @@ export interface components {
             /** @description Warning message (e.g. "AI requires OPENAI_API_KEY") */
             warning?: string | null;
         };
+        /** @description Screenshot options for /scrape */
+        ScreenshotRequestOptions: {
+            /**
+             * @description Capture the whole scrollable page (default) instead of only the
+             *     viewport. Very long pages are cropped to 16384 px.
+             */
+            full_page?: boolean;
+        };
+        /**
+         * @description Scroll direction for a [`Action::Scroll`].
+         * @enum {string}
+         */
+        ScrollDirection: "up" | "down";
         SearchRequest: {
             filter?: unknown;
             /** Format: int32 */
@@ -4000,6 +4104,15 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description A browser action failed (`action_error`; `details` names the action) */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
