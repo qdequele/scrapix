@@ -122,7 +122,14 @@ Respect target sites by controlling crawl speed:
 | `requests_per_second` | unlimited | Global rate cap |
 | `per_domain_delay_ms` | `100` | Minimum delay between requests to the same domain |
 | `respect_robots_txt` | `true` | Honor `robots.txt` crawl-delay and disallow rules |
-| `default_crawl_delay_ms` | `1000` | Crawl-delay when `robots.txt` doesn't specify one |
+| `default_crawl_delay_ms` | `0` | Fallback `Crawl-delay` used only when robots.txt was fetched, set no `Crawl-delay` of its own, and the job set no explicit `per_domain_delay_ms`/rate — it never lowers an explicit delay |
+
+<Note>
+  The frontier also enforces its own process-wide politeness floor
+  (`DOMAIN_DELAY_MS`, default `250`ms, and `CONCURRENT_PER_DOMAIN`, default
+  `4` in-flight requests per domain) — a job's `rate_limit` can only raise
+  the effective per-domain delay above that floor, never lower it.
+</Note>
 
 ## JavaScript Rendering
 
@@ -307,13 +314,18 @@ Get notified about crawl events:
       "url": "https://your-app.example.com/webhook",
       "events": ["crawl_completed", "crawl_failed"],
       "auth": {
-        "type": "bearer",
-        "token": "webhook-secret-123"
+        "bearer": { "token": "webhook-secret-123" }
       }
     }
   ]
 }
 ```
+
+Deliveries carry `X-Scrapix-Event` and `X-Scrapix-Delivery` (stable across
+retries — dedupe on it) headers, retry up to 3 times total (1s then 5s
+backoff) on a network error or 5xx, and treat any 4xx as terminal. See
+[Crawl Configs](/configuration/crawl-configs#webhooks) for the full auth and
+delivery semantics.
 
 ## Scheduled Crawls
 

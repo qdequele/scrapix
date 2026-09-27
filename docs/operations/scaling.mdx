@@ -61,7 +61,7 @@ In distributed mode, each service scales independently.
 
 | Bottleneck | Symptom | Scale |
 |------------|---------|-------|
-| Crawling too slow | Low `scrapix_pages_fetched_total` rate | Add crawler workers |
+| Crawling too slow | Low `scrapix_crawler_fetches_total` rate | Add crawler workers |
 | Indexing backlog | Growing `scrapix.pages.raw` consumer lag | Add content workers |
 | URL dispatch slow | Growing `scrapix.urls.frontier` lag | Add frontier instances |
 | API overloaded | High latency on `/crawl` endpoint | Add API replicas |

@@ -1,21 +1,47 @@
+# Scrapix Prometheus alert rules.
+#
+# Every expression below uses only the 10 metrics actually registered by
+# `crates/scrapix-core/src/metrics.rs` (served at `GET /metrics` on the
+# engine's HTTP port and on each worker's WAKE_PORT). Metric names are a
+# contract with `qdq-server/monitoring` — don't rename without updating the
+# scrape config there.
+#
+# Not instrumented today (no corresponding metric exists, so no alert can be
+# written for these — see `crates/scrapix-core/src/metrics.rs` if you add
+# one and want to alert on it):
+#   - AI token usage / cost (no AI token metric)
+#   - Per-job progress/stuck-job/long-running-job alerts (no per-job
+#     timestamp or per-job progress-delta metric; `scrapix_frontier_queued`
+#     is per-job but only tracks queue depth, not "no progress")
+#   - HTTP status code distribution (no status-code label on any metric)
+#   - Content extraction error *type* breakdown (only a coarse
+#     success/failure/skipped/duplicate `outcome` label exists)
+#   - Kafka consumer group lag as reported by Kafka itself (Scrapix exposes
+#     its own `scrapix_consumer_uncommitted`, which is not the same number as
+#     the broker-side lag) — a real `kafka_consumer_group_lag` metric needs a
+#     separate Kafka-side exporter, not present in this stack
+#   - Process memory/CPU (no process collector is registered by any Scrapix
+#     service; `process_resident_memory_bytes`/`process_cpu_seconds_total`
+#     do not exist here)
+
 groups:
   - name: scrapix-crawler-alerts
     interval: 30s
     rules:
-      # High error rate
+      # Crawler fetch error rate
       - alert: HighCrawlerErrorRate
         expr: |
           (
-            sum(rate(scrapix_crawler_errors_total[5m])) by (worker_id)
+            sum(rate(scrapix_crawler_fetches_total{outcome="failed"}[5m]))
             /
-            sum(rate(scrapix_crawler_pages_fetched_total[5m])) by (worker_id)
+            sum(rate(scrapix_crawler_fetches_total[5m]))
           ) > 0.1
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High crawler error rate on {{ $labels.worker_id }}"
-          description: "Crawler {{ $labels.worker_id }} has error rate {{ printf \"%.2f\" $value }}% over the last 5 minutes."
+          summary: "High crawler fetch failure rate"
+          description: "{{ printf \"%.2f\" $value }} of crawler fetches failed over the last 5 minutes."
 
       # Crawler worker down
       - alert: CrawlerWorkerDown
@@ -30,15 +56,15 @@ groups:
       # Low throughput
       - alert: LowCrawlerThroughput
         expr: |
-          sum(rate(scrapix_crawler_pages_fetched_total[15m])) < 1
+          sum(rate(scrapix_crawler_fetches_total[15m])) < 1
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Low crawler throughput"
-          description: "Overall crawler throughput is below 1 page/second for 15 minutes."
+          description: "Overall crawler fetch rate is below 1/second for 15 minutes."
 
-      # High response time
+      # High fetch latency
       - alert: HighAverageResponseTime
         expr: |
           histogram_quantile(0.95, sum(rate(scrapix_crawler_fetch_duration_seconds_bucket[5m])) by (le)) > 10
@@ -46,19 +72,37 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "High average response time"
-          description: "95th percentile response time is {{ printf \"%.2f\" $value }} seconds."
+          summary: "High crawler fetch latency"
+          description: "95th percentile fetch duration is {{ printf \"%.2f\" $value }} seconds."
 
-      # Queue backlog growing
-      - alert: QueueBacklogGrowing
+  - name: scrapix-frontier-alerts
+    interval: 30s
+    rules:
+      # Queue backlog: total queued URLs across the top jobs the gauge tracks
+      - alert: QueueBacklogHigh
         expr: |
-          delta(scrapix_frontier_queue_size[10m]) > 100000
+          sum(scrapix_frontier_queued) > 100000
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "Queue backlog is growing"
-          description: "Frontier queue has grown by {{ $value }} URLs in the last 10 minutes."
+          summary: "Frontier queue backlog is high"
+          description: "Total queued URLs across tracked jobs is {{ $value }}."
+
+      # Frontier stalled: it's admitting URLs but has stopped dispatching
+      # them (a dispatch-side wedge — the dispatch loop, a lost Redis
+      # connection, or every job paused/leased elsewhere).
+      - alert: FrontierNotDispatching
+        expr: |
+          sum(rate(scrapix_frontier_admissions_total{result="admitted"}[10m])) > 0
+          and
+          sum(rate(scrapix_frontier_dispatched_total[10m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frontier is admitting URLs but not dispatching any"
+          description: "No URLs have been dispatched in 10 minutes despite ongoing admissions — check the frontier's dispatch loop and Redis connectivity."
 
   - name: scrapix-content-alerts
     interval: 30s
@@ -73,45 +117,35 @@ groups:
           summary: "Content worker is down"
           description: "Content worker {{ $labels.instance }} has been down for more than 2 minutes."
 
-      # High AI token usage
-      - alert: HighAITokenUsage
-        expr: |
-          sum(rate(scrapix_ai_tokens_consumed_total[1h])) * 3600 > 1000000
-        for: 30m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High AI token consumption"
-          description: "AI token consumption is {{ printf \"%.0f\" $value }} tokens/hour."
-
-      # Content extraction failures
-      - alert: HighContentExtractionFailures
+      # Content processing failure rate
+      - alert: HighContentFailureRate
         expr: |
           (
-            sum(rate(scrapix_content_extraction_errors_total[5m]))
+            sum(rate(scrapix_content_documents_total{outcome="failure"}[5m]))
             /
-            sum(rate(scrapix_content_extractions_total[5m]))
+            sum(rate(scrapix_content_documents_total[5m]))
           ) > 0.05
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "High content extraction failure rate"
-          description: "Content extraction failure rate is {{ printf \"%.2f\" $value }}%."
+          summary: "High content-worker failure rate"
+          description: "{{ printf \"%.2f\" $value }} of pages handled by content workers failed over the last 5 minutes."
 
   - name: scrapix-infrastructure-alerts
     interval: 30s
     rules:
-      # Kafka consumer lag
-      - alert: HighKafkaConsumerLag
+      # Consumer offset backlog (this process's own unacked-message gauge,
+      # not the Kafka broker's own lag accounting)
+      - alert: HighConsumerUncommitted
         expr: |
-          kafka_consumer_group_lag > 10000
+          scrapix_consumer_uncommitted > 10000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "High Kafka consumer lag"
-          description: "Consumer group {{ $labels.group }} has lag of {{ $value }} on topic {{ $labels.topic }}."
+          summary: "High in-flight (unacked) message count"
+          description: "Topic {{ $labels.topic }} has {{ $value }} unacked messages held by consumer {{ $labels.instance }}."
 
       # Meilisearch down
       - alert: MeilisearchDown
@@ -133,42 +167,18 @@ groups:
           summary: "Redis is down"
           description: "Redis has been down for more than 2 minutes."
 
-      # High memory usage
-      - alert: HighMemoryUsage
-        expr: |
-          (process_resident_memory_bytes / 1024 / 1024 / 1024) > 4
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High memory usage on {{ $labels.job }}"
-          description: "{{ $labels.instance }} is using {{ printf \"%.2f\" $value }}GB of memory."
-
   - name: scrapix-job-alerts
     interval: 60s
     rules:
-      # Job stuck (no progress)
-      - alert: CrawlJobStuck
+      # Running jobs piling up: a healthy pipeline finishes jobs; a growing
+      # Running count usually means completion/stall detection isn't firing
+      # (or the API can't reach Postgres/accounting) and jobs are stuck.
+      - alert: RunningJobsPilingUp
         expr: |
-          increase(scrapix_job_urls_crawled_total[30m]) == 0
-          and
-          scrapix_job_status == 1
+          scrapix_api_jobs{status="running"} > 50
         for: 30m
         labels:
           severity: warning
         annotations:
-          summary: "Crawl job appears to be stuck"
-          description: "Job {{ $labels.job_id }} has made no progress in 30 minutes."
-
-      # Job running too long
-      - alert: CrawlJobRunningTooLong
-        expr: |
-          (time() - scrapix_job_start_timestamp) / 3600 > 24
-          and
-          scrapix_job_status == 1
-        for: 1h
-        labels:
-          severity: warning
-        annotations:
-          summary: "Crawl job running longer than expected"
-          description: "Job {{ $labels.job_id }} has been running for {{ printf \"%.1f\" $value }} hours."
+          summary: "Many jobs stuck in Running"
+          description: "{{ $value }} jobs have been Running for at least 30 minutes; check for jobs that should have completed, failed, or been stall-timed-out (JOB_STALL_TIMEOUT_SECS)."

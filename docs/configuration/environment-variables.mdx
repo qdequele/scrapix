@@ -21,6 +21,9 @@ All Scrapix services are configured through environment variables. When running 
 | `MAX_JOBS` | `10000` | Maximum tracked jobs |
 | `JOB_STALL_TIMEOUT_SECS` | `1800` | Seconds without progress before a job is finalized as `FailStalled` (stalled jobs are still billed for pages crawled) |
 | `JOB_COMPLETION_GRACE_MS` | `3000` | Grace period after exact work accounting says a job is done, before finalizing it, to absorb straggler events |
+| `MAX_PENDING_ACKS` | `50000` | Maximum event acks held while waiting for the accounting flush; the event consumer blocks (backpressure) at this cap until a flush frees room |
+| `ALLOW_PRIVATE_IPS` | `false` | Allow webhook deliveries to reach private/loopback/link-local addresses (SSRF opt-out; same policy as the crawler's own `ALLOW_PRIVATE_IPS` — off by default, tests only) |
+| `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Maximum webhook deliveries in flight at once, across all jobs and hooks |
 
 ## Message Queue
 
@@ -67,13 +70,15 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches |
 | `DISPATCH_BATCH_SIZE` | `2000` | URLs per dispatch batch |
 | `DOMAIN_DELAY_MS` | `250` | Minimum delay between requests to same domain (jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it) |
-| `BLOOM_CAPACITY` | `10000000` | Bloom filter expected capacity per job |
-| `BLOOM_FP_RATE` | `0.01` | Bloom filter false positive rate |
+| `BLOOM_CAPACITY` | `10000000` | **Deprecated and ignored.** Dedup now lives in the `FrontierStore` (Redis or in-memory), not a bloom filter; kept only so old env files don't fail to parse |
+| `BLOOM_FP_RATE` | `0.01` | **Deprecated and ignored** (see `BLOOM_CAPACITY`) |
 | `MAX_PENDING_PER_JOB` | `1000000` | Maximum pending URLs per job |
 | `CONCURRENT_PER_DOMAIN` | `4` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
 | `REQUEST_TIMEOUT` | `30` | Crawler request timeout (s); a politeness slot without feedback expires after 2× this |
 | `ROBOTS_DELAY_MULTIPLIER` | `1.0` | Multiplier applied to robots.txt `Crawl-delay` |
 | `REDIS_URL` | — | When set, frontier state (dedup/queue via `FrontierStore`) and per-domain politeness state are shared in Redis across instances, so more than one frontier instance can run at once |
+| `FRONTIER_KEY_PREFIX` | `scrapix:frontier` | Redis key prefix for the frontier store (only relevant with `REDIS_URL` set) |
+| `JOB_RETENTION_HOURS` | `168` | How long a finished/cancelled job's counters and state stay queryable after its queue and seen set are released |
 | `INSTANCE_ID` | — | Instance identifier for multi-instance frontier |
 | `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health` |
 
@@ -110,6 +115,7 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 | `WORKER_ID` | — | Worker identifier |
 | `ROCKSDB_PATH` | `./data/crawler-rocksdb` | RocksDB storage path |
 | `REDIS_URL` | — | Optional; when set, enables incremental-crawl header lookups shared across crawler instances (without it, incremental crawling uses in-message headers only) |
+| `ALLOW_PRIVATE_IPS` | `false` | Allow fetching hosts that resolve to private/loopback/link-local/CGNAT/multicast/unspecified addresses (SSRF opt-out). Tests and self-hosted private-network crawls only — never enable in production. Raw-IP URLs stay refused regardless |
 | `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` (Prometheus text) and `GET /health`, and used by Fly's proxy to autostart a suspended machine |
 
 ### DNS Cache

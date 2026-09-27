@@ -516,9 +516,18 @@ GROUP BY date ORDER BY date;
 | `OPENAI_API_KEY` | For AI enrichment features |
 | `JOB_STALL_TIMEOUT_SECS` | API: seconds without progress before a job is finalized `FailStalled` (default `1800`) |
 | `JOB_COMPLETION_GRACE_MS` | API: grace period after exact accounting says a job is done, before finalizing (default `3000`) |
+| `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
+| `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
+| `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
+| `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |
+| `JOB_RETENTION_HOURS` | Frontier: how long a finished/cancelled job's state stays queryable after release (default `168`) |
 | `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` and triggering Fly autostart (default `8081`) |
+
+`BLOOM_CAPACITY`/`BLOOM_FP_RATE` on the frontier are now deprecated and
+ignored — dedup lives in the `FrontierStore` (Redis or in-memory), not a
+bloom filter.
 
 ## Kubernetes Deployment
 

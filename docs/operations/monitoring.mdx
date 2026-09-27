@@ -112,41 +112,54 @@ per machine/pod, not per logical service.
 
 ## Alert Rules
 
-Pre-configured alerts in `deploy/monitoring/prometheus/alerts.yml`:
+Pre-configured alerts in `deploy/monitoring/prometheus/alerts.yml`, all
+written against the 10 real metrics above:
 
 ### Crawler Alerts
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| High Error Rate | Error rate > 10% for 5 minutes | warning |
-| Crawler Worker Down | No metrics for 2 minutes | critical |
-| Low Throughput | < 1 page/min for 10 minutes (when queue > 0) | warning |
-| High Fetch Latency | p95 > 10s for 5 minutes | warning |
-| Queue Backlog | Queue > 100K for 15 minutes | warning |
+| `HighCrawlerErrorRate` | `scrapix_crawler_fetches_total{outcome="failed"}` / total fetches > 10% for 5 minutes | warning |
+| `CrawlerWorkerDown` | No metrics scrape for 2 minutes | critical |
+| `LowCrawlerThroughput` | `scrapix_crawler_fetches_total` rate < 1/s for 15 minutes | warning |
+| `HighAverageResponseTime` | p95 `scrapix_crawler_fetch_duration_seconds` > 10s for 10 minutes | warning |
+
+### Frontier Alerts
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| `QueueBacklogHigh` | `sum(scrapix_frontier_queued)` > 100K for 15 minutes | warning |
+| `FrontierNotDispatching` | Admissions ongoing but `scrapix_frontier_dispatched_total` rate is 0 for 10 minutes | warning |
 
 ### Content Alerts
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| Content Worker Down | No metrics for 2 minutes | critical |
-| High AI Token Usage | > 100K tokens/hour | warning |
-| Extraction Failures | Failure rate > 20% for 5 minutes | warning |
+| `ContentWorkerDown` | No metrics scrape for 2 minutes | critical |
+| `HighContentFailureRate` | `scrapix_content_documents_total{outcome="failure"}` / total > 5% for 10 minutes | warning |
 
 ### Infrastructure Alerts
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| Kafka Consumer Lag | Lag > 10K for 10 minutes | warning |
-| Meilisearch Down | Health check failing | critical |
-| Redis Down | Ping failing | critical |
-| High Memory Usage | > 90% for 5 minutes | warning |
+| `HighConsumerUncommitted` | `scrapix_consumer_uncommitted` > 10K for 10 minutes (this process's own in-flight/unacked count, not the Kafka broker's own consumer-group lag) | warning |
+| `MeilisearchDown` | Health check failing | critical |
+| `RedisDown` | Ping failing | critical |
 
 ### Job Alerts
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| Stuck Job | No progress for 30 minutes | warning |
-| Long Running Job | Running > 24 hours | warning |
+| `RunningJobsPilingUp` | `scrapix_api_jobs{status="running"}` > 50 for 30 minutes | warning |
+
+<Note>
+  Not instrumented today, so no alert exists for them (see the comment at
+  the top of `alerts.yml`): AI token usage/cost, per-job stuck/long-running
+  detection (no per-job progress or start-timestamp metric), HTTP status
+  code distribution, a finer-grained content error-type breakdown, real
+  Kafka broker-side consumer-group lag, and process memory/CPU (no process
+  collector is registered by any Scrapix service).
+</Note>
 
 ## AlertManager Configuration
 
@@ -172,10 +185,19 @@ Configure receivers for your notification channels (Slack, PagerDuty, email) in 
 
 ## Grafana
 
-Grafana is pre-provisioned with Prometheus as a datasource. Import or build dashboards for:
+Grafana is pre-provisioned with Prometheus as a datasource. The bundled
+`Scrapix Overview` dashboard (`deploy/monitoring/grafana/dashboards/scrapix-overview.json`)
+covers, using only the metrics in the table above:
 
-- **Crawl throughput** — pages/sec, bytes/sec over time
-- **Error rate** — by domain, status code
-- **Queue depth** — frontier queue size over time
-- **Latency percentiles** — p50, p95, p99 fetch times
-- **Worker utilization** — active fetches vs capacity
+- **Crawl rate / download rate / error rate** — from `scrapix_crawler_fetches_total`
+  and `scrapix_crawler_bytes_total`
+- **Queue size** — `sum(scrapix_frontier_queued)`
+- **Fetch latency percentiles** — `scrapix_crawler_fetch_duration_seconds`
+- **Crawler fetches by outcome** and **content documents by outcome** — the
+  `outcome` label on `scrapix_crawler_fetches_total` /
+  `scrapix_content_documents_total`
+- **Jobs by status** — `scrapix_api_jobs`
+- **Consumer in-flight (unacked) messages** — `scrapix_consumer_uncommitted`
+
+There is no per-domain, per-status-code, or per-worker-instance breakdown —
+none of those labels exist on the current metrics.

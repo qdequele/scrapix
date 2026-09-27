@@ -20,33 +20,35 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # Scrapix API server
+  # Scrapix API server — GET /metrics on its normal HTTP port (PORT, 8080),
+  # not a dedicated metrics port.
   - job_name: 'scrapix-api'
     static_configs:
-      - targets: ['host.docker.internal:9090']
+      - targets: ['host.docker.internal:8080']
     metrics_path: '/metrics'
 
-  # Scrapix Crawler Workers
+  # Scrapix Crawler Workers — GET /metrics on each machine's WAKE_PORT
+  # (8081 by default). One target per machine/process, not per logical
+  # service; add one line per worker instance you run locally.
   - job_name: 'scrapix-crawler-workers'
     static_configs:
       - targets:
-          - 'host.docker.internal:9091'
-          - 'host.docker.internal:9092'
-          - 'host.docker.internal:9093'
+          - 'host.docker.internal:8081'
     metrics_path: '/metrics'
 
-  # Scrapix Content Workers
+  # Scrapix Content Workers — GET /metrics on each machine's WAKE_PORT.
+  # If you run content workers on the same host as the crawler workers
+  # above, give them a distinct WAKE_PORT (e.g. 8082) and list it here.
   - job_name: 'scrapix-content-workers'
     static_configs:
       - targets:
-          - 'host.docker.internal:9094'
-          - 'host.docker.internal:9095'
+          - 'host.docker.internal:8082'
     metrics_path: '/metrics'
 
-  # Scrapix Frontier Service
+  # Scrapix Frontier Service — GET /metrics on its WAKE_PORT.
   - job_name: 'scrapix-frontier'
     static_configs:
-      - targets: ['host.docker.internal:9096']
+      - targets: ['host.docker.internal:8083']
     metrics_path: '/metrics'
 
   # Kafka/Redpanda metrics (if using)

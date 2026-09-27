@@ -473,20 +473,24 @@ See [Monitoring](docs/operations/monitoring.mdx) for scrape config.
 
 ### Grafana Dashboards
 
-Pre-configured dashboards in `deploy/monitoring/grafana/dashboards/`:
+Pre-configured dashboard in `deploy/monitoring/grafana/dashboards/scrapix-overview.json`:
 
-- **Scrapix Overview** - Crawl rates, error rates, latency percentiles
-- **Job Performance** - Per-job metrics and progress tracking
-- **System Health** - Resource usage, queue depths, worker status
+- **Scrapix Overview** - crawl/download/error rate, queue size, fetch latency
+  percentiles, crawler fetches and content documents by outcome, jobs by
+  status, consumer in-flight message count
 
 ### Alerting Rules
 
-Configured alerts in `deploy/monitoring/prometheus/alerts.yml`:
+Configured alerts in `deploy/monitoring/prometheus/alerts.yml` (see
+[Monitoring](docs/operations/monitoring.mdx) for the full list and the
+metrics behind each one):
 
-- **ScrapixHighErrorRate** - Error rate > 10% for 5 minutes
-- **ScrapixSlowCrawling** - p99 latency > 30s for 10 minutes
-- **ScrapixQueueBacklog** - Queue depth > 100k for 15 minutes
-- **ScrapixWorkerDown** - Worker not responding
+- **HighCrawlerErrorRate** - fetch failure rate > 10% for 5 minutes
+- **LowCrawlerThroughput** - fetch rate < 1/s for 15 minutes
+- **QueueBacklogHigh** - total queued URLs > 100k for 15 minutes
+- **FrontierNotDispatching** - admitting URLs but dispatching none for 10 minutes
+- **CrawlerWorkerDown** / **ContentWorkerDown** - worker not responding to scrapes
+- **RunningJobsPilingUp** - more than 50 jobs stuck `Running` for 30+ minutes
 
 ## Analytics Storage (ClickHouse)
 
