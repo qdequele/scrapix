@@ -420,6 +420,14 @@ impl CrawlerWorker {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
         info!(worker_id = %worker_id, "Initializing crawler worker");
+        if args.worker_id.is_none() {
+            warn!(
+                worker_id = %worker_id,
+                "WORKER_ID is not set: using a random id, so the job-control consumer group \
+                 changes on every restart (controls published while down are missed and old \
+                 groups leak). Set a stable WORKER_ID per worker instance."
+            );
+        }
 
         // Create Kafka consumer
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)

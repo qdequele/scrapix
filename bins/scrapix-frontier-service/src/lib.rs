@@ -57,6 +57,9 @@ use scrapix_lifecycle::{
 };
 use tracing::{debug, error, info, warn};
 
+mod timeout_store;
+pub use timeout_store::{TimeoutStore, STORE_CALL_TIMEOUT};
+
 use scrapix_core::{Ack, CrawlUrl};
 use scrapix_frontier::{
     extract_domain, Acquire, Admission, CrawlRecord, FetchReport, FetchSignal, FrontierStore,
@@ -171,6 +174,12 @@ pub struct Args {
     /// Dispatch interval (ms)
     #[arg(long, env = "DISPATCH_INTERVAL_MS", default_value = "20")]
     pub dispatch_interval_ms: u64,
+
+    /// On graceful shutdown, how long the dispatcher may take to finish its
+    /// in-flight send and put every popped-but-unsent URL back (ms). Keep it
+    /// below the platform's kill timeout (Fly `kill_timeout` is 30s).
+    #[arg(long, env = "DISPATCH_SHUTDOWN_GRACE_MS", default_value = "10000")]
+    pub dispatch_shutdown_grace_ms: u64,
 
     /// Maximum pending URLs per job (queue capacity passed to `admit`)
     #[arg(long, env = "MAX_PENDING_PER_JOB", default_value = "1000000")]
@@ -442,6 +451,11 @@ struct FrontierService {
     job_retention: Duration,
     dispatch_batch_size: usize,
     dispatch_interval: Duration,
+    /// See `Args::dispatch_shutdown_grace_ms`.
+    dispatch_shutdown_grace: Duration,
+    /// Set once the shutdown grace is nearly spent: an in-flight send is
+    /// abandoned and its URL requeued (see `dispatch_job`).
+    hard_stop: tokio::sync::watch::Sender<bool>,
     linkgraph_compute_interval: Duration,
 }
 
@@ -528,6 +542,14 @@ impl FrontierService {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
         info!(instance_id = %instance_id, "Initializing frontier service");
+        if args.instance_id.is_none() {
+            warn!(
+                instance_id = %instance_id,
+                "INSTANCE_ID is not set: using a random id, so the job-control consumer group \
+                 changes on every restart (controls published while down are missed and old \
+                 groups leak). Set a stable INSTANCE_ID per frontier instance."
+            );
+        }
 
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)
             .client_id(format!("scrapix-frontier-{}", instance_id))
@@ -678,6 +700,9 @@ impl FrontierService {
         politeness: Arc<dyn PolitenessStore>,
     ) -> Self {
         let extras = build_extras(args);
+        // Every store call is bounded, so a hung Redis cannot block the
+        // dispatcher, admission or shutdown (final review fix 1).
+        let store: Arc<dyn FrontierStore> = Arc::new(TimeoutStore::new(store, STORE_CALL_TIMEOUT));
 
         Self {
             consumer: buses.main,
@@ -705,6 +730,8 @@ impl FrontierService {
             job_retention: Duration::from_secs(args.job_retention_hours.saturating_mul(3600)),
             dispatch_batch_size: args.dispatch_batch_size,
             dispatch_interval: Duration::from_millis(args.dispatch_interval_ms),
+            dispatch_shutdown_grace: Duration::from_millis(args.dispatch_shutdown_grace_ms),
+            hard_stop: tokio::sync::watch::channel(false).0,
             linkgraph_compute_interval: Duration::from_secs(args.linkgraph_compute_interval),
         }
     }
@@ -724,8 +751,20 @@ impl FrontierService {
         let result = self.clone().process_messages().await;
 
         self.shutdown.store(true, Ordering::Relaxed);
+        // Never abort the dispatcher: URLs it popped are already counted
+        // `dispatched` in the store, so dropping them loses them for good.
+        self.drain_dispatcher(dispatcher_handle).await;
+        self.flush_unrequeued().await;
+        {
+            let left: usize = self.unrequeued.lock().values().map(Vec::len).sum();
+            if left > 0 {
+                error!(
+                    count = left,
+                    "Shutting down with popped URLs the store refused back; they are lost"
+                );
+            }
+        }
         metrics_handle.abort();
-        dispatcher_handle.abort();
         progress_handle.abort();
         for h in [
             links_handle,
@@ -741,6 +780,36 @@ impl FrontierService {
         }
 
         result
+    }
+
+    /// Wait for the dispatcher to stop after `shutdown` was set: it stops
+    /// popping, finishes its in-flight send and requeues the rest of its
+    /// batch. After 4/5 of the grace, `hard_stop` makes it abandon a send
+    /// that is still stuck (that URL is requeued as well; with Kafka it may
+    /// also have been delivered, i.e. crawled twice, which is safe). Only if
+    /// the dispatcher is still running at the end of the grace is it
+    /// aborted, which can lose its batch (logged).
+    async fn drain_dispatcher(&self, mut handle: tokio::task::JoinHandle<()>) {
+        let grace = self.dispatch_shutdown_grace;
+        let soft = grace.mul_f64(0.8);
+        if tokio::time::timeout(soft, &mut handle).await.is_ok() {
+            return;
+        }
+        warn!(
+            waited_ms = soft.as_millis() as u64,
+            "Dispatcher still busy at shutdown; abandoning its in-flight send"
+        );
+        let _ = self.hard_stop.send(true);
+        if tokio::time::timeout(grace.saturating_sub(soft), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            error!(
+                grace_ms = grace.as_millis() as u64,
+                "Dispatcher did not stop within the shutdown grace; aborted (its current batch may be lost)"
+            );
+        }
     }
 
     fn start_metrics_logger(&self) -> tokio::task::JoinHandle<()> {
@@ -1065,6 +1134,9 @@ impl FrontierService {
             let mut tick = tokio::time::interval(self.dispatch_interval);
             while !self.shutdown.load(Ordering::Relaxed) {
                 tick.tick().await;
+                if self.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 self.dispatch_tick().await;
             }
         })
@@ -1093,6 +1165,10 @@ impl FrontierService {
 
         let mut held = HashSet::new();
         for job_id in jobs {
+            if self.shutdown.load(Ordering::Relaxed) {
+                // Pop nothing more once shutting down.
+                break;
+            }
             match self.dispatch_job(&job_id).await {
                 Ok(true) => {
                     held.insert(job_id);
@@ -1140,6 +1216,9 @@ impl FrontierService {
             return Ok(true);
         };
 
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
         let pop_size = self.pop_size(job_id);
         let now = now_ms();
         let urls = self.store.pop_ready(job_id, pop_size, now).await?;
@@ -1158,8 +1237,16 @@ impl FrontierService {
         let mut not_ready: HashMap<String, Duration> = HashMap::new();
         let mut lease_held = true;
         let mut last_renew = std::time::Instant::now();
+        let mut hard_stop = self.hard_stop.subscribe();
         let mut urls = urls.into_iter();
         while let Some(url) = urls.next() {
+            if self.shutdown.load(Ordering::Relaxed) {
+                // Graceful shutdown: send nothing more, put the rest back.
+                info!(job_id = %job_id, count = urls.len() + 1, "Shutting down mid-batch; requeuing unsent URLs");
+                bounced.push(url);
+                bounced.extend(urls.by_ref());
+                break;
+            }
             if last_renew.elapsed() >= LEASE_RENEW_EVERY {
                 match self
                     .store
@@ -1197,7 +1284,15 @@ impl FrontierService {
             };
             // Park a URL that may not be fetched yet until it is expected to
             // be, so the next ticks don't pop and requeue it over and over.
-            let wait = match self.politeness.try_acquire(&slot).await {
+            let acquired =
+                tokio::time::timeout(STORE_CALL_TIMEOUT, self.politeness.try_acquire(&slot))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(scrapix_core::ScrapixError::Timeout(
+                            "politeness try_acquire timed out".to_string(),
+                        ))
+                    });
+            let wait = match acquired {
                 Ok(Acquire::Granted) => None,
                 Ok(Acquire::Wait(wait)) => {
                     not_ready.insert(domain.clone(), wait);
@@ -1240,15 +1335,19 @@ impl FrontierService {
             let mut msg = template.child(url);
             msg.message_id = token;
 
-            match self
+            let key = msg.partition_key();
+            let send = self
                 .producer
-                .send(
-                    topic_names::URL_PROCESSING,
-                    Some(&msg.partition_key()),
-                    &msg,
-                )
-                .await
-            {
+                .send(topic_names::URL_PROCESSING, Some(&key), &msg);
+            // Raced only against the shutdown hard stop (see
+            // `drain_dispatcher`); normally the send runs to completion.
+            let sent = tokio::select! {
+                r = send => r,
+                _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
+                    "send abandoned at shutdown".to_string(),
+                )),
+            };
+            match sent {
                 Ok(_) => {
                     dispatched += 1;
                     self.metrics.urls_dispatched.fetch_add(1, Ordering::Relaxed);
@@ -1261,11 +1360,17 @@ impl FrontierService {
                     error!(url = %msg.url.url, job_id = %job_id, error = %e, "Failed to dispatch URL");
                     // A bus outage is not the domain's fault: free the slot
                     // without error accounting (no backoff, no pause).
-                    if let Err(e) = self
-                        .politeness
-                        .release(&domain, job_id, &msg.message_id)
-                        .await
-                    {
+                    let released = tokio::time::timeout(
+                        STORE_CALL_TIMEOUT,
+                        self.politeness.release(&domain, job_id, &msg.message_id),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(scrapix_core::ScrapixError::Timeout(
+                            "politeness release timed out".to_string(),
+                        ))
+                    });
+                    if let Err(e) = released {
                         warn!(domain = %domain, error = %e, "Failed to release politeness slot; it will expire");
                     }
                     let mut url = msg.url;
@@ -1961,7 +2066,10 @@ mod tests {
         }
 
         async fn start_with(args: Args, store: Arc<dyn FrontierStore>) -> Self {
-            let bus = ChannelBus::new();
+            Self::start_on(ChannelBus::new(), args, store).await
+        }
+
+        async fn start_on(bus: ChannelBus, args: Args, store: Arc<dyn FrontierStore>) -> Self {
             let service = spawn_service(&bus, &args, store).await;
             let handle = tokio::spawn(service.clone().run());
             Self {
@@ -2969,5 +3077,191 @@ mod tests {
         let resumed = h.collect_dispatched(Duration::from_millis(800)).await;
         h.stop();
         assert_eq!(resumed.len(), 3);
+    }
+
+    /// Drain whatever is still buffered on `c` (non-blocking-ish).
+    async fn drain_count(c: &AnyConsumer) -> u64 {
+        let mut n = 0;
+        while c
+            .poll_one::<UrlMessage>(Duration::from_millis(50))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            n += 1;
+        }
+        n
+    }
+
+    /// Final review fix 1: a graceful shutdown in the middle of a dispatch
+    /// batch (slow producer) finishes the in-flight send and puts every
+    /// popped-but-unsent URL back, instead of aborting the dispatcher and
+    /// losing them (they were counted `dispatched` by `pop_ready`).
+    #[tokio::test]
+    async fn graceful_shutdown_mid_batch_requeues_unsent_urls() {
+        const N: u64 = 20;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        seed_store(&*store, "job-drain", N as usize).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 10_000;
+        // One-slot topics: every send waits for the slow reader below.
+        let h = Harness::start_on(ChannelBus::with_capacity(1), args, store.clone()).await;
+        let reader = Arc::new(h.consumer(topic_names::URL_PROCESSING));
+        let received = Arc::new(AtomicU64::new(0));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let reader_task = {
+            let (reader, received, stop) = (reader.clone(), received.clone(), stop_reader.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    if reader
+                        .poll_one::<UrlMessage>(Duration::from_millis(20))
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                    }
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(received.load(Ordering::SeqCst) >= 3, "dispatch started");
+
+        h.service.shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), h.handle)
+            .await
+            .expect("run() returns within the grace")
+            .unwrap()
+            .unwrap();
+        stop_reader.store(true, Ordering::SeqCst);
+        reader_task.await.unwrap();
+        let sent = received.load(Ordering::SeqCst) + drain_count(&reader).await;
+
+        assert!(sent < N, "shutdown landed mid-batch (sent {sent})");
+        let c = store.counters("job-drain").await.unwrap();
+        assert_eq!(c.dispatched, sent, "`dispatched` counts only URLs sent");
+        assert_eq!(
+            store.queued("job-drain").await.unwrap(),
+            N - sent,
+            "every popped-but-unsent URL is back in the store"
+        );
+        assert_eq!(
+            h.service.metrics.urls_dispatched.load(Ordering::Relaxed),
+            sent
+        );
+    }
+
+    /// Final review fix 1: a send that never completes (bus stuck) does not
+    /// hold shutdown past the grace, and its URL is requeued too.
+    #[tokio::test]
+    async fn stuck_send_is_abandoned_at_the_grace_and_requeued() {
+        const N: u64 = 10;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        seed_store(&*store, "job-stuck", N as usize).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 10_000;
+        args.dispatch_shutdown_grace_ms = 400;
+        // One-slot topic and no reader: the second send blocks forever.
+        let h = Harness::start_on(ChannelBus::with_capacity(1), args, store.clone()).await;
+        let reader = h.consumer(topic_names::URL_PROCESSING);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = Instant::now();
+        h.service.shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(3), h.handle)
+            .await
+            .expect("run() returns within the grace")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let sent = drain_count(&reader).await;
+
+        assert_eq!(sent, 1, "one message fit the one-slot topic");
+        assert_eq!(store.counters("job-stuck").await.unwrap().dispatched, 1);
+        assert_eq!(store.queued("job-stuck").await.unwrap(), N - 1);
+    }
+
+    /// Final review fix 1: a hung store call times out and surfaces as a
+    /// store error instead of blocking its caller (and shutdown) forever.
+    #[tokio::test]
+    async fn hung_store_call_times_out_as_an_error() {
+        #[derive(Default)]
+        struct Hung(MemoryFrontierStore);
+        #[async_trait::async_trait]
+        impl FrontierStore for Hung {
+            async fn ensure_job(
+                &self,
+                job_id: &str,
+                t: &str,
+                p: Option<u64>,
+                d: Option<u32>,
+            ) -> scrapix_core::Result<()> {
+                self.0.ensure_job(job_id, t, p, d).await
+            }
+            async fn job_template(&self, j: &str) -> scrapix_core::Result<Option<String>> {
+                self.0.job_template(j).await
+            }
+            async fn admit(
+                &self,
+                _: &str,
+                _: &CrawlUrl,
+                _: usize,
+            ) -> scrapix_core::Result<Admission> {
+                std::future::pending().await
+            }
+            async fn pop_ready(
+                &self,
+                _: &str,
+                _: usize,
+                _: i64,
+            ) -> scrapix_core::Result<Vec<CrawlUrl>> {
+                std::future::pending().await
+            }
+            async fn requeue(&self, j: &str, u: Vec<CrawlUrl>) -> scrapix_core::Result<()> {
+                self.0.requeue(j, u).await
+            }
+            async fn queued(&self, j: &str) -> scrapix_core::Result<u64> {
+                self.0.queued(j).await
+            }
+            async fn counters(&self, j: &str) -> scrapix_core::Result<JobCounters> {
+                self.0.counters(j).await
+            }
+            async fn set_state(&self, j: &str, s: JobRunState) -> scrapix_core::Result<()> {
+                self.0.set_state(j, s).await
+            }
+            async fn state(&self, j: &str) -> scrapix_core::Result<Option<JobRunState>> {
+                self.0.state(j).await
+            }
+            async fn active_jobs(&self) -> scrapix_core::Result<Vec<String>> {
+                self.0.active_jobs().await
+            }
+            async fn release(&self, j: &str, r: Duration) -> scrapix_core::Result<()> {
+                self.0.release(j, r).await
+            }
+            async fn try_lease(&self, j: &str, o: &str, t: Duration) -> scrapix_core::Result<bool> {
+                self.0.try_lease(j, o, t).await
+            }
+        }
+
+        let store = TimeoutStore::new(Arc::new(Hung::default()), Duration::from_millis(50));
+        let started = Instant::now();
+        let url = CrawlUrl::seed("https://example.com/");
+        assert!(matches!(
+            store.admit("j", &url, 10).await,
+            Err(scrapix_core::ScrapixError::Timeout(_))
+        ));
+        assert!(matches!(
+            store.pop_ready("j", 10, 0).await,
+            Err(scrapix_core::ScrapixError::Timeout(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Calls that answer go through unchanged.
+        assert_eq!(store.queued("j").await.unwrap(), 0);
     }
 }

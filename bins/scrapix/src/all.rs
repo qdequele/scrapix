@@ -144,6 +144,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
         max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
         allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
             .map(|v| v == "true" || v == "1")
@@ -170,6 +171,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
+        dispatch_shutdown_grace_ms: env_or("DISPATCH_SHUTDOWN_GRACE_MS", 10_000),
         max_pending_per_job: 1_000_000,
         instance_id: Some("all-in-one".to_string()),
         verbose: args.verbose,
@@ -448,6 +450,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
         max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
         allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
             .map(|v| v == "true" || v == "1")
@@ -474,6 +477,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         robots_delay_multiplier: 1.0,
         dispatch_batch_size: 2000,
         dispatch_interval_ms: 20,
+        dispatch_shutdown_grace_ms: env_or("DISPATCH_SHUTDOWN_GRACE_MS", 10_000),
         max_pending_per_job: 1_000_000,
         instance_id: Some("all-in-one".to_string()),
         verbose: args.verbose,

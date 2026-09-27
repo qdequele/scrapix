@@ -445,6 +445,14 @@ impl ContentWorker {
     async fn new(args: &Args) -> anyhow::Result<Self> {
         let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker");
+        if args.worker_id.is_none() {
+            warn!(
+                worker_id = %worker_id,
+                "WORKER_ID is not set: using a random id, so the job-control consumer group \
+                 changes on every restart (controls published while down are missed and old \
+                 groups leak). Set a stable WORKER_ID per worker instance."
+            );
+        }
 
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)
             .client_id(format!("scrapix-content-{}", worker_id))

@@ -150,6 +150,14 @@ pub struct Args {
     #[arg(long, env = "JOB_COMPLETION_GRACE_MS", default_value = "3000")]
     pub completion_grace_ms: u64,
 
+    /// A Running job whose work is not fully accounted for and that received
+    /// no pipeline event for this many seconds gets its `Resume` control
+    /// re-published (a lost or reordered Resume would otherwise leave the
+    /// frontier paused until the stall timeout fails the job). Resume is a
+    /// no-op for a job the frontier already runs.
+    #[arg(long, env = "RESUME_HEAL_AFTER_SECS", default_value = "60")]
+    pub resume_heal_after_secs: u64,
+
     /// Maximum event acks held while waiting for the accounting flush; at
     /// the cap the event consumer blocks (backpressure) until a flush frees
     /// room.
@@ -286,6 +294,14 @@ struct AppState {
     accounting_persisted: std::sync::atomic::AtomicBool,
     /// Set on shutdown (unblocks a `settle_ack` waiting at the cap).
     shutting_down: std::sync::atomic::AtomicBool,
+    /// Ordered `JobControl` queue: one drainer task publishes the controls
+    /// one at a time, in request order, so a Pause and the Resume after it
+    /// can never reach the bus swapped (see `publish_control`).
+    control_tx: tokio::sync::mpsc::UnboundedSender<JobControl>,
+    /// Receiving end, taken by the drainer when it is first needed.
+    control_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JobControl>>>,
+    /// Controls queued but not yet published (or given up on).
+    controls_pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +311,8 @@ struct AppConfig {
     job_stall_timeout: Duration,
     /// See [`Args::completion_grace_ms`]
     completion_grace: Duration,
+    /// See [`Args::resume_heal_after_secs`]
+    resume_heal_after: Duration,
     /// See [`Args::max_pending_acks`]
     max_pending_acks: usize,
 }
@@ -305,6 +323,7 @@ impl AppConfig {
             max_jobs: args.max_jobs,
             job_stall_timeout: Duration::from_secs(args.job_stall_timeout_secs),
             completion_grace: Duration::from_millis(args.completion_grace_ms),
+            resume_heal_after: Duration::from_secs(args.resume_heal_after_secs.max(1)),
             max_pending_acks: args.max_pending_acks.max(1),
         }
     }
@@ -328,6 +347,7 @@ impl AppState {
         webhook_dispatcher: webhooks::WebhookDispatcher,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(10_000);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             producer,
             config,
@@ -365,6 +385,9 @@ impl AppState {
             ai_service,
             accounting_persisted: std::sync::atomic::AtomicBool::new(db_pool.is_some()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            control_tx,
+            control_rx: parking_lot::Mutex::new(Some(control_rx)),
+            controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             db_pool,
             stripe_client,
             analytics_store,
@@ -708,46 +731,133 @@ impl AppState {
             }
             JobStatus::Pending | JobStatus::Running => return,
         };
-        {
-            let mut last = self.crawl.control_republished.lock();
-            if last
-                .get(job_id)
-                .is_some_and(|t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY)
-            {
-                return;
-            }
-            if last.len() >= MAX_CONTROL_REPUBLISH_ENTRIES {
-                last.retain(|_, t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY);
-            }
-            last.insert(job_id.to_string(), now);
+        if !self.take_republish_slot(job_id, now) {
+            return;
         }
         info!(job_id = %job_id, ?action, "Pipeline event for a stopped/paused job: re-publishing its control");
         self.publish_control(job_id, action);
     }
 
-    /// Publish a `JobControl` to the pipeline (frontier + workers). Spawned
+    /// Rate limit of the self-heal re-publishes: true (and the slot taken)
+    /// if `job_id` had no re-publish in the last `CONTROL_REPUBLISH_EVERY`.
+    fn take_republish_slot(&self, job_id: &str, now: std::time::Instant) -> bool {
+        let mut last = self.crawl.control_republished.lock();
+        if last
+            .get(job_id)
+            .is_some_and(|t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY)
+        {
+            return false;
+        }
+        if last.len() >= MAX_CONTROL_REPUBLISH_ENTRIES {
+            last.retain(|_, t| now.saturating_duration_since(*t) < CONTROL_REPUBLISH_EVERY);
+        }
+        last.insert(job_id.to_string(), now);
+        true
+    }
+
+    /// Self-heal of a lost or reordered Resume: a Running job whose work is
+    /// not balanced and that has had no pipeline event for
+    /// `resume_heal_after` may be sitting `Paused` at the frontier. Re-publish
+    /// `Resume` (rate-limited with the other re-publishes). Safe for a job
+    /// that is just slow: the frontier ignores Resume for Running, Cancelled
+    /// and Finished jobs. Called by the completion loop every tick.
+    fn heal_silent_running(&self, now: std::time::Instant) {
+        let threshold = self.config.resume_heal_after;
+        let silent: Vec<String> = {
+            let jobs = self.crawl.jobs.read();
+            let accs = self.crawl.accounting.read();
+            let activity = self.crawl.job_last_activity.read();
+            jobs.iter()
+                .filter(|(_, j)| matches!(j.status, JobStatus::Running))
+                .filter(|(id, _)| accs.get(*id).is_some_and(|a| !a.is_balanced()))
+                .filter(|(id, _)| {
+                    activity
+                        .get(*id)
+                        .is_some_and(|t| now.saturating_duration_since(*t) >= threshold)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for job_id in silent {
+            if self.take_republish_slot(&job_id, now) {
+                info!(
+                    job_id = %job_id,
+                    silent_secs = threshold.as_secs(),
+                    "Running job silent and unbalanced: re-publishing Resume"
+                );
+                self.publish_control(&job_id, JobAction::Resume);
+            }
+        }
+    }
+
+    /// Publish a `JobControl` to the pipeline (frontier + workers). Queued,
     /// so a slow or blocked publish never delays the caller (a finalize
-    /// batch, an HTTP request). Best effort: a lost Cancel/Finish leaves
-    /// the frontier's copy of the job to its own retention, a lost Pause
-    /// means the frontier keeps dispatching.
+    /// batch, an HTTP request), and published by a single drainer task in
+    /// request order (a Pause and the Resume after it never swap). Best
+    /// effort: a send that fails or times out (5 s) is logged and dropped;
+    /// a lost Cancel/Finish/Pause is re-published by the self-heal on the
+    /// job's next pipeline event (`heal_control`), a lost Resume by
+    /// `heal_silent_running`.
     fn publish_control(&self, job_id: &str, action: JobAction) {
+        self.ensure_control_drainer();
+        self.controls_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .control_tx
+            .send(JobControl::new(job_id, action))
+            .is_err()
+        {
+            self.controls_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            warn!(job_id = %job_id, ?action, "JobControl queue closed; control dropped");
+        }
+    }
+
+    /// Start the control drainer on first use (needs a runtime, which
+    /// `AppState::new` does not).
+    fn ensure_control_drainer(&self) {
+        let Some(mut rx) = self.control_rx.lock().take() else {
+            return;
+        };
         let producer = self.producer.clone();
-        let job_id = job_id.to_string();
+        let pending = self.controls_pending.clone();
         tokio::spawn(async move {
-            let control = JobControl::new(&job_id, action);
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                producer.send(topic_names::JOB_STATUS, Some(&job_id), &control),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    warn!(job_id = %job_id, ?action, error = %e, "Failed to publish JobControl")
+            while let Some(control) = rx.recv().await {
+                let (job_id, action) = (control.job_id.clone(), control.action);
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    producer.send(topic_names::JOB_STATUS, Some(&job_id), &control),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        warn!(job_id = %job_id, ?action, error = %e, "Failed to publish JobControl")
+                    }
+                    Err(_) => warn!(job_id = %job_id, ?action, "Timed out publishing JobControl"),
                 }
-                Err(_) => warn!(job_id = %job_id, ?action, "Timed out publishing JobControl"),
+                pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
         });
+    }
+
+    /// Wait (at most `timeout`) until every queued control was published.
+    /// Returns false if some were still pending at the deadline.
+    async fn drain_controls(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self
+                .controls_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Cancel a job (R5): `Cancelled` is terminal, so the check-and-set runs
@@ -6265,6 +6375,7 @@ pub async fn run_with_bus(
                             .finalize_job(&job_id, decision, std::time::Instant::now())
                             .await;
                     }
+                    completion_state.heal_silent_running(std::time::Instant::now());
                 }
                 _ = completion_shutdown_rx.changed() => {
                     info!("Job completion loop shutting down");
@@ -6349,7 +6460,7 @@ pub async fn run_with_bus(
         .merge(public_routes)
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     // OAuth token cleanup: both backends validate tokens from the shared
     // Postgres; the engine hosts the hourly expired-code/token sweep.
@@ -6503,6 +6614,16 @@ pub async fn run_with_bus(
     }
     if let Err(e) = completion_handle.await {
         warn!("Completion loop task failed during shutdown: {}", e);
+    }
+    // Controls requested before shutdown (a cancel, a finalize's Finish)
+    // still reach the pipeline, within a bounded wait.
+    if !state.drain_controls(Duration::from_secs(5)).await {
+        warn!(
+            pending = state
+                .controls_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "Shutting down with JobControls still unpublished"
+        );
     }
     if let Some(handle) = cron_handle {
         if let Err(e) = handle.await {
@@ -7059,6 +7180,7 @@ mod lifecycle_tests {
                 max_jobs: 100,
                 job_stall_timeout: Duration::from_secs(1800),
                 completion_grace: Duration::from_secs(3),
+                resume_heal_after: Duration::from_secs(60),
                 max_pending_acks: 50_000,
             },
             None,
@@ -8501,6 +8623,80 @@ mod lifecycle_tests {
         );
         state.heal_control("j1", &crawled("j1", "m3"), later + Duration::from_secs(60));
         assert!(next_control(&control).await.is_none());
+    }
+
+    /// Final review fix 2a: controls are published in the order they were
+    /// requested (a Pause and the Resume after it never swap), and a
+    /// shutdown drain waits for the queue to empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn controls_are_published_in_request_order() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        let action = |i: usize| {
+            if i % 2 == 0 {
+                JobAction::Pause
+            } else {
+                JobAction::Resume
+            }
+        };
+        for i in 0..200 {
+            state.publish_control(&format!("j{}", i / 2), action(i));
+        }
+        assert!(
+            state.drain_controls(Duration::from_secs(5)).await,
+            "queue drained"
+        );
+        for i in 0..200 {
+            let ctl = next_control(&control).await.expect("control published");
+            assert_eq!(
+                (ctl.job_id.clone(), ctl.action),
+                (format!("j{}", i / 2), action(i)),
+                "control #{i} out of order"
+            );
+        }
+        assert!(next_control(&control).await.is_none());
+    }
+
+    /// Final review fix 2b: a Running job that is not balanced and has had
+    /// no event for `resume_heal_after` may have lost its Resume: re-publish
+    /// Resume, at most once per `CONTROL_REPUBLISH_EVERY`.
+    #[tokio::test]
+    async fn silent_running_job_gets_one_resume_per_window() {
+        let bus = ChannelBus::new();
+        let control = bus.consumer();
+        control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 2);
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &crawled("j1", "m1")); // m2 in flight
+                                                         // A balanced job is never nudged.
+        running_job(&state, "done", 1);
+        for e in [
+            progress("done", 1, 1, 0),
+            crawled("done", "m1"),
+            indexed("done", "m1"),
+        ] {
+            state.process_event("done", &e);
+        }
+        let t0 = Instant::now();
+        for id in ["j1", "done"] {
+            state.crawl.job_last_activity.write().insert(id.into(), t0);
+        }
+
+        state.heal_silent_running(t0 + Duration::from_secs(30));
+        assert!(next_control(&control).await.is_none(), "below threshold");
+
+        state.heal_silent_running(t0 + Duration::from_secs(61));
+        let ctl = next_control(&control).await.expect("Resume re-published");
+        assert_eq!((ctl.job_id.as_str(), ctl.action), ("j1", JobAction::Resume));
+        state.heal_silent_running(t0 + Duration::from_secs(65));
+        assert!(next_control(&control).await.is_none(), "rate-limited");
+        state.heal_silent_running(t0 + Duration::from_secs(72));
+        let ctl = next_control(&control).await.expect("next window");
+        assert_eq!((ctl.job_id.as_str(), ctl.action), ("j1", JobAction::Resume));
+        assert!(next_control(&control).await.is_none(), "exactly one");
     }
 
     #[test]
