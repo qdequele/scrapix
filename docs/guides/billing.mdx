@@ -116,7 +116,8 @@ Base formats (`html`, `rawHtml`, `content`) are free — they don't add to the c
 
 Browser rendering on `/scrape` has no surcharge of its own: a request that
 renders in the browser (`render_js: true`, or implicitly because it asks for
-the `screenshot` format or sends `actions`) costs the same as the HTTP path.
+the `screenshot` format, sends `actions` or sets `mobile: true`) costs the
+same as the HTTP path. Cookies are free.
 The `screenshot` format itself is +1 like any other feature format; page
 `actions` are free. A request whose action fails (`action_error`) is not
 billed.

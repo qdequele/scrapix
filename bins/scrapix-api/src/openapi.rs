@@ -67,6 +67,7 @@ use utoipa::OpenApi;
         crate::ScrapeActionsResult,
         scrapix_core::browser::Action,
         scrapix_core::browser::ScrollDirection,
+        scrapix_core::browser::RequestCookie,
         crate::AiOptions,
         crate::AiExtractOptions,
         crate::AiFieldDef,

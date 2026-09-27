@@ -82,7 +82,7 @@ use tower_http::{
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
-use scrapix_core::browser::Action;
+use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::{
     ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
     JobStatus, PdfConfig,
@@ -2558,6 +2558,18 @@ struct ScrapeRequest {
     /// actions together must finish within 30s.
     #[serde(default)]
     actions: Vec<Action>,
+
+    /// Emulate a phone (mobile viewport, touch, Android Chrome user agent)
+    /// to get the mobile layout of responsive sites. Forces browser
+    /// rendering.
+    #[serde(default)]
+    mobile: bool,
+
+    /// Cookies sent with the request (both the HTTP and the browser path),
+    /// scoped to the target site: a cookie's `domain` must be the target
+    /// host or a parent domain of it. At most 50.
+    #[serde(default)]
+    cookies: Vec<RequestCookie>,
 }
 
 impl Default for ScrapeRequest {
@@ -2579,6 +2591,8 @@ impl Default for ScrapeRequest {
             ai: None,
             screenshot: None,
             actions: Vec::new(),
+            mobile: false,
+            cookies: Vec::new(),
         }
     }
 }
@@ -3147,6 +3161,8 @@ pub(crate) async fn perform_scrape(
 
     scrapix_core::browser::validate_actions(&request.actions)
         .map_err(|e| ApiError::new(e, "validation_error"))?;
+    scrapix_core::browser::validate_cookies(&request.cookies, &parsed_url)
+        .map_err(|e| ApiError::new(e, "validation_error"))?;
 
     // Features that only the browser can provide force the browser path.
     let screenshot_opts = request
@@ -3155,14 +3171,19 @@ pub(crate) async fn perform_scrape(
         .then(|| ScreenshotOptions {
             full_page: request.screenshot.as_ref().map_or(true, |s| s.full_page),
         });
-    let use_browser = request.render_js || screenshot_opts.is_some() || !request.actions.is_empty();
+    let use_browser = request.render_js
+        || screenshot_opts.is_some()
+        || !request.actions.is_empty()
+        || request.mobile;
     if use_browser && state.browser_renderer.is_none() {
         let reason = if request.render_js {
             "JS rendering"
         } else if screenshot_opts.is_some() {
             "The screenshot format"
-        } else {
+        } else if !request.actions.is_empty() {
             "Page actions"
+        } else {
+            "Mobile emulation"
         };
         return Err(ApiError::new(
             format!(
@@ -3186,6 +3207,12 @@ pub(crate) async fn perform_scrape(
             // Caller-supplied actions and scripts must not be able to reach
             // internal addresses: every request the page makes is checked.
             guard_requests: true,
+            mobile: request.mobile,
+            cookies: request.cookies.clone(),
+            // A fresh browser context per request: cookies (supplied or set
+            // by the site) and storage never reach another request on the
+            // shared browser.
+            isolate: true,
             ..Default::default()
         };
         let mut rendered = renderer
@@ -3217,15 +3244,16 @@ pub(crate) async fn perform_scrape(
             });
         }
         CdpRenderer::raw_page(&crawl_url, rendered)
-    } else if request.headers.is_empty() {
-        // Use the shared fetcher (connection pooling, DNS cache, retries)
+    } else if request.headers.is_empty() && request.cookies.is_empty() {
+        // Use the shared fetcher (connection pooling, DNS cache, retries).
+        // It has no cookie store, so nothing carries over between requests.
         state
             .fetcher
             .fetch(&crawl_url)
             .await
             .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     } else {
-        // Build a one-off fetcher with custom headers
+        // Build a one-off fetcher with custom headers and/or cookies
         let robots_config = RobotsConfig {
             respect_robots: false,
             ..Default::default()
@@ -3237,9 +3265,16 @@ pub(crate) async fn perform_scrape(
             )
         })?);
 
+        // Its cookie store (seeded with the request's cookies) lives only
+        // for this request, so session cookies set along a redirect or login
+        // flow are kept within the fetch and never shared.
         let mut builder = HttpFetcherBuilder::new()
             .timeout(Duration::from_millis(request.timeout_ms))
-            .allow_private_ips(state.fetcher.allows_private_ips());
+            .allow_private_ips(state.fetcher.allows_private_ips())
+            .cookie_store(true);
+        for cookie in &request.cookies {
+            builder = builder.cookie(cookie.to_set_cookie_string(), parsed_url.clone());
+        }
 
         // Add custom headers (block sensitive headers to prevent injection attacks)
         const BLOCKED_HEADERS: &[&str] = &[

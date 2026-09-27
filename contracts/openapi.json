@@ -5137,6 +5137,48 @@
           }
         }
       },
+      "RequestCookie": {
+        "type": "object",
+        "description": "A cookie to send with a one-off fetch (HTTP or browser).",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cookie domain. Defaults to the target URL's host (host-only cookie).\nMust be the target host or a parent domain of it."
+          },
+          "http_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cookie path (default `/`)."
+          },
+          "secure": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "SchemaFeatureConfig": {
         "type": "object",
         "description": "Schema.org extraction settings",
@@ -5310,6 +5352,13 @@
               }
             ]
           },
+          "cookies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestCookie"
+            },
+            "description": "Cookies sent with the request (both the HTTP and the browser path),\nscoped to the target site: a cookie's `domain` must be the target\nhost or a parent domain of it. At most 50."
+          },
           "exclude_selectors": {
             "type": "array",
             "items": {
@@ -5354,6 +5403,10 @@
               "type": "string"
             },
             "description": "CSS selectors to keep (only extract from these)"
+          },
+          "mobile": {
+            "type": "boolean",
+            "description": "Emulate a phone (mobile viewport, touch, Android Chrome user agent)\nto get the mobile layout of responsive sites. Forces browser\nrendering."
           },
           "only_main_content": {
             "type": "boolean",

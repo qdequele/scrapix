@@ -72,6 +72,8 @@ pub mod sitemap;
 #[cfg(feature = "browser-cdp")]
 pub mod cdp_actions;
 #[cfg(feature = "browser-cdp")]
+pub(crate) mod cdp_stealth;
+#[cfg(feature = "browser-cdp")]
 pub mod renderer_cdp;
 
 #[cfg(feature = "browser-webdriver")]

@@ -24,7 +24,7 @@ use scrapix_crawler::{
     CdpRenderer, CdpRendererBuilder, PageOptions, ScreenshotOptions, ACTION_TIMEOUT,
 };
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A renderer on the test browser, or `None` (skip) when
 /// `SCRAPIX_TEST_CHROME` is not set.
@@ -341,5 +341,216 @@ async fn execute_script_returns_value() {
     let url = serve(&server, "/actions", ACTIONS_PAGE).await;
     let v = r.execute_script(&url, "document.title").await.unwrap();
     assert_eq!(v, serde_json::json!("Actions"));
+    r.close().await;
+}
+
+// ============================================================================
+// Stealth, mobile emulation, cookies (SCR-76)
+// ============================================================================
+
+/// Echoes the request's `Cookie`, `User-Agent` and `Sec-CH-UA-Mobile`
+/// headers into the page, plus a page script's view of the fingerprint.
+struct EchoPage;
+
+impl Respond for EchoPage {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let h = |name: &str| {
+            req.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let body = format!(
+            r#"<!doctype html><html><head><title>Echo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>.desktop{{display:block}} .mobile{{display:none}}
+@media (max-width: 600px) {{ .desktop{{display:none}} .mobile{{display:block}} }}</style>
+<script>
+  // Runs before load, like a bot-detection script would.
+  const gl = document.createElement('canvas').getContext('webgl');
+  const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+  window.__fp = {{
+    webdriver: navigator.webdriver,
+    webdriverType: typeof navigator.webdriver,
+    plugins: navigator.plugins.length,
+    languages: navigator.languages,
+    chrome: typeof window.chrome,
+    chromeRuntime: !!(window.chrome && window.chrome.runtime),
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    brands: navigator.userAgentData ? navigator.userAgentData.brands.map(b => b.brand) : null,
+    uaMobile: navigator.userAgentData ? navigator.userAgentData.mobile : null,
+    webglVendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null,
+    webglRenderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null,
+    getParameterSource: gl ? Function.prototype.toString.call(gl.getParameter) : null,
+    maxTouchPoints: navigator.maxTouchPoints,
+    innerWidth: window.innerWidth,
+    narrow: matchMedia('(max-width: 600px)').matches,
+  }};
+</script></head><body>
+<div class="desktop">DESKTOP LAYOUT</div><div class="mobile">MOBILE LAYOUT</div>
+<pre id="cookie">{cookie}</pre><pre id="ua">{ua}</pre><pre id="chmobile">{chm}</pre>
+</body></html>"#,
+            cookie = h("cookie"),
+            ua = h("user-agent"),
+            chm = h("sec-ch-ua-mobile"),
+        );
+        ResponseTemplate::new(200).set_body_raw(body, "text/html; charset=utf-8")
+    }
+}
+
+async fn serve_echo(server: &MockServer) -> String {
+    Mock::given(path("/echo"))
+        .respond_with(EchoPage)
+        .mount(server)
+        .await;
+    format!("{}/echo", server.uri().replace("127.0.0.1", "localhost"))
+}
+
+/// Text of `<pre id="{id}">` in rendered HTML.
+fn pre(html: &str, id: &str) -> String {
+    let open = format!("<pre id=\"{id}\">");
+    let start = html.find(&open).unwrap_or_else(|| panic!("no #{id}")) + open.len();
+    let end = start + html[start..].find("</pre>").unwrap();
+    html[start..end]
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Render `url` with `opts` and return the page script's fingerprint.
+async fn fingerprint(
+    r: &CdpRenderer,
+    url: &str,
+    mut opts: PageOptions,
+) -> (serde_json::Value, String) {
+    opts.actions.push(Action::ExecuteJavascript {
+        script: "window.__fp".into(),
+    });
+    let result = r.render_page(url, &opts).await.unwrap();
+    (result.javascript_returns[0].clone(), result.html)
+}
+
+/// The page's own (pre-load) script sees a regular desktop Chrome:
+/// `navigator.webdriver` is undefined, no "HeadlessChrome" anywhere, and
+/// plausible plugins, languages, `window.chrome` and WebGL strings.
+#[tokio::test]
+async fn stealth_fingerprint_looks_like_desktop_chrome() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+
+    let (fp, html) = fingerprint(&r, &url, PageOptions::default()).await;
+    eprintln!("desktop fingerprint: {fp:#}");
+    assert_eq!(fp["webdriverType"], "undefined", "{fp}");
+    assert!(fp["webdriver"].is_null());
+    assert!(fp["plugins"].as_u64().unwrap() > 0, "{fp}");
+    assert_eq!(fp["languages"], serde_json::json!(["en-US", "en"]));
+    assert_eq!(fp["chrome"], "object");
+    assert_eq!(fp["chromeRuntime"], true);
+    let ua = fp["userAgent"].as_str().unwrap();
+    assert!(!ua.contains("Headless"), "{ua}");
+    assert!(ua.contains("Chrome/"), "{ua}");
+    let brands = fp["brands"].to_string();
+    assert!(!brands.contains("Headless"), "{brands}");
+    assert!(brands.contains("Google Chrome"), "{brands}");
+    assert_eq!(fp["maxTouchPoints"], 0, "desktop has no touch");
+    assert_eq!(fp["uaMobile"], false);
+    // WebGL is available (software rasterizer) and reports a real GPU.
+    let vendor = fp["webglVendor"].as_str().expect("WebGL available");
+    assert!(!vendor.contains("SwiftShader"), "{vendor}");
+    let renderer = fp["webglRenderer"].as_str().unwrap();
+    assert!(!renderer.contains("SwiftShader"), "{renderer}");
+    assert!(renderer.starts_with("ANGLE ("), "{renderer}");
+    assert!(
+        fp["getParameterSource"]
+            .as_str()
+            .unwrap()
+            .contains("[native code]"),
+        "patched getParameter still looks native"
+    );
+    // The request header matches navigator.userAgent.
+    let header_ua = pre(&html, "ua");
+    assert!(!header_ua.contains("Headless"), "{header_ua}");
+    assert_eq!(header_ua, ua);
+    assert!(html.contains("DESKTOP LAYOUT"));
+    r.close().await;
+}
+
+/// `mobile: true` renders the phone layout of a responsive page, with a
+/// mobile user agent, client hints and touch.
+#[tokio::test]
+async fn mobile_emulation_renders_mobile_layout() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+
+    let mut opts = PageOptions {
+        mobile: true,
+        screenshot: Some(ScreenshotOptions { full_page: false }),
+        ..Default::default()
+    };
+    opts.isolate = true;
+    let (fp, _) = fingerprint(&r, &url, opts.clone()).await;
+    eprintln!("mobile fingerprint: {fp:#}");
+    assert_eq!(fp["narrow"], true, "mobile media query matches: {fp}");
+    assert_eq!(fp["innerWidth"], 412);
+    assert!(fp["maxTouchPoints"].as_u64().unwrap() > 0);
+    assert_eq!(fp["uaMobile"], true);
+    assert!(fp["userAgent"].as_str().unwrap().contains("Android"));
+
+    let result = r.render_page(&url, &opts).await.unwrap();
+    let text = pre(&result.html, "ua");
+    assert!(text.contains("Mobile Safari"), "UA header: {text}");
+    assert_eq!(pre(&result.html, "chmobile"), "?1", "Sec-CH-UA-Mobile");
+    let (w, _) = png_size(result.screenshot.as_deref().unwrap());
+    assert!(w < 1280, "phone-width screenshot (device pixels), got {w}");
+
+    // The same page without `mobile` is the desktop layout.
+    let (fp, _) = fingerprint(&r, &url, PageOptions::default()).await;
+    assert_eq!(fp["narrow"], false);
+    assert_eq!(fp["innerWidth"], 1280);
+    r.close().await;
+}
+
+/// Supplied cookies reach the server on the browser path; isolated renders
+/// never see each other's cookies (supplied or set by the page).
+#[tokio::test]
+async fn cookies_are_sent_and_isolated() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+
+    let cookie = |name: &str, value: &str| scrapix_core::browser::RequestCookie {
+        name: name.into(),
+        value: value.into(),
+        domain: None,
+        path: None,
+        secure: None,
+        http_only: Some(true),
+    };
+    let first = PageOptions {
+        cookies: vec![cookie("sid", "abc123"), cookie("theme", "dark")],
+        isolate: true,
+        actions: vec![Action::ExecuteJavascript {
+            script: "document.cookie = 'set_by_page=1; path=/'; document.cookie".into(),
+        }],
+        ..Default::default()
+    };
+    let result = r.render_page(&url, &first).await.unwrap();
+    let sent = pre(&result.html, "cookie");
+    assert!(sent.contains("sid=abc123"), "cookie header: {sent}");
+    assert!(sent.contains("theme=dark"), "cookie header: {sent}");
+    // HttpOnly cookies are not visible to the page's script.
+    assert_eq!(result.javascript_returns[0], "set_by_page=1");
+
+    // A later isolated render starts from an empty jar.
+    let second = PageOptions {
+        isolate: true,
+        ..Default::default()
+    };
+    let result = r.render_page(&url, &second).await.unwrap();
+    assert_eq!(pre(&result.html, "cookie"), "", "no cookie leaks");
     r.close().await;
 }

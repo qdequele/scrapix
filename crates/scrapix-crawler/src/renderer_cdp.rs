@@ -28,11 +28,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use chromiumoxide::cdp::browser_protocol::network::{CookieParam, SetCookiesParams};
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ClipRect,
 };
-use chromiumoxide::handler::viewport::Viewport;
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
 use chromiumoxide::Page;
 use chrono::Utc;
 use futures::StreamExt;
@@ -49,7 +51,12 @@ use chromiumoxide::ArcHttpRequest;
 
 use scrapix_core::browser::Action;
 
+use scrapix_core::browser::RequestCookie;
+
 use crate::cdp_actions::{execute_actions, install_request_guard, ACTIONS_BUDGET};
+use crate::cdp_stealth::{
+    chrome_major, emulate_desktop, emulate_mobile, stealth_script, BrowserIdentity, LAUNCH_ARGS,
+};
 use crate::fetcher::FetchOptions;
 use crate::robots::RobotsCache;
 use crate::safe_client::reject_ip_host;
@@ -104,6 +111,17 @@ pub struct PageOptions {
     /// addresses (see `install_request_guard`). Recommended whenever the
     /// page runs caller-supplied actions or scripts.
     pub guard_requests: bool,
+    /// Emulate a phone: mobile viewport and device metrics, touch, and an
+    /// Android Chrome user agent (unless `user_agent` is set).
+    pub mobile: bool,
+    /// Cookies set for this page before navigating (validate them with
+    /// `RequestCookie::validate_for`). Host-only cookies are scoped to the
+    /// target URL.
+    pub cookies: Vec<RequestCookie>,
+    /// Render in a fresh browser context (own cookie jar, storage and
+    /// cache), disposed afterwards, so nothing this render sets or receives
+    /// is visible to any other render on the shared browser.
+    pub isolate: bool,
 }
 
 /// HTTP status of the main document as reported by CDP (`Network.Response.status`),
@@ -262,6 +280,20 @@ async fn capture_screenshot(page: &Page, opts: ScreenshotOptions) -> Result<Vec<
     BASE64
         .decode(data)
         .map_err(|e| CdpError::ScreenshotFailed(format!("invalid screenshot data: {e}")).into())
+}
+
+/// A request cookie as a CDP `CookieParam`: host-only cookies are scoped to
+/// the target URL, domain cookies to their (already validated) domain.
+fn browser_cookie(cookie: &RequestCookie, target_url: &str) -> CookieParam {
+    let mut param = CookieParam::new(cookie.name.clone(), cookie.value.clone());
+    match cookie.normalized_domain() {
+        Some(domain) => param.domain = Some(format!(".{domain}")),
+        None => param.url = Some(target_url.to_string()),
+    }
+    param.path = Some(cookie.path.clone().unwrap_or_else(|| "/".to_string()));
+    param.secure = cookie.secure;
+    param.http_only = cookie.http_only;
+    param
 }
 
 /// Errors specific to CDP rendering
@@ -473,6 +505,15 @@ pub struct CdpRenderer {
     /// This browser's own profile directory, removed when the renderer
     /// is closed or dropped.
     user_data_dir: std::path::PathBuf,
+    /// Identity applied to every page without a per-request user agent:
+    /// the browser's UA without "HeadlessChrome", with matching client
+    /// hints. `None` when the operator configured a user agent.
+    desktop_identity: Option<BrowserIdentity>,
+    /// The browser's Chrome major version (for the mobile identity).
+    chrome_major: String,
+    /// Fingerprint patches for desktop and mobile pages.
+    desktop_stealth: String,
+    mobile_stealth: String,
 }
 
 /// A fresh, unique profile directory for one browser launch.
@@ -525,6 +566,15 @@ impl CdpRenderer {
 
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_pages));
 
+        let browser_ua = browser.user_agent().await.unwrap_or_default();
+        let desktop_identity = config
+            .user_agent
+            .is_none()
+            .then(|| BrowserIdentity::desktop(&browser_ua));
+        let chrome_major = chrome_major(&browser_ua).unwrap_or_else(|| "140".to_string());
+        let desktop_stealth = stealth_script(Some(&BrowserIdentity::desktop(&browser_ua)));
+        let mobile_stealth = stealth_script(Some(&BrowserIdentity::mobile(&chrome_major)));
+
         Ok(Self {
             browser,
             config,
@@ -533,6 +583,10 @@ impl CdpRenderer {
             console_logs: Arc::new(Mutex::new(Vec::new())),
             js_errors: Arc::new(Mutex::new(Vec::new())),
             user_data_dir,
+            desktop_identity,
+            chrome_major,
+            desktop_stealth,
+            mobile_stealth,
         })
     }
 
@@ -546,7 +600,12 @@ impl CdpRenderer {
         config: &CdpConfig,
         user_data_dir: &std::path::Path,
     ) -> Result<BrowserConfig> {
-        let mut builder = BrowserConfig::builder().user_data_dir(user_data_dir);
+        // Our own launch flags instead of chromiumoxide's defaults (which
+        // include `--enable-automation`), see `cdp_stealth::LAUNCH_ARGS`.
+        let mut builder = BrowserConfig::builder()
+            .user_data_dir(user_data_dir)
+            .disable_default_args()
+            .args(LAUNCH_ARGS.iter().copied());
 
         // (Previously ignored: `CHROME_PATH` never reached the launcher.)
         if let Some(ref path) = config.executable_path {
@@ -564,7 +623,12 @@ impl CdpRenderer {
         }
 
         if config.disable_gpu {
-            builder = builder.arg("--disable-gpu");
+            // Keep WebGL available through the software rasterizer: a
+            // browser without WebGL at all is itself a bot tell (its
+            // SwiftShader vendor strings are masked by the stealth script).
+            builder = builder
+                .arg("--disable-gpu")
+                .arg("--enable-unsafe-swiftshader");
         }
 
         if config.no_sandbox {
@@ -572,18 +636,15 @@ impl CdpRenderer {
             builder = builder.arg("--disable-setuid-sandbox");
         }
 
-        // Set viewport via window size argument, and make the per-page
-        // emulated viewport match it (chromiumoxide otherwise emulates
-        // 800x600 on every page).
+        // No chromiumoxide viewport emulation: it would emulate 800x600
+        // *with touch* on every page (a desktop browser reporting touch
+        // points is a bot tell). Each page gets desktop metrics of the
+        // configured size, or mobile emulation, instead (`render_on_page`).
         builder = builder.arg(format!(
             "--window-size={},{}",
             config.viewport_width, config.viewport_height
         ));
-        builder = builder.viewport(Viewport {
-            width: config.viewport_width,
-            height: config.viewport_height,
-            ..Viewport::default()
-        });
+        builder = builder.viewport(None);
 
         // Set user agent via argument
         if let Some(ref user_agent) = config.user_agent {
@@ -643,15 +704,35 @@ impl CdpRenderer {
 
         let start = Instant::now();
 
-        // Create new page
-        let page = self
-            .browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| CdpError::LaunchFailed(format!("Failed to create page: {}", e)))?;
+        // A fresh browser context per isolated render.
+        let context = if req.isolate {
+            Some(
+                self.browser
+                    .create_browser_context(CreateBrowserContextParams::default())
+                    .await
+                    .map_err(|e| {
+                        CdpError::LaunchFailed(format!("Failed to create browser context: {e}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut new_tab = CreateTargetParams::new("about:blank");
+        new_tab.browser_context_id = context.clone();
 
-        // Always close the page (and stop its request guard), including on
-        // error paths.
+        // Create new page
+        let page = match self.browser.new_page(new_tab).await {
+            Ok(page) => page,
+            Err(e) => {
+                if let Some(context) = context {
+                    let _ = self.browser.dispose_browser_context(context).await;
+                }
+                return Err(CdpError::LaunchFailed(format!("Failed to create page: {}", e)).into());
+            }
+        };
+
+        // Always close the page (and stop its request guard, and dispose its
+        // context), including on error paths.
         let mut guard = None;
         let result = self
             .render_on_page(&page, url, req, start, &mut guard)
@@ -659,6 +740,9 @@ impl CdpRenderer {
         let _ = page.close().await;
         if let Some(guard) = guard {
             guard.abort();
+        }
+        if let Some(context) = context {
+            let _ = self.browser.dispose_browser_context(context).await;
         }
         result
     }
@@ -672,7 +756,7 @@ impl CdpRenderer {
         guard: &mut Option<tokio::task::JoinHandle<()>>,
     ) -> Result<RenderResult> {
         // Setup page
-        self.setup_page(page).await?;
+        self.setup_page(page, req.mobile).await?;
 
         if req.guard_requests {
             *guard = Some(
@@ -682,12 +766,45 @@ impl CdpRenderer {
             );
         }
 
-        // Per-job user agent and headers, set on this page only (the browser
-        // is shared by every job on the worker).
+        // Per-job user agent, device and headers, set on this page only (the
+        // browser is shared by every job on the worker).
         if let Some(ua) = req.user_agent.as_deref() {
             page.set_user_agent(ua.to_string())
                 .await
                 .map_err(|e| CdpError::NavigationFailed(format!("set user agent: {e}")))?;
+        } else if req.mobile {
+            BrowserIdentity::mobile(&self.chrome_major)
+                .apply(page)
+                .await
+                .map_err(CdpError::NavigationFailed)?;
+        } else if let Some(identity) = &self.desktop_identity {
+            identity
+                .apply(page)
+                .await
+                .map_err(CdpError::NavigationFailed)?;
+        }
+        if req.mobile {
+            emulate_mobile(page)
+                .await
+                .map_err(CdpError::NavigationFailed)?;
+        } else {
+            emulate_desktop(
+                page,
+                self.config.viewport_width,
+                self.config.viewport_height,
+            )
+            .await
+            .map_err(CdpError::NavigationFailed)?;
+        }
+        if !req.cookies.is_empty() {
+            let cookies = req
+                .cookies
+                .iter()
+                .map(|c| browser_cookie(c, url))
+                .collect::<Vec<_>>();
+            page.execute(SetCookiesParams::new(cookies))
+                .await
+                .map_err(|e| CdpError::NavigationFailed(format!("set cookies: {e}")))?;
         }
         if !req.extra_headers.is_empty() {
             let headers: serde_json::Map<String, serde_json::Value> = req
@@ -817,7 +934,17 @@ impl CdpRenderer {
     }
 
     /// Setup page with configured options
-    async fn setup_page(&self, page: &Page) -> Result<()> {
+    async fn setup_page(&self, page: &Page, mobile: bool) -> Result<()> {
+        // Fingerprint patches, before any page script (every page).
+        let stealth = if mobile {
+            &self.mobile_stealth
+        } else {
+            &self.desktop_stealth
+        };
+        page.evaluate_on_new_document(stealth.as_str())
+            .await
+            .map_err(|e| CdpError::JsExecutionFailed(format!("stealth script: {e}")))?;
+
         // Inject script if configured
         if let Some(ref script) = self.config.inject_script {
             page.evaluate_on_new_document(script.clone())

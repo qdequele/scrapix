@@ -15,8 +15,8 @@
 
 use super::*;
 use scrapix_queue::ChannelBus;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// `(renderer, fetcher)` for tests: both allow private IPs so `localhost`
 /// fixtures are reachable.
@@ -308,4 +308,197 @@ async fn actions_are_validated() {
         "actions": [{"type": "hover", "selector": "a"}]
     }))
     .is_err());
+}
+
+/// Echoes the request's `Cookie` and `User-Agent` headers into the page;
+/// the layout is responsive (phone below 600px).
+struct EchoPage;
+
+impl Respond for EchoPage {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let h = |name: &str| {
+            req.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let body = format!(
+            r#"<!doctype html><html><head><title>Echo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body><p>cookie=[{}]</p><p>ua=[{}]</p></body></html>"#,
+            h("cookie"),
+            h("user-agent")
+        );
+        ResponseTemplate::new(200).set_body_raw(body, "text/html")
+    }
+}
+
+async fn serve_echo(server: &MockServer) -> String {
+    Mock::given(path("/echo"))
+        .respond_with(EchoPage)
+        .mount(server)
+        .await;
+    format!("{}/echo", server.uri().replace("127.0.0.1", "localhost"))
+}
+
+/// SCR-76: supplied cookies reach the server on the HTTP path, and never
+/// carry over to a later request (the shared fetcher has no cookie store).
+#[tokio::test]
+async fn cookies_on_http_path_do_not_leak() {
+    let state = Arc::new(state_with(None));
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": url,
+            "formats": ["rawhtml"],
+            "cookies": [{"name": "sid", "value": "abc123"}, {"name": "theme", "value": "dark", "path": "/"}]
+        })),
+    )
+    .await
+    .unwrap();
+    let html = resp.raw_html.unwrap();
+    assert!(html.contains("sid=abc123"), "{html}");
+    assert!(html.contains("theme=dark"), "{html}");
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({"url": url, "formats": ["rawhtml"]})),
+    )
+    .await
+    .unwrap();
+    assert!(resp.raw_html.unwrap().contains("cookie=[]"), "no leak");
+}
+
+/// SCR-76: the one-off fetcher keeps cookies set along a redirect (login
+/// flow) within the request.
+#[tokio::test]
+async fn http_path_keeps_session_cookies_across_redirects() {
+    let state = Arc::new(state_with(None));
+    let server = MockServer::start().await;
+    Mock::given(path("/login"))
+        .and(header("cookie", "sid=abc123"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("set-cookie", "session=s3cr3t; Path=/")
+                .insert_header("location", "/account"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/account"))
+        .and(|req: &Request| {
+            let c = req
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            c.contains("sid=abc123") && c.contains("session=s3cr3t")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<p>welcome back</p>", "text/html"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/account"))
+        .respond_with(ResponseTemplate::new(401).set_body_raw("<p>denied</p>", "text/html"))
+        .mount(&server)
+        .await;
+    let url = format!("{}/login", server.uri().replace("127.0.0.1", "localhost"));
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": url,
+            "formats": ["rawhtml"],
+            "cookies": [{"name": "sid", "value": "abc123"}]
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status_code, 200);
+    assert!(resp.raw_html.unwrap().contains("welcome back"));
+}
+
+/// Cookies for another site are refused up front.
+#[tokio::test]
+async fn cookies_are_validated_against_the_target() {
+    let state = Arc::new(state_with(None));
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": "https://www.example.com/",
+            "cookies": [{"name": "sid", "value": "x", "domain": "evil.com"}]
+        })),
+    )
+    .await
+    .expect_err("foreign domain");
+    assert_eq!(err.code, "validation_error");
+    assert!(err.error.contains("does not match"), "{}", err.error);
+
+    // `mobile` needs the browser.
+    let err = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({"url": "https://www.example.com/", "mobile": true})),
+    )
+    .await
+    .expect_err("no browser");
+    assert_eq!(err.code, "render_js_unavailable");
+}
+
+/// SCR-76 on the browser path: `mobile: true` renders the phone layout with
+/// a mobile UA, cookies arrive, `navigator.webdriver` is undefined, and the
+/// next request (fresh browser context) does not see the cookies.
+#[tokio::test]
+async fn browser_path_mobile_cookies_and_stealth() {
+    let Some(state) = browser_state().await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({
+            "url": url,
+            "formats": ["rawhtml"],
+            "mobile": true,
+            "cookies": [{"name": "sid", "value": "abc123", "http_only": true}],
+            "actions": [{"type": "execute_javascript", "script":
+                "({ webdriver: typeof navigator.webdriver, narrow: matchMedia('(max-width: 600px)').matches, width: innerWidth })"}]
+        })),
+    )
+    .await
+    .unwrap();
+    let html = resp.raw_html.unwrap();
+    assert!(html.contains("cookie=[sid=abc123]"), "{html}");
+    assert!(
+        html.contains("Android") && !html.contains("Headless"),
+        "{html}"
+    );
+    let fp = &resp.actions.unwrap().javascript_returns[0];
+    assert_eq!(
+        fp,
+        &serde_json::json!({"webdriver": "undefined", "narrow": true, "width": 412})
+    );
+
+    let resp = perform_scrape(
+        &state,
+        &None,
+        &request(serde_json::json!({"url": url, "formats": ["rawhtml"], "render_js": true})),
+    )
+    .await
+    .unwrap();
+    let html = resp.raw_html.unwrap();
+    assert!(html.contains("cookie=[]"), "isolated: {html}");
+    assert!(
+        !html.contains("Headless") && !html.contains("Android"),
+        "{html}"
+    );
 }
