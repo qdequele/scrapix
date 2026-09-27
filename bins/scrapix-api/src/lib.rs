@@ -49,6 +49,7 @@ pub mod email_scheduler;
 pub mod jobs_db;
 pub mod openapi;
 pub mod stripe;
+pub mod webhooks;
 
 use axum::{
     extract::{
@@ -155,6 +156,13 @@ pub struct Args {
     #[arg(long, env = "MAX_PENDING_ACKS", default_value = "50000")]
     pub max_pending_acks: usize,
 
+    /// Allow webhook deliveries to reach private/loopback/link-local
+    /// addresses. Off by default (SSRF protection, same policy as the
+    /// crawler's own `ALLOW_PRIVATE_IPS`); tests turn it on to reach a
+    /// local wiremock server.
+    #[arg(long, env = "ALLOW_PRIVATE_IPS", default_value = "false")]
+    pub allow_private_ips: bool,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -259,6 +267,8 @@ struct AppState {
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
+    /// Delivers `CrawlEvent`s to jobs' subscribed webhooks (SCR-72).
+    webhook_dispatcher: webhooks::WebhookDispatcher,
     /// Accounting is persisted and event acks are deferred until the flush
     /// (true when Postgres is configured; turned off for the process if the
     /// `accounting` column turns out to be missing, see `finish_flush`).
@@ -304,6 +314,7 @@ impl AppState {
         db_pool: Option<sqlx::PgPool>,
         stripe_client: Option<::stripe::Client>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
+        webhook_dispatcher: webhooks::WebhookDispatcher,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(10_000);
         Self {
@@ -346,6 +357,7 @@ impl AppState {
             db_pool,
             stripe_client,
             analytics_store,
+            webhook_dispatcher,
         }
     }
 
@@ -769,6 +781,23 @@ impl AppState {
         self.crawl.paused_since.lock().remove(job_id);
         self.write_terminal(snapshot.clone());
         self.publish_control(job_id, JobAction::Cancel);
+        // Cancellation doesn't flow through the pipeline's CrawlEvent
+        // stream (nothing publishes one for a cancel), so it's the one
+        // terminal transition `process_event_at` never sees. Fire a
+        // synthetic `JobFailed { error: "cancelled" }` directly so
+        // `crawl_failed` webhook subscribers still hear about it — chosen
+        // over adding a dedicated `crawl.cancelled` WebhookEvent to avoid a
+        // config schema change (see webhooks.rs module docs).
+        self.webhook_dispatcher.enqueue(
+            &snapshot.webhooks,
+            job_id,
+            &CrawlEvent::JobFailed {
+                job_id: job_id.to_string(),
+                account_id: snapshot.account_id.clone(),
+                error: "cancelled".to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            },
+        );
         info!(
             job_id = %job_id,
             pages_billed = pages_http + pages_browser,
@@ -1201,6 +1230,11 @@ impl AppState {
             TerminalTransition::Applied(snapshot) => Some(*snapshot),
             TerminalTransition::NotTerminal | TerminalTransition::UnknownJob => None,
         };
+        // Captured now (before `terminal_snapshot` is moved into
+        // `on_terminal` below) so webhook delivery still sees this job's
+        // subscriptions even after its accounting/activity tracking is
+        // freed (SCR-72).
+        let webhook_hooks_from_terminal = terminal_snapshot.as_ref().map(|j| j.webhooks.clone());
 
         // A pipeline event for a job the API has stopped (or paused a while
         // ago) means the pipeline missed that control: re-publish it (R-22).
@@ -1570,6 +1604,23 @@ impl AppState {
             }
             _ => {}
         }
+
+        // Deliver webhooks for this job's subscriptions (SCR-72). Captured
+        // from the terminal snapshot when this event just finalized the job
+        // (its accounting/activity tracking is freed by `on_terminal`
+        // above, but the snapshot was taken before that), falling back to
+        // the live in-memory job otherwise.
+        let hooks = webhook_hooks_from_terminal
+            .or_else(|| {
+                self.crawl
+                    .jobs
+                    .read()
+                    .get(job_id)
+                    .map(|j| j.webhooks.clone())
+            })
+            .unwrap_or_default();
+        self.webhook_dispatcher.enqueue(&hooks, job_id, event);
+
         EventOutcome {
             applied: true,
             accounting_touched,
@@ -3389,7 +3440,29 @@ pub(crate) fn validate_crawl_config(config: &CrawlConfig) -> Result<(), ApiError
         validate_proxy_config(proxy)
             .map_err(|msg| ApiError::new(format!("proxy: {msg}"), "validation_error"))?;
     }
+    for hook in &config.webhooks {
+        webhooks::validate_webhook_config(hook)
+            .map_err(|msg| ApiError::new(format!("webhooks: {msg}"), "validation_error"))?;
+    }
     Ok(())
+}
+
+/// Redact secrets in a `CrawlConfig` before it's persisted (`jobs.config`)
+/// or ever handed back over the API (`JobStatusResponse::config`): the
+/// Meilisearch API key and any webhook auth secrets (SCR-72). The real,
+/// unredacted config is never stored — only kept transiently in this
+/// request and, for webhooks specifically, in `JobState::webhooks` for
+/// delivery.
+fn redact_crawl_config_for_storage(config: &CrawlConfig) -> Option<serde_json::Value> {
+    let mut v = serde_json::to_value(config).ok()?;
+    if let Some(obj) = v.get_mut("meilisearch").and_then(|ms| ms.as_object_mut()) {
+        obj.insert(
+            "api_key".to_string(),
+            serde_json::Value::String("***".to_string()),
+        );
+    }
+    webhooks::redact_webhooks_json(&mut v);
+    Some(v)
 }
 
 /// Reject proxy configs the crawler cannot use safely: no proxy at all
@@ -3614,17 +3687,9 @@ pub(crate) async fn do_create_crawl(
     job.start_urls = config.start_urls.clone();
     job.max_pages = config.max_pages;
     // Redact sensitive fields before persisting config to database
-    job.config = serde_json::to_value(&config).ok().map(|mut v| {
-        if let Some(ms) = v.get_mut("meilisearch") {
-            if let Some(obj) = ms.as_object_mut() {
-                obj.insert(
-                    "api_key".to_string(),
-                    serde_json::Value::String("***".to_string()),
-                );
-            }
-        }
-        v
-    });
+    job.config = redact_crawl_config_for_storage(&config);
+    // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
+    job.webhooks = config.webhooks.clone();
     if replace_index {
         // Store Meilisearch connection info for post-crawl stale document cleanup
         job.swap_meilisearch_url = Some(config.meilisearch.url.clone());
@@ -3824,17 +3889,9 @@ pub(crate) async fn do_create_crawl(
         j.start_urls = config.start_urls.clone();
         j.max_pages = config.max_pages;
         // Redact sensitive fields before persisting config to database
-        j.config = serde_json::to_value(&config).ok().map(|mut v| {
-            if let Some(ms) = v.get_mut("meilisearch") {
-                if let Some(obj) = ms.as_object_mut() {
-                    obj.insert(
-                        "api_key".to_string(),
-                        serde_json::Value::String("***".to_string()),
-                    );
-                }
-            }
-            v
-        });
+        j.config = redact_crawl_config_for_storage(&config);
+        // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
+        j.webhooks = config.webhooks.clone();
         j.started_at = Some(chrono::Utc::now());
         j.swap_temp_index = None;
         j.swap_meilisearch_url = replace_url;
@@ -5921,6 +5978,13 @@ pub async fn run_with_bus(
     let config = AppConfig::from_args(&args);
     let db_pool = auth_state.as_ref().map(|a| a.pool.clone());
     let stripe_client = args.stripe_secret_key.as_ref().map(::stripe::Client::new);
+    if args.allow_private_ips {
+        warn!("ALLOW_PRIVATE_IPS is set: SSRF protection for webhook deliveries is off");
+    }
+    let webhook_client = scrapix_crawler::safe_client_builder(None, args.allow_private_ips)
+        .build()
+        .expect("failed to build webhook delivery HTTP client");
+    let webhook_dispatcher = webhooks::WebhookDispatcher::new(webhook_client);
     let state = Arc::new(AppState::new(
         producer,
         config,
@@ -5934,6 +5998,7 @@ pub async fn run_with_bus(
         db_pool,
         stripe_client,
         analytics_state.clone(),
+        webhook_dispatcher,
     ));
 
     // Recover active jobs from Postgres on startup
@@ -6827,6 +6892,67 @@ mod tests {
         .unwrap();
         assert!(validate_crawl_config(&cfg).is_ok());
     }
+
+    fn config_with_webhook(webhook: serde_json::Value) -> CrawlConfig {
+        serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a", "webhooks": [webhook]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_private_ip_webhook_url() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://10.0.0.5/hook",
+            "http://169.254.169.254/hook",
+        ] {
+            let cfg = config_with_webhook(serde_json::json!({
+                "url": url, "events": ["crawl_completed"]
+            }));
+            let err = validate_crawl_config(&cfg).expect_err(&format!("{url} must be rejected"));
+            let json = serde_json::to_value(&err).unwrap();
+            assert_eq!(json["code"], "validation_error", "{url}");
+        }
+    }
+
+    #[test]
+    fn accepts_public_webhook_url() {
+        let cfg = config_with_webhook(serde_json::json!({
+            "url": "https://example.com/hook", "events": ["crawl_completed"]
+        }));
+        assert!(validate_crawl_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_sha256_hmac_webhook_algorithm() {
+        let cfg = config_with_webhook(serde_json::json!({
+            "url": "https://example.com/hook",
+            "events": ["crawl_completed"],
+            "auth": {"hmac": {"secret": "s", "algorithm": "sha1", "header": "X-Sig"}}
+        }));
+        assert!(validate_crawl_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn webhook_secrets_are_redacted_in_persisted_config() {
+        let cfg = config_with_webhook(serde_json::json!({
+            "url": "https://example.com/hook",
+            "events": ["crawl_completed"],
+            "auth": {"bearer": {"token": "top-secret-token"}}
+        }));
+        let redacted = redact_crawl_config_for_storage(&cfg).expect("config must serialize");
+        let hook = &redacted["webhooks"][0];
+        assert_eq!(hook["auth"]["bearer"]["token"], "***");
+        assert_eq!(
+            hook["url"], "https://example.com/hook",
+            "non-secret fields survive"
+        );
+        // The real config (not the redacted JSON) still carries the real
+        // secret — this is what gets copied onto JobState::webhooks for
+        // in-memory delivery.
+        assert_eq!(cfg.webhooks[0].url, "https://example.com/hook");
+    }
 }
 
 /// Job lifecycle (R5/R9) tests on a DB-less `AppState` over the in-process bus.
@@ -6858,6 +6984,11 @@ mod lifecycle_tests {
             None,
             None,
             None,
+            webhooks::WebhookDispatcher::new(
+                scrapix_crawler::safe_client_builder(None, true)
+                    .build()
+                    .unwrap(),
+            ),
         )
     }
 
@@ -7931,6 +8062,43 @@ mod lifecycle_tests {
         assert_eq!(emails(&state), 0);
 
         assert_eq!(state.cancel("nope").unwrap_err(), ControlError::NotFound);
+    }
+
+    /// SCR-72: cancelling a job doesn't go through the pipeline's
+    /// `CrawlEvent` stream, so `cancel()` must fire a synthetic
+    /// `crawl_failed` webhook (`data.error == "cancelled"`) itself for any
+    /// hook subscribed to `CrawlFailed`.
+    #[tokio::test]
+    async fn cancel_fires_crawl_failed_cancelled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "j1", 1);
+        state.update_job("j1", |j| {
+            j.webhooks = vec![scrapix_core::WebhookConfig {
+                url: format!("{}/hook", server.uri()),
+                events: vec![scrapix_core::WebhookEvent::CrawlFailed],
+                auth: None,
+                enabled: true,
+                timeout_ms: 5_000,
+                name: None,
+            }];
+        });
+
+        state.cancel("j1").expect("running job cancels");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // wiremock asserts `.expect(1)` was met when `server` drops.
     }
 
     /// Cancel after the job completed is rejected: the terminal status is

@@ -421,6 +421,15 @@ pub struct JobState {
     /// in arrival order. In-memory only (not persisted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+
+    /// The job's webhook subscriptions, with auth secrets intact (unlike
+    /// `config`, which is redacted before being stored). In-memory only:
+    /// never persisted to Postgres (see `jobs_db::row_to_job_state`, which
+    /// always sets this to empty), so webhook delivery for a job recovered
+    /// after a restart is a known gap — the job's `config.webhooks` still
+    /// carries the URLs but its secrets read back as `"***"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhooks: Vec<crate::config::WebhookConfig>,
 }
 
 impl JobState {
@@ -448,6 +457,7 @@ impl JobState {
             swap_meilisearch_url: None,
             swap_meilisearch_api_key: None,
             warnings: Vec::new(),
+            webhooks: Vec::new(),
         }
     }
 

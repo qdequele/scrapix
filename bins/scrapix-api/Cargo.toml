@@ -81,3 +81,6 @@ hmac = "0.12"
 # OpenAPI
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+[dev-dependencies]
+wiremock = { workspace = true }

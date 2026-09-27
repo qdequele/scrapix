@@ -145,6 +145,9 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
         max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
         verbose: args.verbose,
     };
 
@@ -442,6 +445,9 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
         max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
         verbose: args.verbose,
     };
 

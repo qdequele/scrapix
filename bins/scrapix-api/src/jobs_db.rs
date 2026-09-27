@@ -70,6 +70,10 @@ fn row_to_job_state(row: &sqlx::postgres::PgRow) -> JobState {
         swap_meilisearch_url: row.get("swap_meilisearch_url"),
         swap_meilisearch_api_key: row.get("swap_meilisearch_api_key"),
         warnings: Vec::new(),
+        // Webhook auth secrets are never persisted (redacted before the
+        // `config` blob is stored); a job recovered from Postgres after a
+        // restart has no real webhooks to deliver to.
+        webhooks: Vec::new(),
     }
 }
 
