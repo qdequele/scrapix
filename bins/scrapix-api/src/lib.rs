@@ -216,6 +216,10 @@ struct DiagnosticsState {
     /// observability; one request per billed terminal job)
     job_bills_requested: std::sync::atomic::AtomicU64,
     pages_billed: std::sync::atomic::AtomicU64,
+    /// Total crawl credits computed by `bill_job` (test hook / observability;
+    /// incremented even without a DB pool configured, so tests can assert on
+    /// the computed amount without a live Postgres — D4/R4).
+    credits_billed: std::sync::atomic::AtomicI64,
 }
 
 /// ClickHouse analytics batchers
@@ -326,6 +330,7 @@ impl AppState {
                 job_emails_requested: std::sync::atomic::AtomicU64::new(0),
                 job_bills_requested: std::sync::atomic::AtomicU64::new(0),
                 pages_billed: std::sync::atomic::AtomicU64::new(0),
+                credits_billed: std::sync::atomic::AtomicI64::new(0),
             },
             analytics: AnalyticsState {
                 request_batcher,
@@ -635,7 +640,13 @@ impl AppState {
         // idle detector completed, and so billed, such jobs). A Replace
         // cleanup failure stays unbilled, as before.
         if decision == Finalize::FailStalled {
-            self.bill_job(job_id, job.account_id.as_ref(), acc.pages_crawled_ok);
+            self.bill_job(
+                job_id,
+                job.account_id.as_ref(),
+                acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
+                acc.pages_browser,
+                acc.pages_ai,
+            );
         }
 
         // Tell the pipeline to release the job's state.
@@ -733,13 +744,24 @@ impl AppState {
             j.completed_at = Some(chrono::Utc::now());
             j.clone()
         };
-        let pages = self
-            .crawl
-            .accounting
-            .read()
-            .get(job_id)
-            .map_or(snapshot.pages_crawled, |acc| acc.pages_crawled_ok);
-        self.bill_job(job_id, snapshot.account_id.as_ref(), pages);
+        let (pages_http, pages_browser, pages_ai) =
+            self.crawl.accounting.read().get(job_id).map_or(
+                (snapshot.pages_crawled, 0, 0),
+                |acc| {
+                    (
+                        acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
+                        acc.pages_browser,
+                        acc.pages_ai,
+                    )
+                },
+            );
+        self.bill_job(
+            job_id,
+            snapshot.account_id.as_ref(),
+            pages_http,
+            pages_browser,
+            pages_ai,
+        );
         // Terminal: free the accounting so the completion loop never
         // finalizes it, and persist it (checked by the next flush before
         // the job's held acks are released).
@@ -747,7 +769,11 @@ impl AppState {
         self.crawl.paused_since.lock().remove(job_id);
         self.write_terminal(snapshot.clone());
         self.publish_control(job_id, JobAction::Cancel);
-        info!(job_id = %job_id, pages_billed = pages, "Job cancelled");
+        info!(
+            job_id = %job_id,
+            pages_billed = pages_http + pages_browser,
+            "Job cancelled"
+        );
         Ok(snapshot)
     }
 
@@ -803,8 +829,22 @@ impl AppState {
     /// Deduct crawl credits for `pages` pages of a finished job
     /// (fire-and-forget). Cost per page depends on the job's crawler_type and
     /// enabled features. The single billing path for terminal jobs.
-    fn bill_job(&self, job_id: &str, account_id: Option<&String>, pages: u64) {
-        if pages == 0 {
+    /// D4/R4: credits are computed from what was actually delivered, not
+    /// from the job's static config — `pages_http`/`pages_browser` split the
+    /// crawled-ok page count by whether each page was actually rendered
+    /// with a browser (`PageCrawled.js_rendered`), and `pages_ai` counts
+    /// only pages that were actually AI-enriched (`DocumentIndexed.ai_enriched`),
+    /// regardless of whether the job merely had AI features enabled.
+    fn bill_job(
+        &self,
+        job_id: &str,
+        account_id: Option<&String>,
+        pages_http: u64,
+        pages_browser: u64,
+        pages_ai: u64,
+    ) {
+        let total_pages = pages_http + pages_browser;
+        if total_pages == 0 {
             return;
         }
         self.diagnostics
@@ -812,30 +852,33 @@ impl AppState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.diagnostics
             .pages_billed
-            .fetch_add(pages, std::sync::atomic::Ordering::Relaxed);
-        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
-            return;
-        };
-        // Extract crawler_type and features from persisted job config
-        let (crawler_type, features) = {
+            .fetch_add(total_pages, std::sync::atomic::Ordering::Relaxed);
+
+        // Extract features from persisted job config (crawler_type is no
+        // longer needed here: base rate now follows the per-page split
+        // above, not the job's declared crawler_type).
+        let features = {
             let jobs = self.crawl.jobs.read();
             jobs.get(job_id)
                 .and_then(|j| j.config.as_ref())
-                .map(|cfg| {
-                    let ct = cfg
-                        .get("crawler_type")
-                        .and_then(|v| serde_json::from_value::<CrawlerType>(v.clone()).ok())
-                        .unwrap_or_default();
-                    let ft = cfg
-                        .get("features")
+                .and_then(|cfg| {
+                    cfg.get("features")
                         .and_then(|v| serde_json::from_value::<FeaturesConfig>(v.clone()).ok())
-                        .unwrap_or_default();
-                    (ct, ft)
                 })
                 .unwrap_or_default()
         };
-        let cost_per_page = billing::crawl_credits_per_page(&crawler_type, &features);
-        let credits = pages as i64 * cost_per_page;
+        let credits = billing::crawl_credits(pages_http, pages_browser, pages_ai, &features);
+        self.diagnostics
+            .credits_billed
+            .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
+
+        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
+            return;
+        };
+        let description = format!(
+            "Job {} ({} http + {} browser pages, {} AI-enriched)",
+            job_id, pages_http, pages_browser, pages_ai
+        );
         let job_id = job_id.to_string();
         let stripe_cl = self.stripe_client.clone();
         tokio::spawn(async move {
@@ -843,10 +886,7 @@ impl AppState {
                 &pool,
                 &acct_id,
                 credits,
-                &format!(
-                    "Job {} ({} pages × {} credits/page)",
-                    job_id, pages, cost_per_page
-                ),
+                &description,
                 stripe_cl.as_ref(),
             )
             .await
@@ -855,7 +895,6 @@ impl AppState {
                     info!(
                         account_id = %acct_id,
                         credits_deducted = credits,
-                        cost_per_page,
                         new_balance,
                         job_id = %job_id,
                         "Crawl credits deducted"
@@ -1229,86 +1268,6 @@ impl AppState {
             }
         }
 
-        // Persist crawl completion to request_events (1 row per crawl job at completion)
-        if let Some(ref batcher) = self.analytics.request_batcher {
-            if let CrawlEvent::JobCompleted {
-                account_id,
-                pages_crawled,
-                bytes_downloaded,
-                duration_secs,
-                errors,
-                ..
-            } = event
-            {
-                // Look up the job to get the start URL, crawler_type, AI feature flags, and api_key_id
-                let (
-                    url,
-                    domain,
-                    is_js_rendered,
-                    has_ai_summary,
-                    has_ai_extraction,
-                    job_api_key_id,
-                ) = {
-                    let jobs = self.crawl.jobs.read();
-                    jobs.get(job_id)
-                        .map(|j| {
-                            let url = j.start_urls.first().cloned().unwrap_or_default();
-                            let domain = extract_domain(&url).unwrap_or_default();
-                            let cfg = j.config.as_ref().and_then(|v| {
-                                serde_json::from_value::<CrawlConfig>(v.clone()).ok()
-                            });
-                            let is_js = cfg
-                                .as_ref()
-                                .map(|c| c.crawler_type == CrawlerType::Browser)
-                                .unwrap_or(false);
-                            let has_summary = cfg
-                                .as_ref()
-                                .map(|c| c.features.ai_summary.as_ref().is_some_and(|t| t.enabled))
-                                .unwrap_or(false);
-                            let has_extraction = cfg
-                                .as_ref()
-                                .map(|c| {
-                                    c.features.ai_extraction.as_ref().is_some_and(|t| t.enabled)
-                                })
-                                .unwrap_or(false);
-                            let api_key_id = j.api_key_id.clone().unwrap_or_default();
-                            (url, domain, is_js, has_summary, has_extraction, api_key_id)
-                        })
-                        .unwrap_or_default()
-                };
-
-                let ch_event = ClickHouseRequestEvent {
-                    account_id: account_id.clone().unwrap_or_default(),
-                    api_key_id: job_api_key_id,
-                    job_id: job_id.to_string(),
-                    operation: "crawl".to_string(),
-                    url,
-                    domain,
-                    status_code: if *errors > 0 { 0 } else { 200 },
-                    duration_ms: (*duration_secs * 1000) as u32,
-                    content_length: *bytes_downloaded,
-                    error: String::new(),
-                    js_rendered: is_js_rendered,
-                    ai_summary: has_ai_summary,
-                    ai_extraction: has_ai_extraction,
-                    ai_prompt_tokens: 0,
-                    ai_completion_tokens: 0,
-                    ai_model: String::new(),
-                    urls_found: 0,
-                    pages_fetched: *pages_crawled as u32,
-                    search_query: String::new(),
-                    results_count: 0,
-                    timestamp: time::OffsetDateTime::now_utc(),
-                };
-                let batcher = batcher.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = batcher.add(ch_event).await {
-                        debug!(error = %e, "Failed to add crawl request event to ClickHouse");
-                    }
-                });
-            }
-        }
-
         // Fold the event into the job's exact work accounting (R5). Only jobs
         // with an entry (created with the job / recovered at startup, freed
         // once terminal) are tracked, so late events for a finished job do
@@ -1318,6 +1277,11 @@ impl AppState {
         // An accounting event at or below the job's persisted high-water mark
         // was already folded into the restored snapshot and is skipped
         // (redelivery after a restart, R-19).
+        //
+        // Computed here (before the ClickHouse request-event block below) so
+        // that block can report what was actually delivered (js_rendered /
+        // AI flags from `pages_browser`/`pages_ai`) instead of the job's
+        // static config (D4/R4).
         let (accounted, accounting_touched) = {
             let mut accs = self.crawl.accounting.write();
             match accs.get_mut(job_id) {
@@ -1341,6 +1305,76 @@ impl AppState {
         };
         if accounting_touched {
             self.crawl.dirty_jobs.write().insert(job_id.to_string());
+        }
+
+        // Persist crawl completion to request_events (1 row per crawl job at completion)
+        if let Some(ref batcher) = self.analytics.request_batcher {
+            if let CrawlEvent::JobCompleted {
+                account_id,
+                pages_crawled,
+                bytes_downloaded,
+                duration_secs,
+                errors,
+                ..
+            } = event
+            {
+                // Look up the job to get the start URL and api_key_id. Note:
+                // js_rendered/AI flags below come from delivered-page
+                // accounting, not from this config lookup (D4/R4).
+                let (url, domain, job_api_key_id) = {
+                    let jobs = self.crawl.jobs.read();
+                    jobs.get(job_id)
+                        .map(|j| {
+                            let url = j.start_urls.first().cloned().unwrap_or_default();
+                            let domain = extract_domain(&url).unwrap_or_default();
+                            let api_key_id = j.api_key_id.clone().unwrap_or_default();
+                            (url, domain, api_key_id)
+                        })
+                        .unwrap_or_default()
+                };
+
+                // D4/R4: bill and report what was actually delivered, not
+                // what the job's config merely enabled. Falls back to
+                // treating all pages as plain HTTP/no-AI if the accounting
+                // entry was already freed (shouldn't happen: `accounted` is
+                // captured above, before `on_terminal` runs).
+                let (pages_browser, pages_ai) = accounted
+                    .as_ref()
+                    .map(|c| (c.pages_browser, c.pages_ai))
+                    .unwrap_or((0, 0));
+                let is_js_rendered = pages_browser > 0;
+                let has_ai = pages_ai > 0;
+
+                let ch_event = ClickHouseRequestEvent {
+                    account_id: account_id.clone().unwrap_or_default(),
+                    api_key_id: job_api_key_id,
+                    job_id: job_id.to_string(),
+                    operation: "crawl".to_string(),
+                    url,
+                    domain,
+                    status_code: if *errors > 0 { 0 } else { 200 },
+                    duration_ms: (*duration_secs * 1000) as u32,
+                    content_length: *bytes_downloaded,
+                    error: String::new(),
+                    js_rendered: is_js_rendered,
+                    ai_summary: has_ai,
+                    ai_extraction: has_ai,
+                    ai_prompt_tokens: 0,
+                    ai_completion_tokens: 0,
+                    ai_model: String::new(),
+                    urls_found: 0,
+                    pages_fetched: *pages_crawled as u32,
+                    search_query: String::new(),
+                    results_count: 0,
+                    timestamp: time::OffsetDateTime::now_utc(),
+                };
+                let batcher = batcher.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = batcher.add(ch_event).await {
+                        debug!(error = %e, "Failed to add crawl request event to ClickHouse");
+                    }
+                });
+            }
         }
 
         match event {
@@ -1458,8 +1492,22 @@ impl AppState {
                     }),
                 );
 
-                // Deduct credits for crawled pages (fire-and-forget)
-                self.bill_job(job_id, account_id.as_ref(), *pages_crawled);
+                // Deduct credits for crawled pages (fire-and-forget). D4/R4:
+                // bill for what was actually delivered — `accounted` (folded
+                // above, before `on_terminal` frees the accounting entry)
+                // carries the browser/AI-enriched page counts.
+                let (pages_browser, pages_ai) = accounted
+                    .as_ref()
+                    .map(|c| (c.pages_browser, c.pages_ai))
+                    .unwrap_or((0, 0));
+                let pages_http = pages_crawled.saturating_sub(pages_browser);
+                self.bill_job(
+                    job_id,
+                    account_id.as_ref(),
+                    pages_http,
+                    pages_browser,
+                    pages_ai,
+                );
             }
             CrawlEvent::JobFailed { error, .. } => {
                 // No temp index cleanup needed — Replace strategy writes directly to the real index.
@@ -1665,6 +1713,13 @@ struct AccountedCounters {
     pages_failed: u64,
     documents_indexed: u64,
     bytes_downloaded: u64,
+    /// Of `pages_crawled_ok`, how many were actually rendered with a
+    /// browser (`PageCrawled.js_rendered`) — D4/R4: billing and reporting
+    /// must reflect what was delivered, not what the job's config enabled.
+    pages_browser: u64,
+    /// Of the indexed documents, how many were actually AI-enriched
+    /// (`DocumentIndexed.ai_enriched`) — see `pages_browser`.
+    pages_ai: u64,
 }
 
 impl From<&JobAccounting> for AccountedCounters {
@@ -1674,6 +1729,8 @@ impl From<&JobAccounting> for AccountedCounters {
             pages_failed: acc.pages_failed,
             documents_indexed: acc.documents_indexed,
             bytes_downloaded: acc.bytes_downloaded,
+            pages_browser: acc.pages_browser,
+            pages_ai: acc.pages_ai,
         }
     }
 }
@@ -7655,6 +7712,100 @@ mod lifecycle_tests {
         let d = &state.diagnostics;
         assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
         assert_eq!(d.pages_billed.load(Ordering::Relaxed), 1);
+    }
+
+    /// D4/R4: a completed job with a mix of plain-HTTP, browser-rendered and
+    /// AI-enriched pages bills exactly the credits for what was delivered —
+    /// not the whole job at the browser rate, and not AI credits for pages
+    /// that were never AI-enriched. Uses the DB-less `credits_billed`
+    /// diagnostic hook (no Postgres needed, matching the other billing
+    /// tests in this module).
+    #[tokio::test]
+    async fn completed_job_with_mixed_delivery_bills_expected_credits() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "mix", 3);
+
+        // AI features enabled on the job (surcharge = 5 + 5 = 10/page), no
+        // other features, crawler_type is irrelevant to billing now.
+        let features = FeaturesConfig::from_cli_args(
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            Some("extract".to_string()),
+        );
+        state.update_job("mix", |j| {
+            j.config = Some(serde_json::json!({ "features": features }));
+        });
+
+        state.process_event("mix", &progress("mix", 3, 3, 0));
+        // m1: plain HTTP, not AI-enriched.
+        state.process_event(
+            "mix",
+            &CrawlEvent::PageCrawled {
+                job_id: "mix".into(),
+                account_id: None,
+                url: "https://a.test/1".into(),
+                status: 200,
+                content_length: 0,
+                duration_ms: 0,
+                timestamp: 0,
+                links_published: 0,
+                url_message_id: "m1".into(),
+                js_rendered: false,
+                sitemap_pending: false,
+            },
+        );
+        // m2 and m3: browser-rendered; only m3 is AI-enriched.
+        for id in ["m2", "m3"] {
+            state.process_event(
+                "mix",
+                &CrawlEvent::PageCrawled {
+                    job_id: "mix".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    status: 200,
+                    content_length: 0,
+                    duration_ms: 0,
+                    timestamp: 0,
+                    links_published: 0,
+                    url_message_id: id.into(),
+                    js_rendered: true,
+                    sitemap_pending: false,
+                },
+            );
+        }
+        for (id, ai_enriched) in [("m1", false), ("m2", false), ("m3", true)] {
+            state.process_event(
+                "mix",
+                &CrawlEvent::DocumentIndexed {
+                    job_id: "mix".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    document_id: format!("d-{id}"),
+                    timestamp: 0,
+                    url_message_id: id.into(),
+                    ai_enriched,
+                },
+            );
+        }
+
+        state
+            .finalize_job("mix", Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(state.get_job("mix").unwrap().status, JobStatus::Completed);
+
+        let d = &state.diagnostics;
+        assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
+        // 1 http page + 2 browser pages delivered.
+        assert_eq!(d.pages_billed.load(Ordering::Relaxed), 3);
+        // 1 http (1 credit) + 2 browser (2 credits each = 4) + 1 AI-enriched
+        // page (10 credits surcharge) = 15. Not 3 * 12 = 36, which is what
+        // the old per-job browser+AI rate would have charged.
+        assert_eq!(d.credits_billed.load(Ordering::Relaxed), 15);
     }
 
     /// A decision computed up front is re-validated right before finalizing

@@ -212,6 +212,16 @@ pub fn crawl_credits_per_page(crawler_type: &CrawlerType, features: &FeaturesCon
     scrapix_billing::crawl_credits_per_page(crawler_type, features)
 }
 
+/// Re-export delivery-based crawl credit calculation directly (D4/R4).
+pub fn crawl_credits(
+    pages_http: u64,
+    pages_browser: u64,
+    pages_ai: u64,
+    features: &FeaturesConfig,
+) -> i64 {
+    scrapix_billing::crawl_credits(pages_http, pages_browser, pages_ai, features)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
