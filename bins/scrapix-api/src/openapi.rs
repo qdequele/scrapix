@@ -63,6 +63,7 @@ use utoipa::OpenApi;
         crate::ScrapeResponse,
         crate::ScrapeFormat,
         crate::ScrapeMetadata,
+        crate::ScreenshotRequestOptions,
         crate::AiOptions,
         crate::AiExtractOptions,
         crate::AiFieldDef,

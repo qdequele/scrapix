@@ -24,7 +24,8 @@ Scrape a single URL and return extracted content in the requested formats.
   "exclude_selectors": [],
   "include_selectors": [],
   "extract": {},
-  "ai": null
+  "ai": null,
+  "screenshot": { "full_page": true }
 }
 ```
 
@@ -42,6 +43,8 @@ Scrape a single URL and return extracted content in the requested formats.
 | `include_selectors` | string[] | `[]` | CSS selectors to keep (extract only from these) |
 | `extract` | object | `{}` | Custom CSS selector extraction (see below) |
 | `ai` | object | `null` | AI enrichment options (see below) |
+| `render_js` | boolean | `false` | Render the page in a headless browser before extracting content |
+| `screenshot` | object | `null` | Screenshot options: `{ "full_page": true }` (default) captures the whole page, `false` only the viewport. Used when `formats` includes `screenshot` |
 
 ### Output Formats
 
@@ -55,8 +58,34 @@ Scrape a single URL and return extracted content in the requested formats.
 | `metadata` | Title, description, Open Graph, Twitter cards |
 | `schema` | JSON-LD and microdata structured data |
 | `blocks` | Content split by headings into blocks |
+| `screenshot` | Base64-encoded PNG of the rendered page (see [Screenshots](#screenshots)) |
 
-When `formats` is empty, all formats are returned.
+When `formats` is empty, `markdown`, `content` and `metadata` are returned.
+
+### Screenshots
+
+Requesting the `screenshot` format renders the page in the server's headless
+browser — `render_js` is enabled automatically — and returns the capture as a
+base64-encoded PNG in the `screenshot` field:
+
+```json
+{
+  "url": "https://example.com",
+  "formats": ["screenshot", "markdown"],
+  "screenshot": { "full_page": false }
+}
+```
+
+- `full_page: true` (default) captures the whole scrollable page. Very long
+  pages are cropped to 16,384 px.
+- `full_page: false` captures only the viewport (1920×1080 by default).
+- The screenshot is taken after the page loaded, from the same page load whose
+  HTML is extracted.
+- If the server has no browser available, the request fails with
+  `render_js_unavailable` instead of silently omitting the screenshot.
+
+The screenshot format costs +1 credit, like the other feature formats (see
+[Billing](/guides/billing#scrape)).
 
 ### Custom CSS Extraction
 
@@ -169,6 +198,7 @@ Requires `OPENAI_API_KEY` environment variable.
     "price": "$29.99",
     "images": ["https://example.com/img1.jpg", "https://example.com/img2.jpg"]
   },
+  "screenshot": "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAIAAABnsVYUAAA...",
   "ai": {
     "summary": "This article discusses...",
     "extract": {

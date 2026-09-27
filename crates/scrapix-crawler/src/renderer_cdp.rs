@@ -26,9 +26,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
-use chromiumoxide::page::ScreenshotParams;
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ClipRect,
+};
+use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::Page;
 use chrono::Utc;
 use futures::StreamExt;
@@ -52,12 +56,40 @@ use crate::safe_dns::is_public_ip;
 /// shared browser has a single, worker-level proxy.
 pub const BROWSER_PROXY_UNSUPPORTED: &str = "per-job proxy is not supported for browser rendering";
 
-/// Per-render request shaping (from the job's `FetchOptions`).
-#[derive(Default)]
-struct PageRequest<'a> {
-    user_agent: Option<&'a str>,
-    extra_headers: &'a [(String, String)],
-    respect_robots: Option<bool>,
+/// Tallest full-page screenshot captured, in CSS pixels. Longer pages are
+/// cropped to this height (Chrome cannot rasterize arbitrarily tall
+/// surfaces, and the base64 payload would be unbounded).
+pub const MAX_SCREENSHOT_HEIGHT: f64 = 16_384.0;
+
+/// Screenshot capture options for [`CdpRenderer::render_page`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenshotOptions {
+    /// Capture the whole scrollable page (up to [`MAX_SCREENSHOT_HEIGHT`])
+    /// instead of only the viewport.
+    pub full_page: bool,
+}
+
+impl Default for ScreenshotOptions {
+    fn default() -> Self {
+        Self { full_page: true }
+    }
+}
+
+/// Per-page options for one render. Everything here is applied to the
+/// single page opened for the render — the browser itself is shared (by
+/// every job on a worker, or every `/scrape` request on the API), so no
+/// per-request setting may be applied browser-wide.
+#[derive(Debug, Clone, Default)]
+pub struct PageOptions {
+    /// User agent for this page (`None` keeps the browser's).
+    pub user_agent: Option<String>,
+    /// Extra request headers for this page (`Network.setExtraHTTPHeaders`;
+    /// applies to every request the page makes, subresources included).
+    pub extra_headers: Vec<(String, String)>,
+    /// `Some(false)` skips the robots.txt check (the SSRF check always runs).
+    pub respect_robots: Option<bool>,
+    /// Capture a PNG screenshot after the page loaded.
+    pub screenshot: Option<ScreenshotOptions>,
 }
 
 /// HTTP status of the main document as reported by CDP (`Network.Response.status`),
@@ -174,6 +206,46 @@ pub(crate) async fn check_render_final_url(
                 "redirected to a target that could not be checked: {other}"
             )),
         })
+}
+
+/// Capture a PNG of `page` as it is now.
+///
+/// Full-page captures use `captureBeyondViewport` with a clip of the
+/// document's content size instead of resizing the emulated viewport (as
+/// chromiumoxide's `Page::screenshot` does), so the page layout — e.g. a
+/// mobile emulation — is not disturbed by the capture.
+async fn capture_screenshot(page: &Page, opts: ScreenshotOptions) -> Result<Vec<u8>> {
+    let _ = page.bring_to_front().await;
+    let mut params = CaptureScreenshotParams::builder().format(CaptureScreenshotFormat::Png);
+    if opts.full_page {
+        let metrics = page
+            .layout_metrics()
+            .await
+            .map_err(|e| CdpError::ScreenshotFailed(format!("layout metrics: {e}")))?;
+        let width = metrics.css_content_size.width.ceil();
+        let height = metrics
+            .css_content_size
+            .height
+            .ceil()
+            .min(MAX_SCREENSHOT_HEIGHT);
+        if width >= 1.0 && height >= 1.0 {
+            params = params.capture_beyond_viewport(true).clip(ClipRect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+                scale: 1.0,
+            });
+        }
+    }
+    let shot = page
+        .execute(params.build())
+        .await
+        .map_err(|e| CdpError::ScreenshotFailed(e.to_string()))?;
+    let data: &str = shot.result.data.as_ref();
+    BASE64
+        .decode(data)
+        .map_err(|e| CdpError::ScreenshotFailed(format!("invalid screenshot data: {e}")).into())
 }
 
 /// Errors specific to CDP rendering
@@ -379,12 +451,45 @@ pub struct CdpRenderer {
     robots_cache: Option<Arc<RobotsCache>>,
     console_logs: Arc<Mutex<Vec<String>>>,
     js_errors: Arc<Mutex<Vec<String>>>,
+    /// This browser's own profile directory, removed when the renderer
+    /// is closed or dropped.
+    user_data_dir: std::path::PathBuf,
+}
+
+/// A fresh, unique profile directory for one browser launch.
+///
+/// chromiumoxide defaults every browser to the same
+/// `$TMPDIR/chromiumoxide-runner` profile, so a second browser on the host
+/// (the API and a worker, two workers, parallel tests) fails to start on
+/// Chrome's profile lock — and cookies/storage would persist across
+/// restarts. Each renderer gets its own directory instead.
+fn unique_user_data_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "scrapix-chrome-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        nanos
+    ))
+}
+
+impl Drop for CdpRenderer {
+    fn drop(&mut self) {
+        // Best effort: the browser process may still be exiting.
+        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+    }
 }
 
 impl CdpRenderer {
     /// Create a new CDP renderer with the given configuration
     pub async fn new(config: CdpConfig, robots_cache: Option<Arc<RobotsCache>>) -> Result<Self> {
-        let browser_config = Self::build_browser_config(&config)?;
+        let user_data_dir = unique_user_data_dir();
+        let browser_config = Self::build_browser_config(&config, &user_data_dir)?;
 
         let (browser, mut handler) = Browser::launch(browser_config)
             .await
@@ -408,6 +513,7 @@ impl CdpRenderer {
             robots_cache,
             console_logs: Arc::new(Mutex::new(Vec::new())),
             js_errors: Arc::new(Mutex::new(Vec::new())),
+            user_data_dir,
         })
     }
 
@@ -417,10 +523,24 @@ impl CdpRenderer {
     }
 
     /// Build browser configuration from our config
-    fn build_browser_config(config: &CdpConfig) -> Result<BrowserConfig> {
-        let mut builder = BrowserConfig::builder();
+    fn build_browser_config(
+        config: &CdpConfig,
+        user_data_dir: &std::path::Path,
+    ) -> Result<BrowserConfig> {
+        let mut builder = BrowserConfig::builder().user_data_dir(user_data_dir);
 
+        // (Previously ignored: `CHROME_PATH` never reached the launcher.)
+        if let Some(ref path) = config.executable_path {
+            builder = builder.chrome_executable(path);
+        }
+
+        // `with_head()` means *headful*: only use it when headless is off.
+        // (This was inverted, which launched a visible browser — or failed
+        // to launch at all on display-less servers — when `headless` was
+        // requested.)
         if config.headless {
+            builder = builder.new_headless_mode();
+        } else {
             builder = builder.with_head();
         }
 
@@ -433,11 +553,18 @@ impl CdpRenderer {
             builder = builder.arg("--disable-setuid-sandbox");
         }
 
-        // Set viewport via window size argument
+        // Set viewport via window size argument, and make the per-page
+        // emulated viewport match it (chromiumoxide otherwise emulates
+        // 800x600 on every page).
         builder = builder.arg(format!(
             "--window-size={},{}",
             config.viewport_width, config.viewport_height
         ));
+        builder = builder.viewport(Viewport {
+            width: config.viewport_width,
+            height: config.viewport_height,
+            ..Viewport::default()
+        });
 
         // Set user agent via argument
         if let Some(ref user_agent) = config.user_agent {
@@ -473,13 +600,14 @@ impl CdpRenderer {
     /// Render a page and return the result
     #[instrument(skip(self), fields(url = %url))]
     pub async fn render(&self, url: &str) -> Result<RenderResult> {
-        self.render_checked(url, &PageRequest::default()).await
+        self.render_page(url, &PageOptions::default()).await
     }
 
     /// Render a page after the SSRF check and (unless `req.respect_robots`
-    /// is `Some(false)`) the robots.txt check, applying the per-request user
-    /// agent and extra headers to the page before navigating.
-    async fn render_checked(&self, url: &str, req: &PageRequest<'_>) -> Result<RenderResult> {
+    /// is `Some(false)`) the robots.txt check, applying the per-page options
+    /// (user agent, headers, screenshot, ...) to the page only.
+    #[instrument(skip(self, req), fields(url = %url))]
+    pub async fn render_page(&self, url: &str, req: &PageOptions) -> Result<RenderResult> {
         let robots = if req.respect_robots == Some(false) {
             None
         } else {
@@ -513,7 +641,7 @@ impl CdpRenderer {
         &self,
         page: &Page,
         url: &str,
-        req: &PageRequest<'_>,
+        req: &PageOptions,
         start: Instant,
     ) -> Result<RenderResult> {
         // Setup page
@@ -521,7 +649,7 @@ impl CdpRenderer {
 
         // Per-job user agent and headers, set on this page only (the browser
         // is shared by every job on the worker).
-        if let Some(ua) = req.user_agent {
+        if let Some(ua) = req.user_agent.as_deref() {
             page.set_user_agent(ua.to_string())
                 .await
                 .map_err(|e| CdpError::NavigationFailed(format!("set user agent: {e}")))?;
@@ -561,6 +689,11 @@ impl CdpRenderer {
             .unwrap_or_else(|| url.to_string());
         // A redirect must not land the browser on an internal target.
         check_render_final_url(&final_url, url, self.config.allow_private_ips).await?;
+
+        let screenshot = match req.screenshot {
+            Some(opts) => Some(capture_screenshot(page, opts).await?),
+            None => None,
+        };
 
         // Get HTML content
         let html = page
@@ -609,7 +742,7 @@ impl CdpRenderer {
             status,
             headers,
             content_type,
-            screenshot: None,
+            screenshot,
             console_logs,
             js_errors,
             render_duration,
@@ -651,37 +784,17 @@ impl CdpRenderer {
         Ok(navigation)
     }
 
-    /// Render a page and take a screenshot
+    /// Render a page and take a full-page screenshot of it (one page load:
+    /// the screenshot shows exactly the document whose HTML is returned).
     pub async fn render_with_screenshot(&self, url: &str) -> Result<RenderResult> {
-        let mut result = self.render(url).await?;
-
-        // Create a new page for screenshot (since we closed the original)
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| CdpError::PoolExhausted)?;
-
-        let page = self
-            .browser
-            .new_page(url)
-            .await
-            .map_err(|e| CdpError::LaunchFailed(format!("Failed to create page: {}", e)))?;
-
-        self.setup_page(&page).await?;
-        self.wait_for_page(&page).await?;
-
-        // Take screenshot
-        let screenshot = page
-            .screenshot(ScreenshotParams::builder().full_page(true).build())
-            .await
-            .map_err(|e| CdpError::ScreenshotFailed(e.to_string()))?;
-
-        let _ = page.close().await;
-
-        result.screenshot = Some(screenshot);
-
-        Ok(result)
+        self.render_page(
+            url,
+            &PageOptions {
+                screenshot: Some(ScreenshotOptions { full_page: true }),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// Execute JavaScript on a page and return the result
@@ -759,14 +872,19 @@ impl CdpRenderer {
         if options.proxy.is_some() {
             return Err(ScrapixError::Config(BROWSER_PROXY_UNSUPPORTED.to_string()));
         }
-        let req = PageRequest {
-            user_agent: options.user_agent.as_deref(),
-            extra_headers: &options.extra_headers,
+        let req = PageOptions {
+            user_agent: options.user_agent.clone(),
+            extra_headers: options.extra_headers.clone(),
             respect_robots: options.respect_robots,
+            ..Default::default()
         };
-        let result = self.render_checked(&url.url, &req).await?;
+        let result = self.render_page(&url.url, &req).await?;
+        Ok(Self::raw_page(url, result))
+    }
 
-        Ok(RawPage {
+    /// Convert a render into the crawler's `RawPage`.
+    pub fn raw_page(url: &CrawlUrl, result: RenderResult) -> RawPage {
+        RawPage {
             url: url.url.clone(),
             final_url: result.final_url,
             status: result.status,
@@ -776,7 +894,21 @@ impl CdpRenderer {
             js_rendered: true,
             fetched_at: Utc::now(),
             fetch_duration_ms: result.render_duration.as_millis() as u64,
-        })
+        }
+    }
+
+    /// Close the browser and wait for its process to exit (dropping the
+    /// renderer only kills it in the background). A browser that does not
+    /// close within 2s is killed.
+    pub async fn close(mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.browser.close()).await;
+        if tokio::time::timeout(Duration::from_secs(2), self.browser.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.browser.kill().await;
+            let _ = self.browser.wait().await;
+        }
     }
 
     /// Get the current configuration
@@ -989,6 +1121,14 @@ mod tests {
                 "{final_url}"
             );
         }
+    }
+
+    #[test]
+    fn each_browser_gets_its_own_profile_dir() {
+        let a = unique_user_data_dir();
+        let b = unique_user_data_dir();
+        assert_ne!(a, b);
+        assert!(a.starts_with(std::env::temp_dir()));
     }
 
     #[test]

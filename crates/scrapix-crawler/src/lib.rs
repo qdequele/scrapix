@@ -99,8 +99,8 @@ pub use sitemap::{
 // CDP renderer re-exports
 #[cfg(feature = "browser-cdp")]
 pub use renderer_cdp::{
-    CdpConfig, CdpError, CdpRenderer, CdpRendererBuilder, RenderResult, WaitUntil,
-    BROWSER_PROXY_UNSUPPORTED,
+    CdpConfig, CdpError, CdpRenderer, CdpRendererBuilder, PageOptions, RenderResult,
+    ScreenshotOptions, WaitUntil, BROWSER_PROXY_UNSUPPORTED, MAX_SCREENSHOT_HEIGHT,
 };
 
 // WebDriver renderer re-exports

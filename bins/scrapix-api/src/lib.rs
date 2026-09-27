@@ -51,6 +51,9 @@ pub mod openapi;
 pub mod stripe;
 pub mod webhooks;
 
+#[cfg(test)]
+mod scrape_browser_tests;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -65,6 +68,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
 use futures::{stream::Stream, SinkExt, StreamExt as FuturesStreamExt};
 use parking_lot::RwLock;
@@ -83,8 +87,8 @@ use scrapix_core::{
     JobStatus, PdfConfig,
 };
 use scrapix_crawler::{
-    is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, RobotsCache,
-    RobotsConfig, SitemapParser, WaitUntil,
+    is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, PageOptions,
+    RobotsCache, RobotsConfig, ScreenshotOptions, SitemapParser, WaitUntil,
 };
 use scrapix_extractor::{
     ContentBlock, ExtractedMetadata, ExtractedSchema, Extractor, SelectorDefinition,
@@ -2542,6 +2546,41 @@ struct ScrapeRequest {
     /// AI enrichment options
     #[serde(default)]
     ai: Option<AiOptions>,
+
+    /// Screenshot options, used when `formats` includes `"screenshot"`
+    #[serde(default)]
+    screenshot: Option<ScreenshotRequestOptions>,
+}
+
+impl Default for ScrapeRequest {
+    /// The request the API would deserialize from `{"url": ""}`: every
+    /// field at its serde default. Lets internal callers (batch scrape,
+    /// extract) build requests with `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            formats: Vec::new(),
+            only_main_content: default_true_bool(),
+            include_links: false,
+            render_js: false,
+            timeout_ms: default_timeout(),
+            headers: HashMap::new(),
+            exclude_selectors: Vec::new(),
+            include_selectors: Vec::new(),
+            extract: HashMap::new(),
+            ai: None,
+            screenshot: None,
+        }
+    }
+}
+
+/// Screenshot options for /scrape
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+struct ScreenshotRequestOptions {
+    /// Capture the whole scrollable page (default) instead of only the
+    /// viewport. Very long pages are cropped to 16384 px.
+    #[serde(default = "default_true_bool")]
+    full_page: bool,
 }
 
 /// AI enrichment options for /scrape
@@ -2658,6 +2697,10 @@ struct ScrapeResponse {
     /// AI enrichment results
     #[serde(skip_serializing_if = "Option::is_none")]
     ai: Option<AiResult>,
+
+    /// Base64-encoded PNG screenshot (if format "screenshot" requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screenshot: Option<String>,
 
     /// Warning message (e.g. "AI requires OPENAI_API_KEY")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3081,10 +3124,24 @@ pub(crate) async fn perform_scrape(
         ));
     }
 
-    let use_browser = request.render_js;
+    // Features that only the browser can provide force the browser path.
+    let screenshot_opts = request
+        .formats
+        .contains(&ScrapeFormat::Screenshot)
+        .then(|| ScreenshotOptions {
+            full_page: request.screenshot.as_ref().map_or(true, |s| s.full_page),
+        });
+    let use_browser = request.render_js || screenshot_opts.is_some();
     if use_browser && state.browser_renderer.is_none() {
+        let reason = if request.render_js {
+            "JS rendering"
+        } else {
+            "The screenshot format"
+        };
         return Err(ApiError::new(
-            "JS rendering is not available (Chrome/Chromium not found on this server)",
+            format!(
+                "{reason} requires a browser, which is not available on this server (Chrome/Chromium not found)"
+            ),
             "render_js_unavailable",
         ));
     }
@@ -3094,20 +3151,23 @@ pub(crate) async fn perform_scrape(
     // (a) Fetch using browser renderer or HTTP fetcher
     let crawl_url = CrawlUrl::seed(&request.url);
 
-    let raw_page = if use_browser {
-        // Use browser renderer for JS rendering
-        state
-            .browser_renderer
-            .as_ref()
-            .unwrap()
-            .fetch(&crawl_url)
+    let mut screenshot_png: Option<Vec<u8>> = None;
+    let raw_page = if let Some(renderer) = state.browser_renderer.as_ref().filter(|_| use_browser) {
+        let page_options = PageOptions {
+            screenshot: screenshot_opts,
+            ..Default::default()
+        };
+        let mut rendered = renderer
+            .render_page(&request.url, &page_options)
             .await
             .map_err(|e| {
                 ApiError::new(
                     format!("Failed to render URL with browser: {}", e),
                     "fetch_error",
                 )
-            })?
+            })?;
+        screenshot_png = rendered.screenshot.take();
+        CdpRenderer::raw_page(&crawl_url, rendered)
     } else if request.headers.is_empty() {
         // Use the shared fetcher (connection pooling, DNS cache, retries)
         state
@@ -3128,8 +3188,9 @@ pub(crate) async fn perform_scrape(
             )
         })?);
 
-        let mut builder =
-            HttpFetcherBuilder::new().timeout(Duration::from_millis(request.timeout_ms));
+        let mut builder = HttpFetcherBuilder::new()
+            .timeout(Duration::from_millis(request.timeout_ms))
+            .allow_private_ips(state.fetcher.allows_private_ips());
 
         // Add custom headers (block sensitive headers to prevent injection attacks)
         const BLOCKED_HEADERS: &[&str] = &[
@@ -3213,6 +3274,7 @@ pub(crate) async fn perform_scrape(
             blocks: None,
             extract: None,
             ai: None,
+            screenshot: None,
             warning: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
@@ -3488,6 +3550,7 @@ pub(crate) async fn perform_scrape(
         blocks,
         extract: custom_extract,
         ai: ai_result,
+        screenshot: screenshot_png.map(|png| BASE64.encode(png)),
         warning,
         status_code,
         scrape_duration_ms,

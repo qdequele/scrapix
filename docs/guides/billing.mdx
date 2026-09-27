@@ -114,6 +114,11 @@ Every API action consumes credits from your account balance. The cost depends on
 
 Base formats (`html`, `rawHtml`, `content`) are free — they don't add to the cost.
 
+Browser rendering on `/scrape` has no surcharge of its own: a request that
+renders in the browser (`render_js: true`, or implicitly because it asks for
+the `screenshot` format) costs the same as the HTTP path. The `screenshot`
+format itself is +1 like any other feature format.
+
 **Examples:**
 
 | Request | Credits |
@@ -121,6 +126,8 @@ Base formats (`html`, `rawHtml`, `content`) are free — they don't add to the c
 | `formats: ["html"]` | 1 |
 | `formats: ["markdown", "metadata"]` | 2 |
 | `formats: ["markdown", "metadata", "links", "schema"]` | 4 |
+| `formats: ["screenshot"]` (browser rendering is implied) | 1 |
+| `formats: ["markdown", "screenshot"]` | 2 |
 | `formats: ["markdown"]` + AI summary | 6 |
 | `formats: ["markdown", "metadata"]` + AI summary + AI extraction | 12 |
 

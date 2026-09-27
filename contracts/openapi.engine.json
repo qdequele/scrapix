@@ -2385,6 +2385,17 @@
             "type": "boolean",
             "description": "Render JavaScript before extracting content (requires Chrome/Chromium)"
           },
+          "screenshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenshotRequestOptions",
+                "description": "Screenshot options, used when `formats` includes `\"screenshot\"`"
+              }
+            ]
+          },
           "timeout_ms": {
             "type": "integer",
             "format": "int64",
@@ -2512,6 +2523,13 @@
             "description": "Time taken to scrape in milliseconds",
             "minimum": 0
           },
+          "screenshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64-encoded PNG screenshot (if format \"screenshot\" requested)"
+          },
           "status_code": {
             "type": "integer",
             "format": "int32",
@@ -2532,6 +2550,16 @@
               "null"
             ],
             "description": "Warning message (e.g. \"AI requires OPENAI_API_KEY\")"
+          }
+        }
+      },
+      "ScreenshotRequestOptions": {
+        "type": "object",
+        "description": "Screenshot options for /scrape",
+        "properties": {
+          "full_page": {
+            "type": "boolean",
+            "description": "Capture the whole scrollable page (default) instead of only the\nviewport. Very long pages are cropped to 16384 px."
           }
         }
       },

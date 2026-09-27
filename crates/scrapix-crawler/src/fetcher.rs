@@ -342,6 +342,12 @@ impl HttpFetcher {
         Ok(client)
     }
 
+    /// Whether this fetcher may fetch hosts resolving to private addresses
+    /// (so one-off fetchers built for a request can inherit the setting).
+    pub fn allows_private_ips(&self) -> bool {
+        self.config.allow_private_ips
+    }
+
     /// Create a new HTTP fetcher with default configuration
     pub fn with_defaults(robots_cache: Arc<RobotsCache>) -> Result<Self> {
         Self::new(FetcherConfig::default(), robots_cache)
