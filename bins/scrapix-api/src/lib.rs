@@ -3025,7 +3025,22 @@ async fn scrape_url(
     let account_ctx =
         extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
+    perform_scrape(&state, &account_ctx, &request)
+        .await
+        .map(Json)
+}
 
+/// The full /scrape pipeline for one URL: credit pre-check, fetch (HTTP or
+/// browser), extraction, AI enrichment, analytics and credit deduction.
+///
+/// Shared by `POST /scrape` and the endpoints that scrape many URLs on the
+/// caller's behalf (batch scrape, extract). Permission checks are the
+/// caller's job; everything else, including per-URL billing, happens here.
+pub(crate) async fn perform_scrape(
+    state: &Arc<AppState>,
+    account_ctx: &Option<AccountContext>,
+    request: &ScrapeRequest,
+) -> Result<ScrapeResponse, ApiError> {
     if let Some(ref ctx) = account_ctx {
         debug!(account_id = %ctx.account_id, "Scrape request from account");
     }
@@ -3184,7 +3199,7 @@ async fn scrape_url(
             );
         }
 
-        return Ok(Json(ScrapeResponse {
+        return Ok(ScrapeResponse {
             success: false,
             url: final_url,
             markdown: None,
@@ -3201,7 +3216,7 @@ async fn scrape_url(
             warning: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
-        }));
+        });
     }
 
     let original_html = raw_page.html;
@@ -3459,7 +3474,7 @@ async fn scrape_url(
         "Scrape completed"
     );
 
-    Ok(Json(ScrapeResponse {
+    Ok(ScrapeResponse {
         success: true,
         url: final_url,
         markdown,
@@ -3476,7 +3491,7 @@ async fn scrape_url(
         warning,
         status_code,
         scrape_duration_ms,
-    }))
+    })
 }
 
 /// Log a scrape request to ClickHouse request_events (fire-and-forget).
