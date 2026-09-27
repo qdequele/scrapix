@@ -18,15 +18,18 @@ import {
   AlertCircle,
   Sparkles,
   ScanText,
+  Download,
+  MousePointerClick,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { codeToHtml } from "shiki";
 import { HighlightedJson } from "@/components/highlighted-json";
-import type { ScrapeResult, Job, DocumentInfo, OcrInfo } from "@/lib/api-types";
+import type { ScrapeResult, Job, DocumentInfo, OcrInfo, ActionErrorDetails } from "@/lib/api-types";
 import { fetchJobStatus } from "@/lib/api";
 import { formatBytes } from "./file-drop";
 
@@ -37,6 +40,8 @@ interface ResultPanelProps {
   mode: "scrape" | "crawl" | "parse";
   loading: boolean;
   error: string | null;
+  /** Set when the scrape failed with a 422 `action_error` */
+  actionError?: ActionErrorDetails | null;
 }
 
 const SCRAPE_EXAMPLE = `curl -X POST https://scrapix.meilisearch.dev/scrape \\
@@ -77,9 +82,14 @@ export function ResultPanel({
   mode,
   loading,
   error,
+  actionError,
 }: ResultPanelProps) {
   if (loading) {
     return <LoadingState />;
+  }
+
+  if (actionError) {
+    return <ActionErrorState details={actionError} />;
   }
 
   if (error) {
@@ -146,6 +156,89 @@ function ErrorState({ error }: { error: string }) {
       <p className="text-xs text-muted-foreground max-w-md text-center">
         {error}
       </p>
+    </div>
+  );
+}
+
+function ActionErrorState({ details }: { details: ActionErrorDetails }) {
+  return (
+    <div className="flex flex-col items-center justify-center h-full gap-3 py-20">
+      <MousePointerClick className="h-10 w-10 text-destructive opacity-60" />
+      <p className="text-sm text-destructive font-medium">
+        Action #{details.action_index + 1} failed
+      </p>
+      <div className="flex items-center gap-2">
+        <Badge variant="outline" className="font-mono text-xs">
+          actions[{details.action_index}]
+        </Badge>
+        <Badge variant="destructive" className="font-mono text-xs">
+          {details.action_type}
+        </Badge>
+      </div>
+      <p className="text-xs text-muted-foreground max-w-md text-center break-words">
+        {details.message}
+      </p>
+      <p className="text-[11px] text-muted-foreground max-w-md text-center">
+        Nothing was captured and the request was not billed. Fix this action
+        and run the scrape again.
+      </p>
+    </div>
+  );
+}
+
+/** Approximate decoded size of a base64 string, in KB. */
+function base64Kb(b64: string): number {
+  return Math.round((b64.length * 3) / 4 / 1024);
+}
+
+function screenshotFilename(url: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/[^a-z0-9.-]/gi, "_");
+    return `screenshot-${host}.png`;
+  } catch {
+    return "screenshot.png";
+  }
+}
+
+/** The result with its base64 screenshot elided (too large to highlight). */
+function withoutScreenshot(result: ScrapeResult): ScrapeResult {
+  if (!result.screenshot) return result;
+  return {
+    ...result,
+    screenshot: `<base64 PNG, ${base64Kb(result.screenshot)} KB, see the Screenshot tab>`,
+  };
+}
+
+export function ScreenshotView({
+  screenshot,
+  url,
+}: {
+  screenshot: string;
+  url: string;
+}) {
+  const dataUrl = `data:image/png;base64,${screenshot}`;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">
+          PNG · {base64Kb(screenshot)} KB
+        </span>
+        <Button variant="outline" size="sm" className="h-7 text-xs" asChild>
+          <a href={dataUrl} download={screenshotFilename(url)}>
+            <Download className="mr-1.5 h-3 w-3" />
+            Download
+          </a>
+        </Button>
+      </div>
+      <Image
+        src={dataUrl}
+        alt={`Screenshot of ${url}`}
+        width={0}
+        height={0}
+        sizes="100vw"
+        unoptimized
+        className="h-auto w-full rounded-md border"
+      />
     </div>
   );
 }
@@ -263,6 +356,7 @@ function CrawlResultState({
 
 function ScrapeResultState({ result }: { result: ScrapeResult }) {
   const availableTabs: { value: string; label: string }[] = [];
+  if (result.screenshot) availableTabs.push({ value: "screenshot", label: "Screenshot" });
   if (result.markdown) availableTabs.push({ value: "markdown", label: "Markdown" });
   if (result.metadata) availableTabs.push({ value: "metadata", label: "Metadata" });
   if (result.links && result.links.length > 0)
@@ -278,6 +372,7 @@ function ScrapeResultState({ result }: { result: ScrapeResult }) {
     availableTabs.push({ value: "extract", label: "Extract" });
   if (result.ai?.summary) availableTabs.push({ value: "ai-summary", label: "AI Summary" });
   if (result.ai?.extract) availableTabs.push({ value: "ai-extract", label: "AI Extract" });
+  if (result.actions) availableTabs.push({ value: "actions", label: "Actions" });
   availableTabs.push({ value: "json", label: "JSON" });
 
   const defaultTab = availableTabs[0]?.value ?? "json";
@@ -356,6 +451,16 @@ function ScrapeResultState({ result }: { result: ScrapeResult }) {
         </TabsList>
 
         <div className="flex-1 min-h-0 border rounded-md">
+          {result.screenshot && (
+            <TabsContent value="screenshot" className="h-full m-0">
+              <ScrollArea className="h-full">
+                <div className="p-4">
+                  <ScreenshotView screenshot={result.screenshot} url={result.url} />
+                </div>
+              </ScrollArea>
+            </TabsContent>
+          )}
+
           {result.markdown && (
             <TabsContent value="markdown" className="h-full m-0">
               <ScrollArea className="h-full">
@@ -492,9 +597,43 @@ function ScrapeResultState({ result }: { result: ScrapeResult }) {
             </TabsContent>
           )}
 
+          {result.actions && (
+            <TabsContent value="actions" className="h-full m-0">
+              <ScrollArea className="h-full">
+                <div className="p-4 space-y-3">
+                  <p className="text-xs text-muted-foreground">
+                    Values returned by the{" "}
+                    <code className="font-mono">execute_javascript</code>{" "}
+                    actions, in order.
+                  </p>
+                  {result.actions.javascript_returns.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      All actions ran. None of them was an{" "}
+                      <code className="font-mono">execute_javascript</code>{" "}
+                      action.
+                    </p>
+                  ) : (
+                    result.actions.javascript_returns.map((value, i) => (
+                      <div key={i} className="space-y-1">
+                        <Badge variant="outline" className="font-mono text-[10px]">
+                          javascript_returns[{i}]
+                        </Badge>
+                        <div className="rounded-md border">
+                          <HighlightedJson
+                            code={JSON.stringify(value, null, 2) ?? "null"}
+                          />
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </ScrollArea>
+            </TabsContent>
+          )}
+
           <TabsContent value="json" className="h-full m-0">
             <ScrollArea className="h-full">
-              <HighlightedJson code={JSON.stringify(result, null, 2)} />
+              <HighlightedJson code={JSON.stringify(withoutScreenshot(result), null, 2)} />
             </ScrollArea>
           </TabsContent>
         </div>

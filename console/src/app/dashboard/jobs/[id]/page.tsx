@@ -27,7 +27,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -54,6 +54,8 @@ import type { JobStatus, WsServerMessage, CrawlEvent } from "@/lib/api-types";
 import { toast } from "sonner";
 import { formatDistanceToNow } from "date-fns";
 import { cn } from "@/lib/utils";
+import { JobResults } from "../job-results";
+import { JobTypeBadge } from "../job-type-badge";
 
 type LogCategory = "crawled" | "indexed" | "error" | "info";
 
@@ -64,8 +66,8 @@ interface LogEntry {
   category: LogCategory;
 }
 
-const LOG_TABS = ["all", "crawled", "indexed", "errors"] as const;
-type LogTab = (typeof LOG_TABS)[number];
+type LogTab = "all" | "crawled" | "indexed" | "errors";
+type DetailTab = "overview" | "results";
 
 const statusVariant: Record<
   string,
@@ -87,8 +89,34 @@ function getHostname(url: string): string | null {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function ConfigSummary({ config }: { config: Record<string, any> }) {
+function Section({
+  title,
+  entries,
+}: {
+  title: string;
+  entries: [string, string][];
+}) {
+  if (entries.length === 0) return null;
+  return (
+    <div>
+      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+        {title}
+      </p>
+      <div className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1">
+        {entries.map(([label, value]) => (
+          <div key={label} className="contents">
+            <span className="text-sm text-muted-foreground capitalize">
+              {label}
+            </span>
+            <span className="text-sm font-mono truncate">{value}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ConfigSummary({ config }: { config: Record<string, unknown> }) {
   const mainFields: [string, string][] = [];
   const meilisearch: [string, string][] = [];
   const patterns: [string, string][] = [];
@@ -154,31 +182,6 @@ function ConfigSummary({ config }: { config: Record<string, any> }) {
     }
   }
 
-  const Section = ({
-    title,
-    entries,
-  }: {
-    title: string;
-    entries: [string, string][];
-  }) =>
-    entries.length > 0 ? (
-      <div>
-        <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
-          {title}
-        </p>
-        <div className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1">
-          {entries.map(([label, value]) => (
-            <div key={label} className="contents">
-              <span className="text-sm text-muted-foreground capitalize">
-                {label}
-              </span>
-              <span className="text-sm font-mono truncate">{value}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    ) : null;
-
   return (
     <div className="space-y-4">
       <Section title="Crawl" entries={mainFields} />
@@ -221,7 +224,12 @@ function JobConfigPanel({ status }: { status: JobStatus }) {
         <CardDescription>Parameters used to start this job</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3 flex-1 overflow-y-auto">
-        <ConfigRow label="Index">{status.index_uid}</ConfigRow>
+        <ConfigRow label="Type">
+          <JobTypeBadge type={status.job_type} />
+        </ConfigRow>
+        {status.index_uid && (
+          <ConfigRow label="Index">{status.index_uid}</ConfigRow>
+        )}
 
         {status.start_urls && status.start_urls.length > 0 && (
           <div className="grid grid-cols-[auto_1fr] gap-x-6 items-start">
@@ -273,6 +281,7 @@ export default function JobDetailPage() {
   const [logSearch, setLogSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [selectedTab, setSelectedTab] = useState<DetailTab | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState<number | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -573,6 +582,9 @@ export default function JobDetailPage() {
   };
 
   const isRunning = status?.status === "running";
+  const isCrawl = !status?.job_type || status.job_type === "crawl";
+  // Batch scrape and extract jobs are about their results: open that tab first.
+  const detailTab: DetailTab = selectedTab ?? (isCrawl ? "overview" : "results");
 
   const hostname = status?.start_urls?.[0]
     ? getHostname(status.start_urls[0])
@@ -620,6 +632,7 @@ export default function JobDetailPage() {
                   {status.status}
                 </Badge>
               )}
+              {status && <JobTypeBadge type={status.job_type} />}
             </div>
             <div className="flex items-center gap-2 text-muted-foreground">
               <p className="font-mono text-xs">{id}</p>
@@ -651,7 +664,7 @@ export default function JobDetailPage() {
               </>
             )}
             <DropdownMenuItem
-              disabled={isRunning || !status?.config}
+              disabled={isRunning || !status?.config || !isCrawl}
               onClick={handleRetry}
             >
               <RotateCw className="mr-2 h-4 w-4" />
@@ -693,7 +706,7 @@ export default function JobDetailPage() {
             <Card className="border-t-2 border-t-primary">
               <CardContent className="py-4">
                 <span className="text-sm text-muted-foreground">
-                  Pages Crawled
+                  {isCrawl ? "Pages Crawled" : "Pages Scraped"}
                 </span>
                 <div className="flex items-baseline gap-2 mt-1">
                   <span className="text-2xl font-bold">
@@ -750,124 +763,149 @@ export default function JobDetailPage() {
             </Card>
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-[2fr_3fr] flex-1 min-h-0">
-            <JobConfigPanel status={status} />
+          <Tabs
+            value={detailTab}
+            onValueChange={(v) => setSelectedTab(v as DetailTab)}
+            className="flex-1 min-h-0 gap-3"
+          >
+            <TabsList>
+              <TabsTrigger value="overview" className="text-xs px-3">
+                Overview
+              </TabsTrigger>
+              <TabsTrigger value="results" className="text-xs px-3">
+                Results
+              </TabsTrigger>
+            </TabsList>
 
-            {/* Live Event Log */}
-            <Card className="h-full flex flex-col overflow-hidden">
-              <CardHeader className="pb-3 shrink-0">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <CardTitle className="text-base">Live Events</CardTitle>
-                    <CardDescription>Real-time crawl activity</CardDescription>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {logs.length > 0 && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 text-xs gap-1"
-                        onClick={() => setLogs([])}
-                      >
-                        <Eraser className="h-3 w-3" />
-                        Clear
-                      </Button>
-                    )}
-                    {logs.length > 0 && (
-                      <Badge variant="outline" className="text-xs">
-                        {filteredLogs.length} events
-                      </Badge>
-                    )}
-                    <Badge variant={wsConnected ? "default" : "outline"}>
-                      <span
-                        className={cn(
-                          "mr-1.5 inline-block h-1.5 w-1.5 rounded-full",
-                          wsConnected ? "bg-green-400" : "bg-gray-400",
-                        )}
-                      />
-                      {wsConnected ? "Live" : "Disconnected"}
-                    </Badge>
-                  </div>
-                </div>
+            <TabsContent value="results" className="flex-1 min-h-0 overflow-y-auto">
+              <Card>
+                <CardContent className="py-4">
+                  <JobResults jobId={id} />
+                </CardContent>
+              </Card>
+            </TabsContent>
 
-                {/* Search + filter row */}
-                <div className="flex items-center gap-2 mt-2">
-                  <div className="relative flex-1">
-                    <Input
-                      placeholder="Search events…"
-                      value={logSearch}
-                      onChange={(e) => setLogSearch(e.target.value)}
-                      className="h-8 text-xs pr-7"
-                    />
-                    {logSearch && (
-                      <button
-                        type="button"
-                        aria-label="Clear search"
-                        onClick={() => setLogSearch("")}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </div>
-                  <Tabs
-                    value={logFilter}
-                    onValueChange={(v) => setLogFilter(v as LogTab)}
-                  >
-                    <TabsList className="h-8">
-                      <TabsTrigger value="all" className="text-xs h-7 px-2.5">
-                        All
-                      </TabsTrigger>
-                      <TabsTrigger value="crawled" className="text-xs h-7 px-2.5">
-                        Crawled
-                      </TabsTrigger>
-                      <TabsTrigger value="indexed" className="text-xs h-7 px-2.5">
-                        Indexed
-                      </TabsTrigger>
-                      <TabsTrigger value="errors" className="text-xs h-7 px-2.5">
-                        Errors
-                      </TabsTrigger>
-                    </TabsList>
-                  </Tabs>
-                </div>
-              </CardHeader>
-              <CardContent className="flex-1 min-h-0 px-4 pb-4 pt-0">
-                <ScrollArea className="h-full rounded-lg bg-muted">
-                  <div
-                    ref={logRef}
-                    className="p-4 font-mono text-xs space-y-0.5"
-                  >
-                    {filteredLogs.length === 0 ? (
-                      <div className="flex items-center justify-center h-48 text-muted-foreground">
-                        <p>
-                          {isTerminal && historyLoading
-                            ? "Loading event history..."
-                            : logs.length === 0
-                              ? "Waiting for events..."
-                              : "No matching events"}
-                        </p>
+            <TabsContent value="overview" className="flex-1 min-h-0">
+              <div className="grid gap-4 lg:grid-cols-[2fr_3fr] h-full min-h-0">
+                <JobConfigPanel status={status} />
+
+                {/* Live Event Log */}
+                <Card className="h-full flex flex-col overflow-hidden">
+                  <CardHeader className="pb-3 shrink-0">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <CardTitle className="text-base">Live Events</CardTitle>
+                        <CardDescription>Real-time crawl activity</CardDescription>
                       </div>
-                    ) : (
-                      filteredLogs.map((log, i) => (
-                        <div
-                          key={i}
-                          className={cn(
-                            "py-0.5",
-                            log.variant === "error" && "text-destructive",
-                          )}
-                        >
-                          <span className="text-muted-foreground select-none">
-                            [{log.time}]
-                          </span>{" "}
-                          {log.message}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </ScrollArea>
-              </CardContent>
-            </Card>
-          </div>
+                      <div className="flex items-center gap-2">
+                        {logs.length > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs gap-1"
+                            onClick={() => setLogs([])}
+                          >
+                            <Eraser className="h-3 w-3" />
+                            Clear
+                          </Button>
+                        )}
+                        {logs.length > 0 && (
+                          <Badge variant="outline" className="text-xs">
+                            {filteredLogs.length} events
+                          </Badge>
+                        )}
+                        <Badge variant={wsConnected ? "default" : "outline"}>
+                          <span
+                            className={cn(
+                              "mr-1.5 inline-block h-1.5 w-1.5 rounded-full",
+                              wsConnected ? "bg-green-400" : "bg-gray-400",
+                            )}
+                          />
+                          {wsConnected ? "Live" : "Disconnected"}
+                        </Badge>
+                      </div>
+                    </div>
+
+                    {/* Search + filter row */}
+                    <div className="flex items-center gap-2 mt-2">
+                      <div className="relative flex-1">
+                        <Input
+                          placeholder="Search events…"
+                          value={logSearch}
+                          onChange={(e) => setLogSearch(e.target.value)}
+                          className="h-8 text-xs pr-7"
+                        />
+                        {logSearch && (
+                          <button
+                            type="button"
+                            aria-label="Clear search"
+                            onClick={() => setLogSearch("")}
+                            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                      <Tabs
+                        value={logFilter}
+                        onValueChange={(v) => setLogFilter(v as LogTab)}
+                      >
+                        <TabsList className="h-8">
+                          <TabsTrigger value="all" className="text-xs h-7 px-2.5">
+                            All
+                          </TabsTrigger>
+                          <TabsTrigger value="crawled" className="text-xs h-7 px-2.5">
+                            Crawled
+                          </TabsTrigger>
+                          <TabsTrigger value="indexed" className="text-xs h-7 px-2.5">
+                            Indexed
+                          </TabsTrigger>
+                          <TabsTrigger value="errors" className="text-xs h-7 px-2.5">
+                            Errors
+                          </TabsTrigger>
+                        </TabsList>
+                      </Tabs>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="flex-1 min-h-0 px-4 pb-4 pt-0">
+                    <ScrollArea className="h-full rounded-lg bg-muted">
+                      <div
+                        ref={logRef}
+                        className="p-4 font-mono text-xs space-y-0.5"
+                      >
+                        {filteredLogs.length === 0 ? (
+                          <div className="flex items-center justify-center h-48 text-muted-foreground">
+                            <p>
+                              {isTerminal && historyLoading
+                                ? "Loading event history..."
+                                : logs.length === 0
+                                  ? "Waiting for events..."
+                                  : "No matching events"}
+                            </p>
+                          </div>
+                        ) : (
+                          filteredLogs.map((log, i) => (
+                            <div
+                              key={i}
+                              className={cn(
+                                "py-0.5",
+                                log.variant === "error" && "text-destructive",
+                              )}
+                            >
+                              <span className="text-muted-foreground select-none">
+                                [{log.time}]
+                              </span>{" "}
+                              {log.message}
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </ScrollArea>
+                  </CardContent>
+                </Card>
+              </div>
+            </TabsContent>
+          </Tabs>
         </>
       )}
 
