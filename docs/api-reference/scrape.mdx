@@ -24,7 +24,8 @@ Scrape a single URL and return extracted content in the requested formats.
   "exclude_selectors": [],
   "include_selectors": [],
   "extract": {},
-  "ai": null
+  "ai": null,
+  "screenshot": { "full_page": true }
 }
 ```
 
@@ -42,6 +43,11 @@ Scrape a single URL and return extracted content in the requested formats.
 | `include_selectors` | string[] | `[]` | CSS selectors to keep (extract only from these) |
 | `extract` | object | `{}` | Custom CSS selector extraction (see below) |
 | `ai` | object | `null` | AI enrichment options (see below) |
+| `render_js` | boolean | `false` | Render the page in a headless browser before extracting content |
+| `screenshot` | object | `null` | Screenshot options: `{ "full_page": true }` (default) captures the whole page, `false` only the viewport. Used when `formats` includes `screenshot` |
+| `actions` | object[] | `[]` | Browser actions run after the page loads (see [Page actions](#page-actions)) |
+| `mobile` | boolean | `false` | Render as a phone (see [Mobile emulation](#mobile-emulation)) |
+| `cookies` | object[] | `[]` | Cookies to send (see [Cookies](#cookies)) |
 
 ### Output Formats
 
@@ -55,8 +61,157 @@ Scrape a single URL and return extracted content in the requested formats.
 | `metadata` | Title, description, Open Graph, Twitter cards |
 | `schema` | JSON-LD and microdata structured data |
 | `blocks` | Content split by headings into blocks |
+| `screenshot` | Base64-encoded PNG of the rendered page (see [Screenshots](#screenshots)) |
 
-When `formats` is empty, all formats are returned.
+When `formats` is empty, `markdown`, `content` and `metadata` are returned.
+
+### Screenshots
+
+Requesting the `screenshot` format renders the page in the server's headless
+browser — `render_js` is enabled automatically — and returns the capture as a
+base64-encoded PNG in the `screenshot` field:
+
+```json
+{
+  "url": "https://example.com",
+  "formats": ["screenshot", "markdown"],
+  "screenshot": { "full_page": false }
+}
+```
+
+- `full_page: true` (default) captures the whole scrollable page. Very long
+  pages are cropped to 16,384 px.
+- `full_page: false` captures only the viewport (1920×1080 by default).
+- The screenshot is taken after the page loaded, from the same page load whose
+  HTML is extracted.
+- If the server has no browser available, the request fails with
+  `render_js_unavailable` instead of silently omitting the screenshot.
+
+The screenshot format costs +1 credit, like the other feature formats (see
+[Billing](/guides/billing#scrape)).
+
+### Page actions
+
+`actions` is a list of browser interactions run, in order, after the page
+loads and before content (and any screenshot) is captured — for pages that
+need a click, a scroll or a search before the content you want is there.
+Sending actions enables the browser automatically.
+
+```json
+{
+  "url": "https://example.com/search",
+  "formats": ["markdown", "screenshot"],
+  "actions": [
+    { "type": "write", "selector": "input[name=q]", "text": "meilisearch" },
+    { "type": "press", "key": "Enter" },
+    { "type": "wait", "selector": ".results" },
+    { "type": "scroll", "direction": "down", "amount": 2 },
+    { "type": "click", "selector": "button.load-more" },
+    { "type": "wait", "ms": 500 },
+    { "type": "execute_javascript", "script": "document.querySelectorAll('.result').length" }
+  ]
+}
+```
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `wait` | `ms` **or** `selector` | Sleep `ms` milliseconds (max 30000), or wait until an element matches `selector` |
+| `click` | `selector` | Click the first matching element (waits for it to exist) |
+| `scroll` | `direction` (`up`/`down`, default `down`), `amount` (screens, default `1`) | Scroll the page by `amount` viewport heights |
+| `write` | `selector`, `text` | Focus the first matching element and type `text` into it |
+| `press` | `key` | Press a key on the focused element: `Enter`, `Tab`, `Escape`, `ArrowDown`, `Backspace`, a single character, ... |
+| `execute_javascript` | `script` | Run JavaScript in the page and return its value |
+
+`execute_javascript` returns the value of the script — an expression
+(`document.title`), a promise (awaited), a script using top-level `await`, or
+a function body with `return` (`return {count: 3}`). Values are
+JSON-serialized, in order, in `actions.javascript_returns`; `undefined` and
+non-serializable values (DOM nodes) come back as `null` / `{}`:
+
+```json
+{
+  "success": true,
+  "markdown": "...",
+  "actions": { "javascript_returns": [12] }
+}
+```
+
+**Limits.** At most 50 actions per request. Each action has a 10 second
+timeout (a `wait` with `ms` gets its own duration), and all actions together
+must finish within 30 seconds. A click, key press or script that navigates
+waits (up to 5s) for the new page to load.
+
+**Errors.** The first failing action stops the request with a `422`
+`action_error` naming the action — its content is not returned and the
+request is not billed:
+
+```json
+{
+  "error": "actions[2] (wait) failed: no element matches `.results` within 10.0s",
+  "code": "action_error",
+  "details": { "action_index": 2, "action_type": "wait", "message": "no element matches `.results` within 10.0s" }
+}
+```
+
+Invalid actions (unknown `type`, a `wait` with neither or both of `ms` and
+`selector`, more than 50 actions) are rejected up front with
+`validation_error`.
+
+**Network safety.** Pages driven by actions stay under the same SSRF rules as
+the page itself: every request the page makes — navigations triggered by a
+click or a script, redirects, `fetch`/XHR, subresources — is blocked when it
+targets a private or internal address.
+
+### Mobile emulation
+
+`"mobile": true` renders the page as a phone: a 412×915 viewport at device
+scale 2.625, touch input, and an Android Chrome user agent with matching
+client hints (`Sec-CH-UA-Mobile: ?1`). Responsive sites serve their mobile
+layout, and screenshots are phone-sized. Mobile emulation enables the browser
+automatically.
+
+```json
+{ "url": "https://example.com", "formats": ["markdown", "screenshot"], "mobile": true }
+```
+
+### Cookies
+
+`cookies` are sent with the request on both paths — the HTTP fetch and the
+browser:
+
+```json
+{
+  "url": "https://app.example.com/dashboard",
+  "cookies": [
+    { "name": "session", "value": "abc123" },
+    { "name": "locale", "value": "fr", "domain": "example.com", "path": "/", "secure": true, "http_only": false }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | **required** | Cookie name |
+| `value` | string | **required** | Cookie value (no `;`, `,`, quotes or control characters) |
+| `domain` | string | target host | The target host or one of its parent domains; omitted = host-only cookie for the target |
+| `path` | string | `/` | Cookie path |
+| `secure` | boolean | `false` | HTTPS only |
+| `http_only` | boolean | `false` | Hidden from the page's JavaScript (browser path) |
+
+Cookies can only be set for the site being scraped: a `domain` that does not
+cover the target host is rejected with `validation_error` (at most 50
+cookies). Cookies set by the site during the request — e.g. a login redirect
+that sets a session cookie — are kept for the rest of that request only.
+Each request starts from an empty cookie jar: nothing supplied or received is
+ever visible to another request.
+
+### Browser fingerprint
+
+Pages rendered in the browser see a regular desktop Chrome rather than an
+automated headless one: `navigator.webdriver` is `undefined`, the user agent
+and client hints carry no `HeadlessChrome` marker, and `navigator.plugins`,
+`navigator.languages`, `window.chrome` and the WebGL vendor/renderer strings
+have realistic values.
 
 ### Custom CSS Extraction
 
@@ -169,6 +324,7 @@ Requires `OPENAI_API_KEY` environment variable.
     "price": "$29.99",
     "images": ["https://example.com/img1.jpg", "https://example.com/img2.jpg"]
   },
+  "screenshot": "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAIAAABnsVYUAAA...",
   "ai": {
     "summary": "This article discusses...",
     "extract": {
