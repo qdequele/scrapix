@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scrapix"
+version = "0.1.0"
+description = "Official Python SDK for the Scrapix API: scrape, map, search and crawl the web."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Meilisearch" }]
+requires-python = ">=3.9"
+dependencies = [
+    "anyio>=3.5,<5",
+    "httpx>=0.23,<1",
+    "pydantic>=2.0,<3",
+]
+keywords = ["scrapix", "scraping", "crawler", "web-crawler", "meilisearch", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://scrapix.meilisearch.com"
+Documentation = "https://scrapix.meilisearch.com/docs/sdks/python"
+Repository = "https://github.com/qdequele/scrapix"
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "ruff==0.16.9",
+    "mypy==1.18.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scrapix"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/scrapix", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["src/scrapix/_generated", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+# Keep `Optional[...]` / `Union[...]`: the package supports Python 3.9.
+ignore = ["UP007", "UP045"]
+
+[tool.mypy]
+strict = true
+files = ["src/scrapix"]
+exclude = ["src/scrapix/_generated/"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "scrapix._generated.*"
+ignore_errors = true

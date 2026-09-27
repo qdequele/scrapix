@@ -1,0 +1,62 @@
+{
+  "name": "scrapix",
+  "version": "0.1.0",
+  "description": "Official TypeScript/JavaScript SDK for the Scrapix API: scrape, map, search and crawl the web.",
+  "license": "MIT",
+  "author": "Meilisearch",
+  "homepage": "https://scrapix.meilisearch.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qdequele/scrapix.git",
+    "directory": "sdks/typescript"
+  },
+  "keywords": [
+    "scrapix",
+    "scraping",
+    "crawler",
+    "web-crawler",
+    "meilisearch",
+    "sdk"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "generate": "bash ../generate.sh typescript",
+    "check:generated": "bash ../generate.sh --check typescript",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run check:generated && npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "openapi-typescript": "7.13.0",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}

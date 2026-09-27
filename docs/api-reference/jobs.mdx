@@ -157,13 +157,40 @@ Item fields follow `POST /scrape` (`url`, `markdown`, `html`, `content`, `metada
 
 ### Example
 
-```bash
+<CodeGroup>
+
+```bash curl
 # First page
 curl "http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/results?limit=50"
 
 # Next page
 curl "http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/results?limit=50&cursor=76313a3530"
 ```
+
+```python Python
+from scrapix import Scrapix
+
+client = Scrapix(base_url="http://localhost:8080")
+job_id = "550e8400-e29b-41d4-a716-446655440000"
+
+# Follows `next` for you; wait=True keeps polling a running job until it ends
+for item in client.iter_job_results(job_id, page_size=50):
+    print(item.url, item.success)
+```
+
+```ts TypeScript
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix({ baseUrl: "http://localhost:8080" });
+const jobId = "550e8400-e29b-41d4-a716-446655440000";
+
+// Follows `next` for you; { wait: true } keeps polling a running job until it ends
+for await (const item of scrapix.iterJobResults(jobId, { pageSize: 50 })) {
+  console.log(item.url, item.success);
+}
+```
+
+</CodeGroup>
 
 ---
 

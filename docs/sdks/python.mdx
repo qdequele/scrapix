@@ -1,0 +1,111 @@
+---
+title: Python SDK
+description: Official Python client for the Scrapix API, sync and async
+---
+
+# Python SDK
+
+The `scrapix` package is a typed client for the Scrapix API: sync (`Scrapix`) and async (`AsyncScrapix`) clients, pydantic models generated from the [OpenAPI spec](https://github.com/qdequele/scrapix/blob/main/contracts/openapi.json), retries that honor `Retry-After`, and a job watcher that turns an async crawl into a single call.
+
+```bash
+pip install scrapix
+```
+
+Python 3.9+. Runtime dependencies: `httpx`, `pydantic` v2, `anyio`.
+
+## Quickstart
+
+```python
+from scrapix import Scrapix
+
+client = Scrapix(api_key="sk_live_...")  # or set SCRAPIX_API_KEY
+
+page = client.scrape("https://example.com", formats=["markdown", "metadata"])
+print(page.markdown)
+
+result = client.crawl_and_wait(
+    "https://docs.example.com",
+    max_pages=200,
+    on_progress=lambda job: print(job.status.value, job.pages_crawled),
+)
+print(result.status, len(result.documents))
+```
+
+## Configuration
+
+| Argument | Environment variable | Default |
+|----------|----------------------|---------|
+| `api_key` | `SCRAPIX_API_KEY` | none |
+| `base_url` | `SCRAPIX_API_URL` | `https://scrapix.meilisearch.dev` |
+| `timeout` | | `60` seconds per request (`None` disables it) |
+| `max_retries` | | `2` |
+
+API keys (`sk_live_...`, `sk_test_...`) are sent in the `x-api-key` header; any other value is sent as an OAuth access token (`Authorization: Bearer`). See [Authentication](/guides/authentication). A self-hosted engine without `DATABASE_URL` needs no key:
+
+```python
+client = Scrapix(base_url="http://localhost:8080")
+```
+
+## Requests and responses
+
+Options are keyword arguments named like the API fields, so every field documented in the [API reference](/api-reference/overview) works as-is. You can also pass a request model or a `dict`:
+
+```python
+from scrapix.models import ScrapeRequest
+
+client.scrape("https://example.com", only_main_content=True, render_js=True)
+client.scrape(ScrapeRequest(url="https://example.com", formats=["html"]))
+client.map("https://example.com", limit=500)
+client.search("https://docs.example.com", "rate limits", limit=5)
+```
+
+Responses are pydantic models (`ScrapeResponse`, `JobStatusResponse`, ...). All models live in `scrapix.models`.
+
+## Jobs
+
+`crawl`, `batch_scrape` and `extract` start a job and return its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
+
+| Helper | What it does |
+|--------|--------------|
+| `get_job(job_id)` | `GET /job/{id}/status` |
+| `iter_job_status(job_id, poll_interval=2)` | yields every polled status, ending with the terminal one |
+| `wait_for_job(job_id, poll_interval=2, timeout=None, on_progress=None)` | blocks until terminal, returns the final status |
+| `iter_job_results(job_id, page_size=100, wait=False)` | every result, following the `next` cursor |
+| `crawl_and_wait(...)`, `batch_scrape_and_wait(...)`, `extract_and_wait(...)` | start + wait + read all results |
+| `cancel_job`, `pause_job`, `resume_job`, `list_jobs` | job control |
+
+```python
+created = client.batch_scrape(["https://a.com", "https://b.com"], formats=["markdown"])
+final = client.wait_for_job(created.job_id, timeout=600)  # JobTimeoutError after 10 min
+for item in client.iter_job_results(created.job_id):
+    print(item.index, item.url, item.success)
+
+extraction = client.extract_and_wait(
+    ["https://example.com/blog/*"], prompt="The title and author of each post"
+)
+print(extraction.data)
+```
+
+A failed or cancelled job is returned, not raised: check `result.succeeded`. `iter_job_results` on a running job stops once it caught up with the results so far; `wait=True` keeps polling until the job ends.
+
+<Note>
+  Crawl results are read from the job's Meilisearch index, which indexes asynchronously: the last documents of a crawl that just finished can take a few seconds to appear.
+</Note>
+
+## Async
+
+```python
+from scrapix import AsyncScrapix
+
+async with AsyncScrapix() as client:
+    page = await client.scrape("https://example.com")
+    result = await client.crawl_and_wait(["https://docs.example.com"], max_pages=50)
+    async for item in client.iter_job_results(result.job_id):
+        print(item.url)
+```
+
+## Errors and retries
+
+Non-2xx responses raise an `APIStatusError` subclass with `status_code`, `code`, `message` and `details`: `BadRequestError` (400), `AuthenticationError` (401), `InsufficientCreditsError` (402), `PermissionDeniedError` (403), `NotFoundError` (404), `ConflictError` (409), `RateLimitError` (429, `retry_after`), `InternalServerError` (5xx). Network failures raise `APIConnectionError` / `APITimeoutError`.
+
+429 responses are retried after the `Retry-After` delay ([rate limits](/api-reference/rate-limiting)). Reads, `scrape`, `map` and `search` are also retried on 408/5xx and network errors with exponential backoff. Requests that create or change a job are only retried on 429 and connection failures, so a job is never started twice.
