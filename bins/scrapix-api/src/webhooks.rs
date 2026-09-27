@@ -574,13 +574,15 @@ fn wire_name(event: &WebhookEvent) -> &'static str {
 /// host is a raw IP literal, it must be public. Hostnames are re-checked at
 /// delivery time by `SafeResolver` (via `safe_client_builder`).
 pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), String> {
-    let parsed =
-        url::Url::parse(url_str).map_err(|e| format!("invalid webhook URL '{url_str}': {e}"))?;
+    // Errors show scheme and host only: the path and query of a webhook URL
+    // often carry a token.
+    let parsed = url::Url::parse(url_str).map_err(|e| format!("invalid webhook URL: {e}"))?;
+    let shown = scrapix_core::redact::url_origin_for_display(&parsed);
     match parsed.scheme() {
         "http" | "https" => {}
         other => {
             return Err(format!(
-                "unsupported webhook URL scheme '{other}' in '{url_str}' (use http or https)"
+                "unsupported webhook URL scheme '{other}' in '{shown}' (use http or https)"
             ))
         }
     }
@@ -588,12 +590,12 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<(), String> {
         Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
         Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
         Some(url::Host::Domain(_)) => None,
-        None => return Err(format!("webhook URL '{url_str}' has no host")),
+        None => return Err(format!("webhook URL '{shown}' has no host")),
     };
     if let Some(ip) = ip {
         if !scrapix_crawler::is_public_ip(ip) {
             return Err(format!(
-                "webhook URL '{url_str}' points to a non-public address"
+                "webhook URL '{shown}' points to a non-public address"
             ));
         }
     }
@@ -1115,6 +1117,25 @@ mod tests {
                 "{url} should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn validate_webhook_url_errors_show_scheme_and_host_only() {
+        for url in [
+            "http://10.0.0.1/hook?token=abc123",
+            "ftp://example.org/hook?token=abc123",
+            "http://user:abc123@127.0.0.1:9/cb",
+            "http://exa mple.com/hook?token=abc123",
+        ] {
+            let err = validate_webhook_url(url).expect_err(url);
+            assert!(!err.contains("abc123"), "{url}: {err}");
+            assert!(
+                !err.contains("/hook") && !err.contains("/cb"),
+                "{url}: {err}"
+            );
+        }
+        let err = validate_webhook_url("http://10.0.0.1/hook?token=abc123").unwrap_err();
+        assert!(err.contains("http://10.0.0.1"), "{err}");
     }
 
     #[test]

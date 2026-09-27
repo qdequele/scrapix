@@ -101,12 +101,27 @@ pub(crate) async fn check_render_target(
     robots: Option<&RobotsCache>,
 ) -> Result<()> {
     let parsed = url::Url::parse(url)?;
-    reject_ip_host(&parsed)?;
+    check_ssrf_target(&parsed, allow_private_ips).await?;
 
+    if let Some(cache) = robots {
+        if !cache.is_allowed(url).await? {
+            return Err(ScrapixError::RobotsDisallowed {
+                url: url.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The SSRF half of [`check_render_target`]: raw-IP hosts are refused
+/// (always), and a hostname must resolve only to public addresses (unless
+/// `allow_private_ips`).
+async fn check_ssrf_target(parsed: &url::Url, allow_private_ips: bool) -> Result<()> {
+    reject_ip_host(parsed)?;
     if !allow_private_ips {
         let host = parsed
             .host_str()
-            .ok_or_else(|| ScrapixError::Crawl(format!("URL has no host: {url}")))?;
+            .ok_or_else(|| ScrapixError::Crawl(format!("URL has no host: {parsed}")))?;
         let port = parsed.port_or_known_default().unwrap_or(443);
         let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
             .await
@@ -118,15 +133,47 @@ pub(crate) async fn check_render_target(
             )));
         }
     }
-
-    if let Some(cache) = robots {
-        if !cache.is_allowed(url).await? {
-            return Err(ScrapixError::RobotsDisallowed {
-                url: url.to_string(),
-            });
-        }
-    }
     Ok(())
+}
+
+/// Check the URL the browser ended on after navigating to `requested`
+/// (server redirects, meta refresh, JS `location` changes): the same SSRF
+/// rules as [`check_render_target`], failing closed with
+/// `ScrapixError::Refused` so the content of an internal page is never
+/// returned. `requested` itself was checked before navigating, and pages
+/// without a network origin (`about:blank`, `chrome-error://`, `data:`)
+/// have nothing to check.
+///
+/// This covers where the main frame landed only. The browser may still have
+/// *requested* an internal URL on the way (a redirect hop, a subresource, a
+/// fetch/XHR, an iframe, a JS navigation that was redirected again); full
+/// coverage needs CDP `Fetch` interception of every request, which is
+/// deferred. Workers that render untrusted pages should run the browser in
+/// a network namespace without access to internal addresses.
+pub(crate) async fn check_render_final_url(
+    final_url: &str,
+    requested: &str,
+    allow_private_ips: bool,
+) -> Result<()> {
+    if final_url == requested {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(final_url)
+        .map_err(|e| ScrapixError::Refused(format!("browser ended on an unparsable URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
+        return Ok(());
+    }
+    check_ssrf_target(&parsed, allow_private_ips)
+        .await
+        .map_err(|e| match e {
+            ScrapixError::Refused(msg) => {
+                ScrapixError::Refused(format!("redirected to a refused target: {msg}"))
+            }
+            // A DNS failure on the final host: we cannot tell it is public.
+            other => ScrapixError::Refused(format!(
+                "redirected to a target that could not be checked: {other}"
+            )),
+        })
 }
 
 /// Errors specific to CDP rendering
@@ -512,6 +559,8 @@ impl CdpRenderer {
             .await
             .map_err(|e| CdpError::NavigationFailed(e.to_string()))?
             .unwrap_or_else(|| url.to_string());
+        // A redirect must not land the browser on an internal target.
+        check_render_final_url(&final_url, url, self.config.allow_private_ips).await?;
 
         // Get HTML content
         let html = page
@@ -909,6 +958,37 @@ mod tests {
         assert!(check_render_target("http://localhost/", true, None)
             .await
             .is_ok());
+    }
+
+    /// Final review fix 4: the page the browser ended on (after HTTP or JS
+    /// redirects) gets the same SSRF check as the requested URL.
+    #[tokio::test]
+    async fn redirect_final_url_is_checked_like_the_target() {
+        let seed = "https://example.com/start";
+        for final_url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/admin",
+            "http://localhost:6379/",
+        ] {
+            let r = check_render_final_url(final_url, seed, false).await;
+            assert!(
+                matches!(r, Err(ScrapixError::Refused(_))),
+                "{final_url}: {r:?}"
+            );
+        }
+        // Raw IPs stay refused with the opt-out; hostnames then pass.
+        let r = check_render_final_url("http://127.0.0.1/", seed, true).await;
+        assert!(matches!(r, Err(ScrapixError::Refused(_))), "{r:?}");
+        assert!(check_render_final_url("http://localhost/", seed, true)
+            .await
+            .is_ok());
+        // No redirect (already checked) and non-network pages pass.
+        for final_url in [seed, "about:blank", "chrome-error://chromewebdata/"] {
+            assert!(
+                check_render_final_url(final_url, seed, false).await.is_ok(),
+                "{final_url}"
+            );
+        }
     }
 
     #[test]

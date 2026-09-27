@@ -3625,7 +3625,8 @@ pub(crate) fn validate_crawl_config(config: &mut CrawlConfig) -> Result<(), ApiE
 
 /// Redact secrets in a `CrawlConfig` before it's persisted (`jobs.config`)
 /// or ever handed back over the API (`JobStatusResponse::config`): the
-/// Meilisearch API key and any webhook auth secrets (SCR-72). The real,
+/// Meilisearch API key, any webhook auth secrets (SCR-72), proxy URL
+/// credentials and custom header values. The real,
 /// unredacted config is never stored — only kept transiently in this
 /// request and, for webhooks specifically, in `JobState::webhooks` for
 /// delivery.
@@ -3638,7 +3639,35 @@ fn redact_crawl_config_for_storage(config: &CrawlConfig) -> Option<serde_json::V
         );
     }
     webhooks::redact_webhooks_json(&mut v);
+    redact_proxy_and_headers_json(&mut v);
     Some(v)
+}
+
+/// Mask proxy URL credentials (userinfo) and every custom header value in
+/// a serialized `CrawlConfig`. Header names stay visible; the values are
+/// typically auth tokens. The crawler never reads this copy: its `JobSpec`
+/// is built from the in-memory config.
+fn redact_proxy_and_headers_json(v: &mut serde_json::Value) {
+    fn redact_url(u: &mut serde_json::Value) {
+        if let Some(raw) = u.as_str() {
+            *u = serde_json::Value::String(scrapix_core::redact::redact_userinfo_str(raw));
+        }
+    }
+    if let Some(proxy) = v.get_mut("proxy").and_then(|p| p.as_object_mut()) {
+        if let Some(urls) = proxy.get_mut("urls").and_then(|u| u.as_array_mut()) {
+            urls.iter_mut().for_each(redact_url);
+        }
+        if let Some(tiers) = proxy.get_mut("tiered").and_then(|t| t.as_array_mut()) {
+            for tier in tiers.iter_mut().filter_map(|t| t.as_array_mut()) {
+                tier.iter_mut().for_each(redact_url);
+            }
+        }
+    }
+    if let Some(headers) = v.get_mut("headers").and_then(|h| h.as_object_mut()) {
+        for value in headers.values_mut() {
+            *value = serde_json::Value::String("***".to_string());
+        }
+    }
 }
 
 /// Reject proxy configs the crawler cannot use safely: no proxy at all
@@ -3653,18 +3682,20 @@ fn validate_proxy_config(proxy: &scrapix_core::ProxyConfig) -> Result<(), String
         return Err("at least one proxy URL is required in `urls` or `tiered`".to_string());
     }
     for entry in proxy.urls.iter().chain(tiered.iter().flatten()) {
+        // Proxy URLs carry credentials: never echo them back.
+        let shown = scrapix_core::redact::redact_userinfo_str(entry);
         let parsed =
-            url::Url::parse(entry).map_err(|e| format!("invalid proxy URL '{entry}': {e}"))?;
+            url::Url::parse(entry).map_err(|e| format!("invalid proxy URL '{shown}': {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
             "socks5" | "socks5h" => {
                 return Err(format!(
-                    "socks5 proxies are not supported by the crawler ('{entry}'); use http or https"
+                    "socks5 proxies are not supported by the crawler ('{shown}'); use http or https"
                 ))
             }
             other => {
                 return Err(format!(
-                    "unsupported proxy scheme '{other}' in '{entry}' (use http or https)"
+                    "unsupported proxy scheme '{other}' in '{shown}' (use http or https)"
                 ))
             }
         }
@@ -3672,12 +3703,12 @@ fn validate_proxy_config(proxy: &scrapix_core::ProxyConfig) -> Result<(), String
             Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
             Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
             Some(url::Host::Domain(_)) => None,
-            None => return Err(format!("proxy URL '{entry}' has no host")),
+            None => return Err(format!("proxy URL '{shown}' has no host")),
         };
         if let Some(ip) = ip {
             if !scrapix_crawler::is_public_ip(ip) {
                 return Err(format!(
-                    "proxy URL '{entry}' points to a non-public address"
+                    "proxy URL '{shown}' points to a non-public address"
                 ));
             }
         }
@@ -7065,6 +7096,67 @@ mod tests {
                 "{proxy}"
             );
         }
+    }
+
+    /// Final review fix 3: proxy credentials never appear in validation
+    /// errors (they are returned to the client and may be logged).
+    #[test]
+    fn proxy_validation_errors_redact_credentials() {
+        for proxy in [
+            serde_json::json!({"urls": ["http://alice:s3cret@10.0.0.1:3128"]}),
+            serde_json::json!({"urls": ["socks5://alice:s3cret@proxy.test:1080"]}),
+            serde_json::json!({"urls": ["ftp://alice:s3cret@proxy.test:21"]}),
+            serde_json::json!({"urls": [], "tiered": [["http://alice:s3cret@127.0.0.1:1"]]}),
+            serde_json::json!({"urls": ["http://alice:s3cret@exa mple:1"]}),
+        ] {
+            let err = validate_crawl_config(&mut config_with_proxy(proxy.clone()))
+                .expect_err(&format!("{proxy} must be rejected"));
+            assert!(
+                !err.error.contains("s3cret") && !err.error.contains("alice"),
+                "{proxy}: {}",
+                err.error
+            );
+        }
+    }
+
+    /// Final review fix 3: the persisted/returned config masks proxy
+    /// credentials and custom header values; the in-memory config (from
+    /// which the crawler's `JobSpec` is built) keeps the real ones.
+    #[test]
+    fn stored_config_redacts_proxy_userinfo_and_header_values() {
+        let cfg: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "proxy": {
+                "urls": ["http://alice:s3cret@proxy.example.com:8080"],
+                "tiered": [["https://bob:hunter2@p2.example.com:1"], ["http://plain.example.com:1"]]
+            },
+            "headers": {"Authorization": "Bearer tok-123", "X-Tenant": "t1"}
+        }))
+        .unwrap();
+        let stored = redact_crawl_config_for_storage(&cfg).unwrap();
+        let text = stored.to_string();
+        for secret in ["s3cret", "alice", "hunter2", "tok-123", "t1\""] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(
+            stored["proxy"]["urls"][0],
+            "http://***@proxy.example.com:8080/"
+        );
+        assert_eq!(
+            stored["proxy"]["tiered"][1][0],
+            "http://plain.example.com:1"
+        );
+        assert_eq!(stored["headers"]["Authorization"], "***");
+        assert_eq!(stored["headers"]["X-Tenant"], "***");
+
+        // The crawler gets the real values (JobSpec is built from the
+        // in-memory config, never from the stored copy).
+        let spec = JobSpec::from_config(&cfg);
+        assert_eq!(
+            spec.proxy.unwrap().urls[0],
+            "http://alice:s3cret@proxy.example.com:8080"
+        );
+        assert_eq!(spec.headers["Authorization"], "Bearer tok-123");
     }
 
     #[test]

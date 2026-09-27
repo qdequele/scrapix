@@ -16,6 +16,7 @@ pub mod document;
 pub mod error;
 pub mod job_spec;
 pub mod metrics;
+pub mod redact;
 pub mod telemetry;
 pub mod traits;
 pub mod url_glob;
