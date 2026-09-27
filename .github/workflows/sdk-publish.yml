@@ -1,0 +1,85 @@
+name: Publish SDKs
+
+# Publishes the SDKs to npm / PyPI. Never runs on push to a branch or on PRs:
+# only on a manual run (Actions → Publish SDKs → Run workflow) or when a
+# release tag is pushed:
+#   sdk-typescript-v0.1.0  → npm   (sdks/typescript, package `scrapix`)
+#   sdk-python-v0.1.0      → PyPI  (sdks/python, package `scrapix`)
+# The tag's version must match the package version.
+#
+# Both registries use trusted publishing (OIDC, no long-lived token): configure
+# this repository + workflow as a trusted publisher on npmjs.com and pypi.org
+# (environments `npm` and `pypi`) before the first release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk:
+        description: SDK to publish
+        required: true
+        type: choice
+        options: [typescript, python]
+  push:
+    tags:
+      - 'sdk-typescript-v*'
+      - 'sdk-python-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'typescript') ||
+      startsWith(github.ref, 'refs/tags/sdk-typescript-v')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --no-audit --no-fund
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "sdk-typescript-v$(node -p 'require("./package.json").version')" = "${GITHUB_REF_NAME}"
+      - run: npm run check:generated
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm publish --provenance --access public
+
+  python:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.sdk == 'python') ||
+      startsWith(github.ref, 'refs/tags/sdk-python-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n1)
+          test "sdk-python-v${version}" = "${GITHUB_REF_NAME}"
+      - run: ../generate.sh --check python
+      - run: uv run --group dev pytest
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdks/python/dist

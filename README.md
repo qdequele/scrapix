@@ -234,6 +234,15 @@ GET /jobs?limit=10&offset=0
 GET /health
 ```
 
+## SDKs
+
+Official clients generated from [`contracts/openapi.json`](contracts/openapi.json), with retries and a job watcher (`crawl_and_wait` / `crawlAndWait`):
+
+- Python: [`sdks/python`](sdks/python) (`pip install scrapix`)
+- TypeScript: [`sdks/typescript`](sdks/typescript) (`npm install scrapix`)
+
+After changing the spec, run `just sdk-generate` (CI fails on stale generated code via `just sdk-check`). See [`sdks/README.md`](sdks/README.md).
+
 ## CLI Usage
 
 ```bash

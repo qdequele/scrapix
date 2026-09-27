@@ -1,0 +1,95 @@
+---
+title: TypeScript SDK
+description: Official TypeScript/JavaScript client for the Scrapix API
+---
+
+# TypeScript SDK
+
+The `scrapix` npm package is a typed client for the Scrapix API with no runtime dependencies (it uses the global `fetch`). It ships ESM and CommonJS builds, types generated from the [OpenAPI spec](https://github.com/qdequele/scrapix/blob/main/contracts/openapi.json), retries that honor `Retry-After`, and a job watcher.
+
+```bash
+npm install scrapix
+```
+
+Node.js 18+, or any runtime with `fetch` (Deno, Bun, edge runtimes).
+
+## Quickstart
+
+```ts
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix({ apiKey: "sk_live_..." }); // or set SCRAPIX_API_KEY
+
+const page = await scrapix.scrape("https://example.com", { formats: ["markdown", "metadata"] });
+console.log(page.markdown);
+
+const { job, documents } = await scrapix.crawlAndWait(
+  { start_urls: ["https://docs.example.com"], max_pages: 200 },
+  { onProgress: (s) => console.log(s.status, s.pages_crawled) },
+);
+console.log(job.status, documents.length);
+```
+
+## Configuration
+
+| Option | Environment variable | Default |
+|--------|----------------------|---------|
+| `apiKey` | `SCRAPIX_API_KEY` | none |
+| `baseUrl` | `SCRAPIX_API_URL` | `https://scrapix.meilisearch.dev` |
+| `timeoutMs` | | `60000` per request (`0` disables it) |
+| `maxRetries` | | `2` |
+| `fetch` | | `globalThis.fetch` |
+
+API keys (`sk_live_...`, `sk_test_...`) are sent in the `x-api-key` header; any other value is sent as an OAuth access token (`Authorization: Bearer`). See [Authentication](/guides/authentication). Every method also takes a last `{ timeoutMs, maxRetries, signal }` argument.
+
+<Warning>
+  Do not ship an API key to browsers. Call Scrapix from your server, or use a short-lived OAuth token.
+</Warning>
+
+## Requests and responses
+
+Request bodies use the API's snake_case field names and are typed from the spec (`ScrapeRequest`, `CrawlConfig`, `BatchScrapeRequest`, `ExtractRequest`, ...); every schema is also available as `Schemas["Name"]`.
+
+```ts
+await scrapix.scrape("https://example.com", { only_main_content: true, render_js: true });
+await scrapix.map("https://example.com", { limit: 500 });
+await scrapix.search("https://docs.example.com", "rate limits", { limit: 5 });
+```
+
+## Jobs
+
+`crawl`, `batchScrape` and `extract` start a job and resolve with its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
+
+| Helper | What it does |
+|--------|--------------|
+| `getJob(jobId)` | `GET /job/{id}/status` |
+| `watchJob(jobId, { pollIntervalMs })` | async iterator over every polled status, ending with the terminal one |
+| `waitForJob(jobId, { pollIntervalMs, timeoutMs, onProgress })` | resolves with the final status |
+| `iterJobResults(jobId, { pageSize, wait })` | async iterator over every result, following the `next` cursor |
+| `crawlAndWait`, `batchScrapeAndWait`, `extractAndWait` | start + wait + read all results |
+| `cancelJob`, `pauseJob`, `resumeJob`, `listJobs` | job control |
+
+```ts
+const { job_id } = await scrapix.batchScrape({ urls: ["https://a.com", "https://b.com"], formats: ["markdown"] });
+
+for await (const status of scrapix.watchJob(job_id)) console.log(status.status, status.pages_crawled);
+for await (const item of scrapix.iterJobResults(job_id)) console.log(item.index, item.url, item.success);
+
+const extraction = await scrapix.extractAndWait({
+  urls: ["https://example.com/blog/*"],
+  prompt: "The title and author of each post",
+});
+console.log(extraction.extract.data);
+```
+
+Failed or cancelled jobs resolve (they do not reject): check `job.status`. With `timeoutMs`, waiting rejects with `JobTimeoutError` (the job keeps running). `iterJobResults` on a running job stops once caught up; `{ wait: true }` keeps polling until the job ends.
+
+<Note>
+  Crawl results are read from the job's Meilisearch index, which indexes asynchronously: the last documents of a crawl that just finished can take a few seconds to appear.
+</Note>
+
+## Errors and retries
+
+Non-2xx responses reject with an `APIError` subclass with `status`, `code`, `apiMessage` and `details`: `BadRequestError` (400), `AuthenticationError` (401), `InsufficientCreditsError` (402), `PermissionDeniedError` (403), `NotFoundError` (404), `ConflictError` (409), `RateLimitError` (429, `retryAfter`), `InternalServerError` (5xx). Network failures reject with `APIConnectionError` / `APITimeoutError`.
+
+429 responses are retried after the `Retry-After` delay ([rate limits](/api-reference/rate-limiting)). Reads, `scrape`, `map` and `search` are also retried on 408/5xx and network errors with exponential backoff. Requests that create or change a job are only retried on 429, so a job is never started twice.

@@ -37,6 +37,13 @@
       ]
     },
     {
+      "group": "SDKs",
+      "pages": [
+        "sdks/python",
+        "sdks/typescript"
+      ]
+    },
+    {
       "group": "Configuration",
       "pages": [
         "configuration/environment-variables",

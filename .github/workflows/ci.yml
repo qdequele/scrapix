@@ -9,6 +9,9 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'sdks/**'
+      - 'contracts/openapi.json'
+      - 'justfile'
       - '.github/workflows/ci.yml'
   workflow_call:
 
@@ -43,3 +46,62 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all -- -D warnings
 
+
+  # ---------------------------------------------------------------------------
+  # SDKs (sdks/typescript, sdks/python)
+  # ---------------------------------------------------------------------------
+
+  sdk-drift:
+    name: SDK generated code is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+      - run: sdks/generate.sh --check
+
+  sdk-typescript:
+    name: SDK (TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  sdk-python:
+    name: SDK (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv run --group dev ruff check .
+      - run: uv run --group dev ruff format --check .
+      - run: uv run --group dev mypy
+      - run: uv run --group dev pytest
+      # Oldest supported dependency versions (httpx 0.23, pydantic 2.0, anyio 3.5)
+      - if: matrix.python == '3.9'
+        run: uv run --group dev --resolution lowest-direct pytest
+      - run: uv build

@@ -341,6 +341,38 @@ Fields are only present if the corresponding format was requested. A `warning` f
 
 ### Examples
 
+<CodeGroup>
+
+```bash curl
+curl -X POST https://scrapix.meilisearch.dev/scrape \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $SCRAPIX_API_KEY" \
+  -d '{
+    "url": "https://example.com",
+    "formats": ["markdown", "metadata"]
+  }'
+```
+
+```python Python
+from scrapix import Scrapix
+
+client = Scrapix()  # reads SCRAPIX_API_KEY
+page = client.scrape("https://example.com", formats=["markdown", "metadata"])
+print(page.metadata, page.markdown)
+```
+
+```ts TypeScript
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix(); // reads SCRAPIX_API_KEY
+const page = await scrapix.scrape("https://example.com", { formats: ["markdown", "metadata"] });
+console.log(page.metadata, page.markdown);
+```
+
+</CodeGroup>
+
+More request shapes (self-hosted engine on `localhost:8080`):
+
 <Tabs>
   <Tab title="Basic Markdown">
     ```bash
