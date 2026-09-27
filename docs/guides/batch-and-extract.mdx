@@ -1,0 +1,161 @@
+---
+title: Batch Scrape and Extract
+description: Scrape a list of URLs in one job, or turn many pages into one structured result
+---
+
+# Batch Scrape and Extract
+
+[`/scrape`](/guides/scraping) handles one URL per request. When you have many pages,
+two job endpoints do the fan-out for you:
+
+| You want | Use |
+|----------|-----|
+| The content of each URL in a known list | [`POST /batch/scrape`](/api-reference/batch-scrape) |
+| One structured answer built from several pages | [`POST /extract`](/api-reference/extract) |
+| Every page of a site, following links | [`POST /crawl`](/guides/crawling) |
+
+Batch scrapes and extractions are jobs, like crawls. They return a `job_id` right away
+and work in the background. Track them with `GET /job/{id}/status`, SSE, the WebSocket
+or webhooks. Pause, resume or cancel them with the usual job endpoints. Read the pages
+they fetched with `GET /job/{id}/results`.
+
+## Batch Scrape
+
+Send up to 1,000 URLs. Any `/scrape` option (formats, `render_js`, `actions`,
+`screenshot`, `ai`, …) applies to every URL:
+
+<CodeGroup>
+
+```bash curl
+curl -X POST https://scrapix.meilisearch.dev/batch/scrape \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
+  -d '{
+    "urls": ["https://example.com/pricing", "https://example.com/docs"],
+    "formats": ["markdown", "metadata"],
+    "concurrency": 10
+  }'
+```
+
+```python Python
+from scrapix import Scrapix
+
+client = Scrapix()  # reads SCRAPIX_API_KEY
+result = client.batch_scrape_and_wait(
+    ["https://example.com/pricing", "https://example.com/docs"],
+    formats=["markdown", "metadata"],
+)
+for doc in result.documents:
+    print(doc.url, doc.success)
+```
+
+```typescript TypeScript
+import { Scrapix } from "scrapix";
+
+const scrapix = new Scrapix(); // reads SCRAPIX_API_KEY
+const { job, documents } = await scrapix.batchScrapeAndWait({
+  urls: ["https://example.com/pricing", "https://example.com/docs"],
+  formats: ["markdown", "metadata"],
+});
+console.log(job.status, documents.length);
+```
+
+</CodeGroup>
+
+A URL that fails doesn't fail the batch. It comes back as a result item with
+`success: false` and an `error` code: `fetch_error`, `http_error`, `validation_error`,
+`timeout` or `insufficient_credits`. Each result item also has `source_url` (the URL
+you sent) and `index` (its position in `urls`), because results arrive in the order
+the URLs finish.
+
+**Credits.** Each URL costs what the same `/scrape` request costs, charged as it is
+scraped. The batch is rejected with `402` up front if your balance can't cover every
+URL. If the balance runs out anyway, the remaining URLs are skipped with
+`insufficient_credits`.
+
+## Extract
+
+Describe what you want with a `prompt`, a JSON Schema, or both. List the pages to read;
+a URL with `*` is a glob that Scrapix expands from the site's sitemaps and links:
+
+<CodeGroup>
+
+```bash curl
+curl -X POST https://scrapix.meilisearch.dev/extract \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
+  -d '{
+    "urls": ["https://example.com/team", "https://example.com/blog/*"],
+    "prompt": "The leadership team and the titles of recent blog posts",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "leaders": { "type": "array", "items": { "type": "string" } },
+        "posts": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }'
+
+# then poll
+curl https://scrapix.meilisearch.dev/extract/$JOB_ID -H "X-API-Key: $SCRAPIX_API_KEY"
+```
+
+```python Python
+result = client.extract_and_wait(
+    ["https://example.com/team", "https://example.com/blog/*"],
+    prompt="The leadership team and the titles of recent blog posts",
+)
+print(result.data)             # the extraction
+print(result.extract.sources)  # every URL used, including resolved globs
+```
+
+```typescript TypeScript
+const result = await scrapix.extractAndWait({
+  urls: ["https://example.com/team", "https://example.com/blog/*"],
+  prompt: "The leadership team and the titles of recent blog posts",
+});
+console.log(result.extract.data, result.extract.sources);
+```
+
+</CodeGroup>
+
+How it works:
+
+1. **Resolve.** Globs are expanded to same-host pages, capped at 50 URLs in total.
+   `sources` lists each one, with `from_glob` for the ones a glob produced.
+2. **Fetch.** Each URL is scraped as markdown, like `/scrape`.
+3. **Extract.** If all pages fit the AI context budget, one extraction runs over their
+   combined content. Otherwise each page is extracted on its own, then a merge pass
+   combines the partial results.
+
+Extract needs an AI provider on the server (see [AI enrichment](/guides/ai-enrichment));
+without one, `POST /extract` returns `503`.
+
+**Credits.** Each page fetched costs what `/scrape` costs, each glob costs a `/map`
+(2 credits) and each AI call costs 5 credits. A large extraction makes one AI call per
+page plus one merge call, so keep URL lists focused.
+
+## Reading Results
+
+`GET /job/{id}/results` pages through what any job produced — crawl, batch scrape or
+extract — with each item shaped like a `/scrape` response:
+
+```bash
+curl "https://scrapix.meilisearch.dev/job/$JOB_ID/results?limit=50" \
+  -H "X-API-Key: $SCRAPIX_API_KEY"
+```
+
+Follow the `next` URL (an opaque cursor) until it is `null`. While a job runs, `next`
+stays set so you can keep polling for new items; it becomes `null` only once the job
+has ended and you have read everything. The SDKs do this for you: `iter_job_results`
+(Python) and `iterJobResults` (TypeScript).
+
+See the [jobs API reference](/api-reference/jobs#get-job-id-results) for the full
+response format and the paging rules for crawl results.
+
+## Good to Know
+
+- Batch and extract jobs run inside the API server. If it restarts, a job that was
+  running is marked `failed`; the results it already stored stay readable.
+- `POST /batch/scrape` and `POST /extract` return `200`, like `POST /crawl`.
+- Both count towards your plan's concurrent job limit.

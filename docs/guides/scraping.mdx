@@ -51,6 +51,7 @@ Request only the formats you need to reduce response size:
 | `metadata` | SEO analysis, title/description extraction |
 | `schema` | Structured data (JSON-LD, microdata) |
 | `blocks` | Split content by headings for granular indexing |
+| `screenshot` | A PNG of the rendered page, base64-encoded (turns on browser rendering) |
 
 ```bash
 # Get everything
@@ -285,12 +286,110 @@ Send custom headers with the request (useful for authenticated pages or specific
   "url": "https://api.example.com/page",
   "headers": {
     "Authorization": "Bearer token123",
-    "Accept-Language": "en-US",
-    "Cookie": "session=abc123"
+    "Accept-Language": "en-US"
   },
   "formats": ["markdown"]
 }
 ```
+
+Custom headers are sent on the HTTP path only. With browser rendering they are not
+attached, because the browser would also send them to every third-party host the
+page loads. For session cookies, use [`cookies`](#cookies-and-sessions), which work
+on both paths.
+
+## Browser Rendering
+
+Set `render_js: true` to load the page in headless Chrome before extracting it — for
+single-page apps and content that only appears after JavaScript runs. Screenshots,
+page actions and mobile emulation need the browser, so requesting any of them turns
+rendering on by itself. If the server has no Chrome/Chromium, these requests fail with
+`render_js_unavailable`.
+
+Every rendered `/scrape` runs in a fresh browser context that is discarded afterwards:
+cookies and storage never carry over between requests. Pages are rendered with the
+usual automation fingerprints removed (`navigator.webdriver` is undefined, no
+`HeadlessChrome` in the user agent), so basic bot checks don't block them.
+
+### Screenshots
+
+```json
+{
+  "url": "https://example.com",
+  "formats": ["markdown", "screenshot"],
+  "screenshot": { "full_page": true }
+}
+```
+
+The response carries `screenshot`, a base64-encoded PNG taken from the same page load
+as the extracted content. `full_page: true` (the default) captures the whole page, up to
+16,384 px tall; `false` captures only the viewport. A screenshot costs +1 credit.
+
+### Page Actions
+
+Some content only appears after you interact with the page: a cookie wall to dismiss,
+a "Load more" button, an infinite scroll, a search box. List `actions` to run, in
+order, after the page loads and before it is captured:
+
+```json
+{
+  "url": "https://shop.example.com/catalog",
+  "formats": ["markdown"],
+  "actions": [
+    { "type": "click", "selector": "#accept-cookies" },
+    { "type": "wait", "selector": ".product-grid" },
+    { "type": "scroll", "direction": "down", "amount": 3 },
+    { "type": "click", "selector": ".load-more" },
+    { "type": "wait", "ms": 1000 },
+    { "type": "execute_javascript", "script": "return document.querySelectorAll('.product').length" }
+  ]
+}
+```
+
+| Action | Fields | What it does |
+|--------|--------|--------------|
+| `wait` | `ms` or `selector` | Waits a fixed time, or until an element exists |
+| `click` | `selector` | Clicks an element |
+| `scroll` | `direction` (`up`/`down`), `amount` (screens) | Scrolls the page |
+| `write` | `selector`, `text` | Types text into a field |
+| `press` | `key` | Presses a key, e.g. `Enter` |
+| `execute_javascript` | `script` | Runs a script; its return value is sent back |
+
+Return values of `execute_javascript` come back in `actions.javascript_returns`, in
+order. A request can hold up to 50 actions; each one has 10 seconds and all of them
+together 30 seconds. The first action that fails stops the request with a `422`
+`action_error` whose `details` name the action's index and type, and the request is
+not billed. See the [API reference](/api-reference/scrape#page-actions) for the error
+format.
+
+### Mobile Layout
+
+```json
+{ "url": "https://example.com", "mobile": true, "formats": ["markdown", "screenshot"] }
+```
+
+`mobile: true` renders the page as an Android phone (412×915 viewport, touch, mobile
+user agent), so responsive sites serve their mobile layout.
+
+### Cookies and Sessions
+
+```json
+{
+  "url": "https://app.example.com/dashboard",
+  "cookies": [
+    { "name": "session", "value": "abc123", "secure": true, "http_only": true }
+  ]
+}
+```
+
+Cookies are sent on both the HTTP and the browser path. A cookie without `domain` is
+scoped to the target host; one with `domain` must be the target host or a parent of it.
+Up to 50 cookies per request. Cookies set by the site during the fetch (for example
+along a login redirect) are kept for that request only.
+
+## Scraping Many Pages
+
+To scrape a list of URLs in one call, or to turn several pages into one structured
+result, see [Batch scrape and extract](/guides/batch-and-extract).
 
 ## Timeout
 

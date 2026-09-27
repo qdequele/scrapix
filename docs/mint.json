@@ -101,6 +101,7 @@
       "group": "Guides",
       "pages": [
         "guides/scraping",
+        "guides/batch-and-extract",
         "guides/crawling",
         "guides/authentication",
         "guides/oauth",

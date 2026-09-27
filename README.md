@@ -166,6 +166,37 @@ GET /job/{job_id}/status
 }
 ```
 
+### Get Job Results
+
+```bash
+GET /job/{job_id}/results?limit=50&cursor=<next>
+
+# Paginated documents from any job (crawl, batch scrape, extract),
+# each shaped like a /scrape response
+```
+
+### Batch Scrape
+
+```bash
+POST /batch/scrape
+Content-Type: application/json
+
+{ "urls": ["https://a.com/x", "https://b.com/y"], "formats": ["markdown"] }
+
+# Response: { "job_id": "..." } — read pages via /job/{job_id}/results
+```
+
+### Extract
+
+```bash
+POST /extract
+Content-Type: application/json
+
+{ "urls": ["https://example.com/blog/*"], "prompt": "Titles and authors of the posts" }
+
+# Poll GET /extract/{job_id} for { "status", "data", "sources" }
+```
+
 ### Stream Job Events (SSE)
 
 ```bash

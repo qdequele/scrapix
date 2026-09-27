@@ -102,8 +102,8 @@ The request is rejected with `402` when the balance cannot cover the minimum (th
 ```bash
 JOB=$(curl -s -X POST http://localhost:8080/extract \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
   -d '{"urls": ["https://example.com"], "prompt": "What is this site about? Return {\"summary\": string}"}' | jq -r .job_id)
 
-curl -s http://localhost:8080/extract/$JOB -H "Authorization: Bearer $SCRAPIX_API_KEY"
+curl -s http://localhost:8080/extract/$JOB -H "X-API-Key: $SCRAPIX_API_KEY"
 ```

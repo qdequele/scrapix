@@ -112,9 +112,9 @@ Results are stored in Postgres (`job_results`) when the engine has a database, o
 ```bash
 JOB=$(curl -s -X POST http://localhost:8080/batch/scrape \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -H "X-API-Key: $SCRAPIX_API_KEY" \
   -d '{"urls": ["https://example.com", "https://example.org"], "formats": ["markdown"]}' | jq -r .job_id)
 
-curl -s http://localhost:8080/job/$JOB/status -H "Authorization: Bearer $SCRAPIX_API_KEY"
-curl -s "http://localhost:8080/job/$JOB/results?limit=50" -H "Authorization: Bearer $SCRAPIX_API_KEY"
+curl -s http://localhost:8080/job/$JOB/status -H "X-API-Key: $SCRAPIX_API_KEY"
+curl -s "http://localhost:8080/job/$JOB/results?limit=50" -H "X-API-Key: $SCRAPIX_API_KEY"
 ```
