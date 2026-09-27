@@ -14,7 +14,13 @@ scrapix-parser = { path = "../crates/scrapix-parser" }
 scrapix-extractor = { path = "../crates/scrapix-extractor" }
 scrapix-frontier = { path = "../crates/scrapix-frontier" }
 scrapix-crawler = { path = "../crates/scrapix-crawler" }
-scrapix-queue = { path = "../crates/scrapix-queue" }
+scrapix-queue = { path = "../crates/scrapix-queue", features = ["test-hooks"] }
+
+# Real services, run together over the in-process bus (distributed_pipeline)
+scrapix-frontier-service = { path = "../bins/scrapix-frontier-service" }
+scrapix-worker-crawler = { path = "../bins/scrapix-worker-crawler" }
+scrapix-worker-content = { path = "../bins/scrapix-worker-content" }
+clap = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -102,3 +108,7 @@ path = "src/document_uid.rs"
 [[test]]
 name = "simhash_properties"
 path = "src/simhash_properties.rs"
+
+[[test]]
+name = "distributed_pipeline"
+path = "src/distributed_pipeline.rs"

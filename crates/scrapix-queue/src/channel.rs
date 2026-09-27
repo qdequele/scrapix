@@ -138,6 +138,8 @@ impl ChannelBus {
             capacity: self.capacity,
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             group: None,
+            #[cfg(feature = "test-hooks")]
+            hooks: Arc::new(hooks::Hooks::default()),
         }
     }
 
@@ -242,6 +244,9 @@ pub struct ChannelConsumer {
     subscriptions: Arc<RwLock<Vec<String>>>,
     /// Named consumer group (`None`: the topic's shared queue).
     group: Option<String>,
+    /// Un-acked delivery tracking (test builds only).
+    #[cfg(feature = "test-hooks")]
+    hooks: Arc<hooks::Hooks>,
 }
 
 impl ChannelConsumer {
@@ -398,9 +403,17 @@ impl MessageConsumer for ChannelConsumer {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
+            #[cfg(feature = "test-hooks")]
+            if self.hooks.crashed() {
+                break;
+            }
 
             match tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await {
                 Ok(Ok(bytes)) => {
+                    // Tracked from receipt: a crash while waiting for a
+                    // handler permit must not lose the message either.
+                    #[cfg(feature = "test-hooks")]
+                    let token = self.hooks.track(&topic_name, &bytes);
                     let metadata = MessageMetadata {
                         topic: topic_name.clone(),
                         partition: 0,
@@ -420,14 +433,30 @@ impl MessageConsumer for ChannelConsumer {
                             let handler = handler.clone();
                             // The in-process channel bus has no durable offset to
                             // commit, so `Ack` here is a no-op — it exists only to
-                            // keep the handler signature uniform with Kafka.
+                            // keep the handler signature uniform with Kafka. Test
+                            // builds record it so un-acked messages can be
+                            // redelivered (`redeliver_unacked`).
+                            #[cfg(not(feature = "test-hooks"))]
                             let ack = scrapix_core::Ack::noop();
-                            tokio::spawn(async move {
+                            #[cfg(feature = "test-hooks")]
+                            let ack = {
+                                if self.hooks.crashed() {
+                                    // Left un-acked, as a crashed process would.
+                                    break;
+                                }
+                                self.hooks.ack_for(token)
+                            };
+                            let _task = tokio::spawn(async move {
                                 handler(payload, metadata, ack).await;
                                 drop(permit);
                             });
+                            #[cfg(feature = "test-hooks")]
+                            self.hooks.register(_task.abort_handle());
                         }
                         Err(e) => {
+                            // A poison message is never redelivered.
+                            #[cfg(feature = "test-hooks")]
+                            self.hooks.ack_for(token).ack();
                             error!(
                                 topic = %metadata.topic,
                                 offset = metadata.offset,
@@ -472,6 +501,103 @@ impl MessageConsumer for ChannelConsumer {
     }
 }
 
+/// Test-only hooks simulating Kafka's un-acked redelivery on the channel
+/// bus (feature `test-hooks`): every message a `process_with_ack` consumer
+/// receives is recorded until its `Ack` fires; [`ChannelConsumer::crash`]
+/// kills the consumer and its in-flight handlers (their acks never fire),
+/// and [`ChannelConsumer::redeliver_unacked`] republishes what was never
+/// acked, like a consumer-group rebalance after a crash.
+#[cfg(feature = "test-hooks")]
+mod hooks {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    /// Un-acked messages by delivery token: `(topic, payload)`.
+    type Unacked = Arc<Mutex<HashMap<u64, (String, Vec<u8>)>>>;
+
+    #[derive(Default)]
+    pub(super) struct Hooks {
+        next: AtomicU64,
+        crashed: AtomicBool,
+        pub(super) unacked: Unacked,
+        tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    }
+
+    impl Hooks {
+        pub(super) fn track(&self, topic: &str, bytes: &[u8]) -> u64 {
+            let token = self.next.fetch_add(1, Ordering::Relaxed);
+            self.unacked
+                .lock()
+                .insert(token, (topic.to_string(), bytes.to_vec()));
+            token
+        }
+
+        pub(super) fn ack_for(&self, token: u64) -> scrapix_core::Ack {
+            let unacked = self.unacked.clone();
+            scrapix_core::Ack::from_fn(move || {
+                unacked.lock().remove(&token);
+            })
+        }
+
+        pub(super) fn register(&self, task: tokio::task::AbortHandle) {
+            let mut tasks = self.tasks.lock();
+            tasks.retain(|t| !t.is_finished());
+            tasks.push(task);
+        }
+
+        pub(super) fn crashed(&self) -> bool {
+            self.crashed.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn crash(&self) {
+            self.crashed.store(true, Ordering::SeqCst);
+            for task in self.tasks.lock().drain(..) {
+                task.abort();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl ChannelConsumer {
+    /// Number of received messages whose `Ack` has not fired yet.
+    pub fn unacked_count(&self) -> usize {
+        self.hooks.unacked.lock().len()
+    }
+
+    /// Simulate a crash: stop receiving and abort every in-flight handler
+    /// (their acks never fire). Messages stay recorded as un-acked.
+    pub fn crash(&self) {
+        self.hooks.crash();
+    }
+
+    /// Republish every un-acked message to its topic's shared queue (what a
+    /// Kafka rebalance does after a consumer died), returning how many.
+    /// Meant to be called after [`crash`](Self::crash).
+    pub async fn redeliver_unacked(&self) -> usize {
+        let pending: Vec<(String, Vec<u8>)> = {
+            let mut unacked = self.hooks.unacked.lock();
+            let mut entries: Vec<(u64, (String, Vec<u8>))> = unacked.drain().collect();
+            entries.sort_by_key(|(token, _)| *token);
+            entries.into_iter().map(|(_, m)| m).collect()
+        };
+        let producer = ChannelProducer {
+            bus: self.bus.clone(),
+            capacity: self.capacity,
+        };
+        let mut sent = 0;
+        for (topic, bytes) in pending {
+            if producer.route(&topic).deliver(&topic, bytes).await.is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +606,61 @@ mod tests {
         c.poll_one::<String>(Duration::from_millis(100))
             .await
             .unwrap()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn crashed_consumer_redelivers_only_unacked_messages() {
+        let bus = ChannelBus::new();
+        let p = bus.producer();
+        for m in ["ok", "stuck"] {
+            p.send("t", None, &m.to_string()).await.unwrap();
+        }
+        let c = Arc::new(bus.consumer());
+        c.subscribe(&["t"]).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let acked_ok = Arc::new(AtomicBool::new(false));
+        let stuck_started = Arc::new(AtomicBool::new(false));
+        let run = {
+            let c = c.clone();
+            let (acked_ok, stuck_started) = (acked_ok.clone(), stuck_started.clone());
+            tokio::spawn(async move {
+                c.process_with_ack::<String, _, _>(
+                    move |m, _, ack| {
+                        let (acked_ok, stuck_started) = (acked_ok.clone(), stuck_started.clone());
+                        async move {
+                            if m == "ok" {
+                                ack.ack();
+                                acked_ok.store(true, Ordering::SeqCst);
+                            } else {
+                                stuck_started.store(true, Ordering::SeqCst);
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    },
+                    4,
+                    shutdown,
+                )
+                .await
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !(acked_ok.load(Ordering::SeqCst) && stuck_started.load(Ordering::SeqCst)) {
+            assert!(std::time::Instant::now() < deadline, "never settled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(c.unacked_count(), 1);
+        c.crash();
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("crashed consumer stops")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.redeliver_unacked().await, 1);
+        let next = bus.consumer();
+        next.subscribe(&["t"]).unwrap();
+        assert_eq!(poll(&next).await.as_deref(), Some("stuck"));
+        assert_eq!(poll(&next).await, None);
     }
 
     #[tokio::test]
