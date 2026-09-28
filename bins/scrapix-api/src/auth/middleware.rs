@@ -27,6 +27,16 @@ impl IntoResponse for AuthError {
     }
 }
 
+impl AuthError {
+    #[allow(dead_code)] // used by the router (standalone mode)
+    pub(crate) fn new(error: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            code: code.into(),
+        }
+    }
+}
+
 /// Hash an API key using SHA-256
 fn hash_api_key(key: &str) -> String {
     let mut hasher = Sha256::new();
