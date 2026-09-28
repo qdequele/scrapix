@@ -147,7 +147,7 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
         brokers: String::new(),
         group_id: "scrapix-frontier".to_string(),
         // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         frontier_key_prefix: "scrapix:frontier".to_string(),
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
@@ -192,7 +192,7 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
         link_graph_interval: 1000,
         publish_links: false,
         incremental_crawl: true,
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         browser_render: args.browser_render,
         browser_render_patterns: args.browser_render_patterns.clone(),
         chrome_path: args.chrome_path.clone(),
@@ -499,7 +499,7 @@ async fn run_all_kafka(
     let feedback_group = scrapix_frontier_service::feedback_group_id(
         "scrapix-all-frontier",
         "all-in-one",
-        std::env::var("REDIS_URL").is_ok_and(|u| !u.is_empty()),
+        redis_url().is_some(),
     );
     let frontier_feedback: Arc<AnyConsumer> = Arc::new({
         let c = ConsumerBuilder::new(brokers, &feedback_group)
@@ -561,7 +561,7 @@ async fn run_all_kafka(
         brokers: brokers.to_string(),
         group_id: "scrapix-all-frontier".to_string(),
         // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         frontier_key_prefix: "scrapix:frontier".to_string(),
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
@@ -606,7 +606,7 @@ async fn run_all_kafka(
         link_graph_interval: 1000,
         publish_links: false,
         incremental_crawl: true,
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         browser_render: args.browser_render,
         browser_render_patterns: args.browser_render_patterns.clone(),
         chrome_path: args.chrome_path.clone(),
@@ -694,6 +694,17 @@ async fn run_all_kafka(
     .await
 }
 
+/// `REDIS_URL`, with an empty (or blank) value treated as unset: compose
+/// files pass `REDIS_URL=${REDIS_URL:-}`, which must not make the services
+/// try to connect to `""`.
+fn redis_url() -> Option<String> {
+    non_empty(std::env::var("REDIS_URL").ok())
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
 /// Parse an optional numeric env var, falling back to `default`.
 fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -708,6 +719,17 @@ mod tests {
 
     fn idle_workers() -> [JoinHandle<()>; 3] {
         std::array::from_fn(|_| tokio::spawn(std::future::pending::<()>()))
+    }
+
+    #[test]
+    fn empty_redis_url_is_unset() {
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some(String::new())), None);
+        assert_eq!(non_empty(Some("  ".into())), None);
+        assert_eq!(
+            non_empty(Some("redis://dragonfly:6379".into())).as_deref(),
+            Some("redis://dragonfly:6379")
+        );
     }
 
     #[tokio::test]
