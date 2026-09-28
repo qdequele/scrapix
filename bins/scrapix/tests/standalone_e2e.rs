@@ -37,7 +37,6 @@ fn spawn_engine(port: u16, db: &str, meili: &str, meili_key: Option<&str>) -> Ch
         // The fixture site is served on 127.0.0.1, so SSRF protection must
         // be off for the crawler to be allowed to fetch it.
         .env("ALLOW_PRIVATE_IPS", "true")
-        .env("DOMAIN_DELAY_MS", "0")
         .env("JOB_COMPLETION_GRACE_MS", "500")
         .env_remove("KAFKA_BROKERS")
         .env_remove("REDIS_URL")
@@ -49,21 +48,23 @@ fn spawn_engine(port: u16, db: &str, meili: &str, meili_key: Option<&str>) -> Ch
     cmd.spawn().expect("spawn scrapix all")
 }
 
-/// SIGTERM → graceful shutdown (final flush), then wait. `scrapix all`
-/// drains and flushes on SIGTERM but may keep waiting for Ctrl+C
-/// afterwards, so fall back to SIGKILL once the deadline passes — the
-/// flush already happened by then.
-fn stop_child(mut child: Child) {
+/// How long `scrapix all` gets to exit on its own after SIGTERM: the API
+/// drain is bounded at 15 s in `all.rs`, the workers' stop after it.
+const SIGTERM_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// SIGTERM → graceful shutdown (final flush), then wait up to
+/// [`SIGTERM_EXIT_TIMEOUT`] for the process to exit on its own. Returns its
+/// exit status, or `None` if it was still running at the deadline.
+fn sigterm_and_wait(child: &mut Child) -> Option<std::process::ExitStatus> {
     let _ = Command::new("kill").arg(child.id().to_string()).status();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + SIGTERM_EXIT_TIMEOUT;
     while Instant::now() < deadline {
-        if child.try_wait().unwrap().is_some() {
-            return;
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    None
 }
 
 /// Owns a spawned `scrapix all` process and guarantees it is stopped even
@@ -87,20 +88,35 @@ impl EngineGuard {
 
     /// Explicit, deterministic stop — used at the restart point so the
     /// prior engine has fully exited (and flushed) before the next one
-    /// starts.
+    /// starts. Asserts the engine exits on its own, successfully, after
+    /// SIGTERM (as `docker stop` needs) instead of hanging until SIGKILL.
     fn stop(mut self) {
-        if let Some(child) = self.0.take() {
-            stop_child(child);
+        let mut child = self.0.take().expect("engine already stopped");
+        let status = sigterm_and_wait(&mut child);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
+        let status = status.unwrap_or_else(|| {
+            panic!("scrapix all did not exit within {SIGTERM_EXIT_TIMEOUT:?} of SIGTERM")
+        });
+        assert!(
+            status.success(),
+            "scrapix all exited with {status} after SIGTERM"
+        );
     }
 }
 
 impl Drop for EngineGuard {
     fn drop(&mut self) {
-        // Safety net for panicking paths: `stop()` above already took the
-        // child in the normal case, so this is a no-op then.
-        if let Some(child) = self.0.take() {
-            stop_child(child);
+        // Safety net for panicking paths only: `stop()` above already took
+        // the child in the normal case, so this is a no-op then. Here the
+        // engine gets SIGTERM, then SIGKILL if it is still running.
+        if let Some(mut child) = self.0.take() {
+            if sigterm_and_wait(&mut child).is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }

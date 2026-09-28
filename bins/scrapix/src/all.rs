@@ -4,9 +4,12 @@
 //! then spawns API, Frontier, Crawler, and Content as concurrent tokio tasks.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
-use tracing::{error, info};
+use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use scrapix_queue::{topic_names, AnyConsumer, AnyProducer, ChannelBus};
 
@@ -209,8 +212,11 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
 
     info!("Spawning all services as concurrent tasks...");
 
+    // Listen for signals before the API exists, so none is missed.
+    let signals = Signals::install()?;
+
     // Spawn all 4 services
-    let mut api_handle = tokio::spawn(scrapix_api::run_with_bus(
+    let api_handle = tokio::spawn(scrapix_api::run_with_bus(
         api_args,
         api_producer,
         api_event_consumer,
@@ -265,44 +271,118 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
         port = args.port,
         crawler_concurrency = args.crawler_concurrency,
         content_concurrency = args.content_concurrency,
-        "All services started. Press Ctrl+C to stop."
+        "All services started. Press Ctrl+C (or send SIGTERM) to stop."
     );
 
-    // Wait for ctrl+c (or a failed API)
-    let outcome = wait_for_shutdown(&mut api_handle).await;
+    supervise(
+        signals,
+        api_handle,
+        [frontier_handle, crawler_handle, content_handle],
+    )
+    .await
+}
+
+/// How long the API gets to drain (in-flight requests, background tasks,
+/// final job-store flush) after a shutdown signal before it is aborted.
+const API_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long aborted worker tasks get to unwind before the process exits.
+const WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// SIGINT (Ctrl+C) and SIGTERM (`docker stop`) listeners, installed before
+/// any service task is spawned.
+struct Signals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Signals {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Resolves with the name of the first signal received.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+/// Run until a shutdown signal or the API task ends, then stop everything.
+///
+/// - Signal (SIGINT/SIGTERM): the API receives it too (its own graceful
+///   shutdown handler) and drains; wait for it up to [`API_DRAIN_TIMEOUT`]
+///   instead of aborting it, so its final job-store flush completes.
+/// - The API returning `Ok(())`: it only does so after draining on a
+///   signal, so this is the same clean shutdown.
+/// - The API returning `Err` or panicking (e.g. its database is
+///   unreachable): fail, so `scrapix all` exits non-zero instead of leaving
+///   the workers running without an API.
+///
+/// The workers have no signal handling of their own under `scrapix all`
+/// (their `run_with_bus` entry points don't install any), so they are
+/// aborted once the API is done. Returns `Ok` only for a clean,
+/// signal-driven shutdown.
+async fn supervise(
+    mut signals: Signals,
+    mut api: JoinHandle<anyhow::Result<()>>,
+    workers: [JoinHandle<()>; 3],
+) -> anyhow::Result<()> {
+    let outcome = tokio::select! {
+        sig = signals.recv() => {
+            info!(signal = sig, "Shutdown signal received, waiting for the API to drain...");
+            match tokio::time::timeout(API_DRAIN_TIMEOUT, &mut api).await {
+                Ok(r) => api_outcome(r),
+                Err(_) => {
+                    api.abort();
+                    Err(anyhow::anyhow!(
+                        "API did not finish draining within {}s of {sig}; aborted it",
+                        API_DRAIN_TIMEOUT.as_secs()
+                    ))
+                }
+            }
+        }
+        r = &mut api => api_outcome(r),
+    };
     match &outcome {
-        Ok(()) => info!("Received shutdown signal, stopping all services..."),
+        Ok(()) => info!("API shut down cleanly, stopping workers..."),
         Err(e) => error!(error = %e, "API server failed, stopping all services"),
     }
 
-    // Abort all tasks (each service handles its own graceful shutdown internally)
-    api_handle.abort();
-    frontier_handle.abort();
-    crawler_handle.abort();
-    content_handle.abort();
-
-    // Give services 5 seconds to clean up
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    for worker in &workers {
+        worker.abort();
+    }
+    let unwind = join_workers(workers);
+    if tokio::time::timeout(WORKER_ABORT_TIMEOUT, unwind)
+        .await
+        .is_err()
+    {
+        warn!("Workers still unwinding after abort; exiting anyway");
+    }
 
     info!("All services stopped.");
     outcome
 }
 
-/// Wait for Ctrl+C. Fails if the API task errors or panics first (e.g. its
-/// database is unreachable), so `scrapix all` exits non-zero instead of
-/// leaving the workers running without an API. The API returning `Ok` means
-/// it shut down on a signal (SIGTERM drain): as before, keep waiting for
-/// Ctrl+C.
-async fn wait_for_shutdown(
-    api: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    tokio::select! {
-        r = tokio::signal::ctrl_c() => r.map_err(Into::into),
-        r = api => match r {
-            Ok(Ok(())) => tokio::signal::ctrl_c().await.map_err(Into::into),
-            Ok(Err(e)) => Err(e.context("API server failed")),
-            Err(e) => Err(anyhow::anyhow!("API server task failed: {e}")),
-        },
+/// Map the API task's result: `Ok(Ok(()))` is a clean (signal-driven)
+/// shutdown; an error or a panic fails.
+fn api_outcome(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.context("API server failed")),
+        Err(e) => Err(anyhow::anyhow!("API server task failed: {e}")),
+    }
+}
+
+/// Await every (aborted) worker handle; cancellation errors are expected.
+async fn join_workers(workers: [JoinHandle<()>; 3]) {
+    for worker in workers {
+        let _ = worker.await;
     }
 }
 
@@ -546,7 +626,10 @@ async fn run_all_kafka(
 
     info!("Spawning all services with Kafka bus...");
 
-    let mut api_handle = tokio::spawn(scrapix_api::run_with_bus(
+    // Listen for signals before the API exists, so none is missed.
+    let signals = Signals::install()?;
+
+    let api_handle = tokio::spawn(scrapix_api::run_with_bus(
         api_args,
         api_producer,
         api_event_consumer,
@@ -603,20 +686,12 @@ async fn run_all_kafka(
         "All services started with Kafka. Press Ctrl+C to stop."
     );
 
-    let outcome = wait_for_shutdown(&mut api_handle).await;
-    match &outcome {
-        Ok(()) => info!("Received shutdown signal, stopping all services..."),
-        Err(e) => error!(error = %e, "API server failed, stopping all services"),
-    }
-
-    api_handle.abort();
-    frontier_handle.abort();
-    crawler_handle.abort();
-    content_handle.abort();
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    info!("All services stopped.");
-    outcome
+    supervise(
+        signals,
+        api_handle,
+        [frontier_handle, crawler_handle, content_handle],
+    )
+    .await
 }
 
 /// Parse an optional numeric env var, falling back to `default`.
@@ -625,4 +700,43 @@ fn env_or(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_workers() -> [JoinHandle<()>; 3] {
+        std::array::from_fn(|_| tokio::spawn(std::future::pending::<()>()))
+    }
+
+    #[tokio::test]
+    async fn api_exiting_ok_is_a_clean_shutdown() {
+        // The API only returns Ok after draining on a signal it received
+        // itself: no second Ctrl+C is needed, and the workers are stopped.
+        let api = tokio::spawn(async { Ok(()) });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(Signals::install().unwrap(), api, idle_workers()),
+        )
+        .await
+        .expect("supervise must return once the API has shut down");
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn api_error_fails_the_process() {
+        let api = tokio::spawn(async { Err(anyhow::anyhow!("database unreachable")) });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(Signals::install().unwrap(), api, idle_workers()),
+        )
+        .await
+        .expect("supervise must return once the API has failed");
+        let err = outcome.expect_err("an API error must exit non-zero");
+        assert!(
+            format!("{err:#}").contains("database unreachable"),
+            "{err:#}"
+        );
+    }
 }
