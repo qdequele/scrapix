@@ -342,6 +342,10 @@ struct AppState {
     controls_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Job results layer (`GET /job/{id}/results`, SCR-71).
     results: results::ResultsState,
+    /// Resolves which Meilisearch instance a crawl/search/results request
+    /// uses: env-configured in standalone mode, the account's
+    /// `meilisearch_engines` rows in hosted mode.
+    pub(crate) meili: Arc<dyn crate::meili::MeilisearchResolver>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +434,7 @@ impl AppState {
             control_rx: parking_lot::Mutex::new(Some(control_rx)),
             controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             results: results::ResultsState::default(),
+            meili: Arc::new(crate::meili::EnvResolver(None)),
             db_pool,
             stripe_client,
             analytics_store,
@@ -2314,8 +2319,8 @@ fn crawl_event_to_page_event(job_id: &str, event: &CrawlEvent) -> Option<ClickHo
 /// API error response
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct ApiError {
-    error: String,
-    code: String,
+    pub(crate) error: String,
+    pub(crate) code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<serde_json::Value>,
 }
@@ -4145,46 +4150,19 @@ pub(crate) async fn do_create_crawl(
     };
 
     // Resolve Meilisearch config from account's default engine if not provided
-    let config = if config.meilisearch.url.is_empty() {
-        if let (Some(ref pool), Some(ctx)) = (&state.db_pool, account_ctx) {
-            let account_uuid: uuid::Uuid = ctx
-                .account_id
-                .parse()
-                .map_err(|_| ApiError::new("Invalid account ID", "internal_error"))?;
-            let engine_row = sqlx::query(
-                "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1 AND is_default = true LIMIT 1",
-            )
-            .bind(account_uuid)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| ApiError::new(format!("Database error: {e}"), "internal_error"))?
-            .ok_or_else(|| {
-                ApiError::new(
-                    "No Meilisearch engine configured. Add one in Settings.",
-                    "validation_error",
-                )
-            })?;
-            use sqlx::Row as _;
-            let mut config = config;
-            config.meilisearch.url = engine_row.get::<String, _>("url");
-            config.meilisearch.api_key = engine_row.get::<String, _>("api_key");
-            config
-        } else {
-            return Err(ApiError::new(
-                "Meilisearch configuration is required",
-                "validation_error",
-            ));
-        }
-    } else {
-        config
-    };
+    let mut config = config;
+    config.meilisearch = crate::meili::resolve_crawl_meilisearch(
+        state.meili.as_ref(),
+        account_ctx.map(|c| c.account_id.as_str()),
+        std::mem::take(&mut config.meilisearch),
+    )
+    .await?;
 
     // Full validation (start_urls, index_uid length, and any future
     // #[validate] rules) — after index_uid auto-derivation and Meilisearch
     // engine resolution so both are populated before the length checks run.
-    // `mut`: `validate_crawl_config` clamps out-of-range webhook
-    // `timeout_ms` values in place (SCR-72 fix round 1).
-    let mut config = config;
+    // `validate_crawl_config` clamps out-of-range webhook `timeout_ms`
+    // values in place (SCR-72 fix round 1); `config` is already `mut`.
     validate_crawl_config(&mut config)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
@@ -5190,37 +5168,18 @@ async fn search_url(
     }
 
     // Resolve default Meilisearch engine for this account
-    let pool = state
-        .db_pool
-        .as_ref()
-        .ok_or_else(|| ApiError::new("Search requires database configuration", "internal_error"))?;
-
-    let account_id = account_ctx
-        .as_ref()
-        .map(|c| c.account_id.clone())
-        .ok_or_else(|| ApiError::new("Authentication required", "unauthorized"))?;
-
-    let account_uuid: uuid::Uuid = account_id
-        .parse()
-        .map_err(|_| ApiError::new("Invalid account ID", "internal_error"))?;
-
-    let engine_row = sqlx::query(
-        "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1 AND is_default = true LIMIT 1",
-    )
-    .bind(account_uuid)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ApiError::new(format!("Database error: {e}"), "internal_error"))?
-    .ok_or_else(|| {
-        ApiError::new(
-            "No default Meilisearch engine configured. Add one in Settings > Engines.",
-            "not_found",
-        )
-    })?;
-
-    use sqlx::Row;
-    let engine_url: String = engine_row.get("url");
-    let engine_api_key: String = engine_row.get("api_key");
+    let target = state
+        .meili
+        .default_target(account_ctx.as_ref().map(|c| c.account_id.as_str()))
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                "No default Meilisearch configured (MEILISEARCH_URL, or an engine in Settings > Engines)",
+                "not_found",
+            )
+        })?;
+    let engine_url = target.url;
+    let engine_api_key = target.api_key.unwrap_or_default();
 
     // Build Meilisearch search body
     let mut search_body = serde_json::json!({ "q": request.q });
@@ -6582,6 +6541,28 @@ pub async fn run_with_bus(
         webhook_dispatcher,
     );
     state.ocr = ocr;
+    // Replaced by EngineSettings wiring (standalone plan Task 8).
+    let meili_server = args
+        .meilisearch_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|url| crate::meili::MeiliTarget {
+            url: url.trim_end_matches('/').to_string(),
+            api_key: args
+                .meilisearch_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        });
+    state.meili = match state.db_pool.clone() {
+        Some(pool) => Arc::new(crate::meili::EngineTableResolver {
+            pool,
+            server: meili_server,
+        }),
+        None => Arc::new(crate::meili::EnvResolver(meili_server)),
+    };
     let state = Arc::new(state);
 
     // Recover active jobs from Postgres on startup

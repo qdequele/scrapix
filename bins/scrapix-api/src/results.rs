@@ -450,14 +450,10 @@ async fn crawl_results(
     })
 }
 
-fn same_url(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
-}
-
 /// Where `job`'s documents live: the connection remembered at creation,
 /// else the Replace-strategy connection persisted with the job, else the
-/// account's engine matching the job's (redacted) config URL, else the
-/// server's own `MEILISEARCH_URL`/`MEILISEARCH_API_KEY`.
+/// resolver's target for the job's (redacted) config URL, else the
+/// resolver's default target.
 async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliTarget, ApiError> {
     if let Some(target) = state.results.crawl_target(&job.job_id) {
         return Ok(target);
@@ -476,68 +472,28 @@ async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliT
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    if let (Some(pool), Some(account)) = (&state.db_pool, &job.account_id) {
-        if let Ok(account_uuid) = account.parse::<uuid::Uuid>() {
-            use sqlx::Row as _;
-            let row = match config_url {
-                Some(ref url) => {
-                    sqlx::query(
-                        "SELECT url, api_key FROM meilisearch_engines \
-                     WHERE account_id = $1 AND rtrim(url, '/') = rtrim($2, '/') \
-                     ORDER BY is_default DESC LIMIT 1",
-                    )
-                    .bind(account_uuid)
-                    .bind(url)
-                    .fetch_optional(pool)
-                    .await
-                }
-                None => {
-                    sqlx::query(
-                        "SELECT url, api_key FROM meilisearch_engines \
-                     WHERE account_id = $1 AND is_default = true LIMIT 1",
-                    )
-                    .bind(account_uuid)
-                    .fetch_optional(pool)
-                    .await
-                }
-            };
-            match row {
-                Ok(Some(row)) => {
-                    let api_key: Option<String> = row.try_get("api_key").ok();
-                    return Ok(MeiliTarget {
-                        url: row.get("url"),
-                        api_key: api_key.filter(|k| !k.is_empty()),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(job_id = %job.job_id, error = %e, "Engine lookup for job results failed")
-                }
+    let account = job.account_id.as_deref();
+    if let Some(ref url) = config_url {
+        match state.meili.target_for_url(account, url).await {
+            Ok(Some(t)) => return Ok(t),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(job_id = %job.job_id, error = %e.error, "Engine lookup for job results failed")
             }
         }
-    }
-
-    let env_url = std::env::var("MEILISEARCH_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let env_key = std::env::var("MEILISEARCH_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
-    match (config_url, env_url) {
-        (Some(url), Some(env)) if same_url(&url, &env) => Ok(MeiliTarget {
-            url,
-            api_key: env_key,
-        }),
         // An unknown key: try without one (an unsecured instance).
-        (Some(url), _) => Ok(MeiliTarget { url, api_key: None }),
-        (None, Some(url)) => Ok(MeiliTarget {
-            url,
-            api_key: env_key,
-        }),
-        (None, None) => Err(ApiError::new(
+        return Ok(MeiliTarget {
+            url: url.clone(),
+            api_key: None,
+        });
+    }
+    match state.meili.default_target(account).await {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(ApiError::new(
             "The Meilisearch instance of this job is unknown",
             "not_found",
         )),
+        Err(e) => Err(e),
     }
 }
 
