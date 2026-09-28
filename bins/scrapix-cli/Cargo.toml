@@ -11,7 +11,7 @@ name = "scrapix_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "scrapix"
+name = "scrapix-cli"
 path = "src/main.rs"
 
 [dependencies]

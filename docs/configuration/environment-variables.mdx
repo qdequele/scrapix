@@ -73,6 +73,14 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 
 ## Frontier Service
 
+<Note>
+Under `scrapix all` (single-process mode), `DOMAIN_DELAY_MS` and
+`CONCURRENT_PER_DOMAIN` are hardcoded (`250`ms / `4`) and not read from the
+environment. They're only tunable when the frontier runs as its own
+service (distributed mode) — every other variable below applies in both
+modes.
+</Note>
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches |

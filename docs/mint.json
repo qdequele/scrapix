@@ -63,8 +63,8 @@
     {
       "group": "Deployment",
       "pages": [
-        "deployment/overview",
         "deployment/self-hosting",
+        "deployment/overview",
         "deployment/docker-compose",
         "deployment/kubernetes",
         "deployment/fly-io",

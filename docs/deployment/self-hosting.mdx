@@ -102,8 +102,12 @@ curl -s localhost:8080/search \
 | `CORS_ORIGINS` | — | Comma-separated allowed CORS origins. Leave unset to allow all origins (fine for a server-to-server API with no browser client). |
 
 See [Environment Variables](/configuration/environment-variables) for the
-full reference, including crawler/content-worker/frontier tuning that
-applies whether you self-host or not.
+full reference, including crawler and content-worker tuning that applies
+whether you self-host or not. One exception: under `scrapix all` (the
+single-process mode this guide uses), `DOMAIN_DELAY_MS` and
+`CONCURRENT_PER_DOMAIN` are hardcoded (`250`ms / `4`) and **not** read from
+the environment — they're only tunable when you run the frontier as its own
+service (see **Distributed Mode** below).
 
 ## Authentication
 

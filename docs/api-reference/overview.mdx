@@ -54,22 +54,30 @@ All responses return JSON. Successful responses return the data directly. Errors
 
 ## Endpoints Summary
 
-### Public (No Auth Required)
+### Public (No Auth Required, Every Mode)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | [Health check](/api-reference/diagnostics#health-check) |
 | `GET` | `/health/services` | [Service liveness](/api-reference/diagnostics#service-health) |
-| `GET` | `/stats` | [System statistics](/api-reference/diagnostics#system-stats) |
-| `GET` | `/errors` | [Recent errors](/api-reference/diagnostics#recent-errors) |
-| `GET` | `/domains` | [Domain statistics](/api-reference/diagnostics#domain-stats) |
-| `GET` | `/ws` | [WebSocket (multi-job)](/api-reference/websockets) |
-| `GET` | `/ws/job/{id}` | [WebSocket (single job)](/api-reference/websockets#single-job) |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/openapi.json` | OpenAPI 3.1 specification |
+| `GET` | `/docs` | Interactive API docs (Scalar UI) |
 
-### Protected (Auth Required When Enabled)
+### Diagnostics (Auth Required in Standalone; Public in Hosted)
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/stats` | [System statistics](/api-reference/diagnostics#system-stats) |
+| `GET` | `/errors` | [Recent errors](/api-reference/diagnostics#recent-errors) |
+| `GET` | `/domains` | [Domain statistics](/api-reference/diagnostics#domain-stats) |
+
+### Protected (Auth Required, Every Mode)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ws` | [WebSocket (multi-job)](/api-reference/websockets) |
+| `GET` | `/ws/job/{id}` | [WebSocket (single job)](/api-reference/websockets#single-job) |
 | `POST` | `/scrape` | [Scrape a single URL](/api-reference/scrape) |
 | `POST` | `/batch/scrape` | [Scrape many URLs as one job](/api-reference/batch-scrape) |
 | `POST` | `/extract` | [Structured extraction over pages and globs](/api-reference/extract) |
@@ -87,6 +95,10 @@ All responses return JSON. Successful responses return the data directly. Errors
 | `POST` | `/job/{id}/pause` | [Pause a job](/api-reference/jobs#post-job-id-pause) |
 | `POST` | `/job/{id}/resume` | [Resume a job](/api-reference/jobs#post-job-id-resume) |
 
+See [Authentication](/api-reference/authentication) for exactly what
+"auth required" means in each mode (the admin key in standalone; an
+account key or session in hosted).
+
 <Note>
   Saved configs (`/configs`), engine registration (`/engines`), account/session
   auth (`/auth/*`, `/account/*`) and OAuth (`/oauth/*`) are hosted-platform
@@ -100,13 +112,6 @@ All responses return JSON. Successful responses return the data directly. Errors
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/mcp` | [MCP Streamable HTTP](/guides/mcp#http-mcp-endpoint) |
-
-### OpenAPI
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/openapi.json` | OpenAPI 3.1 specification |
-| `GET` | `/docs` | Interactive API docs (Scalar UI) |
 
 ### Analytics (Hosted Only)
 
