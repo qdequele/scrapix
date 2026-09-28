@@ -8,7 +8,7 @@
 //!   Results are read from the job's index with
 //!   `POST /indexes/{uid}/documents/fetch` filtered on `_crawl_job_id`.
 //! - Jobs the engine runs itself (batch scrape, extract) store one result
-//!   per URL with [`store_page`]: in the `job_results` Postgres table
+//!   per URL with [`store_page`]: in the job store's `job_results` table
 //!   (`seq` = completion order, append-only), or in memory when the engine
 //!   has no database (or could not persist the job row). The cursor is the
 //!   `seq` of the last item read, so paging never skips or repeats an item
@@ -50,10 +50,10 @@ use scrapix_core::{JobState, JobStatus};
 
 use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
 use crate::job_kind::JobKind;
+use crate::job_store::StoreError;
 use crate::meili::MeiliTarget;
 use crate::{
-    check_job_ownership, extract_account_context, is_terminal, jobs_db, AccountContext, ApiError,
-    AppState,
+    check_job_ownership, extract_account_context, is_terminal, AccountContext, ApiError, AppState,
 };
 
 /// Default page size of `GET /job/{id}/results`.
@@ -280,7 +280,7 @@ pub(crate) fn status_str(status: &JobStatus) -> String {
 // Handler
 // ============================================================================
 
-/// The job `job_id` (in memory, else Postgres), if the caller owns it.
+/// The job `job_id` (in memory, else the job store), if the caller owns it.
 /// Same lookup and ownership rules as `GET /job/{id}/status`.
 pub(crate) async fn find_owned_job(
     state: &AppState,
@@ -289,13 +289,11 @@ pub(crate) async fn find_owned_job(
 ) -> Result<JobState, ApiError> {
     let job = if let Some(job) = state.get_job(job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = account_ctx {
-            jobs_db::get_job_for_account(pool, job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -330,7 +328,7 @@ pub(crate) async fn job_results(
     Query(query): Query<JobResultsQuery>,
 ) -> Result<Json<JobResultsResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     let job = find_owned_job(&state, &account_ctx, &job_id).await?;
     results_page(&state, &job, query.limit, query.cursor.as_deref())
         .await
@@ -740,29 +738,21 @@ pub(crate) async fn store_page(
     success: bool,
     payload: Value,
 ) {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let mut m = state.results.memory.write();
         if let Some(pages) = m.pages.get_mut(job_id) {
             pages.push(payload);
         }
         return;
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         return;
     };
-    let mut last_error = None;
+    let mut last_error: Option<StoreError> = None;
     for attempt in 0..3u64 {
-        let res = sqlx::query(
-            "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
-             VALUES ($1, $2, 'page', $3, $4, $5) ON CONFLICT (job_id, seq) DO NOTHING",
-        )
-        .bind(job_id)
-        .bind(seq as i32)
-        .bind(url)
-        .bind(success)
-        .bind(&payload)
-        .execute(pool)
-        .await;
+        let res = store
+            .store_result_page(job_id, seq, url, success, &payload)
+            .await;
         match res {
             Ok(_) => return,
             Err(e) => {
@@ -783,26 +773,17 @@ pub(crate) async fn store_page(
 
 /// Store (replace) the summary of an extract job.
 pub(crate) async fn store_summary(state: &AppState, job_id: &str, payload: Value) {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let mut m = state.results.memory.write();
         if m.pages.contains_key(job_id) {
             m.summaries.insert(job_id.to_string(), payload);
         }
         return;
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         return;
     };
-    if let Err(e) = sqlx::query(
-        "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
-         VALUES ($1, 0, 'extract', NULL, true, $2) \
-         ON CONFLICT (job_id, seq) DO UPDATE SET payload = EXCLUDED.payload",
-    )
-    .bind(job_id)
-    .bind(&payload)
-    .execute(pool)
-    .await
-    {
+    if let Err(e) = store.store_result_summary(job_id, &payload).await {
         tracing::error!(job_id = %job_id, error = %e, "Failed to store an extract result");
     }
 }
@@ -812,16 +793,13 @@ pub(crate) async fn load_summary(state: &AppState, job_id: &str) -> Option<Value
     if state.results.in_memory(job_id) {
         return state.results.memory.read().summaries.get(job_id).cloned();
     }
-    let pool = state.db_pool.as_ref()?;
-    sqlx::query_scalar::<_, Value>(
-        "SELECT payload FROM job_results WHERE job_id = $1 AND kind = 'extract' LIMIT 1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| warn!(job_id = %job_id, error = %e, "Failed to load an extract result"))
-    .ok()
-    .flatten()
+    let store = state.job_store.as_ref()?;
+    store
+        .load_result_summary(job_id)
+        .await
+        .map_err(|e| warn!(job_id = %job_id, error = %e, "Failed to load an extract result"))
+        .ok()
+        .flatten()
 }
 
 /// Stored results of an engine-run job after position `after` (the seq of
@@ -832,7 +810,7 @@ async fn stored_results(
     after: u64,
     limit: usize,
 ) -> Result<ResultsSlice, ApiError> {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let m = state.results.memory.read();
         let pages = m.pages.get(job_id).map(Vec::as_slice).unwrap_or_default();
         let start = (after as usize).min(pages.len());
@@ -844,40 +822,26 @@ async fn stored_results(
             has_more: end < pages.len(),
         });
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         unreachable!("checked above");
     };
-    use sqlx::Row as _;
-    let db_error = |e: sqlx::Error| {
-        warn!(job_id = %job_id, error = %e, "Failed to read job results");
-        ApiError::new("Could not read the job's results", "service_unavailable")
-    };
-    let rows = sqlx::query(
-        "SELECT seq, payload FROM job_results \
-         WHERE job_id = $1 AND kind = 'page' AND seq > $2 ORDER BY seq LIMIT $3",
-    )
-    .bind(job_id)
-    .bind(after.min(i32::MAX as u64) as i32)
-    .bind(limit as i64 + 1)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
-    let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_results WHERE job_id = $1 AND kind = 'page'")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await
-            .map_err(db_error)?;
+    let (rows, total) = store
+        .result_pages(job_id, after, limit + 1)
+        .await
+        .map_err(|e| {
+            warn!(job_id = %job_id, error = %e, "Failed to read job results");
+            ApiError::new("Could not read the job's results", "service_unavailable")
+        })?;
     let has_more = rows.len() > limit;
     let mut end = after;
     let mut data = Vec::with_capacity(rows.len().min(limit));
-    for row in rows.into_iter().take(limit) {
-        end = row.get::<i32, _>("seq") as u64;
-        data.push(row.get::<Value, _>("payload"));
+    for (seq, payload) in rows.into_iter().take(limit) {
+        end = seq;
+        data.push(payload);
     }
     Ok(ResultsSlice {
         data,
-        total: total as u64,
+        total,
         end,
         has_more,
     })

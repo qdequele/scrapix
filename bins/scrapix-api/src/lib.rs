@@ -51,7 +51,7 @@ pub mod email_scheduler;
 pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
-pub mod jobs_db;
+pub mod job_store;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
@@ -317,8 +317,11 @@ struct AppState {
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
-    /// PostgreSQL connection pool (for saved configs, cron scheduling)
-    db_pool: Option<sqlx::PgPool>,
+    /// Durable job state and engine-job results (`jobs`, `job_results`).
+    pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
+    /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
+    /// context, billing, Stripe, saved configs + cron, emails).
+    pub(crate) saas_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
     /// Optional Stripe client for payment-backed auto-topup
     stripe_client: Option<::stripe::Client>,
@@ -392,6 +395,9 @@ impl AppState {
     ) -> Self {
         let (event_tx, _) = broadcast::channel(10_000);
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let job_store: Option<Arc<dyn job_store::JobStore>> = db_pool
+            .clone()
+            .map(|p| Arc::new(job_store::PgJobStore::new(p)) as Arc<dyn job_store::JobStore>);
         Self {
             producer,
             config,
@@ -428,14 +434,15 @@ impl AppState {
             browser_renderer,
             ai_service,
             ocr: None,
-            accounting_persisted: std::sync::atomic::AtomicBool::new(db_pool.is_some()),
+            accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             control_tx,
             control_rx: parking_lot::Mutex::new(Some(control_rx)),
             controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             results: results::ResultsState::default(),
             meili: Arc::new(crate::meili::EnvResolver(None)),
-            db_pool,
+            saas_pool: db_pool,
+            job_store,
             stripe_client,
             analytics_store,
             webhook_dispatcher,
@@ -560,10 +567,9 @@ impl AppState {
                 .write()
                 .insert(job_id, snapshot.clone());
         }
-        if let Some(ref pool) = self.db_pool {
-            let pool = pool.clone();
+        if let Some(store) = self.job_store.clone() {
             tokio::spawn(async move {
-                let _ = jobs_db::update_job_full(&pool, &snapshot).await;
+                let _ = store.update_job_full(&snapshot).await;
             });
         }
     }
@@ -585,7 +591,7 @@ impl AppState {
         self.diagnostics
             .job_emails_requested
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id) else {
+        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id) else {
             return;
         };
         tokio::spawn(async move {
@@ -1088,7 +1094,7 @@ impl AppState {
             .credits_billed
             .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
 
-        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
+        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id.cloned()) else {
             return;
         };
         let description = if pages_ocr > 0 {
@@ -1376,21 +1382,23 @@ impl AppState {
         pending.len() + self.in_flight_acks()
     }
 
-    /// Flush dirty job counters, accounting and owed terminal writes to
-    /// Postgres, then release the acks of the events they cover.
-    async fn flush_to_db(&self, pool: &sqlx::PgPool) {
+    /// Flush dirty job counters, accounting and owed terminal writes to the
+    /// job store, then release the acks of the events they cover.
+    async fn flush_to_db(&self, store: &dyn job_store::JobStore) {
         let batch = self.begin_flush();
         if !batch.snapshots.is_empty() {
-            jobs_db::flush_job_counters(pool, &batch.snapshots).await;
+            if let Err(e) = store.flush_job_counters(&batch.snapshots).await {
+                warn!(error = %e, "Failed to flush job counters");
+            }
         }
-        let accounting = match jobs_db::flush_job_accounting(pool, &batch.accounting).await {
+        let accounting = match store.flush_job_accounting(&batch.accounting).await {
             Ok(()) => AccountingFlush::Ok,
             Err(e) => classify_flush_error(&e),
         };
         let mut failed_terminal = HashSet::new();
         if accounting == AccountingFlush::Ok {
             for job in &batch.terminal {
-                if jobs_db::update_job_full(pool, job).await.is_err() {
+                if store.update_job_full(job).await.is_err() {
                     failed_terminal.insert(job.job_id.clone());
                 }
             }
@@ -1901,18 +1909,10 @@ enum AccountingFlush {
     SchemaMissing,
 }
 
-/// Whether a Postgres SQLSTATE means the schema the accounting flush needs is
-/// missing (42703 undefined_column, 42P01 undefined_table).
-fn is_schema_missing_sqlstate(code: Option<&str>) -> bool {
-    matches!(code, Some("42703") | Some("42P01"))
-}
-
-fn classify_flush_error(e: &sqlx::Error) -> AccountingFlush {
+fn classify_flush_error(e: &job_store::StoreError) -> AccountingFlush {
     match e {
-        sqlx::Error::Database(db) if is_schema_missing_sqlstate(db.code().as_deref()) => {
-            AccountingFlush::SchemaMissing
-        }
-        _ => AccountingFlush::Retry,
+        job_store::StoreError::SchemaMissing(_) => AccountingFlush::SchemaMissing,
+        job_store::StoreError::Other(_) => AccountingFlush::Retry,
     }
 }
 
@@ -3212,7 +3212,7 @@ async fn scrape_url(
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     perform_scrape(&state, &account_ctx, &request)
         .await
@@ -3241,7 +3241,7 @@ pub(crate) async fn perform_scrape(
         billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
 
     // Pre-flight credit check (soft UX check; real deduction is atomic below)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, scrape_cost).await?;
     }
 
@@ -3675,7 +3675,7 @@ pub(crate) async fn perform_scrape(
     }
 
     // Deduct credits for successful scrape (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -4169,19 +4169,16 @@ pub(crate) async fn do_create_crawl(
     let warnings = crawl_config_warnings(&config);
 
     // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref pool), Some(ctx)) = (&state.db_pool, account_ctx) {
+    if let (Some(ref pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
         billing::check_credits(pool, &ctx.account_id, 1).await?;
 
         // Enforce max concurrent jobs per billing tier
         let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
         let max_concurrent = tier.max_concurrent_jobs() as i64;
-        let active_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
-        )
-        .bind(uuid::Uuid::parse_str(&ctx.account_id).ok())
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let active_count: i64 = match state.job_store {
+            Some(ref store) => store.count_active_jobs(&ctx.account_id).await.unwrap_or(0),
+            None => 0,
+        };
 
         if active_count >= max_concurrent {
             return Err(ApiError::new(
@@ -4332,6 +4329,37 @@ pub(crate) async fn do_create_crawl(
         state.crawl.accounting.write().insert(job_id.clone(), acc);
     }
 
+    // Update job state (write back config, start_urls, max_pages, replace metadata)
+    let replace_url = if replace_index {
+        Some(config.meilisearch.url.clone())
+    } else {
+        None
+    };
+    let replace_key = if replace_index {
+        Some(config.meilisearch.api_key.clone())
+    } else {
+        None
+    };
+    let snapshot = state.update_job(&job_id, |j| {
+        j.status = JobStatus::Running;
+        j.start_urls = config.start_urls.clone();
+        j.max_pages = config.max_pages;
+        // Redact sensitive fields before persisting config to database
+        j.config = redact_crawl_config_for_storage(&config);
+        // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
+        j.webhooks = config.webhooks.clone();
+        j.started_at = Some(chrono::Utc::now());
+        j.swap_temp_index = None;
+        j.swap_meilisearch_url = replace_url;
+        j.swap_meilisearch_api_key = replace_key;
+    });
+
+    // Persist before any event for this job can be flushed (an update that
+    // lands before its insert changes 0 rows and is lost).
+    if let (Some(store), Some(ref snapshot)) = (&state.job_store, &snapshot) {
+        let _ = store.insert_job(snapshot).await; // logged by the store
+    }
+
     for url in &config.start_urls {
         let crawl_url = CrawlUrl::seed(url);
         // Use pipeline_index_uid (temp index if replace_index, otherwise target)
@@ -4378,9 +4406,13 @@ pub(crate) async fn do_create_crawl(
     }
 
     if urls_published == 0 {
-        // Update job as failed
-        state.update_job(&job_id, |j| j.fail("Failed to publish any seed URLs"));
+        // Update job as failed (also in the store: the row was inserted
+        // before publishing)
+        let failed = state.update_job(&job_id, |j| j.fail("Failed to publish any seed URLs"));
         state.forget_job_tracking(&job_id);
+        if let (Some(store), Some(ref failed)) = (&state.job_store, &failed) {
+            let _ = store.update_job_full(failed).await; // logged by the store
+        }
         return Err(ApiError::new(
             "Failed to publish seed URLs to queue",
             "queue_error",
@@ -4409,43 +4441,12 @@ pub(crate) async fn do_create_crawl(
     // Broadcast event for SSE
     state.broadcast_event(&job_id, event);
 
-    // Update job state (write back config, start_urls, max_pages, replace metadata)
-    let replace_url = if replace_index {
-        Some(config.meilisearch.url.clone())
-    } else {
-        None
-    };
-    let replace_key = if replace_index {
-        Some(config.meilisearch.api_key.clone())
-    } else {
-        None
-    };
-    let snapshot = state.update_job(&job_id, |j| {
-        j.status = JobStatus::Running;
-        j.start_urls = config.start_urls.clone();
-        j.max_pages = config.max_pages;
-        // Redact sensitive fields before persisting config to database
-        j.config = redact_crawl_config_for_storage(&config);
-        // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
-        j.webhooks = config.webhooks.clone();
-        j.started_at = Some(chrono::Utc::now());
-        j.swap_temp_index = None;
-        j.swap_meilisearch_url = replace_url;
-        j.swap_meilisearch_api_key = replace_key;
-    });
-
     // Remember where the job's documents go (`GET /job/{id}/results`).
     state.results.remember_crawl_target(
         &job_id,
         &config.meilisearch.url,
         &config.meilisearch.api_key,
     );
-
-    // Persist new job to Postgres
-    if let (Some(ref pool), Some(snapshot)) = (&state.db_pool, snapshot) {
-        let pool = pool.clone();
-        tokio::spawn(async move { jobs_db::insert_job(&pool, &snapshot).await });
-    }
 
     info!(
         job_id = %job_id,
@@ -4683,11 +4684,11 @@ async fn map_url(
     Json(request): Json<MapRequest>,
 ) -> Result<Json<MapResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check (map costs 2 credits)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, billing::MAP_CREDITS).await?;
     }
 
@@ -5080,7 +5081,7 @@ async fn map_url(
     }
 
     // Deduct 2 credits for successful map (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -5130,11 +5131,11 @@ async fn search_url(
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, billing::SEARCH_CREDITS).await?;
     }
 
@@ -5291,7 +5292,7 @@ async fn search_url(
     }
 
     // Deduct 2 credits for search
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -5318,7 +5319,7 @@ async fn create_crawl(
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<CreateCrawlResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     Ok(Json(
         do_create_crawl(&state, config, account_ctx.as_ref()).await?,
@@ -5338,7 +5339,7 @@ async fn create_crawl_sync(
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     // First create the async job
     let response = do_create_crawl(&state, config, account_ctx.as_ref()).await?;
@@ -5408,7 +5409,7 @@ async fn create_crawl_bulk(
     Json(configs): Json<Vec<CrawlConfig>>,
 ) -> Result<Json<BulkCrawlResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     let total = configs.len();
@@ -5448,18 +5449,16 @@ async fn job_status(
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
     // Try in-memory first, fall back to Postgres for historical jobs
     let job = if let Some(job) = state.get_job(&job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = &account_ctx {
-            jobs_db::get_job_for_account(pool, &job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, &job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(&job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -5477,7 +5476,7 @@ async fn job_events(
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
     // Check if job exists and ownership
     let job = state
@@ -5582,18 +5581,16 @@ async fn get_job_events_history(
     Query(params): Query<JobEventsHistoryParams>,
 ) -> Result<Json<JobEventsHistoryResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
     // Verify the job exists (check in-memory then Postgres)
     let job = if let Some(job) = state.get_job(&job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = &account_ctx {
-            jobs_db::get_job_for_account(pool, &job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, &job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(&job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -6007,7 +6004,7 @@ async fn ws_job_handler(
 
     // Verify account ownership if auth is enabled
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     if let Some(ref ctx) = account_ctx {
         if let Some(ref job_account_id) = job.account_id {
             if job_account_id != &ctx.account_id {
@@ -6150,7 +6147,8 @@ async fn owned_job(
     user_ext: &Option<Extension<AuthenticatedUser>>,
     job_id: &str,
 ) -> Result<JobState, ApiError> {
-    let account_ctx = extract_account_context(state.db_pool.as_ref(), account_ext, user_ext).await;
+    let account_ctx =
+        extract_account_context(state.saas_pool.as_ref(), account_ext, user_ext).await;
     let existing = state
         .get_job(job_id)
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
@@ -6167,22 +6165,18 @@ async fn list_jobs(
     Query(params): Query<ListJobsQuery>,
 ) -> Json<Vec<JobStatusResponse>> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
     // When Postgres is available, query DB for full history (survives restarts)
     // and overlay in-memory data for running jobs (fresher counters).
-    let jobs: Vec<JobState> = if let Some(ref pool) = state.db_pool {
-        let mut db_jobs = if let Some(ctx) = &account_ctx {
-            jobs_db::list_jobs_for_account_db(
-                pool,
-                &ctx.account_id,
+    let jobs: Vec<JobState> = if let Some(ref store) = state.job_store {
+        let mut db_jobs = store
+            .list_jobs(
+                account_ctx.as_ref().map(|c| c.account_id.as_str()),
                 params.limit as i64,
                 params.offset as i64,
             )
-            .await
-        } else {
-            jobs_db::list_all_jobs_db(pool, params.limit as i64, params.offset as i64).await
-        };
+            .await;
 
         // Overlay in-memory state for active jobs (fresher counters)
         let in_memory = state.crawl.jobs.read();
@@ -6556,7 +6550,7 @@ pub async fn run_with_bus(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
         });
-    state.meili = match state.db_pool.clone() {
+    state.meili = match state.saas_pool.clone() {
         Some(pool) => Arc::new(crate::meili::EngineTableResolver {
             pool,
             server: meili_server,
@@ -6566,11 +6560,11 @@ pub async fn run_with_bus(
     let state = Arc::new(state);
 
     // Recover active jobs from Postgres on startup
-    if let Some(ref pool) = state.db_pool {
-        let recovered = jobs_db::load_active_jobs(pool).await;
+    if let Some(ref store) = state.job_store {
+        let recovered = store.load_active_jobs().await;
         // Engine-run jobs (batch scrape, extract) died with the previous
         // process: mark them failed instead of recovering them as running.
-        let recovered = engine_jobs::fail_interrupted(pool, recovered).await;
+        let recovered = engine_jobs::fail_interrupted(store.as_ref(), recovered).await;
         if !recovered.is_empty() {
             let now = std::time::Instant::now();
             let mut jobs = state.crawl.jobs.write();
@@ -6584,14 +6578,15 @@ pub async fn run_with_bus(
             }
             info!(
                 count = recovered.len(),
-                "Recovered active jobs from Postgres"
+                "Recovered active jobs from {}",
+                store.backend()
             );
         }
 
         // Recover the work accounting of running/paused jobs (R5). The
         // per-page seen-sets are not persisted, so redelivered events after a
         // restart are not deduplicated against pre-restart ones.
-        let persisted = jobs_db::load_active_job_accounting(pool).await;
+        let persisted = store.load_active_job_accounting().await;
         let persisted: HashMap<String, serde_json::Value> = persisted.into_iter().collect();
         let restored = {
             let jobs = state.crawl.jobs.read();
@@ -6610,7 +6605,8 @@ pub async fn run_with_bus(
         if restored > 0 {
             info!(
                 count = restored,
-                "Recovered job work accounting from Postgres"
+                "Recovered job work accounting from {}",
+                store.backend()
             );
         }
     }
@@ -6664,7 +6660,7 @@ pub async fn run_with_bus(
     let has_flush_work = request_batcher.is_some()
         || ai_usage_batcher.is_some()
         || job_event_batcher.is_some()
-        || state.db_pool.is_some();
+        || state.job_store.is_some();
     let flush_handle = if has_flush_work {
         let req_batcher = request_batcher.clone();
         let ai_batcher = ai_usage_batcher.clone();
@@ -6672,7 +6668,7 @@ pub async fn run_with_bus(
         let flush_state = state.clone();
         // With Postgres, the flush task owns the consumer's shutdown join: it
         // must drain before the final flush (R-19).
-        let mut consumer_join = if state.db_pool.is_some() {
+        let mut consumer_join = if state.job_store.is_some() {
             consumer_handle.take()
         } else {
             None
@@ -6700,8 +6696,8 @@ pub async fn run_with_bus(
                         }
                         // Flush dirty job counters + accounting to Postgres,
                         // then release the acks they cover
-                        if let Some(ref pool) = flush_state.db_pool {
-                            flush_state.flush_to_db(pool).await;
+                        if let Some(ref store) = flush_state.job_store {
+                            flush_state.flush_to_db(store.as_ref()).await;
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -6724,13 +6720,13 @@ pub async fn run_with_bus(
                         // Final Postgres flush — only once the event consumer
                         // has drained and sync-committed (R-19), so the final
                         // snapshot covers every event it applied.
-                        if let Some(ref pool) = flush_state.db_pool {
+                        if let Some(ref store) = flush_state.job_store {
                             if let Some(handle) = consumer_join.take() {
                                 if let Err(e) = handle.await {
                                     warn!("Consumer task failed during shutdown: {}", e);
                                 }
                             }
-                            flush_state.flush_to_db(pool).await;
+                            flush_state.flush_to_db(store.as_ref()).await;
                         }
                         break;
                     }
@@ -6740,7 +6736,7 @@ pub async fn run_with_bus(
         if request_batcher.is_some() || ai_usage_batcher.is_some() {
             info!("ClickHouse event persistence enabled (flush interval: 5s)");
         }
-        if state.db_pool.is_some() {
+        if state.job_store.is_some() {
             info!("Postgres job counter flush enabled (flush interval: 5s)");
         }
         Some(handle)
@@ -6782,7 +6778,7 @@ pub async fn run_with_bus(
     );
 
     // Start cron scheduler if database is configured
-    let cron_handle = if let Some(ref pool) = state.db_pool {
+    let cron_handle = if let Some(ref pool) = state.saas_pool {
         let handle =
             configs::spawn_cron_scheduler(state.clone(), pool.clone(), shutdown_rx.clone());
         info!("Cron scheduler started (30s tick interval)");
@@ -7715,6 +7711,123 @@ mod lifecycle_tests {
             .insert(job_id.to_string(), acc);
     }
 
+    /// A job store that records its job inserts and, for each, whether a
+    /// seed URL had already reached the frontier topic.
+    struct SeedOrderStore {
+        frontier: scrapix_queue::ChannelConsumer,
+        inserts: parking_lot::Mutex<Vec<(String, JobStatus, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl job_store::JobStore for SeedOrderStore {
+        fn backend(&self) -> &'static str {
+            "test"
+        }
+        async fn insert_job(&self, job: &JobState) -> Result<(), job_store::StoreError> {
+            let seed_published = self
+                .frontier
+                .poll_one::<serde_json::Value>(Duration::from_millis(50))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            self.inserts
+                .lock()
+                .push((job.job_id.clone(), job.status.clone(), seed_published));
+            Ok(())
+        }
+        async fn update_job_full(&self, _: &JobState) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn flush_job_counters(&self, _: &[JobState]) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn flush_job_accounting(
+            &self,
+            _: &[(String, serde_json::Value)],
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_active_jobs(&self) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn load_active_job_accounting(&self) -> Vec<(String, serde_json::Value)> {
+            Vec::new()
+        }
+        async fn get_job(&self, _: &str, _: Option<&str>) -> Option<JobState> {
+            None
+        }
+        async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn count_active_jobs(&self, _: &str) -> Result<i64, job_store::StoreError> {
+            Ok(0)
+        }
+        async fn store_result_page(
+            &self,
+            _: &str,
+            _: u64,
+            _: &str,
+            _: bool,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn store_result_summary(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_result_summary(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, job_store::StoreError> {
+            Ok(None)
+        }
+        async fn result_pages(
+            &self,
+            _: &str,
+            _: u64,
+            _: usize,
+        ) -> Result<(Vec<(u64, serde_json::Value)>, u64), job_store::StoreError> {
+            Ok((Vec::new(), 0))
+        }
+    }
+
+    /// A crawl job's row is inserted (awaited) before its first seed URL is
+    /// published: the counter flush's UPDATE for an event of the job must
+    /// never land before the INSERT (it would change 0 rows and be lost).
+    #[tokio::test]
+    async fn crawl_job_is_persisted_before_its_first_seed_is_published() {
+        let bus = ChannelBus::new();
+        let frontier = bus.consumer();
+        frontier.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
+        let store = Arc::new(SeedOrderStore {
+            frontier,
+            inserts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut state = test_state(&bus);
+        state.job_store = Some(store.clone());
+        let state = Arc::new(state);
+        let config: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test/"],
+            "index_uid": "a",
+            "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k"}
+        }))
+        .unwrap();
+
+        let created = do_create_crawl(&state, config, None).await.unwrap();
+
+        let inserts = store.inserts.lock().clone();
+        assert_eq!(
+            inserts,
+            vec![(created.job_id, JobStatus::Running, false)],
+            "one insert, of the running job, before any seed was published"
+        );
+    }
+
     /// R10/SCR-22: `/metrics` reports `scrapix_api_jobs{status}` computed
     /// from the in-memory job map at scrape time.
     #[tokio::test]
@@ -8458,13 +8571,13 @@ mod lifecycle_tests {
     /// released.
     #[tokio::test]
     async fn schema_missing_flush_disables_deferral_and_releases_acks() {
-        assert!(is_schema_missing_sqlstate(Some("42703")));
-        assert!(is_schema_missing_sqlstate(Some("42P01")));
-        assert!(!is_schema_missing_sqlstate(Some("08006")));
-        assert!(!is_schema_missing_sqlstate(None));
         assert_eq!(
-            classify_flush_error(&sqlx::Error::PoolTimedOut),
+            classify_flush_error(&job_store::StoreError::Other("timeout".into())),
             AccountingFlush::Retry
+        );
+        assert_eq!(
+            classify_flush_error(&job_store::StoreError::SchemaMissing("x".into())),
+            AccountingFlush::SchemaMissing
         );
 
         let bus = ChannelBus::new();

@@ -238,7 +238,7 @@ pub(crate) async fn batch_scrape(
     Json(body): Json<Value>,
 ) -> Result<Json<BatchScrapeResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     let batch = parse_batch_body(body)?;
     start_batch(&state, &account_ctx, batch).await.map(Json)
