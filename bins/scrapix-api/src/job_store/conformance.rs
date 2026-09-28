@@ -188,3 +188,13 @@ macro_rules! conformance_tests {
 }
 
 conformance_tests!(postgres, super::super::postgres::test_store());
+
+conformance_tests!(sqlite, async {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("t.db").display());
+    let store = super::super::sqlite::SqliteJobStore::open(&url)
+        .await
+        .unwrap();
+    std::mem::forget(dir); // keep the file for the test's lifetime
+    Some(std::sync::Arc::new(store) as std::sync::Arc<dyn super::super::JobStore>)
+});

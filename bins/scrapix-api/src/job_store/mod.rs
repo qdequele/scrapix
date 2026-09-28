@@ -8,11 +8,12 @@
 #[cfg(test)]
 mod conformance;
 pub mod postgres;
-pub mod sqlite; // added in Task 6
+pub mod sqlite;
 
 use scrapix_core::{JobState, JobStatus};
 
 pub use postgres::PgJobStore;
+pub use sqlite::SqliteJobStore;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -55,8 +56,12 @@ pub(crate) fn str_to_status(s: &str) -> JobStatus {
 
 /// Persistence for crawl/engine job state and engine-job results.
 ///
-/// Failures are logged by the store; methods returning `Result` also hand
-/// the error back so the caller can retry or degrade.
+/// Methods returning `Result` hand the error back so the caller can retry
+/// or degrade; most of them also log the failure before returning it.
+/// Exceptions, left to the caller to log if it cares: `count_active_jobs`
+/// and the four `job_results` methods (`store_result_page`,
+/// `store_result_summary`, `load_result_summary`, `result_pages`). `get_job`
+/// returns `Option`, not `Result`, and never logs either way.
 #[async_trait::async_trait]
 pub trait JobStore: Send + Sync {
     /// `"postgres"` or `"sqlite"` (for logs).
