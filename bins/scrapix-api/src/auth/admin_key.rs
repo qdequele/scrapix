@@ -28,7 +28,6 @@ impl AdminKey {
     }
 }
 
-#[allow(dead_code)] // used by the router (standalone mode)
 fn header_key(request: &Request) -> Option<&str> {
     let headers = request.headers();
     if let Some(b) = headers
@@ -45,19 +44,16 @@ fn header_key(request: &Request) -> Option<&str> {
 }
 
 /// The `token` query parameter, percent-decoded.
-#[allow(dead_code)] // used by the router (standalone mode)
 pub(crate) fn query_token(query: Option<&str>) -> Option<String> {
     url::form_urlencoded::parse(query?.as_bytes())
         .find(|(k, _)| k == "token")
         .map(|(_, v)| v.into_owned())
 }
 
-#[allow(dead_code)] // used by the router (standalone mode)
 fn unauthorized() -> AuthError {
     AuthError::new("Missing or invalid admin key", "unauthorized")
 }
 
-#[allow(dead_code)] // used by the router (standalone mode)
 pub(crate) async fn validate_admin_key(
     State(key): State<AdminKey>,
     request: Request,
@@ -71,7 +67,6 @@ pub(crate) async fn validate_admin_key(
 
 /// WebSocket variant: browsers can't set headers on an upgrade, so the key
 /// may also come as `?token=`.
-#[allow(dead_code)] // used by the router (standalone mode)
 pub(crate) async fn validate_admin_key_ws(
     State(key): State<AdminKey>,
     request: Request,

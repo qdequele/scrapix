@@ -28,7 +28,6 @@ impl IntoResponse for AuthError {
 }
 
 impl AuthError {
-    #[allow(dead_code)] // used by the router (standalone mode)
     pub(crate) fn new(error: impl Into<String>, code: impl Into<String>) -> Self {
         Self {
             error: error.into(),

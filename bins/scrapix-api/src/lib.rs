@@ -55,6 +55,7 @@ pub mod job_store;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
+pub(crate) mod router;
 pub mod settings;
 pub mod stripe;
 pub mod webhooks;
@@ -68,13 +69,11 @@ use axum::{
         Extension, Path, Query, State,
     },
     http::StatusCode,
-    middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
-    Json, Router,
+    Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
@@ -83,10 +82,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
@@ -6790,68 +6786,20 @@ pub async fn run_with_bus(
     // Email delivery moved to the Rails app (SolidQueue drains the shared
     // scheduled_emails queue); the engine only inserts rows.
 
-    // Build router
-    // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/health", get(health))
-        .route("/health/services", get(health_services))
-        .route("/metrics", get(metrics))
-        .route("/stats", get(handle_stats))
-        .route("/errors", get(handle_errors))
-        .route("/domains", get(handle_domains))
-        .route("/ws", get(ws_handler))
-        .route("/ws/job/{id}", get(ws_job_handler));
-
-    // Product routes — revenue-generating API endpoints
-    let product_routes = Router::new()
-        .route("/scrape", post(scrape_url))
-        .route("/batch/scrape", post(batch::batch_scrape))
-        .route("/extract", post(extract::create_extract))
-        .route("/extract/{id}", get(extract::get_extract))
-        .route("/map", post(map_url))
-        .route("/search", post(search_url))
-        .route("/crawl", post(create_crawl))
-        .route("/crawl/sync", post(create_crawl_sync))
-        .route("/crawl/bulk", post(create_crawl_bulk));
-
-    // Management routes — job monitoring and configuration
-    let management_routes = Router::new()
-        .route("/jobs", get(list_jobs))
-        .route("/job/{id}/status", get(job_status))
-        .route("/job/{id}/events", get(job_events))
-        .route("/job/{id}/events/history", get(get_job_events_history))
-        .route("/job/{id}/results", get(results::job_results))
-        .route("/job/{id}", delete(cancel_job))
-        .route("/job/{id}/pause", post(pause_job))
-        .route("/job/{id}/resume", post(resume_job));
-
-    // Protected routes (API key auth required when enabled).
-    // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
-    // Stripe, analytics pipes, OAuth provider, /mcp) is served by the Rails
-    // app (saas/, SCR-85); the engine keeps only the crawl data plane.
-    let protected_routes = product_routes.merge(management_routes);
-
-    // Apply auth middleware if configured (accepts API key, Bearer token, or
-    // session cookie). route_layer keeps it off the 404 fallback, so removed
-    // SaaS paths return 404 instead of a misleading 401.
-    let protected_routes = if let Some(ref auth) = auth_state {
-        protected_routes.route_layer(middleware::from_fn_with_state(
-            auth.clone(),
-            auth::validate_api_key_or_session,
-        ))
+    // Replaced by EngineSettings wiring (standalone plan Task 8).
+    let auth_mode = match &auth_state {
+        Some(a) => auth::AuthMode::Saas(a.clone()),
+        None => auth::AuthMode::Disabled,
+    };
+    let mode = if auth_state.is_some() {
+        settings::Mode::Hosted
     } else {
-        protected_routes
+        settings::Mode::Standalone
     };
 
-    // Per-account rate limiting on protected routes was removed — pricing is
-    // usage-based (credits), not per-request, so there's nothing to gate on the
-    // request rate. Brute-force protection on the auth endpoints lives with
-    // the auth endpoints themselves, in the Rails app (Rack::Attack).
-    let mut app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+    // Routes, auth guards, request tracing, /openapi.json + /docs and the
+    // body-size limits (CORS is added below).
+    let mut app = router::build_router(state.clone(), &auth_mode, mode);
 
     // OAuth token cleanup: both backends validate tokens from the shared
     // Postgres; the engine hosts the hourly expired-code/token sweep.
@@ -6859,71 +6807,9 @@ pub async fn run_with_bus(
         auth::oauth::spawn_token_cleanup(auth.pool.clone());
     }
 
-    // OpenAPI spec + Scalar docs UI
-    {
-        use utoipa::OpenApi;
-        let spec = openapi::ScrapixApi::openapi();
-        let spec_json = spec.to_json().expect("OpenAPI JSON serialization");
-        app = app
-            .route(
-                "/openapi.json",
-                get(|| async move {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        spec_json,
-                    )
-                }),
-            )
-            .route(
-                "/docs",
-                get(|| async {
-                    axum::response::Html(
-                        r#"<!doctype html>
-<html>
-<head><title>Scrapix API Reference</title><meta charset="utf-8"/></head>
-<body>
-<script id="api-reference" data-url="/openapi.json"></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-</body>
-</html>"#,
-                    )
-                }),
-            );
-        info!("OpenAPI spec at /openapi.json, docs UI at /docs");
-    }
-
     // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
     // app; the engine only writes events to ClickHouse (batchers above) and
     // reads page-event history for /job/{id}/events/history.
-
-    // Request body size limit (2 MB default, prevents DoS via large payloads)
-    app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
-        2 * 1024 * 1024,
-    ));
-
-    // POST /parse (document upload) is merged after the 2 MB layer — layers
-    // only wrap routes that already exist — with its own cap
-    // (DOCUMENT_MAX_SIZE_MB + multipart overhead) and the same auth.
-    {
-        let upload_limit = documents::max_document_bytes() as usize + 1024 * 1024;
-        let parse_routes = Router::new()
-            .route("/parse", post(documents::parse_upload))
-            .layer(axum::extract::DefaultBodyLimit::max(upload_limit))
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(upload_limit));
-        let parse_routes = if let Some(ref auth) = auth_state {
-            parse_routes.route_layer(middleware::from_fn_with_state(
-                auth.clone(),
-                auth::validate_api_key_or_session,
-            ))
-        } else {
-            parse_routes
-        };
-        app = app.merge(
-            parse_routes
-                .layer(TraceLayer::new_for_http())
-                .with_state(state.clone()),
-        );
-    }
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.
