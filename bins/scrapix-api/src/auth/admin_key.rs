@@ -157,6 +157,29 @@ mod tests {
         assert_eq!(status(app(true), r).await, 200);
     }
 
+    #[tokio::test]
+    async fn ws_missing_key_is_401() {
+        let r = HttpRequest::get("/p").body(Body::empty()).unwrap();
+        assert_eq!(status(app(true), r).await, 401);
+    }
+
+    #[tokio::test]
+    async fn ws_wrong_query_token_is_401() {
+        let r = HttpRequest::get("/p?token=wrong-wrong-wrong-")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(app(true), r).await, 401);
+    }
+
+    #[tokio::test]
+    async fn ws_wrong_header_does_not_fall_back_to_correct_query_token() {
+        let r = HttpRequest::get(format!("/p?token={KEY}"))
+            .header("X-API-Key", "nope-nope-nope-nope")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(app(true), r).await, 401);
+    }
+
     #[test]
     fn matches_rejects_prefixes_and_different_lengths() {
         let k = AdminKey::new(KEY.into());
