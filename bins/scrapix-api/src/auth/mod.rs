@@ -16,7 +16,7 @@ pub use scrapix_auth::{AuthenticatedAccount, AuthenticatedUser, Claims};
 
 pub use admin_key::AdminKey;
 
-pub(crate) use middleware::validate_api_key_or_session;
+pub(crate) use middleware::{validate_api_key_or_session, ws_query_token_as_api_key};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 

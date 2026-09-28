@@ -48,7 +48,8 @@ fn trace_layer() -> TraceLayer<
     })
 }
 
-/// Apply `auth` to `routes`. `ws` routes additionally accept `?token=` in standalone.
+/// Apply `auth` to `routes`. `ws` routes additionally accept `?token=` (in
+/// both modes) when no `Authorization`/`X-API-Key` header is sent.
 ///
 /// `route_layer` keeps the guard off the 404 fallback, so unknown paths
 /// return 404 instead of a misleading 401.
@@ -63,10 +64,18 @@ fn guard(routes: Router<Arc<AppState>>, auth: &AuthMode, ws: bool) -> Router<Arc
             key.clone(),
             auth::admin_key::validate_admin_key,
         )),
-        AuthMode::Saas(state) => routes.route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::validate_api_key_or_session,
-        )),
+        AuthMode::Saas(state) => {
+            let routes = routes.route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::validate_api_key_or_session,
+            ));
+            if ws {
+                // Added last, so it runs first: `?token=` → `X-API-Key`.
+                routes.route_layer(middleware::from_fn(auth::ws_query_token_as_api_key))
+            } else {
+                routes
+            }
+        }
     }
 }
 
@@ -124,7 +133,7 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode, mode: Mode) ->
         Mode::Hosted => diagnostics,
     };
 
-    // Guarded in every mode; standalone also accepts `?token=` (browsers
+    // Guarded in every mode; both modes also accept `?token=` (browsers
     // can't set headers on an upgrade).
     let ws = guard(
         Router::new()
@@ -240,7 +249,10 @@ mod tests {
     }
 
     fn saas() -> AuthMode {
+        // Unreachable: a DB-backed check fails fast instead of waiting out
+        // the default 30 s acquire timeout.
         let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(500))
             .connect_lazy("postgres://x@127.0.0.1:1/x")
             .unwrap();
         AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState {
@@ -356,6 +368,80 @@ mod tests {
     async fn hosted_ws_requires_auth_but_diagnostics_stay_public() {
         assert_eq!(status(app(saas(), Mode::Hosted), "/ws", None).await, 401);
         assert_eq!(status(app(saas(), Mode::Hosted), "/stats", None).await, 200);
+    }
+
+    /// The 401 body's `error` for a request to `uri` with `headers`.
+    async fn auth_error(app: Router, uri: &str, headers: &[(&str, &str)]) -> String {
+        let mut req = Request::get(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), 401, "{uri}");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn hosted_ws_reads_query_token_as_api_key() {
+        // A malformed key is rejected on format before any DB lookup, so the
+        // error proves `?token=` reached the SaaS middleware as an API key
+        // (without it the request is "Missing API key or session").
+        for uri in ["/ws?token=not-a-key", "/ws/job/x?token=not-a-key"] {
+            assert_eq!(
+                auth_error(app(saas(), Mode::Hosted), uri, &[]).await,
+                "Invalid API key format",
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            auth_error(app(saas(), Mode::Hosted), "/ws", &[]).await,
+            "Missing API key or session"
+        );
+        // Percent-decoded, like standalone's `?token=`: `%73k_live_...` is
+        // `sk_live_...`, which passes the format check and reaches the
+        // (unreachable) database.
+        assert_eq!(
+            auth_error(app(saas(), Mode::Hosted), "/ws?token=%73k_live_x", &[]).await,
+            "Authentication service unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_ws_header_wins_over_query_token() {
+        // X-API-Key present: its (malformed) value is the one validated,
+        // not the well-formed `?token=`.
+        assert_eq!(
+            auth_error(
+                app(saas(), Mode::Hosted),
+                "/ws?token=sk_live_x",
+                &[("X-API-Key", "not-a-key")]
+            )
+            .await,
+            "Invalid API key format"
+        );
+        // Authorization present: the Bearer token is validated, `?token=`
+        // is ignored.
+        assert_eq!(
+            auth_error(
+                app(saas(), Mode::Hosted),
+                "/ws?token=not-a-key",
+                &[("Authorization", "Bearer abc")]
+            )
+            .await,
+            "Invalid or expired Bearer token"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_query_token_is_ws_only() {
+        assert_eq!(
+            auth_error(app(saas(), Mode::Hosted), "/jobs?token=not-a-key", &[]).await,
+            "Missing API key or session"
+        );
     }
 
     #[tokio::test]

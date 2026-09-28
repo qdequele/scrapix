@@ -43,6 +43,24 @@ fn hash_api_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Hosted WebSocket routes only, layered in front of
+/// [`validate_api_key_or_session`]: browsers can't set headers on an
+/// upgrade, so when the request carries neither `Authorization` nor
+/// `X-API-Key`, the percent-decoded `?token=` value is presented as an
+/// `X-API-Key` (same rule as standalone's `validate_admin_key_ws`: a header,
+/// when present, always wins). Logs redact `token` query values.
+pub(crate) async fn ws_query_token_as_api_key(mut request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    if !headers.contains_key("Authorization") && !headers.contains_key("X-API-Key") {
+        if let Some(value) = super::admin_key::query_token(request.uri().query())
+            .and_then(|t| axum::http::HeaderValue::from_str(&t).ok())
+        {
+            request.headers_mut().insert("X-API-Key", value);
+        }
+    }
+    next.run(request).await
+}
+
 /// Middleware: accept API key (X-API-Key), Bearer token (Authorization: Bearer), or session cookie.
 /// This allows external API clients, CLI (OAuth), and the console to access protected routes.
 pub(crate) async fn validate_api_key_or_session(
