@@ -32,6 +32,30 @@ impl PgJobStore {
     }
 }
 
+/// Standalone-only migrations: the engine's own `jobs`/`job_results` schema,
+/// tracked in `_sqlx_migrations`. Never run in hosted mode, where Rails owns
+/// the schema.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+impl PgJobStore {
+    /// Standalone only: apply the engine's own schema (tracked in
+    /// `_sqlx_migrations`). Never called in hosted mode, where Rails owns it.
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(format!("Postgres job store migration failed: {e}")))
+    }
+
+    /// A Rails database has `schema_migrations` in the current search path.
+    pub async fn is_rails_database(&self) -> Result<bool, StoreError> {
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('schema_migrations') IS NOT NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(store_err)
+    }
+}
+
 // ============================================================================
 // Row → JobState conversion
 // ============================================================================
@@ -524,13 +548,67 @@ impl JobStore for PgJobStore {
     }
 }
 
+/// Throwaway Postgres for the conformance suite; each call gets a fresh,
+/// migrated schema so tests don't see each other's rows.
+#[cfg(test)]
+pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
+    let url = std::env::var("JOBSTORE_TEST_DATABASE_URL").ok()?;
+    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+    let admin = sqlx::PgPool::connect(&url).await.ok()?;
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .ok()?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect({
+            let schema = schema.clone();
+            move |conn, _| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!("SET search_path TO {schema}"))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            }
+        })
+        .connect(&url)
+        .await
+        .ok()?;
+    let store = PgJobStore::new(pool);
+    store.migrate().await.ok()?;
+    Some(store)
+}
+
+#[cfg(test)]
+pub(crate) async fn test_store() -> Option<std::sync::Arc<dyn JobStore>> {
+    Some(std::sync::Arc::new(test_pg_store().await?))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_pg_store;
+
     #[test]
     fn schema_missing_sqlstates() {
         assert!(super::is_schema_missing_sqlstate(Some("42703")));
         assert!(super::is_schema_missing_sqlstate(Some("42P01")));
         assert!(!super::is_schema_missing_sqlstate(Some("08006")));
         assert!(!super::is_schema_missing_sqlstate(None));
+    }
+
+    #[tokio::test]
+    async fn detects_rails_database() {
+        let Some(pg) = test_pg_store().await else {
+            eprintln!("skipped: postgres backend unavailable");
+            return;
+        };
+        assert!(!pg.is_rails_database().await.unwrap());
+        sqlx::query("CREATE TABLE schema_migrations (version text)")
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+        assert!(pg.is_rails_database().await.unwrap());
     }
 }
