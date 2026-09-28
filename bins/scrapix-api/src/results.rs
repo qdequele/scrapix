@@ -50,6 +50,7 @@ use scrapix_core::{JobState, JobStatus};
 
 use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
 use crate::job_kind::JobKind;
+use crate::meili::MeiliTarget;
 use crate::{
     check_job_ownership, extract_account_context, is_terminal, jobs_db, AccountContext, ApiError,
     AppState,
@@ -169,13 +170,6 @@ pub(crate) struct JobResultError {
     /// Machine-readable code (`fetch_error`, `http_error`, `validation_error`, ...)
     pub code: String,
     pub message: String,
-}
-
-/// Where a crawl job's documents live.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MeiliTarget {
-    pub url: String,
-    pub api_key: Option<String>,
 }
 
 /// Results-layer state kept in `AppState`.

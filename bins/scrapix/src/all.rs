@@ -25,9 +25,9 @@ pub struct AllArgs {
     pub port: u16,
 
     // === Meilisearch ===
-    /// Meilisearch server URL
-    #[arg(long, env = "MEILISEARCH_URL", default_value = "http://localhost:7700")]
-    pub meilisearch_url: String,
+    /// Meilisearch server URL (required unless every crawl passes `meilisearch.url`)
+    #[arg(long, env = "MEILISEARCH_URL")]
+    pub meilisearch_url: Option<String>,
 
     /// Meilisearch API key
     #[arg(long, env = "MEILISEARCH_API_KEY")]
@@ -140,6 +140,11 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         brokers: String::new(), // unused with channel bus
         database_url: args.database_url.clone(),
         jwt_secret: args.jwt_secret.clone(),
+        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
+        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
+        auth: std::env::var("SCRAPIX_AUTH").ok(),
+        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_api_key: args.meilisearch_key.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
@@ -307,7 +312,7 @@ fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content
         brokers,
         group_id: "scrapix-content".to_string(),
         concurrency: args.content_concurrency,
-        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_url: args.meilisearch_url.clone().unwrap_or_default(),
         meilisearch_key: args.meilisearch_key.clone(),
         default_index: "scrapix".to_string(),
         extract_content: true,
@@ -446,6 +451,11 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         brokers: brokers.to_string(),
         database_url: args.database_url.clone(),
         jwt_secret: args.jwt_secret.clone(),
+        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
+        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
+        auth: std::env::var("SCRAPIX_AUTH").ok(),
+        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_api_key: args.meilisearch_key.clone(),
         stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),

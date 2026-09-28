@@ -52,8 +52,10 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod jobs_db;
+pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
+pub mod settings;
 pub mod stripe;
 pub mod webhooks;
 
@@ -141,6 +143,28 @@ pub struct Args {
     /// JWT secret for session tokens (required when DATABASE_URL is set)
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
+
+    /// Deployment mode: `standalone` (default, self-hosted, admin key) or
+    /// `hosted` (Rails control plane, shared Postgres).
+    #[arg(long, env = "SCRAPIX_MODE", default_value = "standalone")]
+    pub mode: String,
+
+    /// Standalone admin key (min 16 chars). Accepted as `Authorization:
+    /// Bearer` or `X-API-Key`.
+    #[arg(long, env = "SCRAPIX_ADMIN_KEY", hide_env_values = true)]
+    pub admin_key: Option<String>,
+
+    /// `disabled` turns auth off in standalone (local dev only).
+    #[arg(long, env = "SCRAPIX_AUTH")]
+    pub auth: Option<String>,
+
+    /// Default Meilisearch for crawls and /search in standalone.
+    #[arg(long, env = "MEILISEARCH_URL")]
+    pub meilisearch_url: Option<String>,
+
+    /// API key for the default Meilisearch.
+    #[arg(long, env = "MEILISEARCH_API_KEY", hide_env_values = true)]
+    pub meilisearch_api_key: Option<String>,
 
     /// Stripe secret key (enables engine-side auto-topup charges)
     #[arg(long, env = "STRIPE_SECRET_KEY")]
