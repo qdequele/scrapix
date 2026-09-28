@@ -179,7 +179,7 @@ pub(crate) struct ResultsState {
     /// Meilisearch connection of recent crawl jobs (the persisted job config
     /// has its API key redacted). Insertion-ordered, bounded.
     crawl_targets: RwLock<(HashMap<String, MeiliTarget>, VecDeque<String>)>,
-    /// Results of engine-run jobs that are not persisted in Postgres.
+    /// Results of engine-run jobs that are not persisted in the job store.
     memory: RwLock<MemoryResults>,
 }
 
@@ -696,7 +696,7 @@ pub(crate) fn document_to_item(doc: &Value) -> JobResultItem {
 /// How many jobs' results the in-memory fallback keeps.
 const MAX_MEMORY_RESULT_JOBS: usize = 50;
 
-/// In-memory results of jobs that are not persisted (no Postgres, or the
+/// In-memory results of jobs that are not persisted (no job store, or the
 /// job row could not be written).
 #[derive(Default)]
 pub(crate) struct MemoryResults {
@@ -706,7 +706,7 @@ pub(crate) struct MemoryResults {
 }
 
 impl ResultsState {
-    /// Keep `job_id`'s results in memory instead of Postgres.
+    /// Keep `job_id`'s results in memory instead of the job store.
     pub(crate) fn use_memory(&self, job_id: &str) {
         let mut m = self.memory.write();
         if m.pages.contains_key(job_id) {
@@ -728,7 +728,7 @@ impl ResultsState {
 }
 
 /// Store result `seq` (1-based, in completion order) of an engine-run job.
-/// A Postgres write is retried; if it keeps failing the item is lost from
+/// A job-store write is retried; if it keeps failing the item is lost from
 /// the results (logged, and counted as a job warning).
 pub(crate) async fn store_page(
     state: &AppState,
@@ -858,7 +858,7 @@ pub(crate) mod test_support {
 
     use crate::{webhooks, AppConfig, AppState};
 
-    /// An `AppState` without Postgres/ClickHouse/AI whose fetcher may reach
+    /// An `AppState` without a job store/ClickHouse/AI whose fetcher may reach
     /// local test servers.
     pub(crate) fn test_state(bus: &ChannelBus) -> Arc<AppState> {
         test_state_with_ai(bus, None)
@@ -899,6 +899,7 @@ pub(crate) mod test_support {
             fetcher,
             None,
             ai_service,
+            None,
             None,
             None,
             None,

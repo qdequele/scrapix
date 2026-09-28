@@ -221,8 +221,91 @@ mod tests {
             .as_u16()
     }
 
+    /// POST `len` bytes to `uri` (with an explicit `Content-Length`, as a
+    /// real client sends).
+    async fn post_status(app: Router, uri: &str, key: Option<&str>, len: usize) -> u16 {
+        let mut req = Request::post(uri).header("Content-Length", len);
+        if let Some(k) = key {
+            req = req.header("X-API-Key", k);
+        }
+        app.oneshot(req.body(Body::from(vec![b'x'; len])).unwrap())
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
     fn admin() -> AuthMode {
         AuthMode::AdminKey(AdminKey::new(KEY.into()))
+    }
+
+    fn saas() -> AuthMode {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://x@127.0.0.1:1/x")
+            .unwrap();
+        AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState {
+            pool,
+            jwt_secret: "s".into(),
+        }))
+    }
+
+    const THREE_MB: usize = 3 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn body_limit_is_2mb_except_parse() {
+        // The admin key is sent so only the body limit can reject.
+        let parse = post_status(
+            app(admin(), Mode::Standalone),
+            "/parse",
+            Some(KEY),
+            THREE_MB,
+        )
+        .await;
+        assert_ne!(parse, 413, "/parse has its own, larger cap");
+        assert_ne!(parse, 401);
+        for uri in ["/scrape", "/openapi.json"] {
+            assert_eq!(
+                post_status(app(admin(), Mode::Standalone), uri, Some(KEY), THREE_MB).await,
+                413,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_docs_are_public() {
+        for uri in ["/openapi.json", "/docs"] {
+            let s = status(app(admin(), Mode::Standalone), uri, None).await;
+            assert_ne!(s, 401, "{uri}");
+            assert_ne!(s, 404, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_upload_and_scrape_require_key() {
+        for uri in ["/parse", "/scrape"] {
+            assert_eq!(
+                post_status(app(admin(), Mode::Standalone), uri, None, 2).await,
+                401,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_unknown_path_is_404() {
+        assert_eq!(
+            status(app(admin(), Mode::Standalone), "/nope", None).await,
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_ws_job_requires_auth() {
+        assert_eq!(
+            status(app(saas(), Mode::Hosted), "/ws/job/x", None).await,
+            401
+        );
     }
 
     #[tokio::test]
@@ -271,18 +354,8 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_ws_requires_auth_but_diagnostics_stay_public() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://x@127.0.0.1:1/x")
-            .unwrap();
-        let saas = AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState {
-            pool,
-            jwt_secret: "s".into(),
-        }));
-        assert_eq!(
-            status(app(saas.clone(), Mode::Hosted), "/ws", None).await,
-            401
-        );
-        assert_eq!(status(app(saas, Mode::Hosted), "/stats", None).await, 200);
+        assert_eq!(status(app(saas(), Mode::Hosted), "/ws", None).await, 401);
+        assert_eq!(status(app(saas(), Mode::Hosted), "/stats", None).await, 200);
     }
 
     #[tokio::test]
