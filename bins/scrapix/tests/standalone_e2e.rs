@@ -49,11 +49,11 @@ fn spawn_engine(port: u16, db: &str, meili: &str, meili_key: Option<&str>) -> Ch
     cmd.spawn().expect("spawn scrapix all")
 }
 
-fn stop(mut child: Child) {
-    // SIGTERM → graceful shutdown (final flush), then wait. `scrapix all`
-    // drains and flushes on SIGTERM but may keep waiting for Ctrl+C
-    // afterwards, so fall back to SIGKILL once the deadline passes — the
-    // flush already happened by then.
+/// SIGTERM → graceful shutdown (final flush), then wait. `scrapix all`
+/// drains and flushes on SIGTERM but may keep waiting for Ctrl+C
+/// afterwards, so fall back to SIGKILL once the deadline passes — the
+/// flush already happened by then.
+fn stop_child(mut child: Child) {
     let _ = Command::new("kill").arg(child.id().to_string()).status();
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -64,6 +64,45 @@ fn stop(mut child: Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Owns a spawned `scrapix all` process and guarantees it is stopped even
+/// if a `panic!`/`assert!` unwinds through the test before the explicit
+/// restart point — `std::process::Child` does not kill on `Drop`, so an
+/// unguarded `Child` would leak the engine (holding the SQLite file and
+/// the Meilisearch connection open) on any failing assertion.
+///
+/// The restart point still calls `stop()` explicitly (consuming the
+/// guard) rather than relying on shadowing + `Drop`: shadowing a `let`
+/// binding does not drop the old value until the end of the enclosing
+/// scope, so an unguarded shadow would leave the old and new engine
+/// running concurrently across the restart, breaking the
+/// flush-then-restart ordering the test depends on.
+struct EngineGuard(Option<Child>);
+
+impl EngineGuard {
+    fn spawn(port: u16, db: &str, meili: &str, meili_key: Option<&str>) -> Self {
+        Self(Some(spawn_engine(port, db, meili, meili_key)))
+    }
+
+    /// Explicit, deterministic stop — used at the restart point so the
+    /// prior engine has fully exited (and flushed) before the next one
+    /// starts.
+    fn stop(mut self) {
+        if let Some(child) = self.0.take() {
+            stop_child(child);
+        }
+    }
+}
+
+impl Drop for EngineGuard {
+    fn drop(&mut self) {
+        // Safety net for panicking paths: `stop()` above already took the
+        // child in the normal case, so this is a no-op then.
+        if let Some(child) = self.0.take() {
+            stop_child(child);
+        }
+    }
 }
 
 async fn wait_healthy(c: &reqwest::Client, base: &str) {
@@ -160,7 +199,7 @@ async fn crawl_search_restart_history() {
     let site = fixture_site().await;
     let c = reqwest::Client::new();
 
-    let engine = spawn_engine(port, &db, &meili, meili_key.as_deref());
+    let engine = EngineGuard::spawn(port, &db, &meili, meili_key.as_deref());
     wait_healthy(&c, &base).await;
 
     // Unauthenticated calls are rejected.
@@ -236,9 +275,11 @@ async fn crawl_search_restart_history() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Restart on the same SQLite file: history survives.
-    stop(engine);
-    let engine = spawn_engine(port, &db, &meili, meili_key.as_deref());
+    // Restart on the same SQLite file: history survives. `stop()` blocks
+    // until the old engine has exited before the new one starts, keeping
+    // the flush-then-restart ordering deterministic (see `EngineGuard`).
+    engine.stop();
+    let engine = EngineGuard::spawn(port, &db, &meili, meili_key.as_deref());
     wait_healthy(&c, &base).await;
     let jobs: Value = c
         .get(format!("{base}/jobs"))
@@ -263,5 +304,5 @@ async fn crawl_search_restart_history() {
         .expect("job survives restart");
     assert_eq!(found["status"], "completed");
     assert_eq!(found["pages_crawled"].as_u64().unwrap(), crawled);
-    stop(engine);
+    engine.stop();
 }
