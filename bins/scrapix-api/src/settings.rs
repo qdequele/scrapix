@@ -125,7 +125,12 @@ impl EngineSettings {
                     tracing::info!("JWT_SECRET is ignored in standalone mode");
                 }
                 let auth = match (non_empty(&args.admin_key), auth_disabled) {
-                    (_, true) => AuthSetting::Disabled,
+                    (Some(_), true) => {
+                        return err(
+                            "SCRAPIX_ADMIN_KEY and SCRAPIX_AUTH=disabled conflict: unset SCRAPIX_AUTH to require the key, or unset SCRAPIX_ADMIN_KEY to run without auth (local dev only)",
+                        )
+                    }
+                    (None, true) => AuthSetting::Disabled,
                     (Some(k), false) if k.chars().count() >= MIN_ADMIN_KEY_LEN => {
                         AuthSetting::AdminKey(k)
                     }
@@ -232,6 +237,18 @@ mod tests {
             ("DATABASE_URL", "postgres://db/x"),
         ]))
         .unwrap_err();
+        assert!(e.0.contains("SCRAPIX_AUTH=disabled"), "{}", e.0);
+    }
+
+    #[test]
+    fn admin_key_with_auth_disabled_refuses() {
+        // Conflicting config: never silently drop a configured key.
+        let e = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_ADMIN_KEY", KEY),
+            ("SCRAPIX_AUTH", "disabled"),
+        ]))
+        .unwrap_err();
+        assert!(e.0.contains("SCRAPIX_ADMIN_KEY"), "{}", e.0);
         assert!(e.0.contains("SCRAPIX_AUTH=disabled"), "{}", e.0);
     }
 

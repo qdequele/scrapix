@@ -94,7 +94,7 @@ curl -s localhost:8080/search \
 |----------|---------|-------------|
 | `SCRAPIX_MODE` | `standalone` | Set explicitly (`standalone` or `hosted`). Standalone is the self-hosting mode this guide covers. |
 | `SCRAPIX_ADMIN_KEY` | — | The operator key. Required in standalone unless `SCRAPIX_AUTH=disabled`. Must be at least 16 characters (leading/trailing whitespace is trimmed). |
-| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off authentication entirely — **local development only**; the engine logs a loud warning at startup and refuses this combination in hosted mode. |
+| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off authentication entirely — **local development only**; the engine logs a loud warning at startup, refuses it in hosted mode, and refuses it together with `SCRAPIX_ADMIN_KEY` (conflicting config: unset one of the two). |
 | `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's own job-history store. SQLite by default (the Docker images default to the absolute path `sqlite:///data/scrapix.db` under the `/data` volume); or a `postgres://`/`postgresql://` URL for a **dedicated** Postgres database. The engine applies its own migrations and refuses to start against a database that already has the Rails platform's schema. See [PostgreSQL](/infrastructure/postgresql). |
 | `MEILISEARCH_URL` / `MEILISEARCH_API_KEY` | — | The default Meilisearch instance used for crawls that don't specify their own `meilisearch` block, and for `/search`. A crawl's own `meilisearch` block always wins over this default. |
 | `REDIS_URL` | — | Optional. When set (e.g. via `--profile durable`), in-flight crawl state survives an engine restart. See **Durability** below. |

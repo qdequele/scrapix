@@ -61,7 +61,8 @@ A missing or invalid key returns `401`:
 Setting `SCRAPIX_AUTH=disabled` turns off authentication for every route.
 This is meant for local development only — the engine logs a loud warning
 at startup, and refuses to start with `SCRAPIX_AUTH=disabled` in hosted
-mode.
+mode or together with `SCRAPIX_ADMIN_KEY` (conflicting config — unset one
+of the two).
 
 ## Hosted
 

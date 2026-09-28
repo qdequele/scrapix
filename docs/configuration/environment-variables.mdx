@@ -13,7 +13,7 @@ All Scrapix services are configured through environment variables. When running 
 |----------|---------|-------------|
 | `SCRAPIX_MODE` | `standalone` | `standalone` (self-hosted, this repo's default) or `hosted` (Rails control plane, shared Postgres). Validated at startup — an unrecognized value refuses to start. See [Self-Hosting](/deployment/self-hosting). |
 | `SCRAPIX_ADMIN_KEY` | — | **Standalone only.** The single operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; WebSockets also accept `?token=`). Required unless `SCRAPIX_AUTH=disabled`; must be at least 16 characters (leading/trailing whitespace trimmed, blank-after-trim counts as unset). |
-| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off all authentication — **standalone only, local development only**. Logs a loud warning at startup; refused in hosted mode. |
+| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off all authentication — **standalone only, local development only**. Logs a loud warning at startup; refused in hosted mode and refused together with `SCRAPIX_ADMIN_KEY` (conflicting config). |
 | `DATABASE_URL` | `sqlite://./data/scrapix.db` (standalone) | **Standalone:** the engine's own job-history store — SQLite by default, or a `postgres://`/`postgresql://` URL for a dedicated Postgres (the engine applies its own migrations and refuses a database that already has the Rails schema). **Hosted:** required, must be a `postgres://` URL — the Rails-owned Postgres; the engine never migrates it. |
 | `JWT_SECRET` | — | **Hosted only, required.** The same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone mode. |
 

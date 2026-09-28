@@ -573,7 +573,7 @@ GROUP BY date ORDER BY date;
 |----------|-------------|
 | `SCRAPIX_MODE` | API: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start |
 | `SCRAPIX_ADMIN_KEY` | API, standalone only: the operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; `?token=` on WebSocket routes). Required unless `SCRAPIX_AUTH=disabled`; must be ≥16 chars after trimming |
-| `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode) |
+| `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode and together with `SCRAPIX_ADMIN_KEY`) |
 | `DATABASE_URL` | API: per-mode meaning. **Standalone** — the engine's own job-history store; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema). **Hosted** — required, must be `postgres://`, the Rails-owned Postgres; the engine never migrates it |
 | `JWT_SECRET` | API, hosted only, required (no default): the same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone |
 | `KAFKA_BROKERS` | Kafka/Redpanda broker addresses |
