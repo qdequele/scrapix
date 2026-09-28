@@ -9,6 +9,12 @@ Scrapix provides WebSocket endpoints for real-time crawl event streaming. WebSoc
 
 For single-job monitoring, [SSE events](/api-reference/jobs#job-events-sse) are simpler.
 
+<Note>
+  Both `/ws` and `/ws/job/{id}` require authentication. A browser can't set
+  headers on the upgrade request, so pass the key as `?token=` instead — see
+  **Authenticating a WebSocket** below.
+</Note>
+
 ## GET /ws
 
 General-purpose WebSocket endpoint. Connect and subscribe to events from one or more jobs.
@@ -16,7 +22,7 @@ General-purpose WebSocket endpoint. Connect and subscribe to events from one or 
 ### Connection
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws');
+const ws = new WebSocket(`ws://localhost:8080/ws?token=${encodeURIComponent(adminKey)}`);
 ```
 
 ### Client Messages
@@ -123,10 +129,31 @@ Single-job WebSocket endpoint. Automatically subscribes to the specified job on 
 ### Connection
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws/job/550e8400-...');
+const ws = new WebSocket(`ws://localhost:8080/ws/job/550e8400-...?token=${encodeURIComponent(adminKey)}`);
 ```
 
 You'll immediately start receiving events for this job without needing to send a subscribe message. You can still send `get_status` and `ping` messages.
+
+---
+
+## Authenticating a WebSocket
+
+Both endpoints require the same key as every other protected route
+(standalone: `SCRAPIX_ADMIN_KEY`; hosted: an account API key or session).
+Since a plain WebSocket handshake from a browser can't set an
+`Authorization` or `X-API-Key` header, send the key as a `token` query
+parameter instead:
+
+```
+ws://localhost:8080/ws?token=<key>
+```
+
+A non-browser client (a server, a script) can use either the header form or
+`?token=` — both are accepted. Percent-encode the token (a raw `+` decodes
+to a space, silently corrupting the key) and make sure your reverse proxy
+strips or redacts query strings from its access logs, since the key would
+otherwise be written to disk in plaintext. A missing or wrong token/header
+closes the connection with `401` before the upgrade completes.
 
 ---
 
@@ -211,4 +238,4 @@ setInterval(() => {
 
 - The broadcast channel buffer holds 1,000 events. Slow clients may miss events if they fall behind.
 - When a job completes, the server sends the final `job_completed` or `job_failed` event. The client should close the connection or unsubscribe.
-- There is no authentication on WebSocket endpoints. If you need to verify job ownership, check job access via the REST API before connecting.
+- The connection itself is authenticated (see above); in hosted mode, job ownership is still enforced the same way it is on the REST API — a session or key that isn't the job's account gets no events for it.

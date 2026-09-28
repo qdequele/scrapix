@@ -1,0 +1,140 @@
+---
+title: API Keys
+description: User accounts, sessions, and API keys for the hosted platform
+---
+
+# API Keys
+
+The hosted Meilisearch Lab platform supports multi-tenant authentication.
+Every account gets isolated jobs, API keys, and billing tier enforcement,
+managed by the Rails control plane against its own PostgreSQL database.
+
+<Note>
+  This guide covers the **hosted** platform. Self-hosted (standalone)
+  deployments use a single operator key instead — see the Authentication
+  guide in the product docs.
+</Note>
+
+## Creating an Account
+
+### 1. Sign Up
+
+```bash
+curl -X POST https://scrapix.meilisearch.dev/auth/signup \
+  -H "Content-Type: application/json" \
+  -c cookies.txt \
+  -d '{
+    "email": "user@example.com",
+    "password": "secure-password",
+    "full_name": "Jane Doe"
+  }'
+```
+
+This creates:
+- A **user** record
+- A **default account** (named after the user)
+- An **account_members** link with `owner` role
+- A **session cookie** (`scrapix_session`)
+
+### 2. Log In (Existing User)
+
+```bash
+curl -X POST https://scrapix.meilisearch.dev/auth/login \
+  -H "Content-Type: application/json" \
+  -c cookies.txt \
+  -d '{
+    "email": "user@example.com",
+    "password": "secure-password"
+  }'
+```
+
+## Using API Keys
+
+API keys are the recommended auth method for programmatic access.
+
+### Create an API Key
+
+```bash
+curl -X POST https://scrapix.meilisearch.dev/account/api-keys \
+  -H "Content-Type: application/json" \
+  -b cookies.txt \
+  -d '{"name": "Production"}'
+```
+
+Response:
+
+```json
+{
+  "id": "key-uuid",
+  "name": "Production",
+  "prefix": "sk_live_abc1",
+  "key": "sk_live_abc123def456..."
+}
+```
+
+<Warning>
+  Save the `key` value immediately — it's only shown once. The API stores a SHA256 hash, not the raw key.
+</Warning>
+
+### Using the Key
+
+Include the key in the `x-api-key` header:
+
+```bash
+curl -X POST https://scrapix.meilisearch.dev/crawl \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk_live_abc123def456..." \
+  -d '{
+    "start_urls": ["https://docs.example.com"],
+    "index_uid": "docs",
+    "meilisearch": {
+      "url": "http://localhost:7700",
+      "api_key": "masterKey"
+    }
+  }'
+```
+
+### Revoke a Key
+
+```bash
+curl -X PATCH https://scrapix.meilisearch.dev/account/api-keys/{key_id} \
+  -H "Content-Type: application/json" \
+  -b cookies.txt \
+  -d '{"active": false}'
+```
+
+## Session Authentication
+
+Sessions use JWT cookies — useful for browser-based UIs like the Scrapix Console.
+
+| Property | Value |
+|----------|-------|
+| Cookie name | `scrapix_session` |
+| Algorithm | HS256 |
+| Expiration | 7 days |
+| HttpOnly | Yes |
+| SameSite | Lax |
+
+The Console frontend sends cookies automatically via the CORS configuration.
+For the engine's WebSocket endpoints to accept this cookie, `SESSION_COOKIE_DOMAIN`
+must be set to a parent domain shared with the API (e.g. `scrapix.meilisearch.com`,
+which covers `api.scrapix.meilisearch.com`).
+
+For OAuth 2.1 (used by MCP clients and third-party integrations), see the
+[OAuth 2.1 guide](/guides/oauth).
+
+## Multi-Account Isolation
+
+When authenticated, all operations are scoped to the account:
+
+| Operation | Behavior |
+|-----------|----------|
+| `POST /crawl` | Job tagged with `account_id` |
+| `GET /jobs` | Only returns jobs for this account |
+| `GET /job/{id}/status` | Returns 404 if job belongs to another account |
+| `DELETE /job/{id}` | Returns 404 if job belongs to another account |
+| `GET /configs` | Only returns configs for this account |
+
+For billing tier limits and credit consumption, see [Billing & Usage](/guides/billing).
+For the full PostgreSQL schema (`users`, `accounts`, `account_members`,
+`api_keys`), see [PostgreSQL](/infrastructure/postgresql).

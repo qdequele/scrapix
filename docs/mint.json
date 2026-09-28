@@ -64,6 +64,7 @@
       "group": "Deployment",
       "pages": [
         "deployment/overview",
+        "deployment/self-hosting",
         "deployment/docker-compose",
         "deployment/kubernetes",
         "deployment/fly-io",
@@ -89,12 +90,8 @@
         "api-reference/search",
         "api-reference/crawl",
         "api-reference/jobs",
-        "api-reference/configs",
-        "api-reference/engines",
         "api-reference/authentication",
-        "api-reference/rate-limiting",
         "api-reference/diagnostics",
-        "api-reference/analytics",
         "api-reference/websockets"
       ]
     },
@@ -106,11 +103,9 @@
         "guides/documents",
         "guides/crawling",
         "guides/authentication",
-        "guides/oauth",
         "guides/mcp",
         "guides/real-time-events",
-        "guides/ai-enrichment",
-        "guides/billing"
+        "guides/ai-enrichment"
       ]
     },
     {

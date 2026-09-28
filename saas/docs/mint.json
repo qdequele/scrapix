@@ -1,0 +1,48 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Meilisearch Lab — Platform",
+  "colors": {
+    "primary": "#FF5CAA",
+    "light": "#FF8FC6",
+    "dark": "#E0418C",
+    "anchors": {
+      "from": "#FF5CAA",
+      "to": "#E0418C"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/quentindequelen/scrapix"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "GitHub",
+      "icon": "github",
+      "url": "https://github.com/quentindequelen/scrapix"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Platform",
+      "pages": ["guides/api-keys", "guides/oauth", "guides/billing"]
+    },
+    {
+      "group": "API Reference",
+      "pages": [
+        "api-reference/configs",
+        "api-reference/engines",
+        "api-reference/analytics",
+        "api-reference/rate-limiting"
+      ]
+    },
+    {
+      "group": "Infrastructure",
+      "pages": ["infrastructure/postgresql"]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/quentindequelen/scrapix"
+  }
+}

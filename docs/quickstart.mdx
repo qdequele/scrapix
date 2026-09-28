@@ -7,6 +7,13 @@ description: Get Scrapix running in 5 minutes
 
 This guide gets you from zero to a working crawl in under 5 minutes using Docker. You'll run Scrapix in single-binary mode — no Kafka, no Postgres, just Meilisearch.
 
+<Note>
+  Setting up a real self-hosted deployment (with authentication and a
+  durability story)? Jump straight to [Self-Hosting](/deployment/self-hosting) —
+  this page is the fastest way to try Scrapix with auth turned off, not a
+  production setup.
+</Note>
+
 ## Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) installed and running
@@ -31,11 +38,17 @@ docker run -d \
   --link meilisearch \
   -e MEILISEARCH_URL=http://meilisearch:7700 \
   -e MEILISEARCH_API_KEY=masterKey \
+  -e SCRAPIX_AUTH=disabled \
   ghcr.io/quentindequelen/scrapix:latest \
   all
 ```
 
-The `all` command starts the API server, frontier, crawler, and content worker in a single process using in-memory channels.
+The `all` command starts the API server, frontier, crawler, and content
+worker in a single process using in-memory channels.
+`SCRAPIX_AUTH=disabled` skips authentication entirely, which is only for
+quick local trials like this one — for anything reachable outside your own
+machine, set `SCRAPIX_ADMIN_KEY` instead and follow
+[Self-Hosting](/deployment/self-hosting).
 
 ## 3. Submit a Crawl Job
 

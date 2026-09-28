@@ -1,0 +1,187 @@
+---
+title: Self-Hosting
+description: Run the Scrapix engine yourself — no accounts, no billing, just the crawl API
+---
+
+# Self-Hosting
+
+Scrapix is a standalone engine you can run on your own infrastructure. This
+guide gets a single-machine deployment running in about five minutes, then
+covers configuration, durability, and upgrades.
+
+## What You Get
+
+Self-hosting gives you the full crawl **engine**:
+
+- The REST API — `/scrape`, `/map`, `/crawl`, `/crawl/sync`, `/crawl/bulk`,
+  `/batch/scrape`, `/extract`, `/parse`, `/search`, job management
+  (`/jobs`, `/job/{id}/*`)
+- Real-time job events over WebSockets (`/ws`, `/ws/job/{id}`) and SSE
+- The `scrapix` CLI and the `scrapix-mcp` MCP server, both of which talk to
+  your engine over the same REST API
+- OpenAPI spec and interactive docs (`/openapi.json`, `/docs`)
+
+What you don't get is the **hosted platform** on top of it: no console UI,
+no multi-user accounts, no per-account billing/credits, no saved-config cron
+scheduling, no OAuth. Those live in the separate Meilisearch Lab platform —
+see the Platform docs if you want that instead of (or in addition to)
+self-hosting.
+
+## 5-Minute Quickstart
+
+You need [Docker](https://docs.docker.com/get-docker/) with Compose v2.22+.
+
+**1. Copy the example env file and fill in two secrets:**
+
+```bash
+cp .env.standalone.example .env
+```
+
+```bash
+# .env
+MEILI_MASTER_KEY=change-me-to-a-long-random-string
+SCRAPIX_ADMIN_KEY=change-me-at-least-16-chars
+```
+
+`SCRAPIX_ADMIN_KEY` is the one credential that guards every write and
+diagnostic endpoint on your engine — generate a real random value, e.g.
+`openssl rand -hex 24`.
+
+**2. Start the engine and Meilisearch:**
+
+```bash
+docker compose -f compose.standalone.yaml up -d
+```
+
+This starts `meilisearch` and `scrapix` (built from the `scrapix-all` image
+target — API, frontier, crawler and content worker in one process, using
+in-memory channels instead of Kafka). The engine is healthy once
+`http://localhost:8080/health` returns `200`.
+
+**3. Submit a crawl.** The CLI reads `~/.config/scrapix/config.toml` for its
+API URL and key (written by `scrapix login`), not environment variables, so
+log in once:
+
+```bash
+scrapix login --api-key
+# paste your SCRAPIX_ADMIN_KEY when prompted (API URL defaults to
+# http://localhost:8080, which matches the compose file's port mapping)
+
+scrapix crawl --inline '{"start_urls":["https://docs.example.com"],"index_uid":"docs","max_pages":50}'
+```
+
+Or skip the CLI and talk to the API directly with `curl`:
+
+```bash
+curl -s localhost:8080/crawl \
+  -H "X-API-Key: $SCRAPIX_ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"start_urls":["https://docs.example.com"],"index_uid":"docs","max_pages":50}'
+```
+
+**4. Search what you crawled**, once pages have been indexed:
+
+```bash
+curl -s localhost:8080/search \
+  -H "X-API-Key: $SCRAPIX_ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://docs.example.com","q":"install"}'
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCRAPIX_MODE` | `standalone` | Set explicitly (`standalone` or `hosted`). Standalone is the self-hosting mode this guide covers. |
+| `SCRAPIX_ADMIN_KEY` | — | The operator key. Required in standalone unless `SCRAPIX_AUTH=disabled`. Must be at least 16 characters (leading/trailing whitespace is trimmed). |
+| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off authentication entirely — **local development only**; the engine logs a loud warning at startup and refuses this combination in hosted mode. |
+| `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's own job-history store. SQLite by default (the Docker images default to the absolute path `sqlite:///data/scrapix.db` under the `/data` volume); or a `postgres://`/`postgresql://` URL for a **dedicated** Postgres database. The engine applies its own migrations and refuses to start against a database that already has the Rails platform's schema. See [PostgreSQL](/infrastructure/postgresql). |
+| `MEILISEARCH_URL` / `MEILISEARCH_API_KEY` | — | The default Meilisearch instance used for crawls that don't specify their own `meilisearch` block, and for `/search`. A crawl's own `meilisearch` block always wins over this default. |
+| `REDIS_URL` | — | Optional. When set (e.g. via `--profile durable`), in-flight crawl state survives an engine restart. See **Durability** below. |
+| `ALLOW_PRIVATE_IPS` | `false` | Allow the engine to fetch or deliver webhooks to private/loopback/link-local addresses. Tests and self-hosted private-network crawls only — never enable this in production. |
+| `CORS_ORIGINS` | — | Comma-separated allowed CORS origins. Leave unset to allow all origins (fine for a server-to-server API with no browser client). |
+
+See [Environment Variables](/configuration/environment-variables) for the
+full reference, including crawler/content-worker/frontier tuning that
+applies whether you self-host or not.
+
+## Authentication
+
+Every protected route (everything except `/health`, `/health/services`,
+`/metrics`, `/openapi.json` and `/docs`) requires `SCRAPIX_ADMIN_KEY`, sent
+as either:
+
+```
+Authorization: Bearer <SCRAPIX_ADMIN_KEY>
+```
+
+or
+
+```
+X-API-Key: <SCRAPIX_ADMIN_KEY>
+```
+
+An invalid or missing key returns `401` with
+`{"error":"Missing or invalid admin key","code":"unauthorized"}`.
+
+`/ws` and `/ws/job/{id}` additionally accept the key as a `?token=` query
+parameter, since browsers can't set headers on a WebSocket upgrade —
+URL-encode it (a raw `+` in the key decodes to a space) and configure your
+reverse proxy to strip or redact query strings from its access logs, or the
+key ends up sitting in plaintext log files.
+
+## Durability
+
+By default (no `REDIS_URL`), the engine runs entirely on one machine with
+in-process channels instead of Kafka:
+
+- **Job history, batch/extract results** persist in SQLite (or your
+  dedicated Postgres) and survive a restart — you can still list past jobs
+  and page through their results after `docker compose restart`.
+- **In-flight crawls do not survive a restart.** A job that's still
+  `Running` when the engine restarts has no queue to resume from and ends
+  `FailStalled` once `JOB_STALL_TIMEOUT_SECS` (default 1800s) elapses.
+
+To keep crawls running across a restart, add `REDIS_URL` and the `durable`
+profile (Dragonfly, an in-memory Redis-compatible store):
+
+```bash
+docker compose -f compose.standalone.yaml --profile durable up -d
+```
+
+with `REDIS_URL=redis://dragonfly:6379` set in `.env` (see
+`.env.standalone.example`). This makes the frontier's URL queue and
+dedup/politeness state durable, so a restarted engine can pick a job back up
+instead of stalling it.
+
+**Back up the `scrapix_data` volume** (the named volume mounted at `/data`)
+if you rely on job history surviving anything beyond a restart — a lost
+volume loses your SQLite job store the same way a lost database would.
+
+## Upgrading
+
+Upgrade with **no job running**: wait for running jobs to finish, or cancel
+them (`DELETE /job/{id}`), before pulling a new image and restarting. A job
+that spans the upgrade loses its in-memory frontier queue and has no
+restored accounting, so it can never balance — it ends `FailStalled` (and is
+still billed for pages crawled, if you're tracking usage) rather than
+resuming. The engine migrates its own SQLite or Postgres store automatically
+on startup; there's no separate migration step to run yourself.
+
+The full rollout checklist (env changes, deploy order, and known caveats
+for a multi-service deployment) is in
+[Crawl Engine Rollout](/operations/crawl-engine-rollout) — most of it is
+aimed at a distributed deployment, but the "drain running jobs first"
+guidance applies to a single-container standalone deployment too.
+
+## Distributed Mode
+
+`compose.standalone.yaml` runs everything as one process
+(`scrapix all`) for simplicity. If you outgrow a single machine, the same
+`SCRAPIX_MODE=standalone` engine can be split into independently-scaled
+services (API, frontier, crawler workers, content workers) behind Redpanda —
+same environment variables, same `SCRAPIX_ADMIN_KEY`, same `DATABASE_URL`
+job store (owned by the API service; the other services are stateless with
+respect to it). See
+[Docker Compose](/deployment/docker-compose) for a distributed Compose setup
+and [Kubernetes](/deployment/kubernetes) for a cluster deployment.

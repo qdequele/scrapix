@@ -263,6 +263,21 @@ by path prefix via `SAAS_API_URL` + `SAAS_PREFIXES`; the frozen full-platform
 spec is `contracts/openapi.json`, the engine-only spec is
 `contracts/openapi.engine.json`.
 
+#### Standalone vs hosted
+
+The "sharing one Postgres" description above is the **hosted** picture.
+`bins/scrapix-api` also runs **standalone** (`SCRAPIX_MODE=standalone`, the
+default) with no Rails control plane at all: one operator key
+(`SCRAPIX_ADMIN_KEY`) instead of accounts/sessions/API keys, and its own
+small job-history store (SQLite by default, or a dedicated Postgres it
+migrates itself — never the Rails-owned database; it refuses to start
+against one). `SCRAPIX_MODE=hosted` requires the Rails Postgres
+(`DATABASE_URL`) and `JWT_SECRET`, and fails closed if either is missing or
+the DB is unreachable. Docs for self-hosters live in `docs/` (this is the
+product repo's docs site); platform-only docs (accounts, billing, API key
+CRUD, OAuth) live in `saas/docs/` and will eventually merge into the
+Meilisearch Lab docs. See `docs/deployment/self-hosting.mdx`.
+
 ### Workspace Structure
 
 The project is organized as a Cargo workspace with two main directories:
@@ -556,6 +571,11 @@ GROUP BY date ORDER BY date;
 
 | Variable | Description |
 |----------|-------------|
+| `SCRAPIX_MODE` | API: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start |
+| `SCRAPIX_ADMIN_KEY` | API, standalone only: the operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; `?token=` on WebSocket routes). Required unless `SCRAPIX_AUTH=disabled`; must be ≥16 chars after trimming |
+| `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode) |
+| `DATABASE_URL` | API: per-mode meaning. **Standalone** — the engine's own job-history store; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema). **Hosted** — required, must be `postgres://`, the Rails-owned Postgres; the engine never migrates it |
+| `JWT_SECRET` | API, hosted only, required (no default): the same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone |
 | `KAFKA_BROKERS` | Kafka/Redpanda broker addresses |
 | `MEILISEARCH_URL` | Meilisearch server URL |
 | `MEILISEARCH_API_KEY` | Meilisearch API key |
