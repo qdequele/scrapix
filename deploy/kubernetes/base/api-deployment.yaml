@@ -43,6 +43,8 @@ spec:
             - secretRef:
                 name: scrapix-secrets
           env:
+            - name: SCRAPIX_MODE
+              value: "hosted"
             - name: HOST
               value: "0.0.0.0"
             - name: PORT

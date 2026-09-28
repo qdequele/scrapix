@@ -14,6 +14,7 @@
 .env
 .env.*
 !.env.example
+!.env.standalone.example
 
 # OS
 .DS_Store

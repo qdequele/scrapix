@@ -117,6 +117,7 @@ USER scrapix
 FROM runtime-documents AS scrapix-api
 COPY --from=builder --chown=scrapix:scrapix /app/target/release/scrapix-api /app/scrapix-api
 EXPOSE 8080
+ENV SCRAPIX_MODE=hosted
 CMD ["/app/scrapix-api", "--port", "8080"]
 
 # -----------------------------------------------------------------------------
