@@ -5740,13 +5740,17 @@ name = "scrapix"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "reqwest 0.12.28",
  "scrapix-api",
  "scrapix-cli",
  "scrapix-frontier-service",
  "scrapix-queue",
  "scrapix-worker-content",
  "scrapix-worker-crawler",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
