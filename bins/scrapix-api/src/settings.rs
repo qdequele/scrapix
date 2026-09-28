@@ -108,17 +108,11 @@ impl EngineSettings {
                 if !is_postgres(&url) {
                     return err("SCRAPIX_MODE=hosted requires a postgres:// DATABASE_URL");
                 }
-                let jwt_secret = non_empty(&args.jwt_secret).unwrap_or_else(|| {
-                    if std::env::var("ENVIRONMENT").as_deref() == Ok("production") {
-                        panic!(
-                            "JWT_SECRET is required in production. Set the JWT_SECRET environment variable."
-                        );
-                    }
-                    tracing::warn!(
-                        "JWT_SECRET not set — using insecure default. Set JWT_SECRET in production!"
+                let Some(jwt_secret) = non_empty(&args.jwt_secret) else {
+                    return err(
+                        "SCRAPIX_MODE=hosted requires JWT_SECRET (the same secret the Rails app signs sessions with)",
                     );
-                    "dev-jwt-secret-change-in-production".to_string()
-                });
+                };
                 Ok(Self {
                     mode,
                     auth: AuthSetting::Saas { jwt_secret },
@@ -282,6 +276,23 @@ mod tests {
         ]))
         .unwrap();
         assert!(matches!(s.auth, AuthSetting::Saas { ref jwt_secret } if jwt_secret == "s3cret"));
+    }
+
+    #[test]
+    fn hosted_requires_jwt_secret() {
+        let e = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_MODE", "hosted"),
+            ("DATABASE_URL", "postgres://db/x"),
+        ]))
+        .unwrap_err();
+        assert!(e.0.contains("JWT_SECRET"), "{}", e.0);
+        let e = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_MODE", "hosted"),
+            ("DATABASE_URL", "postgres://db/x"),
+            ("JWT_SECRET", "   "),
+        ]))
+        .unwrap_err();
+        assert!(e.0.contains("JWT_SECRET"), "{}", e.0);
     }
 
     #[test]
