@@ -101,6 +101,9 @@ just stop         # Stop everything (services + infra)
 - Console runs natively with `npm run dev`
 - All managed by overmind (tmux-based process manager)
 - Environment loaded from `.env` via `set dotenv-load` in the justfile
+- `just dev` is the hosted (Rails) stack: `.env` must set `SCRAPIX_MODE=hosted`
+  (`.env.example` does). An older `.env` without it starts the API in
+  standalone mode, which refuses to run without `SCRAPIX_ADMIN_KEY`.
 
 **Individual service commands** (when you only need one):
 ```bash

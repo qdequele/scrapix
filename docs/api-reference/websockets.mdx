@@ -148,8 +148,14 @@ parameter instead:
 ws://localhost:8080/ws?token=<key>
 ```
 
+In hosted mode, `?token=` carries an account API key (`sk_live_…` /
+`sk_test_…`) and is checked exactly like an `X-API-Key` header; a browser on
+the console can instead rely on its session cookie.
+
 A non-browser client (a server, a script) can use either the header form or
-`?token=` — both are accepted. Percent-encode the token (a raw `+` decodes
+`?token=` — both are accepted. When an `Authorization` or `X-API-Key` header
+is present, it is the credential that's checked and `?token=` is ignored.
+Percent-encode the token (a raw `+` decodes
 to a space, silently corrupting the key) and make sure your reverse proxy
 strips or redacts query strings from its access logs, since the key would
 otherwise be written to disk in plaintext. A missing or wrong token/header
@@ -238,4 +244,4 @@ setInterval(() => {
 
 - The broadcast channel buffer holds 1,000 events. Slow clients may miss events if they fall behind.
 - When a job completes, the server sends the final `job_completed` or `job_failed` event. The client should close the connection or unsubscribe.
-- The connection itself is authenticated (see above); in hosted mode, job ownership is still enforced the same way it is on the REST API — a session or key that isn't the job's account gets no events for it.
+- The connection itself is authenticated (see above). In hosted mode, `/ws/job/{id}` also enforces job ownership the same way the REST API does — a session or key that isn't the job's account is refused. `/ws` does **not** check ownership of the jobs a client subscribes to, so prefer `/ws/job/{id}` for anything account-scoped.

@@ -5,7 +5,12 @@ description: Connect AI assistants to Scrapix via the Model Context Protocol
 
 # MCP Server
 
-<Note>Hosted only — the MCP server runs in the platform (Rails) today.</Note>
+<Note>
+  The HTTP `/mcp` endpoint is hosted only — it runs in the platform (Rails).
+  The stdio `scrapix-mcp` binary works against any engine, including a
+  self-hosted standalone one: point `--api-url` at it and pass your
+  `SCRAPIX_ADMIN_KEY` as `--api-key` (sent as `X-API-Key`).
+</Note>
 
 Scrapix exposes all its API capabilities as MCP (Model Context Protocol) tools, allowing AI assistants like Claude to scrape, crawl, map, and search the web directly.
 

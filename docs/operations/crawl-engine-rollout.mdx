@@ -13,6 +13,7 @@ a checklist, not automation — work through it in order.
 ## Pre-deploy checklist
 
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
+- [ ] **Local dev: add `SCRAPIX_MODE=hosted` to an existing `.env`.** `just dev` runs the engine against the Rails stack's Postgres; an `.env` copied from `.env.example` before standalone mode existed lacks the variable, so the API now starts in standalone mode and refuses to run without `SCRAPIX_ADMIN_KEY`. The current `.env.example` already sets it.
 - [ ] **Confirm `JWT_SECRET` is set** on every hosted API's env. Hosted mode now refuses to start without it — it previously fell back to an insecure default.
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
 

@@ -97,9 +97,9 @@ curl -s localhost:8080/search \
 | `SCRAPIX_AUTH` | — | Set to `disabled` to turn off authentication entirely — **local development only**; the engine logs a loud warning at startup, refuses it in hosted mode, and refuses it together with `SCRAPIX_ADMIN_KEY` (conflicting config: unset one of the two). |
 | `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's own job-history store. SQLite by default (the Docker images default to the absolute path `sqlite:///data/scrapix.db` under the `/data` volume); or a `postgres://`/`postgresql://` URL for a **dedicated** Postgres database. The engine applies its own migrations and refuses to start against a database that already has the Rails platform's schema. See [PostgreSQL](/infrastructure/postgresql). |
 | `MEILISEARCH_URL` / `MEILISEARCH_API_KEY` | — | The default Meilisearch instance used for crawls that don't specify their own `meilisearch` block, and for `/search`. A crawl's own `meilisearch` block always wins over this default. |
-| `REDIS_URL` | — | Optional. When set (e.g. via `--profile durable`), in-flight crawl state survives an engine restart. See **Durability** below. |
+| `REDIS_URL` | — | Optional. When set (e.g. via `--profile durable`), the frontier's URL queue and dedup/politeness state survive an engine restart (in-flight work still doesn't — see **Durability** below). An empty value counts as unset. |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow the engine to fetch or deliver webhooks to private/loopback/link-local addresses. Tests and self-hosted private-network crawls only — never enable this in production. |
-| `CORS_ORIGINS` | — | Comma-separated allowed CORS origins. Leave unset to allow all origins (fine for a server-to-server API with no browser client). |
+| `CORS_ORIGINS` | — | Comma-separated extra browser origins allowed by CORS (e.g. `https://app.example.com,https://admin.example.com`). They are added to the built-in allow-list, which is all that applies when this is unset: `http://localhost:3001`, `http://127.0.0.1:3001`, `https://meilisearch.com` and `https://*.meilisearch.com`. CORS only affects browsers — `curl`, the CLI and server-to-server clients are never blocked by it. |
 
 See [Environment Variables](/configuration/environment-variables) for the
 full reference, including crawler and content-worker tuning that applies
@@ -146,8 +146,8 @@ in-process channels instead of Kafka:
   `Running` when the engine restarts has no queue to resume from and ends
   `FailStalled` once `JOB_STALL_TIMEOUT_SECS` (default 1800s) elapses.
 
-To keep crawls running across a restart, add `REDIS_URL` and the `durable`
-profile (Dragonfly, an in-memory Redis-compatible store):
+To keep the frontier's state across a restart, add `REDIS_URL` and the
+`durable` profile (Dragonfly, an in-memory Redis-compatible store):
 
 ```bash
 docker compose -f compose.standalone.yaml --profile durable up -d
@@ -155,8 +155,15 @@ docker compose -f compose.standalone.yaml --profile durable up -d
 
 with `REDIS_URL=redis://dragonfly:6379` set in `.env` (see
 `.env.standalone.example`). This makes the frontier's URL queue and
-dedup/politeness state durable, so a restarted engine can pick a job back up
-instead of stalling it.
+dedup/politeness state durable: URLs still queued at shutdown are still
+queued after the restart. It does **not** make an in-flight crawl fully
+resumable under `scrapix all` — the in-process channels have no
+redelivery, so URLs being fetched and pages being indexed at the moment of
+shutdown are lost. The job's work accounting (restored from the job store)
+then never balances, so a job running across a restart can still end
+`FailStalled` after `JOB_STALL_TIMEOUT_SECS`, even with Redis. What always
+survives, with or without Redis, is the job history and results in the job
+store, and every page already indexed into Meilisearch.
 
 **Back up the `scrapix_data` volume** (the named volume mounted at `/data`)
 if you rely on job history surviving anything beyond a restart — a lost
@@ -166,10 +173,11 @@ volume loses your SQLite job store the same way a lost database would.
 
 Upgrade with **no job running**: wait for running jobs to finish, or cancel
 them (`DELETE /job/{id}`), before pulling a new image and restarting. A job
-that spans the upgrade loses its in-memory frontier queue and has no
-restored accounting, so it can never balance — it ends `FailStalled` (and is
-still billed for pages crawled, if you're tracking usage) rather than
-resuming. The engine migrates its own SQLite or Postgres store automatically
+that spans the upgrade loses the work that was in flight inside the process
+(and, without `REDIS_URL`, its whole frontier queue), so its accounting can
+never balance — it ends `FailStalled` after `JOB_STALL_TIMEOUT_SECS` rather
+than completing (see **Durability** above). Its history and the pages it
+already indexed are kept. The engine migrates its own SQLite or Postgres store automatically
 on startup; there's no separate migration step to run yourself.
 
 The full rollout checklist (env changes, deploy order, and known caveats
@@ -182,10 +190,23 @@ guidance applies to a single-container standalone deployment too.
 
 `compose.standalone.yaml` runs everything as one process
 (`scrapix all`) for simplicity. If you outgrow a single machine, the same
-`SCRAPIX_MODE=standalone` engine can be split into independently-scaled
-services (API, frontier, crawler workers, content workers) behind Redpanda —
-same environment variables, same `SCRAPIX_ADMIN_KEY`, same `DATABASE_URL`
-job store (owned by the API service; the other services are stateless with
-respect to it). See
-[Docker Compose](/deployment/docker-compose) for a distributed Compose setup
-and [Kubernetes](/deployment/kubernetes) for a cluster deployment.
+engine can run as separate services behind Redpanda (Kafka) — `scrapix api`,
+`scrapix frontier`, `scrapix crawler` and `scrapix content`, each with
+`KAFKA_BROKERS` set:
+
+- Run the API with `SCRAPIX_MODE=standalone` and your `SCRAPIX_ADMIN_KEY`;
+  it owns the `DATABASE_URL` job store (the other services never touch it).
+- One API replica can keep SQLite on a persistent volume. **More than one
+  API replica needs a Postgres `DATABASE_URL`** (a dedicated database, see
+  [PostgreSQL](/infrastructure/postgresql)) — a SQLite file can't be shared
+  between replicas.
+- Give the frontier a `REDIS_URL` for durable state (required to run more
+  than one frontier instance), and give each worker a stable
+  `INSTANCE_ID`/`WORKER_ID`.
+
+The repository's `docker-compose.yml` and the [Kubernetes](/deployment/kubernetes)
+manifests are **not** a ready-made standalone split: they are the hosted
+platform's stack (`SCRAPIX_MODE=hosted`, with the Rails app's Postgres for
+auth). Use them as a reference for the service layout, Redpanda topics and
+environment, but set the API to `SCRAPIX_MODE=standalone` as above and drop
+the Rails/Postgres auth pieces.
