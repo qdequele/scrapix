@@ -6888,7 +6888,7 @@ pub async fn run_with_bus(
         "Job completion loop started (exact work accounting)"
     );
 
-    // Start cron scheduler if database is configured
+    // Cron scheduler: hosted only (fires saved configs from the SaaS pool).
     let cron_handle = if let Some(ref pool) = state.saas_pool {
         let handle =
             configs::spawn_cron_scheduler(state.clone(), pool.clone(), shutdown_rx.clone());
