@@ -10,8 +10,11 @@ license.workspace = true
 name = "scrapix_cli"
 path = "src/lib.rs"
 
+# Standalone CLI binary. The user-facing `scrapix` command is `bins/scrapix`,
+# which embeds these commands next to the service subcommands; a second bin
+# named `scrapix` would collide at target/<profile>/scrapix.
 [[bin]]
-name = "scrapix"
+name = "scrapix-cli"
 path = "src/main.rs"
 
 [dependencies]

@@ -22,6 +22,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(version, about = "Scrapix web crawler — unified binary")]
 #[command(propagate_version = true)]
 struct Cli {
+    // Global options of the CLI commands, mirrored from `scrapix_cli::Cli`
+    // (whose own parser never runs here) and passed through to it.
+    /// API server URL
+    #[arg(long, env = "SCRAPIX_API_URL", global = true)]
+    api_url: Option<String>,
+
+    /// API key for authentication
+    #[arg(long, env = "SCRAPIX_API_KEY", global = true)]
+    api_key: Option<String>,
+
+    /// Output as JSON (default: human-friendly text)
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -90,9 +104,9 @@ async fn main() -> anyhow::Result<()> {
         // --- CLI commands: delegate to scrapix-cli ---
         Command::Cli(cmd) => {
             let exit_code = scrapix_cli::run(scrapix_cli::Cli {
-                api_url: None,
-                api_key: None,
-                json: false,
+                api_url: cli.api_url,
+                api_key: cli.api_key,
+                json: cli.json,
                 command: cmd,
             })
             .await;

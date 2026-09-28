@@ -5746,6 +5746,8 @@ dependencies = [
  "scrapix-queue",
  "scrapix-worker-content",
  "scrapix-worker-crawler",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
