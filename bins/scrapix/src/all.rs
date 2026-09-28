@@ -83,16 +83,22 @@ pub struct AllArgs {
 }
 
 pub async fn run_all(args: AllArgs) -> anyhow::Result<()> {
+    // Validate the API configuration before any bus, consumer or service
+    // exists: a misconfigured engine refuses to start, as `scrapix api` does.
+    let api_args = build_api_args(&args, args.kafka_brokers.clone().unwrap_or_default());
+    scrapix_api::settings::EngineSettings::resolve(&api_args)
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if let Some(ref brokers) = args.kafka_brokers {
         info!(brokers = %brokers, "Running all services with Kafka message bus");
-        run_all_kafka(&args, brokers).await
+        run_all_kafka(&args, brokers, api_args).await
     } else {
         info!("Running all services with in-process channel bus");
-        run_all_channels(&args).await
+        run_all_channels(&args, api_args).await
     }
 }
 
-async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
+async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow::Result<()> {
     let bus = ChannelBus::new();
 
     // Create producers (all services share the same bus)
@@ -134,33 +140,6 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let content_control = Arc::new(control_consumer("content-control")?);
 
     // Build service-specific args
-    let api_args = scrapix_api::Args {
-        host: args.host.clone(),
-        port: args.port,
-        brokers: String::new(), // unused with channel bus
-        database_url: args.database_url.clone(),
-        jwt_secret: args.jwt_secret.clone(),
-        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
-        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
-        auth: std::env::var("SCRAPIX_AUTH").ok(),
-        meilisearch_url: args.meilisearch_url.clone(),
-        meilisearch_api_key: args.meilisearch_key.clone(),
-        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        max_jobs: 1000,
-        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
-        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
-        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
-        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
-        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-        webhook_max_concurrent_deliveries: env_or(
-            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
-            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
-        ) as usize,
-        verbose: args.verbose,
-    };
-
     let frontier_args = scrapix_frontier_service::Args {
         brokers: String::new(),
         group_id: "scrapix-frontier".to_string(),
@@ -231,12 +210,11 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     info!("Spawning all services as concurrent tasks...");
 
     // Spawn all 4 services
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = scrapix_api::run_with_bus(api_args, api_producer, api_event_consumer).await
-        {
-            error!(error = %e, "API server failed");
-        }
-    });
+    let mut api_handle = tokio::spawn(scrapix_api::run_with_bus(
+        api_args,
+        api_producer,
+        api_event_consumer,
+    ));
 
     let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
@@ -290,9 +268,12 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         "All services started. Press Ctrl+C to stop."
     );
 
-    // Wait for ctrl+c
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, stopping all services...");
+    // Wait for ctrl+c (or a failed API)
+    let outcome = wait_for_shutdown(&mut api_handle).await;
+    match &outcome {
+        Ok(()) => info!("Received shutdown signal, stopping all services..."),
+        Err(e) => error!(error = %e, "API server failed, stopping all services"),
+    }
 
     // Abort all tasks (each service handles its own graceful shutdown internally)
     api_handle.abort();
@@ -304,7 +285,55 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     info!("All services stopped.");
-    Ok(())
+    outcome
+}
+
+/// Wait for Ctrl+C. Fails if the API task errors or panics first (e.g. its
+/// database is unreachable), so `scrapix all` exits non-zero instead of
+/// leaving the workers running without an API. The API returning `Ok` means
+/// it shut down on a signal (SIGTERM drain): as before, keep waiting for
+/// Ctrl+C.
+async fn wait_for_shutdown(
+    api: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r.map_err(Into::into),
+        r = api => match r {
+            Ok(Ok(())) => tokio::signal::ctrl_c().await.map_err(Into::into),
+            Ok(Err(e)) => Err(e.context("API server failed")),
+            Err(e) => Err(anyhow::anyhow!("API server task failed: {e}")),
+        },
+    }
+}
+
+/// The API args for `scrapix all` (`brokers` is empty on the channel bus).
+fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
+    scrapix_api::Args {
+        host: args.host.clone(),
+        port: args.port,
+        brokers,
+        database_url: args.database_url.clone(),
+        jwt_secret: args.jwt_secret.clone(),
+        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
+        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
+        auth: std::env::var("SCRAPIX_AUTH").ok(),
+        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_api_key: args.meilisearch_key.clone(),
+        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
+        max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
+        verbose: args.verbose,
+    }
 }
 
 fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content::Args {
@@ -345,7 +374,11 @@ fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content
     }
 }
 
-async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
+async fn run_all_kafka(
+    args: &AllArgs,
+    brokers: &str,
+    api_args: scrapix_api::Args,
+) -> anyhow::Result<()> {
     // When Kafka is specified, just build Kafka-backed producers/consumers
     use scrapix_queue::{ConsumerBuilder, ProducerBuilder};
 
@@ -444,34 +477,6 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     let crawler_control = control_consumer("scrapix-all-crawlers")?;
     let content_control = Arc::new(control_consumer("scrapix-all-content")?);
 
-    // Build the same args as channel mode
-    let api_args = scrapix_api::Args {
-        host: args.host.clone(),
-        port: args.port,
-        brokers: brokers.to_string(),
-        database_url: args.database_url.clone(),
-        jwt_secret: args.jwt_secret.clone(),
-        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
-        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
-        auth: std::env::var("SCRAPIX_AUTH").ok(),
-        meilisearch_url: args.meilisearch_url.clone(),
-        meilisearch_api_key: args.meilisearch_key.clone(),
-        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        max_jobs: 1000,
-        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
-        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
-        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
-        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
-        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-        webhook_max_concurrent_deliveries: env_or(
-            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
-            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
-        ) as usize,
-        verbose: args.verbose,
-    };
-
     let frontier_args = scrapix_frontier_service::Args {
         brokers: brokers.to_string(),
         group_id: "scrapix-all-frontier".to_string(),
@@ -541,12 +546,11 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
 
     info!("Spawning all services with Kafka bus...");
 
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = scrapix_api::run_with_bus(api_args, api_producer, api_event_consumer).await
-        {
-            error!(error = %e, "API server failed");
-        }
-    });
+    let mut api_handle = tokio::spawn(scrapix_api::run_with_bus(
+        api_args,
+        api_producer,
+        api_event_consumer,
+    ));
 
     let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
@@ -599,8 +603,11 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         "All services started with Kafka. Press Ctrl+C to stop."
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, stopping all services...");
+    let outcome = wait_for_shutdown(&mut api_handle).await;
+    match &outcome {
+        Ok(()) => info!("Received shutdown signal, stopping all services..."),
+        Err(e) => error!(error = %e, "API server failed, stopping all services"),
+    }
 
     api_handle.abort();
     frontier_handle.abort();
@@ -609,7 +616,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     info!("All services stopped.");
-    Ok(())
+    outcome
 }
 
 /// Parse an optional numeric env var, falling back to `default`.
