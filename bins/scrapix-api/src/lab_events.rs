@@ -203,7 +203,7 @@ impl LabOutbox for PgOutbox {
         }
         sqlx::query(
             "UPDATE lab_events SET attempts = attempts + 1, \
-             next_attempt_at = now() + make_interval(secs => LEAST(power(2, attempts + 1), 300)) \
+             next_attempt_at = now() + make_interval(secs => LEAST(power(2, LEAST(attempts + 1, 9)), 300)) \
              WHERE id = ANY($1) AND delivered_at IS NULL",
         )
         .bind(ids)
@@ -327,10 +327,10 @@ impl LabOutbox for MemoryOutbox {
     async fn reschedule(&self, ids: &[Uuid]) -> Result<(), StoreError> {
         for r in self.rows.lock().iter_mut() {
             if ids.contains(&r.event.id) && !r.delivered {
-                let backoff = 2u64.saturating_pow(r.attempts + 1).min(300);
+                let backoff = 2u64.pow(r.attempts.saturating_add(1).min(9)).min(300);
                 r.next_attempt =
                     std::time::Instant::now() + std::time::Duration::from_secs(backoff);
-                r.attempts += 1;
+                r.attempts = r.attempts.saturating_add(1);
             }
         }
         Ok(())
@@ -416,6 +416,40 @@ mod tests {
             o.due(10).await.unwrap().is_empty(),
             "rescheduled event is not due yet"
         );
+    }
+
+    #[tokio::test]
+    async fn pg_reschedule_caps_backoff_and_survives_huge_attempt_counts() {
+        let Some(pool) = crate::job_store::postgres::test_pg_pool().await else {
+            eprintln!("skipped");
+            return;
+        };
+        let o = PgOutbox::new(pool.clone());
+        let e = LabEvent::usage(
+            "7f1c2a8e-0000-4000-8000-000000000001",
+            None,
+            "map",
+            1,
+            json!({}),
+            "m".into(),
+            None,
+        );
+        o.enqueue(&[e.clone()]).await.unwrap();
+        sqlx::query("UPDATE lab_events SET attempts = 2000")
+            .execute(&pool)
+            .await
+            .unwrap();
+        o.reschedule(&[e.id]).await.unwrap();
+        let (attempts, secs): (i32, f64) = sqlx::query_as(
+            "SELECT attempts, EXTRACT(EPOCH FROM (next_attempt_at - now()))::float8 \
+             FROM lab_events WHERE id = $1",
+        )
+        .bind(e.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2001);
+        assert!((290.0..=310.0).contains(&secs), "backoff was {secs}s");
     }
 
     #[tokio::test]
