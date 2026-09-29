@@ -52,6 +52,7 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
+pub(crate) mod lab_events;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;

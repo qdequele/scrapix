@@ -548,10 +548,10 @@ impl JobStore for PgJobStore {
     }
 }
 
-/// Throwaway Postgres for the conformance suite; each call gets a fresh,
-/// migrated schema so tests don't see each other's rows.
+/// Throwaway Postgres pool with a fresh schema and the engine migrations
+/// applied; each call gets its own schema so tests don't see each other's rows.
 #[cfg(test)]
-pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
+pub(crate) async fn test_pg_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("JOBSTORE_TEST_DATABASE_URL").ok()?;
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::PgPool::connect(&url).await.ok()?;
@@ -576,9 +576,14 @@ pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
         .connect(&url)
         .await
         .ok()?;
-    let store = PgJobStore::new(pool);
-    store.migrate().await.ok()?;
-    Some(store)
+    PgJobStore::new(pool.clone()).migrate().await.ok()?;
+    Some(pool)
+}
+
+/// Throwaway Postgres for the conformance suite.
+#[cfg(test)]
+pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
+    Some(PgJobStore::new(test_pg_pool().await?))
 }
 
 #[cfg(test)]

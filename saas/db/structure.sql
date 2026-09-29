@@ -250,6 +250,22 @@ CREATE TABLE public.jobs (
 
 
 --
+-- Name: lab_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lab_events (
+    id uuid NOT NULL,
+    type text NOT NULL,
+    account_id uuid NOT NULL,
+    payload jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    delivered_at timestamp with time zone
+);
+
+
+--
 -- Name: meilisearch_engines; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1000,6 +1016,14 @@ ALTER TABLE ONLY public.jobs
 
 
 --
+-- Name: lab_events lab_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lab_events
+    ADD CONSTRAINT lab_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: meilisearch_engines meilisearch_engines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1623,6 +1647,20 @@ CREATE UNIQUE INDEX index_users_on_email ON public.users USING btree (email);
 
 
 --
+-- Name: lab_events_delivered_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lab_events_delivered_idx ON public.lab_events USING btree (delivered_at) WHERE (delivered_at IS NOT NULL);
+
+
+--
+-- Name: lab_events_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lab_events_due_idx ON public.lab_events USING btree (next_attempt_at) WHERE (delivered_at IS NULL);
+
+
+--
 -- Name: jobs trg_jobs_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -1884,6 +1922,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260929000001'),
 ('20260927000001'),
 ('20260926000001'),
 ('20260817160001'),
