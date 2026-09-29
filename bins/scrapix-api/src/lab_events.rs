@@ -62,9 +62,6 @@ fn usage_data(
     d
 }
 
-// Constructors are unused until the charge sites / job lifecycle are wired to
-// the outbox in later tasks of the engine-lab boundary plan.
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 impl LabEvent {
     pub fn usage(
         account_id: &str,
@@ -84,6 +81,7 @@ impl LabEvent {
         )
     }
 
+    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn crawl_final_usage(
         job_id: &str,
         account_id: &str,
@@ -101,15 +99,18 @@ impl LabEvent {
         )
     }
 
+    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     fn lifecycle(kind: &str, job_id: &str, account_id: &str, data: Value) -> Self {
         let id = Uuid::new_v5(&LAB_NAMESPACE, format!("job:{job_id}:lifecycle").as_bytes());
         event(id, kind, account_id, None, data)
     }
 
+    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn job_completed(job_id: &str, account_id: &str, data: Value) -> Self {
         Self::lifecycle("job.completed", job_id, account_id, data)
     }
 
+    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn job_failed(job_id: &str, account_id: &str, data: Value) -> Self {
         Self::lifecycle("job.failed", job_id, account_id, data)
     }
@@ -234,17 +235,16 @@ impl LabOutbox for PgOutbox {
 }
 
 /// Records events; the only entry point handlers use.
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 pub struct Lab {
     outbox: Arc<dyn LabOutbox>,
 }
 
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 impl Lab {
     pub fn new(outbox: Arc<dyn LabOutbox>) -> Self {
         Self { outbox }
     }
 
+    #[allow(dead_code)] // not used yet (engine-lab boundary)
     pub fn outbox(&self) -> &Arc<dyn LabOutbox> {
         &self.outbox
     }
@@ -274,7 +274,6 @@ struct Row {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 impl MemoryOutbox {
     /// Every recorded event (delivered or not), in insertion order.
     pub fn events(&self) -> Vec<LabEvent> {

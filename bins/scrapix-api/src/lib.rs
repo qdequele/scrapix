@@ -3255,6 +3255,110 @@ async fn scrape_url(
         .map(Json)
 }
 
+impl AppState {
+    /// Record one usage event for `ctx` (hosted only; no-op without a Lab).
+    pub(crate) async fn record_usage(
+        &self,
+        ctx: &AccountContext,
+        operation: &str,
+        credits: i64,
+        units: serde_json::Value,
+        description: String,
+        job_id: Option<&str>,
+    ) {
+        let event = lab_events::LabEvent::usage(
+            &ctx.account_id,
+            ctx.api_key_id.as_deref(),
+            operation,
+            credits,
+            units,
+            description,
+            job_id,
+        );
+        self.record_events(&[event]).await;
+    }
+
+    /// Record several events in one outbox write (hosted only; no-op without
+    /// a Lab). Failures are logged by `Lab::record`.
+    pub(crate) async fn record_events(&self, events: &[lab_events::LabEvent]) {
+        let Some(ref lab) = self.lab else { return };
+        let _ = lab.record(events).await;
+    }
+}
+
+/// Attach an in-memory Lab to `state` (tests); the returned outbox exposes
+/// every recorded event.
+#[cfg(test)]
+pub(crate) fn with_memory_lab(state: &mut AppState) -> Arc<lab_events::MemoryOutbox> {
+    let outbox = Arc::new(lab_events::MemoryOutbox::default());
+    state.lab = Some(Arc::new(lab_events::Lab::new(outbox.clone())));
+    outbox
+}
+
+/// Usage event for one successful scrape.
+async fn record_scrape_usage(
+    state: &AppState,
+    ctx: &AccountContext,
+    formats: &[ScrapeFormat],
+    ai_summary: bool,
+    ai_extraction: bool,
+    credits: i64,
+    final_url: &str,
+) {
+    state
+        .record_usage(
+            ctx,
+            "scrape",
+            credits,
+            serde_json::json!({
+                "formats": formats,
+                "ai_summary": ai_summary,
+                "ai_extraction": ai_extraction,
+            }),
+            format!("{final_url} ({credits} credits)"),
+            None,
+        )
+        .await;
+}
+
+/// Usage event for one successful map.
+async fn record_map_usage(state: &AppState, ctx: &AccountContext, url: &str, urls_found: usize) {
+    state
+        .record_usage(
+            ctx,
+            "map",
+            billing::MAP_CREDITS,
+            serde_json::json!({ "urls_found": urls_found }),
+            url.to_string(),
+            None,
+        )
+        .await;
+}
+
+/// Usage event for one search; `result` is the Meilisearch response.
+async fn record_search_usage(
+    state: &AppState,
+    ctx: &AccountContext,
+    url: &str,
+    q: &str,
+    result: &serde_json::Value,
+) {
+    let results = result
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .map_or(0, |a| a.len());
+    state
+        .record_usage(
+            ctx,
+            "search",
+            billing::SEARCH_CREDITS,
+            serde_json::json!({ "results": results }),
+            format!("{url} q={q}"),
+            None,
+        )
+        .await;
+}
+
 /// The full /scrape pipeline for one URL: credit pre-check, fetch (HTTP or
 /// browser), extraction, AI enrichment, analytics and credit deduction.
 ///
@@ -3710,20 +3814,18 @@ pub(crate) async fn perform_scrape(
         );
     }
 
-    // Deduct credits for successful scrape (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        if let Err(e) = billing::check_credits_and_deduct(
-            pool,
-            &ctx.account_id,
+    // Report the charge for a successful scrape to the Lab.
+    if let Some(ref ctx) = account_ctx {
+        record_scrape_usage(
+            state,
+            ctx,
+            &request.formats,
+            has_ai_summary_req,
+            has_ai_extraction_req,
             scrape_cost,
-            "scrape",
-            &format!("{} ({} credits)", final_url, scrape_cost),
-            state.stripe_client.as_ref(),
+            &final_url,
         )
-        .await
-        {
-            warn!(account_id = %ctx.account_id, error = ?e, "Failed to deduct credit for scrape");
-        }
+        .await;
     }
 
     info!(
@@ -5116,20 +5218,9 @@ async fn map_url(
         });
     }
 
-    // Deduct 2 credits for successful map (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        if let Err(e) = billing::check_credits_and_deduct(
-            pool,
-            &ctx.account_id,
-            billing::MAP_CREDITS,
-            "map",
-            &request.url,
-            state.stripe_client.as_ref(),
-        )
-        .await
-        {
-            warn!(account_id = %ctx.account_id, error = ?e, "Failed to deduct credit for map");
-        }
+    // Report the charge for a successful map to the Lab.
+    if let Some(ref ctx) = account_ctx {
+        record_map_usage(&state, ctx, &request.url, total).await;
     }
 
     Ok(Json(MapResponse {
@@ -5327,20 +5418,9 @@ async fn search_url(
         });
     }
 
-    // Deduct 2 credits for search
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        if let Err(e) = billing::check_credits_and_deduct(
-            pool,
-            &ctx.account_id,
-            billing::SEARCH_CREDITS,
-            "search",
-            &format!("{} q={}", request.url, request.q),
-            state.stripe_client.as_ref(),
-        )
-        .await
-        {
-            warn!(account_id = %ctx.account_id, error = ?e, "Failed to deduct credit for search");
-        }
+    // Report the charge for a search to the Lab.
+    if let Some(ref ctx) = account_ctx {
+        record_search_usage(&state, ctx, &request.url, &request.q, &result).await;
     }
 
     Ok(Json(result))
@@ -7777,6 +7857,139 @@ mod lifecycle_tests {
         );
         assert!(state.accounting_persisted());
         assert!(state.saas_pool.is_none());
+    }
+
+    fn ctx() -> AccountContext {
+        AccountContext {
+            account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
+            api_key_id: Some("k".into()),
+            tier: "free".into(),
+            user_role: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_usage_writes_one_event_with_context() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        state
+            .record_usage(
+                &ctx(),
+                "scrape",
+                3,
+                serde_json::json!({"formats":["markdown"]}),
+                "https://e.com (3 credits)".into(),
+                None,
+            )
+            .await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "usage.recorded");
+        assert_eq!(events[0].account_id, "7f1c2a8e-0000-4000-8000-000000000001");
+        assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
+        assert_eq!(events[0].data["operation"], "scrape");
+        assert_eq!(events[0].data["credits"], 3);
+        assert!(events[0].data.get("job_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn record_usage_is_a_noop_without_a_lab() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        let ctx = AccountContext {
+            account_id: "a".into(),
+            api_key_id: None,
+            tier: "free".into(),
+            user_role: None,
+        };
+        state
+            .record_usage(&ctx, "map", 2, serde_json::json!({}), "m".into(), None)
+            .await; // must not panic
+    }
+
+    #[tokio::test]
+    async fn scrape_usage_event_carries_formats_and_ai_flags() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        let formats = vec![ScrapeFormat::Markdown, ScrapeFormat::RawHtml];
+        let credits = billing::scrape_credits(&formats, true, false);
+        record_scrape_usage(
+            &state,
+            &ctx(),
+            &formats,
+            true,
+            false,
+            credits,
+            "https://e.com/x",
+        )
+        .await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "usage.recorded");
+        assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "scrape",
+                "credits": credits,
+                "units": {
+                    "formats": ["markdown", "rawhtml"],
+                    "ai_summary": true,
+                    "ai_extraction": false,
+                },
+                "description": format!("https://e.com/x ({credits} credits)"),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn map_usage_event_counts_urls_found() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        record_map_usage(&state, &ctx(), "https://e.com", 17).await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "map",
+                "credits": billing::MAP_CREDITS,
+                "units": {"urls_found": 17},
+                "description": "https://e.com",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn search_usage_event_counts_hits_and_defaults_to_zero() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        let hits = serde_json::json!({"hits": [{"id": 1}, {"id": 2}, {"id": 3}]});
+        record_search_usage(&state, &ctx(), "https://e.com", "rust", &hits).await;
+        record_search_usage(
+            &state,
+            &ctx(),
+            "https://e.com",
+            "rust",
+            &serde_json::json!({}),
+        )
+        .await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "search",
+                "credits": billing::SEARCH_CREDITS,
+                "units": {"results": 3},
+                "description": "https://e.com q=rust",
+            })
+        );
+        assert_eq!(events[1].data["units"]["results"], 0);
     }
 
     #[tokio::test]

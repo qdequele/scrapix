@@ -869,6 +869,20 @@ pub(crate) mod test_support {
         bus: &ChannelBus,
         ai_service: Option<Arc<scrapix_ai::AiService>>,
     ) -> Arc<AppState> {
+        Arc::new(build_state(bus, ai_service))
+    }
+
+    /// Same as `test_state`, with an in-memory Lab attached (hosted-style
+    /// usage recording); the outbox exposes every recorded event.
+    pub(crate) fn test_state_with_lab(
+        bus: &ChannelBus,
+    ) -> (Arc<AppState>, Arc<crate::lab_events::MemoryOutbox>) {
+        let mut state = build_state(bus, None);
+        let outbox = crate::with_memory_lab(&mut state);
+        (Arc::new(state), outbox)
+    }
+
+    fn build_state(bus: &ChannelBus, ai_service: Option<Arc<scrapix_ai::AiService>>) -> AppState {
         let robots = Arc::new(
             RobotsCache::new(RobotsConfig {
                 respect_robots: false,
@@ -883,7 +897,7 @@ pub(crate) mod test_support {
                 .build(robots)
                 .unwrap(),
         );
-        Arc::new(AppState::new(
+        AppState::new(
             AnyProducer::channel(bus.producer()),
             AppConfig {
                 max_jobs: 1000,
@@ -909,7 +923,7 @@ pub(crate) mod test_support {
                     .unwrap(),
                 webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES,
             ),
-        ))
+        )
     }
 }
 

@@ -27,7 +27,7 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use scrapix_ai::AiUsageContext;
 use scrapix_core::OcrMode;
@@ -36,6 +36,7 @@ use scrapix_parser::{document::markdown_links, DocumentKind, ParseOptions, Parse
 use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 
 use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::lab_events::LabEvent;
 use crate::{
     billing, check_write_permission, extract_account_context, extract_domain, run_ai_enrichment,
     AccountContext, AiOptions, AiRun, ApiError, AppState, ScrapeFormat, ScrapeMetadata,
@@ -186,6 +187,40 @@ pub(crate) struct DocumentJob<'a> {
     pub js_rendered: bool,
     /// Credits for the document itself (before OCR).
     pub base_cost: i64,
+}
+
+/// Usage events for one parsed document: the document itself, plus its OCR
+/// pages (when any were billable) as a second event in the same write.
+async fn record_document_usage(
+    state: &AppState,
+    ctx: &AccountContext,
+    operation: &str,
+    label: &str,
+    base_cost: i64,
+    ocr_billable: u32,
+) {
+    let mut events = vec![LabEvent::usage(
+        &ctx.account_id,
+        ctx.api_key_id.as_deref(),
+        operation,
+        base_cost,
+        serde_json::json!({}),
+        format!("{label} ({base_cost} credits)"),
+        None,
+    )];
+    if ocr_billable > 0 {
+        let ocr_cost = scrapix_billing::ocr_credits(ocr_billable as u64);
+        events.push(LabEvent::usage(
+            &ctx.account_id,
+            ctx.api_key_id.as_deref(),
+            "ocr",
+            ocr_cost,
+            serde_json::json!({ "pages_ocr": ocr_billable }),
+            format!("{label} ({ocr_billable} OCR pages, {ocr_cost} credits)"),
+            None,
+        ));
+    }
+    state.record_events(&events).await;
 }
 
 /// Parse (+ OCR, + AI) a document, bill it, and build the response.
@@ -394,38 +429,17 @@ pub(crate) async fn document_response(
         });
     }
 
-    // Billing: the document under its operation, OCR pages separately.
-    if let (Some(pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
-        if let Err(e) = billing::check_credits_and_deduct(
-            pool,
-            &ctx.account_id,
-            job.base_cost,
+    // Usage: the document under its operation, OCR pages separately.
+    if let Some(ctx) = account_ctx {
+        record_document_usage(
+            state,
+            ctx,
             job.operation,
-            &format!("{} ({} credits)", job.label, job.base_cost),
-            state.stripe_client.as_ref(),
+            &job.label,
+            job.base_cost,
+            ocr_billable,
         )
-        .await
-        {
-            warn!(account_id = %ctx.account_id, error = ?e, "Failed to deduct document credits");
-        }
-        if ocr_billable > 0 {
-            let ocr_cost = scrapix_billing::ocr_credits(ocr_billable as u64);
-            if let Err(e) = billing::check_credits_and_deduct(
-                pool,
-                &ctx.account_id,
-                ocr_cost,
-                "ocr",
-                &format!(
-                    "{} ({} OCR pages, {} credits)",
-                    job.label, ocr_billable, ocr_cost
-                ),
-                state.stripe_client.as_ref(),
-            )
-            .await
-            {
-                warn!(account_id = %ctx.account_id, error = ?e, "Failed to deduct OCR credits");
-            }
-        }
+        .await;
     }
 
     info!(
@@ -1005,5 +1019,88 @@ mod tests {
             .contains("# Quarterly Report"));
         assert_eq!(body["document"]["format"], "docx");
         assert_eq!(body["metadata"]["title"], "Quarterly Report");
+    }
+
+    // -----------------------------------------------------------------
+    // Usage events
+    // -----------------------------------------------------------------
+
+    fn usage_ctx() -> AccountContext {
+        AccountContext {
+            account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
+            api_key_id: Some("k".into()),
+            tier: "free".into(),
+            user_role: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn document_usage_is_one_event_without_ocr() {
+        let bus = ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        record_document_usage(&state, &usage_ctx(), "parse", "upload://a.pdf", 4, 0).await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "usage.recorded");
+        assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "parse",
+                "credits": 4,
+                "units": {},
+                "description": "upload://a.pdf (4 credits)",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn document_usage_adds_an_ocr_event_for_billable_pages() {
+        let bus = ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        record_document_usage(&state, &usage_ctx(), "scrape", "https://e.com/s.pdf", 3, 2).await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data["operation"], "scrape");
+        assert_eq!(events[0].data["credits"], 3);
+        let ocr_cost = scrapix_billing::ocr_credits(2);
+        assert_eq!(
+            events[1].data,
+            serde_json::json!({
+                "operation": "ocr",
+                "credits": ocr_cost,
+                "units": {"pages_ocr": 2},
+                "description": format!("https://e.com/s.pdf (2 OCR pages, {ocr_cost} credits)"),
+            })
+        );
+        assert_ne!(events[0].id, events[1].id);
+    }
+
+    #[tokio::test]
+    async fn document_response_records_usage_for_the_caller() {
+        let bus = ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        let job = DocumentJob {
+            operation: "parse",
+            label: "upload://t.csv".into(),
+            base_url: None,
+            fallback_title: None,
+            bytes: b"a,b\n1,2\n".to_vec(),
+            content_type: Some("text/csv".into()),
+            formats: vec![],
+            include_links: false,
+            parsers: serde_json::from_str("{}").unwrap(),
+            ai: None,
+            status_code: 200,
+            js_rendered: false,
+            base_cost: 1,
+        };
+        document_response(&state, &Some(usage_ctx()), job, Instant::now())
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["operation"], "parse");
+        assert_eq!(events[0].data["credits"], 1);
     }
 }

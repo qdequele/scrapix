@@ -148,6 +148,7 @@ pub(crate) async fn deduct_crawl_usage(
     .await?)
 }
 
+#[allow(dead_code)] // removed in Task 6 (engine-lab boundary)
 pub(crate) async fn check_credits_and_deduct(
     pool: &sqlx::PgPool,
     account_id: &str,
