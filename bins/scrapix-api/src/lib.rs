@@ -277,6 +277,9 @@ struct CrawlState {
     /// a failed record leaves both owed, and the deterministic event ids
     /// make any re-finalization record nothing new.
     pending_lab_events: parking_lot::Mutex<HashMap<String, Vec<lab_events::LabEvent>>>,
+    /// Wakes the flush loop as soon as a terminal write gated on Lab events
+    /// becomes owed, instead of waiting for its next tick.
+    terminal_flush_wake: tokio::sync::Notify,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -438,6 +441,7 @@ impl AppState {
                 paused_since: parking_lot::Mutex::new(HashMap::new()),
                 control_republished: parking_lot::Mutex::new(HashMap::new()),
                 pending_lab_events: parking_lot::Mutex::new(HashMap::new()),
+                terminal_flush_wake: tokio::sync::Notify::new(),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
@@ -637,6 +641,7 @@ impl AppState {
                 .insert(job_id, snapshot.clone());
         }
         if owes_events {
+            self.crawl.terminal_flush_wake.notify_one();
             return;
         }
         if let Some(store) = self.job_store.clone() {
@@ -674,6 +679,25 @@ impl AppState {
             .entry(job_id.to_string())
             .or_default()
             .push(event);
+    }
+
+    /// An account's pending/running jobs, for the concurrent-job quota: the
+    /// store's active rows, minus those this process already knows are
+    /// terminal (their terminal write may still be owed, e.g. waiting for
+    /// its Lab events to be recorded, so the row still reads active).
+    pub(crate) async fn active_job_count(&self, account_id: &str) -> i64 {
+        let Some(ref store) = self.job_store else {
+            return 0;
+        };
+        let mut ids = store.active_job_ids(account_id).await.unwrap_or_default();
+        {
+            let jobs = self.crawl.jobs.read();
+            ids.retain(|id| !jobs.get(id).is_some_and(|j| is_terminal(&j.status)));
+        }
+        // Also terminal: evicted from memory with the write still owed.
+        let owed = self.crawl.terminal_pending.read();
+        ids.retain(|id| !owed.contains_key(id));
+        ids.len() as i64
     }
 
     fn has_pending_lab_events(&self, job_id: &str) -> bool {
@@ -1370,11 +1394,16 @@ impl AppState {
             acks
         };
         let dirty_ids: Vec<String> = self.crawl.dirty_jobs.write().drain().collect();
+        // Terminal jobs are left out of the counter flush: a terminal row is
+        // written only by the owed `update_job_full`, after the job's Lab
+        // events were recorded (a job can still be dirty when it turns
+        // terminal, or be re-marked dirty by an event racing a cancel).
         let snapshots: Vec<JobState> = {
             let jobs = self.crawl.jobs.read();
             dirty_ids
                 .iter()
                 .filter_map(|id| jobs.get(id).cloned())
+                .filter(|j| !is_terminal(&j.status))
                 .collect()
         };
         let accounting = if self.accounting_persisted() {
@@ -4453,10 +4482,7 @@ pub(crate) async fn do_create_crawl(
         // Enforce max concurrent jobs per billing tier
         let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
         let max_concurrent = tier.max_concurrent_jobs() as i64;
-        let active_count: i64 = match state.job_store {
-            Some(ref store) => store.count_active_jobs(&ctx.account_id).await.unwrap_or(0),
-            None => 0,
-        };
+        let active_count = state.active_job_count(&ctx.account_id).await;
 
         if active_count >= max_concurrent {
             return Err(ApiError::new(
@@ -7063,6 +7089,14 @@ pub async fn run_with_bus(
                             flush_state.flush_to_db(store.as_ref()).await;
                         }
                     }
+                    // A terminal write gated on Lab events became owed:
+                    // record its events and persist it now (the quota and
+                    // the Rails app read the job's row).
+                    _ = flush_state.crawl.terminal_flush_wake.notified() => {
+                        if let Some(ref store) = flush_state.job_store {
+                            flush_state.flush_to_db(store.as_ref()).await;
+                        }
+                    }
                     _ = shutdown_rx.changed() => {
                         info!("Flush task shutting down, performing final flush");
                         if let Some(ref b) = req_batcher {
@@ -8208,8 +8242,8 @@ mod lifecycle_tests {
         async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
             Vec::new()
         }
-        async fn count_active_jobs(&self, _: &str) -> Result<i64, job_store::StoreError> {
-            Ok(0)
+        async fn active_job_ids(&self, _: &str) -> Result<Vec<String>, job_store::StoreError> {
+            Ok(Vec::new())
         }
         async fn store_result_page(
             &self,
@@ -8415,6 +8449,10 @@ mod lifecycle_tests {
     struct TerminalStore {
         outbox: Option<Arc<lab_events::MemoryOutbox>>,
         writes: parking_lot::Mutex<Vec<(String, JobStatus, usize)>>,
+        /// Statuses received by `flush_job_counters`.
+        counters: parking_lot::Mutex<Vec<(String, JobStatus)>>,
+        /// What `active_job_ids` returns.
+        active: parking_lot::Mutex<Vec<String>>,
     }
 
     impl TerminalStore {
@@ -8450,7 +8488,15 @@ mod lifecycle_tests {
                 .push((job.job_id.clone(), job.status.clone(), recorded));
             Ok(())
         }
-        async fn flush_job_counters(&self, _: &[JobState]) -> Result<(), job_store::StoreError> {
+        async fn flush_job_counters(
+            &self,
+            snapshots: &[JobState],
+        ) -> Result<(), job_store::StoreError> {
+            self.counters.lock().extend(
+                snapshots
+                    .iter()
+                    .map(|j| (j.job_id.clone(), j.status.clone())),
+            );
             Ok(())
         }
         async fn flush_job_accounting(
@@ -8471,8 +8517,8 @@ mod lifecycle_tests {
         async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
             Vec::new()
         }
-        async fn count_active_jobs(&self, _: &str) -> Result<i64, job_store::StoreError> {
-            Ok(0)
+        async fn active_job_ids(&self, _: &str) -> Result<Vec<String>, job_store::StoreError> {
+            Ok(self.active.lock().clone())
         }
         async fn store_result_page(
             &self,
@@ -8607,6 +8653,90 @@ mod lifecycle_tests {
         state.flush_to_db(store.as_ref()).await;
         assert_eq!(store.writes_of("j1").len(), 1, "nothing owed any more");
         assert_eq!(outbox.events().len(), 2);
+    }
+
+    fn failing_once_lab(state: &mut AppState) -> Arc<lab_events::MemoryOutbox> {
+        let outbox = Arc::new(lab_events::MemoryOutbox::default());
+        state.lab = Some(Arc::new(lab_events::Lab::new(Arc::new(
+            FailingOnceOutbox {
+                inner: outbox.clone(),
+                failed: std::sync::atomic::AtomicBool::new(false),
+            },
+        ))));
+        outbox
+    }
+
+    /// Fix round 1 (1): a job still (or again) dirty when it is terminal in
+    /// memory — e.g. a PageCrawled racing a cancel re-marks it dirty — never
+    /// reaches the counter flush with its terminal status: that write would
+    /// persist the terminal status before the job's events are recorded.
+    #[tokio::test]
+    async fn counter_flush_never_carries_a_terminal_status() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = failing_once_lab(&mut state);
+        let store = Arc::new(TerminalStore::watching(&outbox));
+        running_job(&state, "j1", 2);
+        with_account(&state, "j1");
+        state.process_event("j1", &progress("j1", 2, 2, 0));
+        state.process_event("j1", &crawled("j1", "m1"));
+        state.cancel("j1").expect("running job cancels");
+        // The consumer applied a late event of the job and re-marked it.
+        state.crawl.dirty_jobs.write().insert("j1".to_string());
+
+        state.flush_to_db(store.as_ref()).await; // outbox down
+        assert!(outbox.events().is_empty());
+        assert!(store.writes_of("j1").is_empty(), "no terminal write yet");
+        assert!(
+            store.counters.lock().iter().all(|(_, s)| !is_terminal(s)),
+            "counter flush got a terminal status: {:?}",
+            store.counters.lock()
+        );
+
+        state.crawl.dirty_jobs.write().insert("j1".to_string());
+        state.flush_to_db(store.as_ref()).await; // outbox back
+        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);
+        assert!(store.counters.lock().iter().all(|(_, s)| !is_terminal(s)));
+    }
+
+    /// Fix round 1 (2): a job terminal in memory whose terminal write is
+    /// still owed (its row still reads active, e.g. the outbox is down) does
+    /// not count toward the concurrent-job quota.
+    #[tokio::test]
+    async fn quota_ignores_jobs_terminal_in_memory_with_their_write_owed() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let _outbox = failing_once_lab(&mut state);
+        let store = Arc::new(TerminalStore::default());
+        state.job_store = Some(store.clone());
+
+        complete_one_page_job(&state, "done").await;
+        state.flush_to_db(store.as_ref()).await; // outbox down: still owed
+        assert!(store.writes_of("done").is_empty());
+        running_job(&state, "live", 1);
+        // The store still reads "done" as active; "other" is unknown here.
+        *store.active.lock() = vec!["done".into(), "live".into(), "other".into()];
+
+        assert_eq!(state.active_job_count(ACCT).await, 2);
+
+        // Evicted from memory with the write still owed: still not counted.
+        state.crawl.jobs.write().remove("done");
+        assert_eq!(state.active_job_count(ACCT).await, 2);
+    }
+
+    /// Fix round 1 (2): an events-gated terminal write wakes the flush loop.
+    #[tokio::test]
+    async fn owed_terminal_write_wakes_the_flush_loop() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let _outbox = with_memory_lab(&mut state);
+        complete_one_page_job(&state, "j1").await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            state.crawl.terminal_flush_wake.notified(),
+        )
+        .await
+        .expect("flush loop woken");
     }
 
     /// A job finalized again (as after a crash between the event record and

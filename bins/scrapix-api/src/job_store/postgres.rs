@@ -208,7 +208,9 @@ impl JobStore for PgJobStore {
     ///
     /// Rows already terminal are skipped: a counter snapshot taken before a
     /// job finished must not overwrite its terminal row, which only
-    /// [`update_job_full`](JobStore::update_job_full) writes.
+    /// [`update_job_full`](JobStore::update_job_full) writes. Terminal
+    /// snapshots are skipped too, for the same reason: the terminal status
+    /// is persisted only by `update_job_full` (after the job's Lab events).
     async fn flush_job_counters(&self, snapshots: &[JobState]) -> Result<(), StoreError> {
         if snapshots.is_empty() {
             return Ok(());
@@ -253,7 +255,8 @@ impl JobStore for PgJobStore {
                 crawl_rate, eta_seconds
             )
         ) AS d
-        WHERE j.job_id = d.job_id AND j.status NOT IN ('completed', 'failed', 'cancelled')",
+        WHERE j.job_id = d.job_id AND j.status NOT IN ('completed', 'failed', 'cancelled')
+          AND d.status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&ids)
         .bind(&statuses)
@@ -443,12 +446,12 @@ impl JobStore for PgJobStore {
     }
 
     /// Pending/running jobs of an account (per-tier concurrent job limit).
-    async fn count_active_jobs(&self, account_id: &str) -> Result<i64, StoreError> {
+    async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError> {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
+            "SELECT job_id FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
         )
         .bind(uuid::Uuid::parse_str(account_id).ok())
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(store_err)
     }
