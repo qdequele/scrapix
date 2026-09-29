@@ -68,8 +68,11 @@ module StripeBilling
 
   # Invoice item -> draft invoice -> finalize -> pay (expanding the payment
   # intent so the caller can check its status). Same flow as the Rust
-  # create_and_pay_invoice.
-  def self.create_and_pay_invoice(customer_id:, account_id:, payment_method_id:, credits:, amount_cents:, purchase_type:)
+  # create_and_pay_invoice. With void_unpaid, an invoice whose /pay raises
+  # (e.g. a declined card) is voided before re-raising, so unattended
+  # retries (auto top-up) don't leave open invoices behind.
+  def self.create_and_pay_invoice(customer_id:, account_id:, payment_method_id:, credits:, amount_cents:, purchase_type:,
+                                  void_unpaid: false)
     description = "Scrapix: #{credits} credits"
     client.v1.invoice_items.create(
       customer: customer_id, amount: amount_cents, currency: "usd",
@@ -91,16 +94,30 @@ module StripeBilling
     )
 
     invoice = client.v1.invoices.finalize_invoice(invoice.id, { auto_advance: false })
-    # With collection_method=charge_automatically and a default payment method,
-    # finalize can charge immediately; the explicit pay then 400s with
-    # "Invoice is already paid" even though the customer WAS charged. Treat
-    # that as success and re-fetch to continue the ledger-crediting flow.
-    # (Ports the fix/stripe-invoice-already-paid branch from the Rust API.)
-    client.v1.invoices.pay(invoice.id, { expand: [ "payment_intent" ] })
-  rescue Stripe::InvalidRequestError => e
-    raise unless e.message.include?("already paid")
+    begin
+      client.v1.invoices.pay(invoice.id, { expand: [ "payment_intent" ] })
+    rescue Stripe::StripeError => e
+      # With collection_method=charge_automatically and a default payment
+      # method, finalize can charge immediately; the explicit pay then 400s
+      # with "Invoice is already paid" even though the customer WAS charged.
+      # Treat that as success and re-fetch to continue the ledger-crediting
+      # flow. (Ports the fix/stripe-invoice-already-paid branch from the Rust API.)
+      if e.is_a?(Stripe::InvalidRequestError) && e.message.include?("already paid")
+        return client.v1.invoices.retrieve(invoice.id, { expand: [ "payment_intent" ] })
+      end
 
-    client.v1.invoices.retrieve(invoice.id, { expand: [ "payment_intent" ] })
+      void_invoice(invoice.id) if void_unpaid
+      raise
+    end
+  end
+
+  # Best-effort void of an unpaid invoice (never raises): a failure is only
+  # logged — Stripe refuses to void a paid invoice, which is the safe outcome.
+  def self.void_invoice(invoice_id)
+    client.v1.invoices.void_invoice(invoice_id)
+  rescue StandardError => e
+    Rails.logger.warn("Could not void Stripe invoice #{invoice_id}: #{e.message}")
+    nil
   end
 
   # Idempotent credit grant keyed on the Stripe payment intent id — mirrors

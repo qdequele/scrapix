@@ -133,6 +133,11 @@ class LabEventsTest < ActiveSupport::TestCase
     assert ev.next_attempt_at > Time.current
   end
 
+  test "overlapping runs of the recurring job are limited to one" do
+    assert_equal 1, ProcessLabEventsJob.concurrency_limit
+    assert_equal "ProcessLabEventsJob/process_lab_events", ProcessLabEventsJob.new.concurrency_key
+  end
+
   test "the recurring job processes pending events" do
     ev = usage(2)
     ProcessLabEventsJob.perform_now

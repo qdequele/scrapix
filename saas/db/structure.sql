@@ -128,6 +128,7 @@ CREATE TABLE public.accounts (
     monthly_spend_limit bigint,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
     updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    last_auto_topup_attempt_at timestamp with time zone,
     CONSTRAINT accounts_tier_check CHECK ((tier = ANY (ARRAY['free'::text, 'starter'::text, 'pro'::text, 'enterprise'::text])))
 );
 
@@ -1969,6 +1970,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260929000004'),
 ('20260929000003'),
 ('20260929000002'),
 ('20260929000001'),

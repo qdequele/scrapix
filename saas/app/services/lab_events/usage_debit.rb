@@ -1,6 +1,6 @@
 module LabEvents
   # usage.recorded → one usage_deduction per event (idempotent on the row id),
-  # a low-balance email when the balance crosses LOW_BALANCE, then auto top-up.
+  # a low-balance email when that debit crosses LOW_BALANCE, then auto top-up.
   class UsageDebit
     LOW_BALANCE = 10
 
@@ -20,12 +20,15 @@ module LabEvents
 
       result = account.debit_usage!(credits, lab_event_id: event.id, operation: operation,
                                     description: d["description"].to_s)
-      return unless result
-
-      before, after = result
-      if before > LOW_BALANCE && after <= LOW_BALANCE && (to = account.owner_email)
-        ScheduledEmail.create!(email_type: "low_balance", recipient: to, payload: { balance: after }, send_at: Time.current)
+      if result
+        before, after = result
+        if before > LOW_BALANCE && after <= LOW_BALANCE && (to = account.owner_email)
+          ScheduledEmail.create!(email_type: "low_balance", recipient: to, payload: { balance: after }, send_at: Time.current)
+        end
       end
+      # Also when already debited (a retry): the previous run may have raised
+      # or crashed after the debit committed but before the top-up. Repeating
+      # it is safe — AutoTopup re-checks the balance and its claim under the lock.
       AutoTopup.call(account)
     end
   end
