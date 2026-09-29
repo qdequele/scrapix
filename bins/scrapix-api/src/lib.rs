@@ -6451,11 +6451,15 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
         ) => {
             // The schema is owned by the Rails app (saas/db/migrate,
             // `rails db:prepare`); the engine never migrates it.
-            let auth = auth::AuthState::new(url, jwt_secret.clone())
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
-                })?;
+            let auth = auth::AuthState::new(
+                url,
+                jwt_secret.clone(),
+                settings.lab.as_ref().map(|l| l.service_token.clone()),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
+            })?;
             let auth = Arc::new(auth);
             let pool = auth.pool.clone();
             info!("Authentication enabled via the Rails Postgres");
