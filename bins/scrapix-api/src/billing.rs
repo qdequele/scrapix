@@ -122,6 +122,7 @@ pub(crate) async fn check_credits(
 
 /// Post-hoc billing for completed crawl work — always records the usage,
 /// letting the balance go negative rather than leaving pages unbilled.
+#[allow(dead_code)] // removed in Task 6 (engine-lab boundary)
 pub(crate) async fn deduct_crawl_usage(
     pool: &sqlx::PgPool,
     account_id: &str,

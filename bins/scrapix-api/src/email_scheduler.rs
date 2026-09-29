@@ -62,6 +62,7 @@ pub async fn get_account_email(pool: &PgPool, account_id: uuid::Uuid) -> Option<
 
 /// Fetch the owner's email for an account, only if they opted into job
 /// notification emails.
+#[allow(dead_code)] // removed in Task 6 (engine-lab boundary)
 pub async fn get_account_email_for_job_notification(
     pool: &PgPool,
     account_id: uuid::Uuid,

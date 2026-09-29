@@ -271,6 +271,12 @@ struct CrawlState {
     paused_since: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     /// Last self-heal re-publish of a `JobControl`, per job (rate limit).
     control_republished: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// Lab events (crawl charge, lifecycle email) owed by a job's terminal
+    /// write, hosted only. The job's terminal status is persisted only after
+    /// these were recorded in the outbox (by the flush, see `flush_to_db`):
+    /// a failed record leaves both owed, and the deterministic event ids
+    /// make any re-finalization record nothing new.
+    pending_lab_events: parking_lot::Mutex<HashMap<String, Vec<lab_events::LabEvent>>>,
 }
 
 /// Diagnostics: errors, domain stats, service health
@@ -337,6 +343,7 @@ struct AppState {
     pub(crate) saas_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
     /// Optional Stripe client for payment-backed auto-topup
+    #[allow(dead_code)] // removed in Task 6 (engine-lab boundary)
     stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
@@ -430,6 +437,7 @@ impl AppState {
                 ack_cap_warned_at: parking_lot::Mutex::new(None),
                 paused_since: parking_lot::Mutex::new(HashMap::new()),
                 control_republished: parking_lot::Mutex::new(HashMap::new()),
+                pending_lab_events: parking_lot::Mutex::new(HashMap::new()),
             },
             diagnostics: DiagnosticsState {
                 recent_errors: RwLock::new(VecDeque::with_capacity(1000)),
@@ -585,22 +593,51 @@ impl AppState {
     /// the job store immediately and free its per-job tracking state.
     fn on_terminal(&self, job_id: &str, updated: Option<JobState>) {
         self.forget_job_tracking(job_id);
-        if let Some(snapshot) = updated {
-            self.write_terminal(snapshot);
+        match updated {
+            Some(snapshot) => self.write_terminal(snapshot),
+            // A terminal event for a job this process does not know: there
+            // is no terminal status to persist, so its events (if any) are
+            // recorded on their own, best effort.
+            None => self.record_unowned_lab_events(job_id),
         }
     }
 
-    /// Write a terminal job through to the job store now (best effort, for
-    /// latency) and, while acks are deferred, owe a checked write to the
-    /// next flush: the job's held acks wait for it.
+    /// Record, in the background, the Lab events of a job that has no
+    /// terminal write to order them against.
+    fn record_unowned_lab_events(&self, job_id: &str) {
+        let events = self.take_pending_lab_events(job_id);
+        if let (false, Some(lab)) = (events.is_empty(), self.lab.clone()) {
+            tokio::spawn(async move {
+                let _ = lab.record(&events).await; // logged by `Lab::record`
+            });
+        }
+    }
+
+    /// Persist a terminal job.
+    ///
+    /// Without Lab events owed by the job: written through to the job store
+    /// now (best effort, for latency) and, while acks are deferred, a
+    /// checked write is owed to the next flush (the job's held acks wait for
+    /// it).
+    ///
+    /// With Lab events owed (hosted: its crawl charge / lifecycle email,
+    /// queued before this call): no direct write. The terminal write is
+    /// always owed to the flush, which records the events first and writes
+    /// the terminal status only once they are durably in the outbox
+    /// (`flush_to_db`), so a crash can never persist a terminal job whose
+    /// charge was not recorded.
     fn write_terminal(&self, snapshot: JobState) {
         let job_id = snapshot.job_id.clone();
         self.crawl.dirty_jobs.write().remove(&job_id);
-        if self.accounting_persisted() {
+        let owes_events = self.has_pending_lab_events(&job_id);
+        if self.accounting_persisted() || owes_events {
             self.crawl
                 .terminal_pending
                 .write()
                 .insert(job_id, snapshot.clone());
+        }
+        if owes_events {
+            return;
         }
         if let Some(store) = self.job_store.clone() {
             tokio::spawn(async move {
@@ -614,31 +651,98 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Queue a job notification email (delivered by the Rails app). Called
+    /// Owe `event` to `job_id`'s terminal write (hosted only: a no-op
+    /// without a Lab). Must be called before the job's `write_terminal`.
+    /// An event whose account is not a uuid is dropped with a warning: the
+    /// outbox would refuse it forever, and with it the job's terminal write.
+    fn owe_lab_event(&self, job_id: &str, event: lab_events::LabEvent) {
+        if self.lab.is_none() {
+            return;
+        }
+        if uuid::Uuid::parse_str(&event.account_id).is_err() {
+            warn!(
+                job_id = %job_id,
+                account_id = %event.account_id,
+                kind = %event.kind,
+                "Not recording a lab event for a non-uuid account"
+            );
+            return;
+        }
+        self.crawl
+            .pending_lab_events
+            .lock()
+            .entry(job_id.to_string())
+            .or_default()
+            .push(event);
+    }
+
+    fn has_pending_lab_events(&self, job_id: &str) -> bool {
+        self.crawl
+            .pending_lab_events
+            .lock()
+            .get(job_id)
+            .is_some_and(|events| !events.is_empty())
+    }
+
+    /// Take the Lab events owed by `job_id`'s terminal write.
+    fn take_pending_lab_events(&self, job_id: &str) -> Vec<lab_events::LabEvent> {
+        self.crawl
+            .pending_lab_events
+            .lock()
+            .remove(job_id)
+            .unwrap_or_default()
+    }
+
+    /// Put back events whose record failed (ahead of any queued since).
+    fn requeue_pending_lab_events(&self, job_id: &str, events: Vec<lab_events::LabEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut pending = self.crawl.pending_lab_events.lock();
+        let entry = pending.entry(job_id.to_string()).or_default();
+        let later = std::mem::replace(entry, events);
+        entry.extend(later);
+    }
+
+    /// Record the Lab events owed by `job_id`'s terminal write. `true` when
+    /// the terminal status may now be persisted (nothing owed, or recorded);
+    /// `false` when the record failed: the events are put back and the
+    /// terminal write must stay owed.
+    async fn record_owed_lab_events(&self, job_id: &str) -> bool {
+        let events = self.take_pending_lab_events(job_id);
+        if events.is_empty() {
+            return true;
+        }
+        let Some(lab) = self.lab.as_ref() else {
+            return true; // not reachable: events are only owed with a Lab
+        };
+        match lab.record(&events).await {
+            Ok(()) => true,
+            Err(_) => {
+                // Logged by `Lab::record`.
+                self.requeue_pending_lab_events(job_id, events);
+                false
+            }
+        }
+    }
+
+    /// Queue a job's lifecycle event (the Lab emails the account). Called
     /// only from `process_event`'s terminal branches, which run at most once
-    /// per job.
-    fn request_job_email(
+    /// per job, before the job's terminal write.
+    fn request_job_event(
         &self,
-        email_type: &'static str,
+        job_id: &str,
+        make_event: fn(&str, &str, serde_json::Value) -> lab_events::LabEvent,
         account_id: Option<String>,
         payload: serde_json::Value,
     ) {
         self.diagnostics
             .job_emails_requested
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id) else {
+        let Some(acct_id) = account_id else {
             return;
         };
-        tokio::spawn(async move {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&acct_id) {
-                if let Some(email_addr) =
-                    email_scheduler::get_account_email_for_job_notification(&pool, uuid).await
-                {
-                    email_scheduler::schedule_email_now(&pool, email_type, &email_addr, payload)
-                        .await;
-                }
-            }
-        });
+        self.owe_lab_event(job_id, make_event(job_id, &acct_id, payload));
     }
 
     /// One completion-loop tick (R5): refresh each Running job's balanced
@@ -772,29 +876,29 @@ impl AppState {
             },
         };
 
+        // R-20: a stalled job still pays for the pages it crawled (the old
+        // idle detector completed, and so billed, such jobs). A Replace
+        // cleanup failure stays unbilled, as before. Charged by
+        // process_event, before the terminal write.
+        let failed_charge = (decision == Finalize::FailStalled).then(|| PageCharge {
+            pages_http: acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
+            pages_browser: acc.pages_browser,
+            pages_ai: acc.pages_ai,
+            pages_ocr: acc.pages_ocr,
+        });
+
         info!(job_id = %job_id, ?decision, "Finalizing job from work accounting");
         // The terminal transition is atomic in process_event: if the job was
         // cancelled meanwhile (e.g. during the Replace cleanup), nothing is
-        // applied and nothing else happens here.
-        if !self.process_event(job_id, &event).applied {
+        // applied (nor charged) and nothing else happens here.
+        if !self
+            .process_event_charging(job_id, &event, None, failed_charge)
+            .applied
+        {
             debug!(job_id = %job_id, "Job became terminal before finalize, skipping");
             return;
         }
         self.broadcast_event(job_id, event);
-
-        // R-20: a stalled job still pays for the pages it crawled (the old
-        // idle detector completed, and so billed, such jobs). A Replace
-        // cleanup failure stays unbilled, as before.
-        if decision == Finalize::FailStalled {
-            self.bill_job(
-                job_id,
-                job.account_id.as_ref(),
-                acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
-                acc.pages_browser,
-                acc.pages_ai,
-                acc.pages_ocr,
-            );
-        }
 
         // Tell the pipeline to release the job's state.
         self.publish_control(job_id, JobAction::Finish);
@@ -1079,9 +1183,11 @@ impl AppState {
         Ok(j.clone())
     }
 
-    /// Deduct crawl credits for `pages` pages of a finished job
-    /// (fire-and-forget). Cost per page depends on the job's crawler_type and
-    /// enabled features. The single billing path for terminal jobs.
+    /// Charge the crawled pages of a finished job: owes its crawl usage event
+    /// (deterministic id, one per job) to the job's terminal write, so it
+    /// must be called before `write_terminal`. Cost per page depends on the
+    /// pages delivered and the job's enabled features. The single billing
+    /// path for terminal jobs.
     /// D4/R4: credits are computed from what was actually delivered, not
     /// from the job's static config — `pages_http`/`pages_browser` split the
     /// crawled-ok page count by whether each page was actually rendered
@@ -1129,7 +1235,7 @@ impl AppState {
             .credits_billed
             .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
 
-        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id.cloned()) else {
+        let (Some(_), Some(acct_id)) = (self.lab.as_ref(), account_id) else {
             return;
         };
         let description = if pages_ocr > 0 {
@@ -1143,38 +1249,15 @@ impl AppState {
                 job_id, pages_http, pages_browser, pages_ai
             )
         };
-        let job_id = job_id.to_string();
-        let stripe_cl = self.stripe_client.clone();
-        tokio::spawn(async move {
-            match billing::deduct_crawl_usage(
-                &pool,
-                &acct_id,
-                credits,
-                &description,
-                stripe_cl.as_ref(),
-            )
-            .await
-            {
-                Ok(new_balance) => {
-                    info!(
-                        account_id = %acct_id,
-                        credits_deducted = credits,
-                        new_balance,
-                        job_id = %job_id,
-                        "Crawl credits deducted"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        account_id = %acct_id,
-                        credits = credits,
-                        job_id = %job_id,
-                        error = ?e,
-                        "Failed to deduct crawl credits"
-                    );
-                }
-            }
+        let units = serde_json::json!({
+            "pages_http": pages_http,
+            "pages_browser": pages_browser,
+            "pages_ai": pages_ai,
+            "pages_ocr": pages_ocr,
         });
+        let event =
+            lab_events::LabEvent::crawl_final_usage(job_id, acct_id, credits, units, description);
+        self.owe_lab_event(job_id, event);
     }
 
     /// Atomically apply the state change of a terminal event: check and set
@@ -1352,7 +1435,18 @@ impl AppState {
                 );
                 self.accounting_persisted
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                owed.clear();
+                // Terminal writes whose Lab events are still unrecorded stay
+                // owed (the flush is their only writer); the others are
+                // dropped as before (their direct write already ran).
+                {
+                    let pending = self.crawl.pending_lab_events.lock();
+                    owed.retain(|id, _| pending.contains_key(id));
+                    for j in terminal {
+                        if pending.contains_key(&j.job_id) {
+                            owed.entry(j.job_id.clone()).or_insert(j);
+                        }
+                    }
+                }
                 drop(owed);
                 let held = {
                     let mut pending = self.crawl.pending_acks.lock();
@@ -1433,7 +1527,13 @@ impl AppState {
         let mut failed_terminal = HashSet::new();
         if accounting == AccountingFlush::Ok {
             for job in &batch.terminal {
-                if store.update_job_full(job).await.is_err() {
+                // The job's Lab events (charge, lifecycle email) must be in
+                // the outbox before its terminal status is persisted. A
+                // failed record puts them back and keeps the write owed
+                // (`failed_terminal`): retried, events first, next flush.
+                if !self.record_owed_lab_events(&job.job_id).await
+                    || store.update_job_full(job).await.is_err()
+                {
                     failed_terminal.insert(job.job_id.clone());
                 }
             }
@@ -1454,6 +1554,19 @@ impl AppState {
         job_id: &str,
         event: &CrawlEvent,
         pos: Option<EventPosition>,
+    ) -> EventOutcome {
+        self.process_event_charging(job_id, event, pos, None)
+    }
+
+    /// `process_event_at`, charging a `JobFailed` that transitions the job
+    /// for `failed_charge` (a stalled job pays for the pages it crawled):
+    /// the charge is owed before the terminal write, like every other.
+    fn process_event_charging(
+        &self,
+        job_id: &str,
+        event: &CrawlEvent,
+        pos: Option<EventPosition>,
+        failed_charge: Option<PageCharge>,
     ) -> EventOutcome {
         // Terminal transitions are applied exactly once, atomically: a second
         // JobCompleted/JobFailed for a job that is already terminal (a
@@ -1756,12 +1869,13 @@ impl AppState {
                     .as_ref()
                     .map(|j| j.index_uid.clone())
                     .unwrap_or_default();
-                self.on_terminal(job_id, terminal_snapshot);
 
-                // Queue job completion email (delivered by the Rails app).
-                // The only place a completion email is scheduled (R5).
-                self.request_job_email(
-                    "job_completed",
+                // Queue the job completion event (the Lab emails the
+                // account). The only place a completion email is requested
+                // (R5). Owed before the terminal write (`on_terminal` below).
+                self.request_job_event(
+                    job_id,
+                    lab_events::LabEvent::job_completed,
                     account_id.clone().filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
@@ -1772,10 +1886,10 @@ impl AppState {
                     }),
                 );
 
-                // Deduct credits for crawled pages (fire-and-forget). D4/R4:
-                // bill for what was actually delivered — `accounted` (folded
-                // above, before `on_terminal` frees the accounting entry)
-                // carries the browser/AI-enriched page counts.
+                // Charge the crawled pages. D4/R4: bill for what was
+                // actually delivered — `accounted` (folded above, before
+                // `on_terminal` frees the accounting entry) carries the
+                // browser/AI-enriched page counts.
                 let (pages_browser, pages_ai, pages_ocr) = accounted
                     .as_ref()
                     .map(|c| (c.pages_browser, c.pages_ai, c.pages_ocr))
@@ -1789,6 +1903,8 @@ impl AppState {
                     pages_ai,
                     pages_ocr,
                 );
+                // Only now, with the charge and the email owed: persist.
+                self.on_terminal(job_id, terminal_snapshot);
             }
             CrawlEvent::JobFailed { error, .. } => {
                 // No temp index cleanup needed — Replace strategy writes directly to the real index.
@@ -1798,12 +1914,25 @@ impl AppState {
                     .as_ref()
                     .map(|j| (j.pages_crawled, j.account_id.clone()))
                     .unwrap_or((0, None));
-                self.on_terminal(job_id, terminal_snapshot);
 
-                // Queue job failure email (delivered by the Rails app).
-                // The only place a failure email is scheduled (R5).
-                self.request_job_email(
-                    "job_failed",
+                // A stalled job's charge (`finalize_job`), only when this
+                // event is the one that made the job terminal.
+                if let (Some(c), Some(_)) = (failed_charge, terminal_snapshot.as_ref()) {
+                    self.bill_job(
+                        job_id,
+                        account_id.as_ref(),
+                        c.pages_http,
+                        c.pages_browser,
+                        c.pages_ai,
+                        c.pages_ocr,
+                    );
+                }
+
+                // Queue the job failure event (the Lab emails the account).
+                // The only place a failure email is requested (R5).
+                self.request_job_event(
+                    job_id,
+                    lab_events::LabEvent::job_failed,
                     account_id.filter(|_| pipeline_terminal),
                     serde_json::json!({
                         "job_id": job_id,
@@ -1811,6 +1940,8 @@ impl AppState {
                         "pages_crawled": pages_crawled,
                     }),
                 );
+                // Only now, with the charge and the email owed: persist.
+                self.on_terminal(job_id, terminal_snapshot);
             }
             CrawlEvent::JobWarning { message, .. } => {
                 if !message.is_empty() && !frozen {
@@ -1897,6 +2028,15 @@ impl From<ControlError> for ApiError {
             ),
         }
     }
+}
+
+/// The pages a terminal job is charged for (see `AppState::bill_job`).
+#[derive(Debug, Clone, Copy)]
+struct PageCharge {
+    pages_http: u64,
+    pages_browser: u64,
+    pages_ai: u64,
+    pages_ocr: u64,
 }
 
 /// Result of the atomic terminal check-and-set.
@@ -8254,13 +8394,340 @@ mod lifecycle_tests {
             .load(Ordering::Relaxed)
     }
 
+    const ACCT: &str = "7f1c2a8e-0000-4000-8000-000000000001";
+
+    /// Give `job_id` a (valid uuid) account, as hosted jobs have.
+    fn with_account(state: &AppState, job_id: &str) {
+        state.update_job(job_id, |j| j.account_id = Some(ACCT.to_string()));
+    }
+
+    fn events_of(outbox: &lab_events::MemoryOutbox, kind: &str) -> Vec<lab_events::LabEvent> {
+        outbox
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect()
+    }
+
+    /// A job store recording each terminal write (`update_job_full`) and
+    /// how many events the outbox held at that moment.
+    #[derive(Default)]
+    struct TerminalStore {
+        outbox: Option<Arc<lab_events::MemoryOutbox>>,
+        writes: parking_lot::Mutex<Vec<(String, JobStatus, usize)>>,
+    }
+
+    impl TerminalStore {
+        fn watching(outbox: &Arc<lab_events::MemoryOutbox>) -> Self {
+            Self {
+                outbox: Some(outbox.clone()),
+                ..Default::default()
+            }
+        }
+
+        fn writes_of(&self, job_id: &str) -> Vec<(JobStatus, usize)> {
+            self.writes
+                .lock()
+                .iter()
+                .filter(|(id, _, _)| id == job_id)
+                .map(|(_, s, n)| (s.clone(), *n))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl job_store::JobStore for TerminalStore {
+        fn backend(&self) -> &'static str {
+            "test"
+        }
+        async fn insert_job(&self, _: &JobState) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn update_job_full(&self, job: &JobState) -> Result<(), job_store::StoreError> {
+            let recorded = self.outbox.as_ref().map_or(0, |o| o.events().len());
+            self.writes
+                .lock()
+                .push((job.job_id.clone(), job.status.clone(), recorded));
+            Ok(())
+        }
+        async fn flush_job_counters(&self, _: &[JobState]) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn flush_job_accounting(
+            &self,
+            _: &[(String, serde_json::Value)],
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_active_jobs(&self) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn load_active_job_accounting(&self) -> Vec<(String, serde_json::Value)> {
+            Vec::new()
+        }
+        async fn get_job(&self, _: &str, _: Option<&str>) -> Option<JobState> {
+            None
+        }
+        async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn count_active_jobs(&self, _: &str) -> Result<i64, job_store::StoreError> {
+            Ok(0)
+        }
+        async fn store_result_page(
+            &self,
+            _: &str,
+            _: u64,
+            _: &str,
+            _: bool,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn store_result_summary(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_result_summary(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, job_store::StoreError> {
+            Ok(None)
+        }
+        async fn result_pages(
+            &self,
+            _: &str,
+            _: u64,
+            _: usize,
+        ) -> Result<(Vec<(u64, serde_json::Value)>, u64), job_store::StoreError> {
+            Ok((Vec::new(), 0))
+        }
+    }
+
+    /// An outbox whose first `enqueue` fails (the Lab outbox is down once).
+    struct FailingOnceOutbox {
+        inner: Arc<lab_events::MemoryOutbox>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl lab_events::LabOutbox for FailingOnceOutbox {
+        async fn enqueue(
+            &self,
+            events: &[lab_events::LabEvent],
+        ) -> Result<(), job_store::StoreError> {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                return Err(job_store::StoreError::Other("down".into()));
+            }
+            self.inner.enqueue(events).await
+        }
+        async fn due(
+            &self,
+            limit: i64,
+        ) -> Result<Vec<lab_events::LabEvent>, job_store::StoreError> {
+            self.inner.due(limit).await
+        }
+        async fn mark_delivered(&self, ids: &[uuid::Uuid]) -> Result<(), job_store::StoreError> {
+            self.inner.mark_delivered(ids).await
+        }
+        async fn reschedule(&self, ids: &[uuid::Uuid]) -> Result<(), job_store::StoreError> {
+            self.inner.reschedule(ids).await
+        }
+        async fn pending_stats(
+            &self,
+        ) -> Result<(i64, Option<chrono::DateTime<chrono::Utc>>), job_store::StoreError> {
+            self.inner.pending_stats().await
+        }
+        async fn purge_delivered(
+            &self,
+            older_than_secs: i64,
+        ) -> Result<u64, job_store::StoreError> {
+            self.inner.purge_delivered(older_than_secs).await
+        }
+    }
+
+    /// Drive `job_id` (one seed, one page) to a balanced, completed state.
+    async fn complete_one_page_job(state: &AppState, job_id: &str) {
+        running_job(state, job_id, 1);
+        with_account(state, job_id);
+        for e in [
+            progress(job_id, 1, 1, 0),
+            crawled(job_id, "m1"),
+            indexed(job_id, "m1"),
+        ] {
+            state.process_event(job_id, &e);
+        }
+        state
+            .finalize_job(job_id, Finalize::Complete, Instant::now())
+            .await;
+        assert_eq!(state.get_job(job_id).unwrap().status, JobStatus::Completed);
+    }
+
+    /// The events and the terminal write are recorded first, then the
+    /// terminal status: a failed record leaves the terminal write owed, and
+    /// the next flush records the events and only then writes it.
+    #[tokio::test]
+    async fn terminal_status_is_not_persisted_before_its_events_are_recorded() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = Arc::new(lab_events::MemoryOutbox::default());
+        state.lab = Some(Arc::new(lab_events::Lab::new(Arc::new(
+            FailingOnceOutbox {
+                inner: outbox.clone(),
+                failed: std::sync::atomic::AtomicBool::new(false),
+            },
+        ))));
+        let store = Arc::new(TerminalStore::watching(&outbox));
+        state.job_store = Some(store.clone());
+
+        complete_one_page_job(&state, "j1").await;
+        // Give a (wrongly) spawned direct terminal write a chance to run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(store.writes_of("j1").is_empty(), "no terminal write yet");
+
+        state.flush_to_db(store.as_ref()).await; // enqueue fails
+        assert!(outbox.events().is_empty());
+        assert!(
+            store.writes_of("j1").is_empty(),
+            "terminal status must not be persisted before its events"
+        );
+
+        state.flush_to_db(store.as_ref()).await; // enqueue succeeds
+        assert_eq!(
+            store.writes_of("j1"),
+            vec![(JobStatus::Completed, 2)],
+            "one terminal write, after both events were recorded"
+        );
+        assert_eq!(events_of(&outbox, "usage.recorded").len(), 1);
+        assert_eq!(events_of(&outbox, "job.completed").len(), 1);
+
+        state.flush_to_db(store.as_ref()).await;
+        assert_eq!(store.writes_of("j1").len(), 1, "nothing owed any more");
+        assert_eq!(outbox.events().len(), 2);
+    }
+
+    /// A job finalized again (as after a crash between the event record and
+    /// the terminal write: recovered as running, finalized by the normal
+    /// paths) produces the same event ids: still one charge and one email.
+    #[tokio::test]
+    async fn refinalizing_a_job_does_not_duplicate_its_events() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        let store = TerminalStore::watching(&outbox);
+
+        complete_one_page_job(&state, "j1").await;
+        state.flush_to_db(&store).await;
+        assert_eq!(outbox.events().len(), 2);
+
+        // Recovery: the job is back as running with its accounting.
+        complete_one_page_job(&state, "j1").await;
+        state.flush_to_db(&store).await;
+
+        assert_eq!(
+            store.writes_of("j1").len(),
+            2,
+            "both finalizations persisted"
+        );
+        let usage = events_of(&outbox, "usage.recorded");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(
+            usage[0].id,
+            lab_events::LabEvent::crawl_final_usage(
+                "j1",
+                ACCT,
+                0,
+                serde_json::json!({}),
+                String::new()
+            )
+            .id
+        );
+        assert_eq!(events_of(&outbox, "job.completed").len(), 1);
+        assert_eq!(outbox.events().len(), 2);
+        assert_eq!(emails(&state), 2, "diagnostics count each finalization");
+    }
+
+    /// A terminal event for a job this process does not know is still
+    /// charged and emailed (as before): recorded without a terminal write.
+    #[tokio::test]
+    async fn terminal_event_for_an_unknown_job_records_its_events() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        state.process_event(
+            "ghost",
+            &CrawlEvent::JobCompleted {
+                job_id: "ghost".into(),
+                account_id: Some(ACCT.into()),
+                pages_crawled: 2,
+                documents_indexed: 2,
+                errors: 0,
+                bytes_downloaded: 0,
+                duration_secs: 1,
+                timestamp: 0,
+            },
+        );
+        for _ in 0..100 {
+            if outbox.events().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(events_of(&outbox, "usage.recorded").len(), 1);
+        assert_eq!(events_of(&outbox, "job.completed").len(), 1);
+        assert!(state.crawl.pending_lab_events.lock().is_empty());
+        assert!(state.crawl.terminal_pending.read().is_empty());
+    }
+
+    /// Standalone (no Lab): nothing is recorded, the job still finalizes and
+    /// is persisted, and the billing diagnostics are computed as before.
+    #[tokio::test]
+    async fn standalone_job_records_nothing_and_still_finalizes() {
+        let bus = ChannelBus::new();
+        let store = Arc::new(TerminalStore::default());
+        let state = AppState::new(
+            AnyProducer::channel(bus.producer()),
+            test_config(),
+            None,
+            None,
+            None,
+            None,
+            test_fetcher(),
+            None,
+            None,
+            None,
+            Some(store.clone() as Arc<dyn job_store::JobStore>),
+            None,
+            None,
+            test_webhooks(),
+        );
+        assert!(state.lab.is_none());
+
+        complete_one_page_job(&state, "j1").await;
+        state.flush_to_db(store.as_ref()).await;
+
+        let writes = store.writes_of("j1");
+        assert!(!writes.is_empty(), "terminal status persisted");
+        assert!(writes.iter().all(|(s, _)| *s == JobStatus::Completed));
+        assert!(state.crawl.pending_lab_events.lock().is_empty());
+        let d = &state.diagnostics;
+        assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
+        assert_eq!(d.credits_billed.load(Ordering::Relaxed), 1);
+        assert_eq!(emails(&state), 1);
+    }
+
     #[tokio::test]
     async fn balanced_job_completes_once_after_grace_with_one_email() {
         let bus = ChannelBus::new();
         let control = bus.consumer();
         control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
-        let state = test_state(&bus);
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
         running_job(&state, "j1", 1);
+        with_account(&state, "j1");
 
         for e in [
             progress("j1", 1, 1, 0),
@@ -8335,6 +8802,17 @@ mod lifecycle_tests {
         );
         assert_eq!(emails(&state), 1);
         assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Completed);
+
+        state.flush_to_db(&TerminalStore::default()).await;
+        assert_eq!(
+            outbox
+                .events()
+                .iter()
+                .filter(|e| e.kind == "job.completed")
+                .count(),
+            1
+        );
+        assert!(events_of(&outbox, "job.failed").is_empty());
     }
 
     #[tokio::test]
@@ -8983,8 +9461,10 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn stalled_job_with_crawled_pages_is_billed() {
         let bus = ChannelBus::new();
-        let state = test_state(&bus);
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
         running_job(&state, "j1", 2);
+        with_account(&state, "j1");
         state.process_event("j1", &progress("j1", 2, 2, 0));
         state.process_event("j1", &crawled("j1", "m1"));
         state.process_event("j1", &indexed("j1", "m1")); // m2 never reports
@@ -8998,6 +9478,21 @@ mod lifecycle_tests {
         let d = &state.diagnostics;
         assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
         assert_eq!(d.pages_billed.load(Ordering::Relaxed), 1);
+
+        let store = TerminalStore::watching(&outbox);
+        state.flush_to_db(&store).await;
+        let usage = events_of(&outbox, "usage.recorded");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].data["operation"], "crawl");
+        assert_eq!(usage[0].data["credits"], 1);
+        assert_eq!(usage[0].data["units"]["pages_http"], 1);
+        assert_eq!(usage[0].data["job_id"], "j1");
+        assert_eq!(events_of(&outbox, "job.failed").len(), 1);
+        assert_eq!(
+            store.writes_of("j1"),
+            vec![(JobStatus::Failed, 2)],
+            "the stall charge is recorded before the terminal write"
+        );
     }
 
     #[tokio::test]
@@ -9040,8 +9535,11 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn completed_job_with_mixed_delivery_bills_expected_credits() {
         let bus = ChannelBus::new();
-        let state = test_state(&bus);
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
         running_job(&state, "mix", 3);
+        with_account(&state, "mix");
+        let (job_id, acct) = ("mix".to_string(), ACCT.to_string());
 
         // AI features enabled on the job (surcharge = 5 + 5 = 10/page), no
         // other features, crawler_type is irrelevant to billing now.
@@ -9124,6 +9622,38 @@ mod lifecycle_tests {
         // page (10 credits surcharge) = 15. Not 3 * 12 = 36, which is what
         // the old per-job browser+AI rate would have charged.
         assert_eq!(d.credits_billed.load(Ordering::Relaxed), 15);
+
+        state.flush_to_db(&TerminalStore::default()).await;
+        let usage: Vec<_> = outbox
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == "usage.recorded")
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].data["operation"], "crawl");
+        assert_eq!(usage[0].data["credits"], 15);
+        assert_eq!(
+            usage[0].data["units"]["pages_http"].as_u64().unwrap()
+                + usage[0].data["units"]["pages_browser"].as_u64().unwrap(),
+            3
+        );
+        assert_eq!(usage[0].data["units"]["pages_ai"], 1);
+        assert_eq!(
+            usage[0].data["description"],
+            "Job mix (1 http + 2 browser pages, 1 AI-enriched)"
+        );
+        assert_eq!(usage[0].account_id, acct);
+        assert_eq!(
+            usage[0].id,
+            lab_events::LabEvent::crawl_final_usage(
+                &job_id,
+                &acct,
+                0,
+                serde_json::json!({}),
+                String::new()
+            )
+            .id
+        );
     }
 
     /// A decision computed up front is re-validated right before finalizing
@@ -9219,8 +9749,10 @@ mod lifecycle_tests {
         let bus = ChannelBus::new();
         let control = bus.consumer();
         control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
-        let state = test_state(&bus);
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
         running_job(&state, "j1", 5);
+        with_account(&state, "j1");
         state.process_event("j1", &progress("j1", 5, 5, 0));
         for id in ["m1", "m2", "m3"] {
             state.process_event("j1", &crawled("j1", id));
@@ -9249,6 +9781,14 @@ mod lifecycle_tests {
         assert_eq!(emails(&state), 0);
 
         assert_eq!(state.cancel("nope").unwrap_err(), ControlError::NotFound);
+
+        let store = TerminalStore::watching(&outbox);
+        state.flush_to_db(&store).await;
+        let usage = events_of(&outbox, "usage.recorded");
+        assert_eq!(usage.len(), 1, "one charge");
+        assert_eq!(usage[0].data["credits"], 3);
+        assert_eq!(outbox.events().len(), 1, "no lifecycle email for a cancel");
+        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);
     }
 
     /// SCR-72: cancelling a job doesn't go through the pipeline's
