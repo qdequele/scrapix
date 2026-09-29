@@ -5,8 +5,9 @@
 # purchases go through real Invoices (finalize + pay) so customers get PDFs,
 # and credits are granted idempotently keyed on the payment intent id.
 #
-# The engine-side auto-topup (charge_auto_topup, triggered by usage debits)
-# intentionally stays in Rust — it belongs to the data plane.
+# Auto top-up (triggered by usage debits the engine reports as lab events)
+# lives in AutoTopup, which uses create_and_pay_invoice and
+# add_credits_for_payment below.
 module StripeBilling
   class StripeUnavailable < StandardError; end
 

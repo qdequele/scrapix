@@ -1,9 +1,14 @@
 # Recurring jobs (SolidQueue dispatcher). The scheduled_emails drain delivers
-# engine-queued emails; production also prunes finished SolidQueue jobs.
+# queued emails; process_lab_events sweeps engine events (debits, auto
+# top-up, job emails) including retries; production also prunes finished
+# SolidQueue jobs.
 default: &default
   drain_scheduled_emails:
     class: DrainScheduledEmailsJob
     schedule: every 30 seconds
+  process_lab_events:
+    class: ProcessLabEventsJob
+    schedule: every 10 seconds
 
 development:
   <<: *default

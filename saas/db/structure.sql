@@ -1666,6 +1666,20 @@ CREATE INDEX index_transactions_on_created_at ON public.transactions USING btree
 
 
 --
+-- Name: index_transactions_on_lab_event_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_transactions_on_lab_event_id ON public.transactions USING btree (((metadata ->> 'lab_event_id'::text))) WHERE (metadata ? 'lab_event_id'::text);
+
+
+--
+-- Name: index_transactions_on_stripe_payment_intent_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_transactions_on_stripe_payment_intent_id ON public.transactions USING btree (((metadata ->> 'stripe_payment_intent_id'::text))) WHERE (metadata ? 'stripe_payment_intent_id'::text);
+
+
+--
 -- Name: index_users_on_email; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1955,6 +1969,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260929000003'),
 ('20260929000002'),
 ('20260929000001'),
 ('20260927000001'),
