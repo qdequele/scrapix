@@ -14,7 +14,7 @@ class SerializationTest < ActiveSupport::TestCase
   test "crawl config shape" do
     json = crawl_configs(:daily_docs).as_json
     assert_equal %i[id account_id name description config cron_expression cron_enabled
-                    last_run_at next_run_at last_job_id created_at updated_at], json.keys
+                    last_run_at next_run_at last_job_id last_error created_at updated_at], json.keys
     assert_match ISO8601, json[:updated_at]
   end
 

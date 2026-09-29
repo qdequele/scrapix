@@ -119,6 +119,7 @@ export interface SavedConfig {
   last_run_at: string | null;
   next_run_at: string | null;
   last_job_id: string | null;
+  last_error: string | null;
   created_at: string;
   updated_at: string;
 }

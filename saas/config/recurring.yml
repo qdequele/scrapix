@@ -1,6 +1,7 @@
 # Recurring jobs (SolidQueue dispatcher). The scheduled_emails drain delivers
 # queued emails; process_lab_events sweeps engine events (debits, auto
-# top-up, job emails) including retries; production also prunes finished
+# top-up, job emails) including retries; run_due_crawl_configs fires cron
+# saved configs and cleanup_oauth_tokens sweeps expired OAuth rows; production also prunes finished
 # SolidQueue jobs.
 default: &default
   drain_scheduled_emails:
@@ -9,6 +10,12 @@ default: &default
   process_lab_events:
     class: ProcessLabEventsJob
     schedule: every 10 seconds
+  run_due_crawl_configs:
+    class: RunDueCrawlConfigsJob
+    schedule: every 30 seconds
+  cleanup_oauth_tokens:
+    class: CleanupOauthTokensJob
+    schedule: every hour
 
 development:
   <<: *default

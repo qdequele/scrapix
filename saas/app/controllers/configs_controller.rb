@@ -129,9 +129,8 @@ class ConfigsController < ApplicationController
   end
 
   def compute_next_run(expression)
-    cron = Fugit.parse_cron(expression)
-    api_error!("Invalid cron expression: #{expression}", "validation_error") if cron.nil?
-    cron.next_time(Time.current).to_t.utc
+    CrawlConfig.next_run_for(expression) ||
+      api_error!("Invalid cron expression: #{expression}", "validation_error")
   end
 
   def handle_conflict(error, message)

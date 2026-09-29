@@ -177,7 +177,8 @@ CREATE TABLE public.crawl_configs (
     next_run_at timestamp with time zone,
     last_job_id text,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
-    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL
+    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    last_error text
 );
 
 
@@ -1970,6 +1971,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260929000005'),
 ('20260929000004'),
 ('20260929000003'),
 ('20260929000002'),
