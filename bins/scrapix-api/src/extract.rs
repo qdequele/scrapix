@@ -410,7 +410,7 @@ pub(crate) async fn create_extract(
     Json(request): Json<ExtractRequest>,
 ) -> Result<Json<CreateExtractResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     start_extract(&state, &account_ctx, request).await.map(Json)
 }
@@ -544,7 +544,7 @@ pub(crate) async fn get_extract(
     Path(job_id): Path<String>,
 ) -> Result<Json<ExtractStatusResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     let job = find_owned_job(&state, &account_ctx, &job_id).await?;
     if JobKind::of(&job) != JobKind::Extract {
         return Err(ApiError::new("Extract job not found", "not_found"));
@@ -607,7 +607,7 @@ impl ExtractRunner {
 
     /// Charge `credits` for `operation` (after the work, like /scrape).
     async fn charge(&self, credits: i64, operation: &str, description: &str) {
-        let (Some(pool), Some(ctx)) = (&self.state.db_pool, self.account_ctx.as_ref()) else {
+        let (Some(pool), Some(ctx)) = (&self.state.saas_pool, self.account_ctx.as_ref()) else {
             return;
         };
         if let Err(e) = billing::check_credits_and_deduct(
@@ -626,7 +626,7 @@ impl ExtractRunner {
 
     /// Enough credits for one more AI call?
     async fn can_afford_ai(&self) -> Result<(), String> {
-        let (Some(pool), Some(ctx)) = (&self.state.db_pool, self.account_ctx.as_ref()) else {
+        let (Some(pool), Some(ctx)) = (&self.state.saas_pool, self.account_ctx.as_ref()) else {
             return Ok(());
         };
         billing::check_credits(pool, &ctx.account_id, billing::extract_ai_call_credits())

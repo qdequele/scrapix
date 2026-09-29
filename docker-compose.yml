@@ -191,6 +191,7 @@ services:
       - "8080:8080"
     environment:
       RUST_LOG: info,scrapix=debug
+      SCRAPIX_MODE: hosted
       HOST: 0.0.0.0
       PORT: 8080
       KAFKA_BROKERS: redpanda:9092

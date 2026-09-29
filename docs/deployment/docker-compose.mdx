@@ -9,7 +9,9 @@ Docker Compose is the easiest way to run Scrapix locally or on a single server. 
 
 ## Single Binary (Minimal)
 
-The simplest setup — just Meilisearch and Scrapix:
+The simplest setup — just Meilisearch and Scrapix. For a maintained version
+with a persistent job store and healthchecks, use the repository's
+`compose.standalone.yaml` (see [Self-Hosting](/deployment/self-hosting)).
 
 ```yaml
 # compose.yaml
@@ -36,6 +38,8 @@ services:
     environment:
       MEILISEARCH_URL: http://meilisearch:7700
       MEILISEARCH_API_KEY: masterKey
+      # Required: the engine refuses to start without an operator key (16+ chars).
+      SCRAPIX_ADMIN_KEY: ${SCRAPIX_ADMIN_KEY:?set SCRAPIX_ADMIN_KEY}
       RUST_LOG: info,scrapix=debug
     depends_on:
       meilisearch:
@@ -51,7 +55,10 @@ docker compose up -d
 
 ## Full Distributed Stack
 
-The repository's `docker-compose.yml` runs the full distributed system:
+The repository's `docker-compose.yml` runs the full distributed system of the
+**hosted platform** (`SCRAPIX_MODE=hosted`, with the Rails app and its
+Postgres) — it's the development stack for the platform, not a standalone
+self-hosting setup (see [Self-Hosting → Distributed Mode](/deployment/self-hosting#distributed-mode)):
 
 ```bash
 # Clone the repo and start everything

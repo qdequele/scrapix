@@ -7,15 +7,30 @@
 //! hourly OAuth token cleanup. Core primitives (JWT, types) are in
 //! `scrapix-auth`.
 
+pub(crate) mod admin_key;
 pub(crate) mod middleware;
 pub(crate) mod oauth;
 
 // Re-export core auth primitives from the scrapix-auth crate.
 pub use scrapix_auth::{AuthenticatedAccount, AuthenticatedUser, Claims};
 
-pub(crate) use middleware::validate_api_key_or_session;
+pub use admin_key::AdminKey;
+
+pub(crate) use middleware::{validate_api_key_or_session, ws_query_token_as_api_key};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
+
+/// How protected routes authenticate, fixed at startup (see `settings`).
+#[derive(Clone)]
+pub enum AuthMode {
+    /// Standalone: one operator key.
+    AdminKey(AdminKey),
+    /// Hosted: API keys, OAuth Bearer tokens and session JWTs against the
+    /// Rails-owned Postgres.
+    Saas(std::sync::Arc<AuthState>),
+    /// Standalone with `SCRAPIX_AUTH=disabled` (local dev only).
+    Disabled,
+}
 
 /// Shared auth state: database pool + JWT secret
 #[derive(Clone)]

@@ -5,6 +5,13 @@ description: Connect AI assistants to Scrapix via the Model Context Protocol
 
 # MCP Server
 
+<Note>
+  The HTTP `/mcp` endpoint is hosted only — it runs in the platform (Rails).
+  The stdio `scrapix-mcp` binary works against any engine, including a
+  self-hosted standalone one: point `--api-url` at it and pass your
+  `SCRAPIX_ADMIN_KEY` as `--api-key` (sent as `X-API-Key`).
+</Note>
+
 Scrapix exposes all its API capabilities as MCP (Model Context Protocol) tools, allowing AI assistants like Claude to scrape, crawl, map, and search the web directly.
 
 Two deployment modes are available:
@@ -91,10 +98,10 @@ This is used by Claude App and other remote MCP clients that support the OAuth d
 ### How It Works
 
 1. The client discovers OAuth endpoints via `GET /.well-known/oauth-authorization-server`
-2. The client registers and authenticates via the [OAuth 2.1 flow](/guides/oauth)
+2. The client registers and authenticates via the OAuth 2.1 flow (see **OAuth 2.1** in the Platform docs)
 3. MCP requests are sent to `POST /mcp` with `Authorization: Bearer <access_token>`
 
-See the [OAuth 2.1 guide](/guides/oauth) for the full authentication flow.
+See **OAuth 2.1** in the Platform docs for the full authentication flow.
 
 ### Connecting Claude App
 
@@ -109,9 +116,10 @@ No manual configuration required.
 
 ### Requirements
 
-The HTTP MCP endpoint requires:
-- `DATABASE_URL` — PostgreSQL for OAuth token storage
-- `JWT_SECRET` — For session token signing
+The HTTP MCP endpoint only runs in hosted mode (`SCRAPIX_MODE=hosted`),
+which already requires:
+- `DATABASE_URL` — the Rails Postgres, used here for OAuth token storage
+- `JWT_SECRET` — for session token signing
 
 ## Available Tools
 

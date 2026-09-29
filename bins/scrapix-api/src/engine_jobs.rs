@@ -30,7 +30,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::job_kind::{JobKind, JOB_TYPE_KEY};
-use crate::{billing, is_terminal, jobs_db, webhooks, AccountContext, ApiError, AppState};
+use crate::{billing, is_terminal, webhooks, AccountContext, ApiError, AppState};
 
 /// Error message of a job interrupted by an API restart.
 pub(crate) const INTERRUPTED_MESSAGE: &str =
@@ -62,19 +62,16 @@ pub(crate) async fn preflight(
     account_ctx: &Option<AccountContext>,
     required_credits: i64,
 ) -> Result<(), ApiError> {
-    let (Some(pool), Some(ctx)) = (&state.db_pool, account_ctx) else {
+    let (Some(pool), Some(ctx)) = (&state.saas_pool, account_ctx) else {
         return Ok(());
     };
     billing::check_credits(pool, &ctx.account_id, required_credits.max(1)).await?;
     let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
     let max_concurrent = tier.max_concurrent_jobs() as i64;
-    let active_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
-    )
-    .bind(uuid::Uuid::parse_str(&ctx.account_id).ok())
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let active_count: i64 = match state.job_store {
+        Some(ref store) => store.count_active_jobs(&ctx.account_id).await.unwrap_or(0),
+        None => 0,
+    };
     if active_count >= max_concurrent {
         return Err(ApiError::new(
             format!(
@@ -118,8 +115,8 @@ pub(crate) async fn start_job(
     state.insert_job(job.clone());
 
     // Persist before any result is stored (job_results references jobs).
-    let durable = match state.db_pool {
-        Some(ref pool) => jobs_db::try_insert_job(pool, &job).await.is_ok(),
+    let durable = match state.job_store {
+        Some(ref s) => s.insert_job(&job).await.is_ok(),
         None => false,
     };
     if !durable {
@@ -245,13 +242,16 @@ pub(crate) fn fail_job(state: &AppState, job_id: &str, error: &str) {
 
 /// Startup recovery: engine-run jobs recovered as active can't be resumed
 /// (their runner died with the previous process). Mark them failed, in
-/// Postgres too, and return the list with their new state.
-pub(crate) async fn fail_interrupted(pool: &sqlx::PgPool, jobs: Vec<JobState>) -> Vec<JobState> {
+/// the store too, and return the list with their new state.
+pub(crate) async fn fail_interrupted(
+    store: &dyn crate::job_store::JobStore,
+    jobs: Vec<JobState>,
+) -> Vec<JobState> {
     let mut out = Vec::with_capacity(jobs.len());
     for mut job in jobs {
         if !JobKind::of(&job).is_pipeline() && !is_terminal(&job.status) {
             job.fail(INTERRUPTED_MESSAGE);
-            if jobs_db::update_job_full(pool, &job).await.is_ok() {
+            if store.update_job_full(&job).await.is_ok() {
                 info!(job_id = %job.job_id, "Marked interrupted engine job as failed");
             }
         }

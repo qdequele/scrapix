@@ -5,17 +5,26 @@ description: Proxy search queries to your Meilisearch engine
 
 # Search
 
-The `/search` endpoint lets you search documents indexed by Scrapix through your account's default Meilisearch engine. It resolves the correct index automatically from the target URL.
+The `/search` endpoint proxies a query to Meilisearch. It resolves the
+correct index automatically from the target URL.
+
+- **Standalone:** searches the instance configured by `MEILISEARCH_URL` /
+  `MEILISEARCH_API_KEY`.
+- **Hosted:** searches the account's default Meilisearch engine — see
+  **Engines** in the Platform docs for registering one and setting a
+  default.
 
 <Note>
-  Requires a [default Meilisearch engine](/api-reference/engines#post-enginesiddefault) to be configured for your account.
+  Requires a default Meilisearch to be configured — `MEILISEARCH_URL` in
+  standalone, or a default engine (Platform docs) in hosted.
 </Note>
 
 ## POST /search
 
 Search documents for a given domain.
 
-**Cost:** 2 credits per request
+**Cost:** 2 credits per request (hosted only — see **Billing & Usage** in
+the Platform docs; standalone has no credit metering).
 
 ### Request Body
 

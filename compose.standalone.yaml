@@ -1,0 +1,58 @@
+# Self-hosted Scrapix: engine + Meilisearch. Copy .env.standalone.example to .env, then:
+#   docker compose -f compose.standalone.yaml up -d
+# Add --profile durable (and REDIS_URL in .env) to keep the frontier's URL queue
+# across restarts (Redis-backed frontier; see docs/deployment/self-hosting.mdx).
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.31.0
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+      MEILI_ENV: production
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    profiles: ["durable"]
+    command: ["--dbfilename", "dump", "--snapshot_cron", "* * * * *"]
+    volumes:
+      - dragonfly_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  scrapix:
+    build:
+      context: .
+      target: scrapix-all
+    ports:
+      - "8080:8080"
+    environment:
+      SCRAPIX_MODE: standalone
+      SCRAPIX_ADMIN_KEY: ${SCRAPIX_ADMIN_KEY:?set SCRAPIX_ADMIN_KEY in .env (16+ chars)}
+      DATABASE_URL: sqlite:///data/scrapix.db
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY}
+      REDIS_URL: ${REDIS_URL:-}
+    volumes:
+      - scrapix_data:/data
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  meili_data:
+  scrapix_data:
+  dragonfly_data:

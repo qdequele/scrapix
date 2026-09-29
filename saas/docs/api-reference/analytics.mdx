@@ -5,7 +5,7 @@ description: ClickHouse-powered analytics API with Tinybird-compatible response 
 
 # Analytics
 
-The analytics API provides long-term crawl metrics persisted to ClickHouse. Unlike the [diagnostics endpoints](/api-reference/diagnostics) (in-memory, since last restart), analytics data survives restarts and spans the full history.
+The analytics API provides long-term crawl metrics persisted to ClickHouse. Unlike the diagnostics endpoints in the product docs' API reference (`/stats`, `/errors`, `/domains` — in-memory, since last restart), analytics data survives restarts and spans the full history.
 
 <Note>
   Requires `CLICKHOUSE_URL` to be set. These endpoints return 404 when ClickHouse is not configured.

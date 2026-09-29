@@ -179,12 +179,7 @@ async fn handle_login_api_key(api_url: &str) -> Result<()> {
         anyhow::bail!("API key cannot be empty");
     }
 
-    let client = ApiClient::new(api_url, Some(AuthCredential::ApiKey(api_key.clone())));
-    let health: HealthResponse = client.get("/health").await?;
-
-    if health.status != "ok" {
-        anyhow::bail!("API returned unhealthy status");
-    }
+    let client = verify_api_key(api_url, &api_key).await?;
 
     let credits_msg = match client.get::<BillingResponse>("/account/billing").await {
         Ok(billing) => format!(" — {} credits remaining", billing.credits_balance),
@@ -201,18 +196,39 @@ async fn handle_login_api_key(api_url: &str) -> Result<()> {
     config.oauth_client_id = None;
     config.save()?;
 
-    let masked = if api_key.len() > 12 {
-        format!("{}...", &api_key[..12])
-    } else {
-        api_key
-    };
-
     print_success(&format!(
-        "Authenticated as {}{}",
-        masked.cyan(),
+        "Authenticated with key {}{}",
+        mask_key(&api_key).cyan(),
         credits_msg
     ));
     Ok(())
+}
+
+/// Check `api_key` against an authenticated route (`/health` is public, so
+/// it would accept any key) and return the client built with it.
+async fn verify_api_key(api_url: &str, api_key: &str) -> Result<ApiClient> {
+    let client = ApiClient::new(api_url, Some(AuthCredential::ApiKey(api_key.to_string())));
+    client
+        .get::<serde_json::Value>("/jobs?limit=1")
+        .await
+        .with_context(|| {
+            format!(
+                "API key rejected or unverifiable (GET {}/jobs?limit=1 failed)",
+                client.base_url
+            )
+        })?;
+    Ok(client)
+}
+
+/// A key for display: at most its last 4 characters (none for a key of 4
+/// characters or fewer). Counts chars, so non-ASCII keys never panic.
+fn mask_key(key: &str) -> String {
+    let len = key.chars().count();
+    if len <= 4 {
+        return "****".to_string();
+    }
+    let tail: String = key.chars().skip(len - 4).collect();
+    format!("****{tail}")
 }
 
 async fn handle_login_oauth(api_url: &str) -> Result<()> {
@@ -529,4 +545,73 @@ pub async fn handle_status_auth(client: &ApiClient, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_key_shows_at_most_the_last_four_chars() {
+        assert_eq!(mask_key("sk_live_0123456789abcdef"), "****cdef");
+        assert_eq!(mask_key("e2e-admin-key-0123456789"), "****6789");
+        // Short keys reveal nothing.
+        assert_eq!(mask_key("abcd"), "****");
+        assert_eq!(mask_key(""), "****");
+        // Non-ASCII: counted in chars, never byte-sliced (no panic).
+        assert_eq!(mask_key("clé-secrète-très-longue-éàü"), "****-éàü");
+        assert_eq!(mask_key("ééééééééééééé"), "****éééé");
+    }
+
+    /// One-shot HTTP server answering every request with `status` and
+    /// `body`; returns its base URL and the first request line it saw.
+    async fn one_shot_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (url, rx)
+    }
+
+    #[tokio::test]
+    async fn verify_api_key_uses_an_authenticated_route() {
+        let (url, rx) = one_shot_server("200 OK", "[]").await;
+        verify_api_key(&url, "sk_live_good-key").await.unwrap();
+        let request = rx.await.unwrap();
+        assert!(request.starts_with("GET /jobs?limit=1 "), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-api-key: sk_live_good-key"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_api_key_rejects_a_wrong_key() {
+        let (url, _rx) = one_shot_server(
+            "401 Unauthorized",
+            r#"{"error":"Missing or invalid admin key","code":"unauthorized"}"#,
+        )
+        .await;
+        let Err(err) = verify_api_key(&url, "wrong-key").await else {
+            panic!("a wrong key must fail verification");
+        };
+        assert!(format!("{err:#}").contains("rejected"), "{err:#}");
+    }
 }

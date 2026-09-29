@@ -17,14 +17,11 @@ In production, replace with your deployment URL.
 
 ## Authentication
 
-Authentication is **optional** — when `DATABASE_URL` is not configured, all endpoints are open. When enabled, protected endpoints require one of:
-
-| Method | Header / Cookie | Example |
-|--------|----------------|---------|
-| API Key | `x-api-key` header | `x-api-key: sk_live_abc123...` |
-| Session | `scrapix_session` cookie | Set automatically after login |
-
-See [Authentication Guide](/guides/authentication) for setup details.
+Self-hosted (standalone) engines require one operator key,
+`SCRAPIX_ADMIN_KEY`, sent as `Authorization: Bearer <key>` or `X-API-Key:
+<key>` (unless `SCRAPIX_AUTH=disabled`, local dev only). Hosted deployments
+use per-account API keys and sessions instead — see the [Authentication
+Guide](/guides/authentication) for the full standalone/hosted split.
 
 ## Request Format
 
@@ -57,22 +54,30 @@ All responses return JSON. Successful responses return the data directly. Errors
 
 ## Endpoints Summary
 
-### Public (No Auth Required)
+### Public (No Auth Required, Every Mode)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | [Health check](/api-reference/diagnostics#health-check) |
 | `GET` | `/health/services` | [Service liveness](/api-reference/diagnostics#service-health) |
-| `GET` | `/stats` | [System statistics](/api-reference/diagnostics#system-stats) |
-| `GET` | `/errors` | [Recent errors](/api-reference/diagnostics#recent-errors) |
-| `GET` | `/domains` | [Domain statistics](/api-reference/diagnostics#domain-stats) |
-| `GET` | `/ws` | [WebSocket (multi-job)](/api-reference/websockets) |
-| `GET` | `/ws/job/{id}` | [WebSocket (single job)](/api-reference/websockets#single-job) |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/openapi.json` | OpenAPI 3.1 specification |
+| `GET` | `/docs` | Interactive API docs (Scalar UI) |
 
-### Protected (Auth Required When Enabled)
+### Diagnostics (Auth Required in Standalone; Public in Hosted)
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/stats` | [System statistics](/api-reference/diagnostics#system-stats) |
+| `GET` | `/errors` | [Recent errors](/api-reference/diagnostics#recent-errors) |
+| `GET` | `/domains` | [Domain statistics](/api-reference/diagnostics#domain-stats) |
+
+### Protected (Auth Required, Every Mode)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ws` | [WebSocket (multi-job)](/api-reference/websockets) |
+| `GET` | `/ws/job/{id}` | [WebSocket (single job)](/api-reference/websockets#single-job) |
 | `POST` | `/scrape` | [Scrape a single URL](/api-reference/scrape) |
 | `POST` | `/batch/scrape` | [Scrape many URLs as one job](/api-reference/batch-scrape) |
 | `POST` | `/extract` | [Structured extraction over pages and globs](/api-reference/extract) |
@@ -89,84 +94,38 @@ All responses return JSON. Successful responses return the data directly. Errors
 | `DELETE` | `/job/{id}` | [Cancel a job](/api-reference/jobs#cancel-job) |
 | `POST` | `/job/{id}/pause` | [Pause a job](/api-reference/jobs#post-job-id-pause) |
 | `POST` | `/job/{id}/resume` | [Resume a job](/api-reference/jobs#post-job-id-resume) |
-| `POST` | `/configs` | [Create saved config](/api-reference/configs#create-config) |
-| `GET` | `/configs` | [List saved configs](/api-reference/configs#list-configs) |
-| `GET` | `/configs/{id}` | [Get config](/api-reference/configs#get-config) |
-| `PATCH` | `/configs/{id}` | [Update config](/api-reference/configs#update-config) |
-| `DELETE` | `/configs/{id}` | [Delete config](/api-reference/configs#delete-config) |
-| `POST` | `/configs/{id}/trigger` | [Trigger config](/api-reference/configs#trigger-config) |
 
-### Auth Routes (When DATABASE_URL Set)
+See [Authentication](/api-reference/authentication) for exactly what
+"auth required" means in each mode (the admin key in standalone; an
+account key or session in hosted).
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/auth/signup` | [Create account](/api-reference/authentication#signup) |
-| `POST` | `/auth/login` | [Log in](/api-reference/authentication#login) |
-| `POST` | `/auth/logout` | [Log out](/api-reference/authentication#logout) |
-| `GET` | `/auth/me` | [Get current user](/api-reference/authentication#get-me) |
-| `PATCH` | `/auth/me` | [Update profile](/api-reference/authentication#update-me) |
-| `GET` | `/account` | [Get account](/api-reference/authentication#get-account) |
-| `PATCH` | `/account` | [Update account](/api-reference/authentication#update-account) |
-| `GET` | `/account/api-keys` | [List API keys](/api-reference/authentication#list-api-keys) |
-| `POST` | `/account/api-keys` | [Create API key](/api-reference/authentication#create-api-key) |
-| `PATCH` | `/account/api-keys/{id}` | [Revoke API key](/api-reference/authentication#revoke-api-key) |
-| `GET` | `/account/billing` | [Get billing info](/api-reference/authentication#get-billing) |
-| `PATCH` | `/account/billing` | [Update billing info](/api-reference/authentication#update-billing) |
+<Note>
+  Saved configs (`/configs`), engine registration (`/engines`), account/session
+  auth (`/auth/*`, `/account/*`) and OAuth (`/oauth/*`) are hosted-platform
+  features served by the Rails app, not by this engine — see the Platform
+  docs (Saved Configs, Engines, API keys, OAuth). Self-hosted (standalone)
+  deployments don't have these routes; see [Self-Hosting](/deployment/self-hosting).
+</Note>
 
-### Engines (When DATABASE_URL Set)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/engines` | [Create engine](/api-reference/engines#post-engines) |
-| `GET` | `/engines` | [List engines](/api-reference/engines#get-engines) |
-| `GET` | `/engines/{id}` | [Get engine](/api-reference/engines#get-enginesid) |
-| `PATCH` | `/engines/{id}` | [Update engine](/api-reference/engines#patch-enginesid) |
-| `DELETE` | `/engines/{id}` | [Delete engine](/api-reference/engines#delete-enginesid) |
-| `POST` | `/engines/{id}/default` | [Set default engine](/api-reference/engines#post-enginesiddefault) |
-| `GET` | `/engines/{id}/indexes` | [List engine indexes](/api-reference/engines#get-enginesidindexes) |
-
-### OAuth (When DATABASE_URL Set)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/.well-known/oauth-authorization-server` | [OAuth metadata](/guides/oauth#get-well-knownoauth-authorization-server) |
-| `POST` | `/oauth/register` | [Register OAuth client](/guides/oauth#post-oauthregister) |
-| `GET/POST` | `/oauth/authorize` | [Authorization flow](/guides/oauth#get-oauthauthorize) |
-| `POST` | `/oauth/token` | [Token exchange](/guides/oauth#post-oauthtoken) |
-| `POST` | `/oauth/revoke` | [Revoke token](/guides/oauth#post-oauthrevoke) |
-
-### MCP (When DATABASE_URL Set)
+### MCP (Hosted Only)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/mcp` | [MCP Streamable HTTP](/guides/mcp#http-mcp-endpoint) |
 
-### OpenAPI
+### Analytics (Hosted Only)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/openapi.json` | OpenAPI 3.1 specification |
-| `GET` | `/docs` | Interactive API docs (Scalar UI) |
-
-### Analytics (When CLICKHOUSE_URL Set)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/analytics/v0/pipes` | [List pipes](/api-reference/analytics#list-pipes) |
-| `GET` | `/analytics/v0/pipes/{pipe}.json` | [Query pipe](/api-reference/analytics#query-pipe) |
+The Tinybird-style `/analytics/v0/pipes/*` API is served by the Rails app
+against ClickHouse — see **Analytics** in the Platform docs. Self-hosted
+engines have `/stats`, `/errors` and `/domains` for in-memory diagnostics
+instead (see [Diagnostics](/api-reference/diagnostics)).
 
 ## Rate Limiting
 
-When authentication is enabled, requests are rate-limited per account based on billing tier:
-
-| Tier | Requests/Minute |
-|------|----------------|
-| Free | 10 |
-| Starter | 60 |
-| Pro | 300 |
-| Enterprise | 1,000 |
-
-See [Rate Limiting](/api-reference/rate-limiting) for details on headers, 429 responses, and handling.
+Per-account rate limiting by billing tier is a hosted-platform feature — see
+**Rate Limiting** in the Platform docs for headers, 429 responses, and
+handling. Standalone engines have no built-in per-request rate limiting;
+throttle at your reverse proxy if you need it.
 
 ## OpenAPI & Interactive Docs
 

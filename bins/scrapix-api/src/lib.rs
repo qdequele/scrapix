@@ -51,9 +51,12 @@ pub mod email_scheduler;
 pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
-pub mod jobs_db;
+pub mod job_store;
+pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
+pub(crate) mod router;
+pub mod settings;
 pub mod stripe;
 pub mod webhooks;
 
@@ -66,13 +69,11 @@ use axum::{
         Extension, Path, Query, State,
     },
     http::StatusCode,
-    middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
-    Json, Router,
+    Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
@@ -81,10 +82,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
@@ -141,6 +139,28 @@ pub struct Args {
     /// JWT secret for session tokens (required when DATABASE_URL is set)
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
+
+    /// Deployment mode: `standalone` (default, self-hosted, admin key) or
+    /// `hosted` (Rails control plane, shared Postgres).
+    #[arg(long, env = "SCRAPIX_MODE", default_value = "standalone")]
+    pub mode: String,
+
+    /// Standalone admin key (min 16 chars). Accepted as `Authorization:
+    /// Bearer` or `X-API-Key`.
+    #[arg(long, env = "SCRAPIX_ADMIN_KEY", hide_env_values = true)]
+    pub admin_key: Option<String>,
+
+    /// `disabled` turns auth off in standalone (local dev only).
+    #[arg(long, env = "SCRAPIX_AUTH")]
+    pub auth: Option<String>,
+
+    /// Default Meilisearch for crawls and /search in standalone.
+    #[arg(long, env = "MEILISEARCH_URL")]
+    pub meilisearch_url: Option<String>,
+
+    /// API key for the default Meilisearch.
+    #[arg(long, env = "MEILISEARCH_API_KEY", hide_env_values = true)]
+    pub meilisearch_api_key: Option<String>,
 
     /// Stripe secret key (enables engine-side auto-topup charges)
     #[arg(long, env = "STRIPE_SECRET_KEY")]
@@ -293,8 +313,11 @@ struct AppState {
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
-    /// PostgreSQL connection pool (for saved configs, cron scheduling)
-    db_pool: Option<sqlx::PgPool>,
+    /// Durable job state and engine-job results (`jobs`, `job_results`).
+    pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
+    /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
+    /// context, billing, Stripe, saved configs + cron, emails).
+    pub(crate) saas_pool: Option<sqlx::PgPool>,
     /// Optional email client for transactional emails
     /// Optional Stripe client for payment-backed auto-topup
     stripe_client: Option<::stripe::Client>,
@@ -303,8 +326,8 @@ struct AppState {
     /// Delivers `CrawlEvent`s to jobs' subscribed webhooks (SCR-72).
     webhook_dispatcher: webhooks::WebhookDispatcher,
     /// Accounting is persisted and event acks are deferred until the flush
-    /// (true when Postgres is configured; turned off for the process if the
-    /// `accounting` column turns out to be missing, see `finish_flush`).
+    /// (true when a job store is configured; turned off for the process if
+    /// the `accounting` column turns out to be missing, see `finish_flush`).
     accounting_persisted: std::sync::atomic::AtomicBool,
     /// Set on shutdown (unblocks a `settle_ack` waiting at the cap).
     shutting_down: std::sync::atomic::AtomicBool,
@@ -318,6 +341,15 @@ struct AppState {
     controls_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Job results layer (`GET /job/{id}/results`, SCR-71).
     results: results::ResultsState,
+    /// Resolves which Meilisearch instance a crawl/search/results request
+    /// uses: env-configured in standalone mode, the account's
+    /// `meilisearch_engines` rows in hosted mode.
+    pub(crate) meili: Arc<dyn crate::meili::MeilisearchResolver>,
+    /// `SCRAPIX_AUTH=disabled`: `/health` keeps reminding the logs that
+    /// every route is unauthenticated (see [`AppState::warn_auth_disabled`]).
+    pub(crate) auth_disabled: bool,
+    /// Last time `/health` logged the auth-disabled warning.
+    auth_disabled_warned_at: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,7 +389,8 @@ impl AppState {
         fetcher: Arc<HttpFetcher>,
         browser_renderer: Option<Arc<CdpRenderer>>,
         ai_service: Option<Arc<AiService>>,
-        db_pool: Option<sqlx::PgPool>,
+        saas_pool: Option<sqlx::PgPool>,
+        job_store: Option<Arc<dyn job_store::JobStore>>,
         stripe_client: Option<::stripe::Client>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
         webhook_dispatcher: webhooks::WebhookDispatcher,
@@ -400,17 +433,37 @@ impl AppState {
             browser_renderer,
             ai_service,
             ocr: None,
-            accounting_persisted: std::sync::atomic::AtomicBool::new(db_pool.is_some()),
+            accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             control_tx,
             control_rx: parking_lot::Mutex::new(Some(control_rx)),
             controls_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             results: results::ResultsState::default(),
-            db_pool,
+            meili: Arc::new(crate::meili::EnvResolver(None)),
+            auth_disabled: false,
+            auth_disabled_warned_at: parking_lot::Mutex::new(None),
+            saas_pool,
+            job_store,
             stripe_client,
             analytics_store,
             webhook_dispatcher,
         }
+    }
+
+    /// With auth disabled, log a WARN at most once per minute (called from
+    /// `/health`, so a probed deployment keeps saying it is open). Returns
+    /// whether it logged.
+    fn warn_auth_disabled(&self, now: std::time::Instant) -> bool {
+        if !self.auth_disabled {
+            return false;
+        }
+        let mut warned_at = self.auth_disabled_warned_at.lock();
+        if warned_at.is_some_and(|at| now.duration_since(at) < Duration::from_secs(60)) {
+            return false;
+        }
+        warn!("SCRAPIX_AUTH=disabled: every route is UNAUTHENTICATED. Local development only.");
+        *warned_at = Some(now);
+        true
     }
 
     /// Create a new job
@@ -447,7 +500,7 @@ impl AppState {
     }
 
     /// Serialized accounting of the given jobs (those that still have one),
-    /// for the Postgres flush.
+    /// for the job-store flush.
     fn accounting_snapshots(&self, job_ids: &[String]) -> Vec<(String, serde_json::Value)> {
         let accs = self.crawl.accounting.read();
         job_ids
@@ -511,7 +564,7 @@ impl AppState {
     }
 
     /// A job just became terminal (completed/failed): write it through to
-    /// Postgres immediately and free its per-job tracking state.
+    /// the job store immediately and free its per-job tracking state.
     fn on_terminal(&self, job_id: &str, updated: Option<JobState>) {
         self.forget_job_tracking(job_id);
         if let Some(snapshot) = updated {
@@ -519,7 +572,7 @@ impl AppState {
         }
     }
 
-    /// Write a terminal job through to Postgres now (best effort, for
+    /// Write a terminal job through to the job store now (best effort, for
     /// latency) and, while acks are deferred, owe a checked write to the
     /// next flush: the job's held acks wait for it.
     fn write_terminal(&self, snapshot: JobState) {
@@ -531,10 +584,9 @@ impl AppState {
                 .write()
                 .insert(job_id, snapshot.clone());
         }
-        if let Some(ref pool) = self.db_pool {
-            let pool = pool.clone();
+        if let Some(store) = self.job_store.clone() {
             tokio::spawn(async move {
-                let _ = jobs_db::update_job_full(&pool, &snapshot).await;
+                let _ = store.update_job_full(&snapshot).await;
             });
         }
     }
@@ -556,7 +608,7 @@ impl AppState {
         self.diagnostics
             .job_emails_requested
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id) else {
+        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id) else {
             return;
         };
         tokio::spawn(async move {
@@ -1059,7 +1111,7 @@ impl AppState {
             .credits_billed
             .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
 
-        let (Some(pool), Some(acct_id)) = (self.db_pool.clone(), account_id.cloned()) else {
+        let (Some(pool), Some(acct_id)) = (self.saas_pool.clone(), account_id.cloned()) else {
             return;
         };
         let description = if pages_ocr > 0 {
@@ -1193,7 +1245,7 @@ impl AppState {
                     warn!(
                         held = self.config.max_pending_acks,
                         "Event consumer blocked: held acks at the cap, waiting for a \
-                         successful accounting flush (Postgres unavailable?)"
+                         successful accounting flush (job store unavailable?)"
                     );
                     *warned_at = Some(std::time::Instant::now());
                 }
@@ -1202,7 +1254,7 @@ impl AppState {
         }
     }
 
-    /// Start a Postgres flush: take the held acks first, then the dirty jobs
+    /// Start a job-store flush: take the held acks first, then the dirty jobs
     /// and their snapshots and the owed terminal writes, so every taken
     /// ack's event is covered (an event is applied, and its job marked dirty
     /// or terminal, before its ack is held).
@@ -1347,21 +1399,23 @@ impl AppState {
         pending.len() + self.in_flight_acks()
     }
 
-    /// Flush dirty job counters, accounting and owed terminal writes to
-    /// Postgres, then release the acks of the events they cover.
-    async fn flush_to_db(&self, pool: &sqlx::PgPool) {
+    /// Flush dirty job counters, accounting and owed terminal writes to the
+    /// job store, then release the acks of the events they cover.
+    async fn flush_to_db(&self, store: &dyn job_store::JobStore) {
         let batch = self.begin_flush();
         if !batch.snapshots.is_empty() {
-            jobs_db::flush_job_counters(pool, &batch.snapshots).await;
+            if let Err(e) = store.flush_job_counters(&batch.snapshots).await {
+                warn!(error = %e, "Failed to flush job counters");
+            }
         }
-        let accounting = match jobs_db::flush_job_accounting(pool, &batch.accounting).await {
+        let accounting = match store.flush_job_accounting(&batch.accounting).await {
             Ok(()) => AccountingFlush::Ok,
             Err(e) => classify_flush_error(&e),
         };
         let mut failed_terminal = HashSet::new();
         if accounting == AccountingFlush::Ok {
             for job in &batch.terminal {
-                if jobs_db::update_job_full(pool, job).await.is_err() {
+                if store.update_job_full(job).await.is_err() {
                     failed_terminal.insert(job.job_id.clone());
                 }
             }
@@ -1851,7 +1905,7 @@ struct EventOutcome {
     accounting_touched: bool,
 }
 
-/// One Postgres flush round (see `AppState::begin_flush`).
+/// One job-store flush round (see `AppState::begin_flush`).
 struct FlushBatch {
     acks: Vec<(String, Ack)>,
     dirty_ids: Vec<String>,
@@ -1872,18 +1926,10 @@ enum AccountingFlush {
     SchemaMissing,
 }
 
-/// Whether a Postgres SQLSTATE means the schema the accounting flush needs is
-/// missing (42703 undefined_column, 42P01 undefined_table).
-fn is_schema_missing_sqlstate(code: Option<&str>) -> bool {
-    matches!(code, Some("42703") | Some("42P01"))
-}
-
-fn classify_flush_error(e: &sqlx::Error) -> AccountingFlush {
+fn classify_flush_error(e: &job_store::StoreError) -> AccountingFlush {
     match e {
-        sqlx::Error::Database(db) if is_schema_missing_sqlstate(db.code().as_deref()) => {
-            AccountingFlush::SchemaMissing
-        }
-        _ => AccountingFlush::Retry,
+        job_store::StoreError::SchemaMissing(_) => AccountingFlush::SchemaMissing,
+        job_store::StoreError::Other(_) => AccountingFlush::Retry,
     }
 }
 
@@ -1916,7 +1962,7 @@ fn is_terminal(status: &JobStatus) -> bool {
 }
 
 /// Events that change a job's work accounting (and so mark it dirty for the
-/// Postgres flush).
+/// job-store flush).
 fn is_accounting_event(event: &CrawlEvent) -> bool {
     matches!(
         event,
@@ -2290,8 +2336,8 @@ fn crawl_event_to_page_event(job_id: &str, event: &CrawlEvent) -> Option<ClickHo
 /// API error response
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct ApiError {
-    error: String,
-    code: String,
+    pub(crate) error: String,
+    pub(crate) code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<serde_json::Value>,
 }
@@ -2981,6 +3027,7 @@ struct DomainCounter {
 /// Health check endpoint
 #[utoipa::path(get, path = "/health", tag = "health", responses((status = 200, body = HealthResponse)))]
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    state.warn_auth_disabled(std::time::Instant::now());
     let kafka_connected = state.producer.is_healthy();
     let status = if kafka_connected { "ok" } else { "degraded" };
 
@@ -3183,7 +3230,7 @@ async fn scrape_url(
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     perform_scrape(&state, &account_ctx, &request)
         .await
@@ -3212,7 +3259,7 @@ pub(crate) async fn perform_scrape(
         billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
 
     // Pre-flight credit check (soft UX check; real deduction is atomic below)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, scrape_cost).await?;
     }
 
@@ -3646,7 +3693,7 @@ pub(crate) async fn perform_scrape(
     }
 
     // Deduct credits for successful scrape (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -4121,65 +4168,35 @@ pub(crate) async fn do_create_crawl(
     };
 
     // Resolve Meilisearch config from account's default engine if not provided
-    let config = if config.meilisearch.url.is_empty() {
-        if let (Some(ref pool), Some(ctx)) = (&state.db_pool, account_ctx) {
-            let account_uuid: uuid::Uuid = ctx
-                .account_id
-                .parse()
-                .map_err(|_| ApiError::new("Invalid account ID", "internal_error"))?;
-            let engine_row = sqlx::query(
-                "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1 AND is_default = true LIMIT 1",
-            )
-            .bind(account_uuid)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| ApiError::new(format!("Database error: {e}"), "internal_error"))?
-            .ok_or_else(|| {
-                ApiError::new(
-                    "No Meilisearch engine configured. Add one in Settings.",
-                    "validation_error",
-                )
-            })?;
-            use sqlx::Row as _;
-            let mut config = config;
-            config.meilisearch.url = engine_row.get::<String, _>("url");
-            config.meilisearch.api_key = engine_row.get::<String, _>("api_key");
-            config
-        } else {
-            return Err(ApiError::new(
-                "Meilisearch configuration is required",
-                "validation_error",
-            ));
-        }
-    } else {
-        config
-    };
+    let mut config = config;
+    config.meilisearch = crate::meili::resolve_crawl_meilisearch(
+        state.meili.as_ref(),
+        account_ctx.map(|c| c.account_id.as_str()),
+        std::mem::take(&mut config.meilisearch),
+    )
+    .await?;
 
     // Full validation (start_urls, index_uid length, and any future
     // #[validate] rules) — after index_uid auto-derivation and Meilisearch
     // engine resolution so both are populated before the length checks run.
-    // `mut`: `validate_crawl_config` clamps out-of-range webhook
-    // `timeout_ms` values in place (SCR-72 fix round 1).
-    let mut config = config;
+    // `validate_crawl_config` clamps out-of-range webhook `timeout_ms`
+    // values in place (SCR-72 fix round 1); `config` is already `mut`.
     validate_crawl_config(&mut config)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
 
     // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref pool), Some(ctx)) = (&state.db_pool, account_ctx) {
+    if let (Some(ref pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
         billing::check_credits(pool, &ctx.account_id, 1).await?;
 
         // Enforce max concurrent jobs per billing tier
         let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
         let max_concurrent = tier.max_concurrent_jobs() as i64;
-        let active_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
-        )
-        .bind(uuid::Uuid::parse_str(&ctx.account_id).ok())
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let active_count: i64 = match state.job_store {
+            Some(ref store) => store.count_active_jobs(&ctx.account_id).await.unwrap_or(0),
+            None => 0,
+        };
 
         if active_count >= max_concurrent {
             return Err(ApiError::new(
@@ -4330,6 +4347,37 @@ pub(crate) async fn do_create_crawl(
         state.crawl.accounting.write().insert(job_id.clone(), acc);
     }
 
+    // Update job state (write back config, start_urls, max_pages, replace metadata)
+    let replace_url = if replace_index {
+        Some(config.meilisearch.url.clone())
+    } else {
+        None
+    };
+    let replace_key = if replace_index {
+        Some(config.meilisearch.api_key.clone())
+    } else {
+        None
+    };
+    let snapshot = state.update_job(&job_id, |j| {
+        j.status = JobStatus::Running;
+        j.start_urls = config.start_urls.clone();
+        j.max_pages = config.max_pages;
+        // Redact sensitive fields before persisting config to database
+        j.config = redact_crawl_config_for_storage(&config);
+        // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
+        j.webhooks = config.webhooks.clone();
+        j.started_at = Some(chrono::Utc::now());
+        j.swap_temp_index = None;
+        j.swap_meilisearch_url = replace_url;
+        j.swap_meilisearch_api_key = replace_key;
+    });
+
+    // Persist before any event for this job can be flushed (an update that
+    // lands before its insert changes 0 rows and is lost).
+    if let (Some(store), Some(ref snapshot)) = (&state.job_store, &snapshot) {
+        let _ = store.insert_job(snapshot).await; // logged by the store
+    }
+
     for url in &config.start_urls {
         let crawl_url = CrawlUrl::seed(url);
         // Use pipeline_index_uid (temp index if replace_index, otherwise target)
@@ -4376,9 +4424,13 @@ pub(crate) async fn do_create_crawl(
     }
 
     if urls_published == 0 {
-        // Update job as failed
-        state.update_job(&job_id, |j| j.fail("Failed to publish any seed URLs"));
+        // Update job as failed (also in the store: the row was inserted
+        // before publishing)
+        let failed = state.update_job(&job_id, |j| j.fail("Failed to publish any seed URLs"));
         state.forget_job_tracking(&job_id);
+        if let (Some(store), Some(ref failed)) = (&state.job_store, &failed) {
+            let _ = store.update_job_full(failed).await; // logged by the store
+        }
         return Err(ApiError::new(
             "Failed to publish seed URLs to queue",
             "queue_error",
@@ -4407,43 +4459,12 @@ pub(crate) async fn do_create_crawl(
     // Broadcast event for SSE
     state.broadcast_event(&job_id, event);
 
-    // Update job state (write back config, start_urls, max_pages, replace metadata)
-    let replace_url = if replace_index {
-        Some(config.meilisearch.url.clone())
-    } else {
-        None
-    };
-    let replace_key = if replace_index {
-        Some(config.meilisearch.api_key.clone())
-    } else {
-        None
-    };
-    let snapshot = state.update_job(&job_id, |j| {
-        j.status = JobStatus::Running;
-        j.start_urls = config.start_urls.clone();
-        j.max_pages = config.max_pages;
-        // Redact sensitive fields before persisting config to database
-        j.config = redact_crawl_config_for_storage(&config);
-        // Real (unredacted) webhooks, kept in memory only, for delivery (SCR-72).
-        j.webhooks = config.webhooks.clone();
-        j.started_at = Some(chrono::Utc::now());
-        j.swap_temp_index = None;
-        j.swap_meilisearch_url = replace_url;
-        j.swap_meilisearch_api_key = replace_key;
-    });
-
     // Remember where the job's documents go (`GET /job/{id}/results`).
     state.results.remember_crawl_target(
         &job_id,
         &config.meilisearch.url,
         &config.meilisearch.api_key,
     );
-
-    // Persist new job to Postgres
-    if let (Some(ref pool), Some(snapshot)) = (&state.db_pool, snapshot) {
-        let pool = pool.clone();
-        tokio::spawn(async move { jobs_db::insert_job(&pool, &snapshot).await });
-    }
 
     info!(
         job_id = %job_id,
@@ -4681,11 +4702,11 @@ async fn map_url(
     Json(request): Json<MapRequest>,
 ) -> Result<Json<MapResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check (map costs 2 credits)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, billing::MAP_CREDITS).await?;
     }
 
@@ -5078,7 +5099,7 @@ async fn map_url(
     }
 
     // Deduct 2 credits for successful map (atomic)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -5128,11 +5149,11 @@ async fn search_url(
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         billing::check_credits(pool, &ctx.account_id, billing::SEARCH_CREDITS).await?;
     }
 
@@ -5166,37 +5187,18 @@ async fn search_url(
     }
 
     // Resolve default Meilisearch engine for this account
-    let pool = state
-        .db_pool
-        .as_ref()
-        .ok_or_else(|| ApiError::new("Search requires database configuration", "internal_error"))?;
-
-    let account_id = account_ctx
-        .as_ref()
-        .map(|c| c.account_id.clone())
-        .ok_or_else(|| ApiError::new("Authentication required", "unauthorized"))?;
-
-    let account_uuid: uuid::Uuid = account_id
-        .parse()
-        .map_err(|_| ApiError::new("Invalid account ID", "internal_error"))?;
-
-    let engine_row = sqlx::query(
-        "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1 AND is_default = true LIMIT 1",
-    )
-    .bind(account_uuid)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| ApiError::new(format!("Database error: {e}"), "internal_error"))?
-    .ok_or_else(|| {
-        ApiError::new(
-            "No default Meilisearch engine configured. Add one in Settings > Engines.",
-            "not_found",
-        )
-    })?;
-
-    use sqlx::Row;
-    let engine_url: String = engine_row.get("url");
-    let engine_api_key: String = engine_row.get("api_key");
+    let target = state
+        .meili
+        .default_target(account_ctx.as_ref().map(|c| c.account_id.as_str()))
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                "No default Meilisearch configured (MEILISEARCH_URL, or an engine in Settings > Engines)",
+                "not_found",
+            )
+        })?;
+    let engine_url = target.url;
+    let engine_api_key = target.api_key.unwrap_or_default();
 
     // Build Meilisearch search body
     let mut search_body = serde_json::json!({ "q": request.q });
@@ -5308,7 +5310,7 @@ async fn search_url(
     }
 
     // Deduct 2 credits for search
-    if let (Some(ref pool), Some(ref ctx)) = (&state.db_pool, &account_ctx) {
+    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
         if let Err(e) = billing::check_credits_and_deduct(
             pool,
             &ctx.account_id,
@@ -5335,7 +5337,7 @@ async fn create_crawl(
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<CreateCrawlResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     Ok(Json(
         do_create_crawl(&state, config, account_ctx.as_ref()).await?,
@@ -5355,7 +5357,7 @@ async fn create_crawl_sync(
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
     // First create the async job
     let response = do_create_crawl(&state, config, account_ctx.as_ref()).await?;
@@ -5425,7 +5427,7 @@ async fn create_crawl_bulk(
     Json(configs): Json<Vec<CrawlConfig>>,
 ) -> Result<Json<BulkCrawlResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     check_write_permission(&account_ctx)?;
 
     let total = configs.len();
@@ -5465,18 +5467,16 @@ async fn job_status(
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
-    // Try in-memory first, fall back to Postgres for historical jobs
+    // Try in-memory first, fall back to the job store for historical jobs
     let job = if let Some(job) = state.get_job(&job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = &account_ctx {
-            jobs_db::get_job_for_account(pool, &job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, &job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(&job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -5494,7 +5494,7 @@ async fn job_events(
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
     // Check if job exists and ownership
     let job = state
@@ -5599,18 +5599,16 @@ async fn get_job_events_history(
     Query(params): Query<JobEventsHistoryParams>,
 ) -> Result<Json<JobEventsHistoryResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
-    // Verify the job exists (check in-memory then Postgres)
+    // Verify the job exists (check in-memory then the job store)
     let job = if let Some(job) = state.get_job(&job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = &account_ctx {
-            jobs_db::get_job_for_account(pool, &job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, &job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(&job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -6024,7 +6022,7 @@ async fn ws_job_handler(
 
     // Verify account ownership if auth is enabled
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     if let Some(ref ctx) = account_ctx {
         if let Some(ref job_account_id) = job.account_id {
             if job_account_id != &ctx.account_id {
@@ -6167,7 +6165,8 @@ async fn owned_job(
     user_ext: &Option<Extension<AuthenticatedUser>>,
     job_id: &str,
 ) -> Result<JobState, ApiError> {
-    let account_ctx = extract_account_context(state.db_pool.as_ref(), account_ext, user_ext).await;
+    let account_ctx =
+        extract_account_context(state.saas_pool.as_ref(), account_ext, user_ext).await;
     let existing = state
         .get_job(job_id)
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
@@ -6184,22 +6183,18 @@ async fn list_jobs(
     Query(params): Query<ListJobsQuery>,
 ) -> Json<Vec<JobStatusResponse>> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
 
-    // When Postgres is available, query DB for full history (survives restarts)
+    // With a job store, query it for full history (survives restarts)
     // and overlay in-memory data for running jobs (fresher counters).
-    let jobs: Vec<JobState> = if let Some(ref pool) = state.db_pool {
-        let mut db_jobs = if let Some(ctx) = &account_ctx {
-            jobs_db::list_jobs_for_account_db(
-                pool,
-                &ctx.account_id,
+    let jobs: Vec<JobState> = if let Some(ref store) = state.job_store {
+        let mut db_jobs = store
+            .list_jobs(
+                account_ctx.as_ref().map(|c| c.account_id.as_str()),
                 params.limit as i64,
                 params.offset as i64,
             )
-            .await
-        } else {
-            jobs_db::list_all_jobs_db(pool, params.limit as i64, params.offset as i64).await
-        };
+            .await;
 
         // Overlay in-memory state for active jobs (fresher counters)
         let in_memory = state.crawl.jobs.read();
@@ -6302,7 +6297,7 @@ fn start_event_consumer(
     }
 
     // At-least-once (R2): the offset commits only after the event has been
-    // applied — and, for accounting events with Postgres persistence, only
+    // applied — and, for accounting events with job-store persistence, only
     // after the accounting flush containing it succeeded (R-19). Concurrency 1
     // keeps events applied in partition order. Only Kafka positions are
     // durable, so only they feed the accounting high-water mark.
@@ -6414,6 +6409,129 @@ async fn init_clickhouse() -> (
 // Run
 // ============================================================================
 
+/// What startup wires per mode (see [`wire_mode`]).
+struct ModeWiring {
+    auth_mode: auth::AuthMode,
+    /// Hosted only: the Rails Postgres auth state (OAuth token sweep).
+    auth_state: Option<Arc<auth::AuthState>>,
+    /// Hosted only: the Rails Postgres, for SaaS features.
+    saas_pool: Option<sqlx::PgPool>,
+    job_store: Arc<dyn job_store::JobStore>,
+    meili: Arc<dyn meili::MeilisearchResolver>,
+}
+
+/// Auth, job store and Meilisearch resolver for `settings.mode`. Every
+/// failure aborts startup: an unreachable database never disables auth.
+async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWiring> {
+    match (&settings.mode, &settings.auth, &settings.store) {
+        (
+            settings::Mode::Hosted,
+            settings::AuthSetting::Saas { jwt_secret },
+            settings::StoreUrl::Postgres(url),
+        ) => {
+            // The schema is owned by the Rails app (saas/db/migrate,
+            // `rails db:prepare`); the engine never migrates it.
+            let auth = auth::AuthState::new(url, jwt_secret.clone())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
+                })?;
+            let auth = Arc::new(auth);
+            let pool = auth.pool.clone();
+            info!("Authentication enabled via the Rails Postgres");
+            Ok(ModeWiring {
+                auth_mode: auth::AuthMode::Saas(auth.clone()),
+                auth_state: Some(auth),
+                saas_pool: Some(pool.clone()),
+                job_store: Arc::new(job_store::PgJobStore::new(pool.clone())),
+                meili: Arc::new(meili::EngineTableResolver {
+                    pool,
+                    server: settings.meilisearch.clone(),
+                }),
+            })
+        }
+        (settings::Mode::Standalone, auth_setting, store_url) => {
+            let auth_mode = match auth_setting {
+                settings::AuthSetting::AdminKey(k) => {
+                    auth::AuthMode::AdminKey(auth::AdminKey::new(k.clone()))
+                }
+                settings::AuthSetting::Disabled => {
+                    warn!(
+                        "SCRAPIX_AUTH=disabled: every route is UNAUTHENTICATED. \
+                         Local development only."
+                    );
+                    auth::AuthMode::Disabled
+                }
+                settings::AuthSetting::Saas { .. } => {
+                    unreachable!("EngineSettings::resolve never pairs Saas with standalone")
+                }
+            };
+            let store: Arc<dyn job_store::JobStore> = match store_url {
+                settings::StoreUrl::Sqlite(url) => Arc::new(
+                    job_store::SqliteJobStore::open(url)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
+                settings::StoreUrl::Postgres(url) => {
+                    let pool = sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(10)
+                        .connect(url)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cannot connect to DATABASE_URL: {e}"))?;
+                    let pg = job_store::PgJobStore::new(pool);
+                    if pg
+                        .is_rails_database()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cannot inspect DATABASE_URL: {e}"))?
+                    {
+                        anyhow::bail!(
+                            "DATABASE_URL points at a Rails (hosted) database; set \
+                             SCRAPIX_MODE=hosted, or give standalone a dedicated database"
+                        );
+                    }
+                    pg.migrate()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cannot migrate DATABASE_URL: {e}"))?;
+                    Arc::new(pg)
+                }
+            };
+            info!(backend = store.backend(), "Job store ready");
+            if let Some(ref m) = settings.meilisearch {
+                let health = format!("{}/health", m.url);
+                match reqwest::Client::new()
+                    .get(&health)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        info!(url = %m.url, "Default Meilisearch reachable")
+                    }
+                    Ok(r) => warn!(
+                        url = %m.url,
+                        status = %r.status(),
+                        "Default Meilisearch health check failed"
+                    ),
+                    Err(e) => warn!(url = %m.url, error = %e, "Default Meilisearch unreachable"),
+                }
+            } else {
+                warn!(
+                    "MEILISEARCH_URL not set: every crawl must pass meilisearch.url, \
+                     and /search is unavailable"
+                );
+            }
+            Ok(ModeWiring {
+                auth_mode,
+                auth_state: None,
+                saas_pool: None,
+                job_store: store,
+                meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
+            })
+        }
+        _ => unreachable!("EngineSettings::resolve guarantees a valid mode/auth/store combination"),
+    }
+}
+
 /// Run the API server with pre-built message bus trait objects.
 ///
 /// This is the primary entry point for both the standalone binary and the `scrapix all`
@@ -6424,9 +6542,14 @@ pub async fn run_with_bus(
     producer: AnyProducer,
     consumer: AnyConsumer,
 ) -> anyhow::Result<()> {
+    // Resolved once, before anything connects or binds: a misconfigured
+    // engine exits instead of serving requests.
+    let settings = settings::EngineSettings::resolve(&args)
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
     info!(
         host = %args.host,
         port = args.port,
+        mode = ?settings.mode,
         "Starting Scrapix API server"
     );
 
@@ -6434,32 +6557,13 @@ pub async fn run_with_bus(
     let (analytics_state, request_batcher, ai_usage_batcher, job_event_batcher, page_event_batcher) =
         init_clickhouse().await;
 
-    // Initialize auth state if DATABASE_URL is provided
-    let auth_state = if let Some(ref db_url) = args.database_url {
-        let jwt_secret = args.jwt_secret.clone().unwrap_or_else(|| {
-            if std::env::var("ENVIRONMENT").as_deref() == Ok("production") {
-                panic!("JWT_SECRET is required in production. Set the JWT_SECRET environment variable.");
-            }
-            warn!("JWT_SECRET not set — using insecure default. Set JWT_SECRET in production!");
-            "dev-jwt-secret-change-in-production".to_string()
-        });
-        match auth::AuthState::new(db_url, jwt_secret).await {
-            Ok(state) => {
-                // The schema is owned by the Rails app (saas/db/migrate,
-                // `rails db:prepare`) — the engine no longer applies it.
-
-                info!("Authentication enabled via PostgreSQL");
-                Some(Arc::new(state))
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to connect to PostgreSQL. Auth disabled.");
-                None
-            }
-        }
-    } else {
-        info!("Authentication disabled (DATABASE_URL not set)");
-        None
-    };
+    let ModeWiring {
+        auth_mode,
+        auth_state,
+        saas_pool,
+        job_store,
+        meili,
+    } = wire_mode(&settings).await?;
 
     // Initialize shared HTTP fetcher for /scrape endpoint
     let robots_config = RobotsConfig {
@@ -6527,8 +6631,11 @@ pub async fn run_with_bus(
 
     // Create application state
     let config = AppConfig::from_args(&args);
-    let db_pool = auth_state.as_ref().map(|a| a.pool.clone());
-    let stripe_client = args.stripe_secret_key.as_ref().map(::stripe::Client::new);
+    // Stripe auto-topup debits SaaS accounts: hosted only.
+    let stripe_client = saas_pool
+        .as_ref()
+        .and(args.stripe_secret_key.as_ref())
+        .map(::stripe::Client::new);
     if args.allow_private_ips {
         warn!("ALLOW_PRIVATE_IPS is set: SSRF protection for webhook deliveries is off");
     }
@@ -6552,20 +6659,23 @@ pub async fn run_with_bus(
         fetcher,
         browser_renderer,
         ai_service,
-        db_pool,
+        saas_pool,
+        Some(job_store),
         stripe_client,
         analytics_state.clone(),
         webhook_dispatcher,
     );
     state.ocr = ocr;
+    state.meili = meili;
+    state.auth_disabled = matches!(auth_mode, auth::AuthMode::Disabled);
     let state = Arc::new(state);
 
-    // Recover active jobs from Postgres on startup
-    if let Some(ref pool) = state.db_pool {
-        let recovered = jobs_db::load_active_jobs(pool).await;
+    // Recover active jobs from the job store on startup
+    if let Some(ref store) = state.job_store {
+        let recovered = store.load_active_jobs().await;
         // Engine-run jobs (batch scrape, extract) died with the previous
         // process: mark them failed instead of recovering them as running.
-        let recovered = engine_jobs::fail_interrupted(pool, recovered).await;
+        let recovered = engine_jobs::fail_interrupted(store.as_ref(), recovered).await;
         if !recovered.is_empty() {
             let now = std::time::Instant::now();
             let mut jobs = state.crawl.jobs.write();
@@ -6579,14 +6689,15 @@ pub async fn run_with_bus(
             }
             info!(
                 count = recovered.len(),
-                "Recovered active jobs from Postgres"
+                "Recovered active jobs from {}",
+                store.backend()
             );
         }
 
         // Recover the work accounting of running/paused jobs (R5). The
         // per-page seen-sets are not persisted, so redelivered events after a
         // restart are not deduplicated against pre-restart ones.
-        let persisted = jobs_db::load_active_job_accounting(pool).await;
+        let persisted = store.load_active_job_accounting().await;
         let persisted: HashMap<String, serde_json::Value> = persisted.into_iter().collect();
         let restored = {
             let jobs = state.crawl.jobs.read();
@@ -6605,7 +6716,8 @@ pub async fn run_with_bus(
         if restored > 0 {
             info!(
                 count = restored,
-                "Recovered job work accounting from Postgres"
+                "Recovered job work accounting from {}",
+                store.backend()
             );
         }
     }
@@ -6655,19 +6767,19 @@ pub async fn run_with_bus(
             None
         };
 
-    // Start periodic flush task (ClickHouse batchers + Postgres dirty job counters)
+    // Start periodic flush task (ClickHouse batchers + job-store dirty job counters)
     let has_flush_work = request_batcher.is_some()
         || ai_usage_batcher.is_some()
         || job_event_batcher.is_some()
-        || state.db_pool.is_some();
+        || state.job_store.is_some();
     let flush_handle = if has_flush_work {
         let req_batcher = request_batcher.clone();
         let ai_batcher = ai_usage_batcher.clone();
         let job_batcher = job_event_batcher.clone();
         let flush_state = state.clone();
-        // With Postgres, the flush task owns the consumer's shutdown join: it
+        // With a job store, the flush task owns the consumer's shutdown join: it
         // must drain before the final flush (R-19).
-        let mut consumer_join = if state.db_pool.is_some() {
+        let mut consumer_join = if state.job_store.is_some() {
             consumer_handle.take()
         } else {
             None
@@ -6693,10 +6805,10 @@ pub async fn run_with_bus(
                                 warn!(error = %e, "Failed to flush ClickHouse job event batcher");
                             }
                         }
-                        // Flush dirty job counters + accounting to Postgres,
+                        // Flush dirty job counters + accounting to the job store,
                         // then release the acks they cover
-                        if let Some(ref pool) = flush_state.db_pool {
-                            flush_state.flush_to_db(pool).await;
+                        if let Some(ref store) = flush_state.job_store {
+                            flush_state.flush_to_db(store.as_ref()).await;
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -6716,16 +6828,16 @@ pub async fn run_with_bus(
                                 warn!(error = %e, "Failed final ClickHouse job event flush");
                             }
                         }
-                        // Final Postgres flush — only once the event consumer
+                        // Final job-store flush — only once the event consumer
                         // has drained and sync-committed (R-19), so the final
                         // snapshot covers every event it applied.
-                        if let Some(ref pool) = flush_state.db_pool {
+                        if let Some(ref store) = flush_state.job_store {
                             if let Some(handle) = consumer_join.take() {
                                 if let Err(e) = handle.await {
                                     warn!("Consumer task failed during shutdown: {}", e);
                                 }
                             }
-                            flush_state.flush_to_db(pool).await;
+                            flush_state.flush_to_db(store.as_ref()).await;
                         }
                         break;
                     }
@@ -6735,8 +6847,8 @@ pub async fn run_with_bus(
         if request_batcher.is_some() || ai_usage_batcher.is_some() {
             info!("ClickHouse event persistence enabled (flush interval: 5s)");
         }
-        if state.db_pool.is_some() {
-            info!("Postgres job counter flush enabled (flush interval: 5s)");
+        if state.job_store.is_some() {
+            info!("Job store counter flush enabled (flush interval: 5s)");
         }
         Some(handle)
     } else {
@@ -6776,8 +6888,8 @@ pub async fn run_with_bus(
         "Job completion loop started (exact work accounting)"
     );
 
-    // Start cron scheduler if database is configured
-    let cron_handle = if let Some(ref pool) = state.db_pool {
+    // Cron scheduler: hosted only (fires saved configs from the SaaS pool).
+    let cron_handle = if let Some(ref pool) = state.saas_pool {
         let handle =
             configs::spawn_cron_scheduler(state.clone(), pool.clone(), shutdown_rx.clone());
         info!("Cron scheduler started (30s tick interval)");
@@ -6789,68 +6901,9 @@ pub async fn run_with_bus(
     // Email delivery moved to the Rails app (SolidQueue drains the shared
     // scheduled_emails queue); the engine only inserts rows.
 
-    // Build router
-    // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/health", get(health))
-        .route("/health/services", get(health_services))
-        .route("/metrics", get(metrics))
-        .route("/stats", get(handle_stats))
-        .route("/errors", get(handle_errors))
-        .route("/domains", get(handle_domains))
-        .route("/ws", get(ws_handler))
-        .route("/ws/job/{id}", get(ws_job_handler));
-
-    // Product routes — revenue-generating API endpoints
-    let product_routes = Router::new()
-        .route("/scrape", post(scrape_url))
-        .route("/batch/scrape", post(batch::batch_scrape))
-        .route("/extract", post(extract::create_extract))
-        .route("/extract/{id}", get(extract::get_extract))
-        .route("/map", post(map_url))
-        .route("/search", post(search_url))
-        .route("/crawl", post(create_crawl))
-        .route("/crawl/sync", post(create_crawl_sync))
-        .route("/crawl/bulk", post(create_crawl_bulk));
-
-    // Management routes — job monitoring and configuration
-    let management_routes = Router::new()
-        .route("/jobs", get(list_jobs))
-        .route("/job/{id}/status", get(job_status))
-        .route("/job/{id}/events", get(job_events))
-        .route("/job/{id}/events/history", get(get_job_events_history))
-        .route("/job/{id}/results", get(results::job_results))
-        .route("/job/{id}", delete(cancel_job))
-        .route("/job/{id}/pause", post(pause_job))
-        .route("/job/{id}/resume", post(resume_job));
-
-    // Protected routes (API key auth required when enabled).
-    // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
-    // Stripe, analytics pipes, OAuth provider, /mcp) is served by the Rails
-    // app (saas/, SCR-85); the engine keeps only the crawl data plane.
-    let protected_routes = product_routes.merge(management_routes);
-
-    // Apply auth middleware if configured (accepts API key, Bearer token, or
-    // session cookie). route_layer keeps it off the 404 fallback, so removed
-    // SaaS paths return 404 instead of a misleading 401.
-    let protected_routes = if let Some(ref auth) = auth_state {
-        protected_routes.route_layer(middleware::from_fn_with_state(
-            auth.clone(),
-            auth::validate_api_key_or_session,
-        ))
-    } else {
-        protected_routes
-    };
-
-    // Per-account rate limiting on protected routes was removed — pricing is
-    // usage-based (credits), not per-request, so there's nothing to gate on the
-    // request rate. Brute-force protection on the auth endpoints lives with
-    // the auth endpoints themselves, in the Rails app (Rack::Attack).
-    let mut app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+    // Routes, auth guards, request tracing, /openapi.json + /docs and the
+    // body-size limits (CORS is added below).
+    let mut app = router::build_router(state.clone(), &auth_mode, settings.mode);
 
     // OAuth token cleanup: both backends validate tokens from the shared
     // Postgres; the engine hosts the hourly expired-code/token sweep.
@@ -6858,71 +6911,9 @@ pub async fn run_with_bus(
         auth::oauth::spawn_token_cleanup(auth.pool.clone());
     }
 
-    // OpenAPI spec + Scalar docs UI
-    {
-        use utoipa::OpenApi;
-        let spec = openapi::ScrapixApi::openapi();
-        let spec_json = spec.to_json().expect("OpenAPI JSON serialization");
-        app = app
-            .route(
-                "/openapi.json",
-                get(|| async move {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        spec_json,
-                    )
-                }),
-            )
-            .route(
-                "/docs",
-                get(|| async {
-                    axum::response::Html(
-                        r#"<!doctype html>
-<html>
-<head><title>Scrapix API Reference</title><meta charset="utf-8"/></head>
-<body>
-<script id="api-reference" data-url="/openapi.json"></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
-</body>
-</html>"#,
-                    )
-                }),
-            );
-        info!("OpenAPI spec at /openapi.json, docs UI at /docs");
-    }
-
     // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
     // app; the engine only writes events to ClickHouse (batchers above) and
     // reads page-event history for /job/{id}/events/history.
-
-    // Request body size limit (2 MB default, prevents DoS via large payloads)
-    app = app.layer(tower_http::limit::RequestBodyLimitLayer::new(
-        2 * 1024 * 1024,
-    ));
-
-    // POST /parse (document upload) is merged after the 2 MB layer — layers
-    // only wrap routes that already exist — with its own cap
-    // (DOCUMENT_MAX_SIZE_MB + multipart overhead) and the same auth.
-    {
-        let upload_limit = documents::max_document_bytes() as usize + 1024 * 1024;
-        let parse_routes = Router::new()
-            .route("/parse", post(documents::parse_upload))
-            .layer(axum::extract::DefaultBodyLimit::max(upload_limit))
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(upload_limit));
-        let parse_routes = if let Some(ref auth) = auth_state {
-            parse_routes.route_layer(middleware::from_fn_with_state(
-                auth.clone(),
-                auth::validate_api_key_or_session,
-            ))
-        } else {
-            parse_routes
-        };
-        app = app.merge(
-            parse_routes
-                .layer(TraceLayer::new_for_http())
-                .with_state(state.clone()),
-        );
-    }
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.
@@ -7665,35 +7656,90 @@ mod lifecycle_tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    fn test_state(bus: &ChannelBus) -> AppState {
+    fn test_config() -> AppConfig {
+        AppConfig {
+            max_jobs: 100,
+            job_stall_timeout: Duration::from_secs(1800),
+            completion_grace: Duration::from_secs(3),
+            resume_heal_after: Duration::from_secs(60),
+            max_pending_acks: 50_000,
+        }
+    }
+
+    fn test_fetcher() -> Arc<HttpFetcher> {
         let robots = Arc::new(RobotsCache::new(RobotsConfig::default()).unwrap());
-        let fetcher = Arc::new(HttpFetcherBuilder::new().build(robots).unwrap());
+        Arc::new(HttpFetcherBuilder::new().build(robots).unwrap())
+    }
+
+    fn test_webhooks() -> webhooks::WebhookDispatcher {
+        webhooks::WebhookDispatcher::new(
+            scrapix_crawler::safe_client_builder(None, true)
+                .build()
+                .unwrap(),
+            webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES,
+        )
+    }
+
+    fn test_state(bus: &ChannelBus) -> AppState {
         AppState::new(
             AnyProducer::channel(bus.producer()),
-            AppConfig {
-                max_jobs: 100,
-                job_stall_timeout: Duration::from_secs(1800),
-                completion_grace: Duration::from_secs(3),
-                resume_heal_after: Duration::from_secs(60),
-                max_pending_acks: 50_000,
-            },
+            test_config(),
             None,
             None,
             None,
             None,
-            fetcher,
+            test_fetcher(),
             None,
             None,
             None,
             None,
             None,
-            webhooks::WebhookDispatcher::new(
-                scrapix_crawler::safe_client_builder(None, true)
-                    .build()
-                    .unwrap(),
-                webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES,
-            ),
+            None,
+            test_webhooks(),
         )
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_enables_durable_accounting() {
+        let bus = ChannelBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::job_store::SqliteJobStore::open(&format!(
+            "sqlite://{}",
+            dir.path().join("a.db").display()
+        ))
+        .await
+        .unwrap();
+        let state = AppState::new(
+            AnyProducer::channel(bus.producer()),
+            test_config(),
+            None,
+            None,
+            None,
+            None,
+            test_fetcher(),
+            None,
+            None,
+            None, // saas_pool
+            Some(Arc::new(store) as Arc<dyn crate::job_store::JobStore>),
+            None,
+            None,
+            test_webhooks(),
+        );
+        assert!(state.accounting_persisted());
+        assert!(state.saas_pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_warning_is_rate_limited() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let t0 = Instant::now();
+        assert!(!state.warn_auth_disabled(t0), "auth enabled: never warns");
+
+        state.auth_disabled = true;
+        assert!(state.warn_auth_disabled(t0));
+        assert!(!state.warn_auth_disabled(t0 + Duration::from_secs(59)));
+        assert!(state.warn_auth_disabled(t0 + Duration::from_secs(60)));
     }
 
     /// A Running job with a fresh accounting entry for `seeds` seeds.
@@ -7708,6 +7754,123 @@ mod lifecycle_tests {
             .accounting
             .write()
             .insert(job_id.to_string(), acc);
+    }
+
+    /// A job store that records its job inserts and, for each, whether a
+    /// seed URL had already reached the frontier topic.
+    struct SeedOrderStore {
+        frontier: scrapix_queue::ChannelConsumer,
+        inserts: parking_lot::Mutex<Vec<(String, JobStatus, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl job_store::JobStore for SeedOrderStore {
+        fn backend(&self) -> &'static str {
+            "test"
+        }
+        async fn insert_job(&self, job: &JobState) -> Result<(), job_store::StoreError> {
+            let seed_published = self
+                .frontier
+                .poll_one::<serde_json::Value>(Duration::from_millis(50))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            self.inserts
+                .lock()
+                .push((job.job_id.clone(), job.status.clone(), seed_published));
+            Ok(())
+        }
+        async fn update_job_full(&self, _: &JobState) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn flush_job_counters(&self, _: &[JobState]) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn flush_job_accounting(
+            &self,
+            _: &[(String, serde_json::Value)],
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_active_jobs(&self) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn load_active_job_accounting(&self) -> Vec<(String, serde_json::Value)> {
+            Vec::new()
+        }
+        async fn get_job(&self, _: &str, _: Option<&str>) -> Option<JobState> {
+            None
+        }
+        async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
+            Vec::new()
+        }
+        async fn count_active_jobs(&self, _: &str) -> Result<i64, job_store::StoreError> {
+            Ok(0)
+        }
+        async fn store_result_page(
+            &self,
+            _: &str,
+            _: u64,
+            _: &str,
+            _: bool,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn store_result_summary(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<(), job_store::StoreError> {
+            Ok(())
+        }
+        async fn load_result_summary(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, job_store::StoreError> {
+            Ok(None)
+        }
+        async fn result_pages(
+            &self,
+            _: &str,
+            _: u64,
+            _: usize,
+        ) -> Result<(Vec<(u64, serde_json::Value)>, u64), job_store::StoreError> {
+            Ok((Vec::new(), 0))
+        }
+    }
+
+    /// A crawl job's row is inserted (awaited) before its first seed URL is
+    /// published: the counter flush's UPDATE for an event of the job must
+    /// never land before the INSERT (it would change 0 rows and be lost).
+    #[tokio::test]
+    async fn crawl_job_is_persisted_before_its_first_seed_is_published() {
+        let bus = ChannelBus::new();
+        let frontier = bus.consumer();
+        frontier.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
+        let store = Arc::new(SeedOrderStore {
+            frontier,
+            inserts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut state = test_state(&bus);
+        state.job_store = Some(store.clone());
+        let state = Arc::new(state);
+        let config: CrawlConfig = serde_json::from_value(serde_json::json!({
+            "start_urls": ["https://a.test/"],
+            "index_uid": "a",
+            "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k"}
+        }))
+        .unwrap();
+
+        let created = do_create_crawl(&state, config, None).await.unwrap();
+
+        let inserts = store.inserts.lock().clone();
+        assert_eq!(
+            inserts,
+            vec![(created.job_id, JobStatus::Running, false)],
+            "one insert, of the running job, before any seed was published"
+        );
     }
 
     /// R10/SCR-22: `/metrics` reports `scrapix_api_jobs{status}` computed
@@ -8212,7 +8375,7 @@ mod lifecycle_tests {
     }
 
     fn persist_on(state: &AppState) {
-        // as with a Postgres pool
+        // as with a job store
         state.accounting_persisted.store(true, Ordering::Relaxed);
     }
 
@@ -8453,13 +8616,13 @@ mod lifecycle_tests {
     /// released.
     #[tokio::test]
     async fn schema_missing_flush_disables_deferral_and_releases_acks() {
-        assert!(is_schema_missing_sqlstate(Some("42703")));
-        assert!(is_schema_missing_sqlstate(Some("42P01")));
-        assert!(!is_schema_missing_sqlstate(Some("08006")));
-        assert!(!is_schema_missing_sqlstate(None));
         assert_eq!(
-            classify_flush_error(&sqlx::Error::PoolTimedOut),
+            classify_flush_error(&job_store::StoreError::Other("timeout".into())),
             AccountingFlush::Retry
+        );
+        assert_eq!(
+            classify_flush_error(&job_store::StoreError::SchemaMissing("x".into())),
+            AccountingFlush::SchemaMissing
         );
 
         let bus = ChannelBus::new();

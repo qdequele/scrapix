@@ -424,7 +424,7 @@ pub struct JobState {
 
     /// The job's webhook subscriptions, with auth secrets intact (unlike
     /// `config`, which is redacted before being stored). In-memory only:
-    /// never persisted to Postgres (see `jobs_db::row_to_job_state`, which
+    /// never persisted to Postgres (see `job_store::postgres::row_to_job_state`, which
     /// always sets this to empty), so webhook delivery for a job recovered
     /// after a restart is a known gap — the job's `config.webhooks` still
     /// carries the URLs but its secrets read back as `"***"`.

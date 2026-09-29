@@ -7,6 +7,16 @@ description: Complete reference for all Scrapix configuration variables
 
 All Scrapix services are configured through environment variables. When running in single-binary mode (`scrapix all`), all variables apply to the single process.
 
+## Deployment Mode & Authentication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCRAPIX_MODE` | `standalone` | `standalone` (self-hosted, this repo's default) or `hosted` (Rails control plane, shared Postgres). Validated at startup — an unrecognized value refuses to start. See [Self-Hosting](/deployment/self-hosting). |
+| `SCRAPIX_ADMIN_KEY` | — | **Standalone only.** The single operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; WebSockets also accept `?token=`). Required unless `SCRAPIX_AUTH=disabled`; must be at least 16 characters (leading/trailing whitespace trimmed, blank-after-trim counts as unset). |
+| `SCRAPIX_AUTH` | — | Set to `disabled` to turn off all authentication — **standalone only, local development only**. Logs a loud warning at startup; refused in hosted mode and refused together with `SCRAPIX_ADMIN_KEY` (conflicting config). |
+| `DATABASE_URL` | `sqlite://./data/scrapix.db` (standalone) | **Standalone:** the engine's own job-history store — SQLite by default, or a `postgres://`/`postgresql://` URL for a dedicated Postgres (the engine applies its own migrations and refuses a database that already has the Rails schema). **Hosted:** required, must be a `postgres://` URL — the Rails-owned Postgres; the engine never migrates it. |
+| `JWT_SECRET` | — | **Hosted only, required.** The same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone mode. |
+
 ## API Server
 
 | Variable | Default | Description |
@@ -15,9 +25,6 @@ All Scrapix services are configured through environment variables. When running 
 | `PORT` | `8080` | API server port |
 | `ENABLE_CORS` | `true` | Enable CORS headers |
 | `CORS_ORIGINS` | — | Comma-separated allowed CORS origins (optional, allows all when empty) |
-| `API_KEY` | — | API authentication key (optional) |
-| `JWT_SECRET` | `dev-jwt-secret-change-in-production` | JWT signing secret |
-| `DATABASE_URL` | — | PostgreSQL URL for auth (optional) |
 | `MAX_JOBS` | `10000` | Maximum tracked jobs |
 | `JOB_STALL_TIMEOUT_SECS` | `1800` | Seconds without progress before a job is finalized as `FailStalled` (stalled jobs are still billed for pages crawled) |
 | `JOB_COMPLETION_GRACE_MS` | `3000` | Grace period after exact work accounting says a job is done, before finalizing it, to absorb straggler events |
@@ -65,6 +72,14 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 </Note>
 
 ## Frontier Service
+
+<Note>
+Under `scrapix all` (single-process mode), `DOMAIN_DELAY_MS` and
+`CONCURRENT_PER_DOMAIN` are hardcoded (`250`ms / `4`) and not read from the
+environment. They're only tunable when the frontier runs as its own
+service (distributed mode) — every other variable below applies in both
+modes.
+</Note>
 
 | Variable | Default | Description |
 |----------|---------|-------------|

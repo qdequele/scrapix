@@ -5,7 +5,13 @@ description: Health checks, system stats, error tracking, and domain statistics
 
 # Diagnostics
 
-These endpoints provide real-time visibility into system health and crawl performance. All diagnostic endpoints are public (no auth required) and return in-memory data collected since the API started.
+These endpoints provide real-time visibility into system health and crawl performance, returning in-memory data collected since the API started.
+
+`GET /health`, `/health/services` and `/metrics` are always public. `/stats`,
+`/errors` and `/domains` require the admin key in **standalone** mode (same
+`Authorization: Bearer` / `X-API-Key` as every other protected route — see
+[Authentication](/api-reference/authentication)); they stay public in
+**hosted** mode.
 
 ## GET /health
 
@@ -218,5 +224,7 @@ curl "http://localhost:8080/domains?filter=example.com"
 ```
 
 <Note>
-  All diagnostic data is from in-memory tracking since the API started. For persistent analytics across restarts, use the [Analytics API](/api-reference/analytics) with ClickHouse.
+  All diagnostic data is from in-memory tracking since the API started. For
+  persistent analytics across restarts, the hosted platform has an Analytics
+  API backed by ClickHouse — see **Analytics** in the Platform docs.
 </Note>

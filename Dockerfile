@@ -185,6 +185,17 @@ ENTRYPOINT ["/app/scrapix"]
 # Default target: Single unified binary (runs all services or any subcommand)
 # -----------------------------------------------------------------------------
 FROM runtime-documents AS scrapix-all
+# curl: used by compose.standalone.yaml's healthcheck (neither curl nor wget
+# is present in runtime-base/runtime-documents — libcurl4 above is only the
+# library, not the CLI).
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder --chown=scrapix:scrapix /app/target/release/scrapix /app/scrapix
-ENV RUST_LOG=info
+ENV RUST_LOG=info \
+    SCRAPIX_MODE=standalone \
+    DATABASE_URL=sqlite:///data/scrapix.db
+RUN mkdir -p /data && chown scrapix:scrapix /data
+USER scrapix
+VOLUME /data
 ENTRYPOINT ["/app/scrapix", "all"]

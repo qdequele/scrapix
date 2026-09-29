@@ -1,290 +1,79 @@
 ---
 title: Authentication
-description: User accounts, API keys, sessions, and billing management
+description: How to authenticate requests, standalone or hosted
 ---
 
 # Authentication
 
-When `DATABASE_URL` is configured, Scrapix enables a full authentication system with user accounts, API keys, session-based auth, and billing tier management.
+The engine's authentication depends on `SCRAPIX_MODE`.
 
-<Note>
-  All auth endpoints return 404 when `DATABASE_URL` is not set. Without PostgreSQL, the API runs in open mode with no authentication.
-</Note>
+## Standalone
 
-## POST /auth/signup
+A self-hosted engine (`SCRAPIX_MODE=standalone`, the default) is guarded by
+one operator key: `SCRAPIX_ADMIN_KEY`. There are no per-user accounts, API
+key CRUD, or sessions — every request either proves it knows the admin key
+or is rejected.
 
-Create a new user account. Automatically creates a default account and assigns the user as owner.
+### Sending the Key
 
-### Request Body
+Send the key as either header:
+
+```bash
+curl https://your-engine.example.com/jobs \
+  -H "Authorization: Bearer $SCRAPIX_ADMIN_KEY"
+```
+
+```bash
+curl https://your-engine.example.com/jobs \
+  -H "X-API-Key: $SCRAPIX_ADMIN_KEY"
+```
+
+Both forms are checked in constant time and accepted interchangeably —
+`Authorization: Bearer` is tried first, then `X-API-Key`. WebSocket routes
+(`/ws`, `/ws/job/{id}`) additionally accept `?token=<SCRAPIX_ADMIN_KEY>` as a
+query parameter, since a browser can't set a header on the upgrade request;
+percent-encode the key (a raw `+` decodes to a space) and keep query strings
+out of your reverse proxy's access logs.
+
+### Protected vs Public Routes
+
+| Public (no key required) | Protected (key required) |
+|---------------------------|---------------------------|
+| `GET /health` | `POST /scrape`, `/map`, `/search`, `/crawl`, `/crawl/sync`, `/crawl/bulk` |
+| `GET /health/services` | `POST /batch/scrape`, `/extract`, `POST /parse` |
+| `GET /metrics` | `GET /jobs`, `/job/{id}/*`, `DELETE /job/{id}` |
+| `GET /openapi.json` | `GET /stats`, `/errors`, `/domains` |
+| `GET /docs` | `GET /ws`, `/ws/job/{id}` |
+
+### Error Response
+
+A missing or invalid key returns `401`:
 
 ```json
 {
-  "email": "user@example.com",
-  "password": "secure-password-123",
-  "full_name": "Jane Doe"
+  "error": "Missing or invalid admin key",
+  "code": "unauthorized"
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `email` | string | Yes | Unique email address |
-| `password` | string | Yes | Password (hashed with Argon2) |
-| `full_name` | string | No | Display name |
-
-### Response (201 Created)
-
-Sets a `scrapix_session` HttpOnly cookie and returns the user profile:
-
-```json
-{
-  "id": "a1b2c3d4-...",
-  "email": "user@example.com",
-  "full_name": "Jane Doe",
-  "account": {
-    "id": "x1y2z3-...",
-    "name": "Jane Doe's account",
-    "tier": "free",
-    "active": true,
-    "role": "owner"
-  }
-}
-```
-
----
-
-## POST /auth/login
-
-Authenticate and receive a session cookie.
-
-### Request Body
-
-```json
-{
-  "email": "user@example.com",
-  "password": "secure-password-123"
-}
-```
-
-### Response
-
-Sets a `scrapix_session` HttpOnly cookie (7-day expiration) and returns the user profile (same format as signup).
-
----
-
-## POST /auth/logout
-
-Clear the session cookie.
-
-### Response
-
-```json
-{
-  "message": "Logged out"
-}
-```
-
----
-
-## GET /auth/me
-
-Get the authenticated user's profile.
-
-**Requires:** Session cookie
-
-### Response
-
-```json
-{
-  "id": "a1b2c3d4-...",
-  "email": "user@example.com",
-  "full_name": "Jane Doe",
-  "account": {
-    "id": "x1y2z3-...",
-    "name": "My Company",
-    "tier": "pro",
-    "active": true,
-    "role": "owner"
-  }
-}
-```
-
----
-
-## PATCH /auth/me
-
-Update the authenticated user's profile.
-
-**Requires:** Session cookie
-
-### Request Body
-
-```json
-{
-  "full_name": "Jane Smith",
-  "email": "jane.smith@example.com"
-}
-```
-
----
-
-## GET /account
-
-Get the authenticated user's account details.
-
-**Requires:** Session cookie
-
-### Response
-
-```json
-{
-  "id": "x1y2z3-...",
-  "name": "My Company",
-  "tier": "pro",
-  "active": true,
-  "stripe_customer_id": "cus_abc123"
-}
-```
-
----
-
-## PATCH /account
-
-Update account details.
-
-**Requires:** Session cookie (owner role)
-
-### Request Body
-
-```json
-{
-  "name": "Updated Company Name"
-}
-```
-
----
-
-## API Keys
-
-API keys provide programmatic access to protected endpoints. They are sent via the `x-api-key` header.
-
-### GET /account/api-keys
-
-List all API keys for the authenticated account.
-
-**Requires:** Session cookie
-
-### Response
-
-```json
-[
-  {
-    "id": "k1l2m3-...",
-    "name": "Production Key",
-    "prefix": "sk_live_abc1",
-    "active": true,
-    "last_used_at": "2024-01-15T10:30:00Z",
-    "created_at": "2024-01-01T00:00:00Z"
-  }
-]
-```
-
-<Note>
-  The full key is never shown after creation. Only the 12-character prefix is stored for display.
-</Note>
-
-### POST /account/api-keys
-
-Create a new API key.
-
-**Requires:** Session cookie
-
-### Request Body
-
-```json
-{
-  "name": "Production Key"
-}
-```
-
-### Response (201 Created)
-
-```json
-{
-  "id": "k1l2m3-...",
-  "name": "Production Key",
-  "prefix": "sk_live_abc1",
-  "key": "sk_live_abc123-example-not-a-real-key"
-}
-```
-
-<Warning>
-  The `key` field is only returned once at creation time. Store it securely — it cannot be retrieved again.
-</Warning>
-
-### PATCH /account/api-keys/{id}
-
-Revoke (deactivate) an API key.
-
-**Requires:** Session cookie
-
-### Request Body
-
-```json
-{
-  "active": false
-}
-```
-
----
-
-## GET /account/billing
-
-Get the account's billing tier and Stripe customer ID.
-
-**Requires:** Session cookie
-
-### Response
-
-```json
-{
-  "tier": "pro",
-  "stripe_customer_id": "cus_abc123"
-}
-```
-
----
-
-## OAuth 2.1
-
-Scrapix also supports OAuth 2.1 with PKCE for third-party integrations and MCP clients. OAuth provides:
-
-- **Dynamic client registration** — Clients register themselves automatically
-- **PKCE (S256)** — Secure authorization code flow without client secrets
-- **Refresh token rotation** — Automatic token renewal with revocation on reuse
-- **Bearer tokens** — For authenticating MCP and API requests
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /.well-known/oauth-authorization-server` | OAuth metadata discovery |
-| `POST /oauth/register` | Register an OAuth client |
-| `GET/POST /oauth/authorize` | Authorization code flow |
-| `POST /oauth/token` | Exchange code or refresh token |
-| `POST /oauth/revoke` | Revoke a token |
-
-See the [OAuth 2.1 Guide](/guides/oauth) for the complete flow and integration details.
-
----
-
-## Session Cookie Details
-
-| Property | Value |
-|----------|-------|
-| Name | `scrapix_session` |
-| Type | JWT (HS256) |
-| HttpOnly | Yes |
-| SameSite | Lax |
-| Expiration | 7 days |
-| Path | `/` |
-| Contains | User ID, email |
-
-The JWT is signed with `JWT_SECRET` (set via environment variable or `--jwt-secret` flag).
+### Local Development: Disabling Auth
+
+Setting `SCRAPIX_AUTH=disabled` turns off authentication for every route.
+This is meant for local development only — the engine logs a loud warning
+at startup, and refuses to start with `SCRAPIX_AUTH=disabled` in hosted
+mode or together with `SCRAPIX_ADMIN_KEY` (conflicting config — unset one
+of the two).
+
+## Hosted
+
+The hosted Meilisearch Lab platform uses per-account API keys and sessions
+instead of a single admin key, plus OAuth 2.1 for MCP and third-party
+clients — see **API keys** and **OAuth** in the Platform docs.
+
+On the hosted engine, `/ws` and `/ws/job/{id}` also require authentication
+(a `scrapix_session` cookie or Bearer token) — the console's live job
+updates rely on `SESSION_COOKIE_DOMAIN` being set to a parent domain shared
+with the API (e.g. `scrapix.meilisearch.com`, which covers
+`api.scrapix.meilisearch.com`), so the browser can send the session cookie
+on the WebSocket upgrade. `/stats`, `/errors` and `/domains` stay public in
+hosted mode.

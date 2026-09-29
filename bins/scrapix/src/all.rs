@@ -4,9 +4,12 @@
 //! then spawns API, Frontier, Crawler, and Content as concurrent tokio tasks.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
-use tracing::{error, info};
+use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 use scrapix_queue::{topic_names, AnyConsumer, AnyProducer, ChannelBus};
 
@@ -25,9 +28,9 @@ pub struct AllArgs {
     pub port: u16,
 
     // === Meilisearch ===
-    /// Meilisearch server URL
-    #[arg(long, env = "MEILISEARCH_URL", default_value = "http://localhost:7700")]
-    pub meilisearch_url: String,
+    /// Meilisearch server URL (required unless every crawl passes `meilisearch.url`)
+    #[arg(long, env = "MEILISEARCH_URL")]
+    pub meilisearch_url: Option<String>,
 
     /// Meilisearch API key
     #[arg(long, env = "MEILISEARCH_API_KEY")]
@@ -83,16 +86,22 @@ pub struct AllArgs {
 }
 
 pub async fn run_all(args: AllArgs) -> anyhow::Result<()> {
+    // Validate the API configuration before any bus, consumer or service
+    // exists: a misconfigured engine refuses to start, as `scrapix api` does.
+    let api_args = build_api_args(&args, args.kafka_brokers.clone().unwrap_or_default());
+    scrapix_api::settings::EngineSettings::resolve(&api_args)
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if let Some(ref brokers) = args.kafka_brokers {
         info!(brokers = %brokers, "Running all services with Kafka message bus");
-        run_all_kafka(&args, brokers).await
+        run_all_kafka(&args, brokers, api_args).await
     } else {
         info!("Running all services with in-process channel bus");
-        run_all_channels(&args).await
+        run_all_channels(&args, api_args).await
     }
 }
 
-async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
+async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow::Result<()> {
     let bus = ChannelBus::new();
 
     // Create producers (all services share the same bus)
@@ -134,33 +143,11 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
     let content_control = Arc::new(control_consumer("content-control")?);
 
     // Build service-specific args
-    let api_args = scrapix_api::Args {
-        host: args.host.clone(),
-        port: args.port,
-        brokers: String::new(), // unused with channel bus
-        database_url: args.database_url.clone(),
-        jwt_secret: args.jwt_secret.clone(),
-        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        max_jobs: 1000,
-        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
-        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
-        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
-        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
-        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-        webhook_max_concurrent_deliveries: env_or(
-            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
-            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
-        ) as usize,
-        verbose: args.verbose,
-    };
-
     let frontier_args = scrapix_frontier_service::Args {
         brokers: String::new(),
         group_id: "scrapix-frontier".to_string(),
         // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         frontier_key_prefix: "scrapix:frontier".to_string(),
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
@@ -205,7 +192,7 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         link_graph_interval: 1000,
         publish_links: false,
         incremental_crawl: true,
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         browser_render: args.browser_render,
         browser_render_patterns: args.browser_render_patterns.clone(),
         chrome_path: args.chrome_path.clone(),
@@ -225,13 +212,15 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
 
     info!("Spawning all services as concurrent tasks...");
 
+    // Listen for signals before the API exists, so none is missed.
+    let signals = Signals::install()?;
+
     // Spawn all 4 services
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = scrapix_api::run_with_bus(api_args, api_producer, api_event_consumer).await
-        {
-            error!(error = %e, "API server failed");
-        }
-    });
+    let api_handle = tokio::spawn(scrapix_api::run_with_bus(
+        api_args,
+        api_producer,
+        api_event_consumer,
+    ));
 
     let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
@@ -282,24 +271,149 @@ async fn run_all_channels(args: &AllArgs) -> anyhow::Result<()> {
         port = args.port,
         crawler_concurrency = args.crawler_concurrency,
         content_concurrency = args.content_concurrency,
-        "All services started. Press Ctrl+C to stop."
+        "All services started. Press Ctrl+C (or send SIGTERM) to stop."
     );
 
-    // Wait for ctrl+c
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, stopping all services...");
+    supervise(
+        signals,
+        api_handle,
+        [frontier_handle, crawler_handle, content_handle],
+    )
+    .await
+}
 
-    // Abort all tasks (each service handles its own graceful shutdown internally)
-    api_handle.abort();
-    frontier_handle.abort();
-    crawler_handle.abort();
-    content_handle.abort();
+/// How long the API gets to drain (in-flight requests, background tasks,
+/// final job-store flush) after a shutdown signal before it is aborted.
+const API_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
-    // Give services 5 seconds to clean up
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+/// How long aborted worker tasks get to unwind before the process exits.
+const WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// SIGINT (Ctrl+C) and SIGTERM (`docker stop`) listeners, installed before
+/// any service task is spawned.
+struct Signals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Signals {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Resolves with the name of the first signal received.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+/// Run until a shutdown signal or the API task ends, then stop everything.
+///
+/// - Signal (SIGINT/SIGTERM): the API receives it too (its own graceful
+///   shutdown handler) and drains; wait for it up to [`API_DRAIN_TIMEOUT`]
+///   instead of aborting it, so its final job-store flush completes.
+/// - The API returning `Ok(())`: it only does so after draining on a
+///   signal, so this is the same clean shutdown.
+/// - The API returning `Err` or panicking (e.g. its database is
+///   unreachable): fail, so `scrapix all` exits non-zero instead of leaving
+///   the workers running without an API.
+///
+/// The workers have no signal handling of their own under `scrapix all`
+/// (their `run_with_bus` entry points don't install any), so they are
+/// aborted once the API is done. Returns `Ok` only for a clean,
+/// signal-driven shutdown.
+async fn supervise(
+    mut signals: Signals,
+    mut api: JoinHandle<anyhow::Result<()>>,
+    workers: [JoinHandle<()>; 3],
+) -> anyhow::Result<()> {
+    let outcome = tokio::select! {
+        sig = signals.recv() => {
+            info!(signal = sig, "Shutdown signal received, waiting for the API to drain...");
+            match tokio::time::timeout(API_DRAIN_TIMEOUT, &mut api).await {
+                Ok(r) => api_outcome(r),
+                Err(_) => {
+                    api.abort();
+                    Err(anyhow::anyhow!(
+                        "API did not finish draining within {}s of {sig}; aborted it",
+                        API_DRAIN_TIMEOUT.as_secs()
+                    ))
+                }
+            }
+        }
+        r = &mut api => api_outcome(r),
+    };
+    match &outcome {
+        Ok(()) => info!("API shut down cleanly, stopping workers..."),
+        Err(e) => error!(error = %e, "API server failed, stopping all services"),
+    }
+
+    for worker in &workers {
+        worker.abort();
+    }
+    let unwind = join_workers(workers);
+    if tokio::time::timeout(WORKER_ABORT_TIMEOUT, unwind)
+        .await
+        .is_err()
+    {
+        warn!("Workers still unwinding after abort; exiting anyway");
+    }
 
     info!("All services stopped.");
-    Ok(())
+    outcome
+}
+
+/// Map the API task's result: `Ok(Ok(()))` is a clean (signal-driven)
+/// shutdown; an error or a panic fails.
+fn api_outcome(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.context("API server failed")),
+        Err(e) => Err(anyhow::anyhow!("API server task failed: {e}")),
+    }
+}
+
+/// Await every (aborted) worker handle; cancellation errors are expected.
+async fn join_workers(workers: [JoinHandle<()>; 3]) {
+    for worker in workers {
+        let _ = worker.await;
+    }
+}
+
+/// The API args for `scrapix all` (`brokers` is empty on the channel bus).
+fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
+    scrapix_api::Args {
+        host: args.host.clone(),
+        port: args.port,
+        brokers,
+        database_url: args.database_url.clone(),
+        jwt_secret: args.jwt_secret.clone(),
+        mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
+        admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
+        auth: std::env::var("SCRAPIX_AUTH").ok(),
+        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_api_key: args.meilisearch_key.clone(),
+        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
+        max_jobs: 1000,
+        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
+        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
+        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
+        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
+        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
+        webhook_max_concurrent_deliveries: env_or(
+            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
+        ) as usize,
+        verbose: args.verbose,
+    }
 }
 
 fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content::Args {
@@ -307,7 +421,7 @@ fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content
         brokers,
         group_id: "scrapix-content".to_string(),
         concurrency: args.content_concurrency,
-        meilisearch_url: args.meilisearch_url.clone(),
+        meilisearch_url: args.meilisearch_url.clone().unwrap_or_default(),
         meilisearch_key: args.meilisearch_key.clone(),
         default_index: "scrapix".to_string(),
         extract_content: true,
@@ -340,7 +454,11 @@ fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content
     }
 }
 
-async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
+async fn run_all_kafka(
+    args: &AllArgs,
+    brokers: &str,
+    api_args: scrapix_api::Args,
+) -> anyhow::Result<()> {
     // When Kafka is specified, just build Kafka-backed producers/consumers
     use scrapix_queue::{ConsumerBuilder, ProducerBuilder};
 
@@ -381,7 +499,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     let feedback_group = scrapix_frontier_service::feedback_group_id(
         "scrapix-all-frontier",
         "all-in-one",
-        std::env::var("REDIS_URL").is_ok_and(|u| !u.is_empty()),
+        redis_url().is_some(),
     );
     let frontier_feedback: Arc<AnyConsumer> = Arc::new({
         let c = ConsumerBuilder::new(brokers, &feedback_group)
@@ -439,34 +557,11 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
     let crawler_control = control_consumer("scrapix-all-crawlers")?;
     let content_control = Arc::new(control_consumer("scrapix-all-content")?);
 
-    // Build the same args as channel mode
-    let api_args = scrapix_api::Args {
-        host: args.host.clone(),
-        port: args.port,
-        brokers: brokers.to_string(),
-        database_url: args.database_url.clone(),
-        jwt_secret: args.jwt_secret.clone(),
-        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
-        max_jobs: 1000,
-        job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
-        completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),
-        resume_heal_after_secs: env_or("RESUME_HEAL_AFTER_SECS", 60),
-        max_pending_acks: env_or("MAX_PENDING_ACKS", 50_000) as usize,
-        allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-        webhook_max_concurrent_deliveries: env_or(
-            "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
-            scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
-        ) as usize,
-        verbose: args.verbose,
-    };
-
     let frontier_args = scrapix_frontier_service::Args {
         brokers: brokers.to_string(),
         group_id: "scrapix-all-frontier".to_string(),
         // Durable Redis frontier when REDIS_URL is set, in-memory otherwise.
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         frontier_key_prefix: "scrapix:frontier".to_string(),
         job_retention_hours: 168,
         bloom_capacity: 10_000_000,
@@ -511,7 +606,7 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         link_graph_interval: 1000,
         publish_links: false,
         incremental_crawl: true,
-        redis_url: std::env::var("REDIS_URL").ok(),
+        redis_url: redis_url(),
         browser_render: args.browser_render,
         browser_render_patterns: args.browser_render_patterns.clone(),
         chrome_path: args.chrome_path.clone(),
@@ -531,12 +626,14 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
 
     info!("Spawning all services with Kafka bus...");
 
-    let api_handle = tokio::spawn(async move {
-        if let Err(e) = scrapix_api::run_with_bus(api_args, api_producer, api_event_consumer).await
-        {
-            error!(error = %e, "API server failed");
-        }
-    });
+    // Listen for signals before the API exists, so none is missed.
+    let signals = Signals::install()?;
+
+    let api_handle = tokio::spawn(scrapix_api::run_with_bus(
+        api_args,
+        api_producer,
+        api_event_consumer,
+    ));
 
     let frontier_store = scrapix_frontier_service::build_store(&frontier_args).await?;
     let frontier_handle = tokio::spawn(async move {
@@ -589,17 +686,23 @@ async fn run_all_kafka(args: &AllArgs, brokers: &str) -> anyhow::Result<()> {
         "All services started with Kafka. Press Ctrl+C to stop."
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, stopping all services...");
+    supervise(
+        signals,
+        api_handle,
+        [frontier_handle, crawler_handle, content_handle],
+    )
+    .await
+}
 
-    api_handle.abort();
-    frontier_handle.abort();
-    crawler_handle.abort();
-    content_handle.abort();
+/// `REDIS_URL`, with an empty (or blank) value treated as unset: compose
+/// files pass `REDIS_URL=${REDIS_URL:-}`, which must not make the services
+/// try to connect to `""`.
+fn redis_url() -> Option<String> {
+    non_empty(std::env::var("REDIS_URL").ok())
+}
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    info!("All services stopped.");
-    Ok(())
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
 }
 
 /// Parse an optional numeric env var, falling back to `default`.
@@ -608,4 +711,54 @@ fn env_or(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_workers() -> [JoinHandle<()>; 3] {
+        std::array::from_fn(|_| tokio::spawn(std::future::pending::<()>()))
+    }
+
+    #[test]
+    fn empty_redis_url_is_unset() {
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some(String::new())), None);
+        assert_eq!(non_empty(Some("  ".into())), None);
+        assert_eq!(
+            non_empty(Some("redis://dragonfly:6379".into())).as_deref(),
+            Some("redis://dragonfly:6379")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_exiting_ok_is_a_clean_shutdown() {
+        // The API only returns Ok after draining on a signal it received
+        // itself: no second Ctrl+C is needed, and the workers are stopped.
+        let api = tokio::spawn(async { Ok(()) });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(Signals::install().unwrap(), api, idle_workers()),
+        )
+        .await
+        .expect("supervise must return once the API has shut down");
+        assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn api_error_fails_the_process() {
+        let api = tokio::spawn(async { Err(anyhow::anyhow!("database unreachable")) });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise(Signals::install().unwrap(), api, idle_workers()),
+        )
+        .await
+        .expect("supervise must return once the API has failed");
+        let err = outcome.expect_err("an API error must exit non-zero");
+        assert!(
+            format!("{err:#}").contains("database unreachable"),
+            "{err:#}"
+        );
+    }
 }

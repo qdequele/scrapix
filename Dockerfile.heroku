@@ -134,7 +134,8 @@ WORKDIR /app
 
 COPY --from=builder --chown=scrapix:scrapix /app/target/release/scrapix /app/scrapix
 
-ENV RUST_LOG=info
+ENV RUST_LOG=info \
+    SCRAPIX_MODE=hosted
 
 # CMD (not ENTRYPOINT) so Heroku injects $PORT via shell expansion
 CMD /app/scrapix all --port $PORT --browser-render --chrome-path /usr/bin/chromium

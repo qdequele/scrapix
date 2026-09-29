@@ -1,22 +1,61 @@
 ---
 title: PostgreSQL
-description: Optional database for authentication and API keys
+description: The engine's own job store — SQLite by default, or a dedicated Postgres
 ---
 
 # PostgreSQL
 
-PostgreSQL is **optional**. It's used for user accounts, API key management, and authentication. If you don't need multi-user auth, you can skip it entirely.
+The engine persists job history and engine-job results (batch scrapes,
+extractions) through `DATABASE_URL`. This is a small, engine-owned schema
+(`jobs`, `job_results`) — not the multi-tenant accounts/billing schema the
+hosted platform uses (see PostgreSQL in the Platform docs for that one).
 
-## When Do You Need PostgreSQL?
+<Note>
+  PostgreSQL is **optional** for a self-hosted engine. Without it (the
+  default), job history is stored in a local SQLite file — durable across
+  restarts, but only on that one machine. See
+  [Self-Hosting → Durability](/deployment/self-hosting#durability) for what
+  this does and doesn't survive.
+</Note>
 
-| Feature | PostgreSQL Required? |
-|---------|---------------------|
-| Basic crawling (single user) | No |
-| API key authentication | Yes |
-| User accounts and billing tiers | Yes |
-| Account-based usage tracking | Yes |
+## Default: SQLite
 
-## Quick Setup with Docker
+If `DATABASE_URL` is unset, the engine uses
+`sqlite://./data/scrapix.db` (the Docker images default to
+`sqlite:///data/scrapix.db`, an absolute path under the `/data` volume). No
+setup is required — the engine creates the file and applies its own
+migrations (tracked in `_sqlx_migrations`, source at
+`bins/scrapix-api/migrations/sqlite`) on startup.
+
+## Optional: A Dedicated Postgres
+
+Set `DATABASE_URL` to a `postgres://` or `postgresql://` URL to use Postgres
+instead of SQLite — useful if you already run Postgres, want a shared job
+store across multiple engine replicas, or want managed backups.
+
+```bash
+export DATABASE_URL=postgres://scrapix:scrapix@localhost:5433/scrapix
+```
+
+The engine applies its own migrations (`bins/scrapix-api/migrations/postgres`,
+tracked in `_sqlx_migrations`) the same way it does for SQLite. This
+**must** be a database dedicated to the engine — startup checks for a
+`schema_migrations` table (the Rails app's migration tracking table) and
+refuses to start if it finds one, to avoid two independently-migrated
+schemas colliding in the same database:
+
+```
+DATABASE_URL points at a Rails (hosted) database; set SCRAPIX_MODE=hosted,
+or give standalone a dedicated database
+```
+
+If you're running the hosted platform instead of self-hosting, set
+`SCRAPIX_MODE=hosted` and point `DATABASE_URL` at the Rails-owned Postgres —
+see PostgreSQL in the Platform docs for that schema, and
+[Self-Hosting](/deployment/self-hosting) if you're not sure which mode you
+want.
+
+### Quick Setup with Docker
 
 ```bash
 docker run -d \
@@ -29,76 +68,7 @@ docker run -d \
   postgres:17-alpine
 ```
 
-Then configure Scrapix:
-
-```bash
-export DATABASE_URL=postgres://scrapix:scrapix@localhost:5433/scrapix
-export JWT_SECRET=change-this-in-production
-```
-
-## Database Schema
-
-Scrapix automatically initializes the schema on first connection. The schema includes:
-
-### Tables
-
-**`users`** — User accounts
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Primary key |
-| `email` | VARCHAR (unique) | Login email |
-| `password_hash` | VARCHAR | bcrypt hash |
-| `full_name` | VARCHAR | Display name |
-| `created_at` | TIMESTAMPTZ | Registration date |
-| `updated_at` | TIMESTAMPTZ | Last update |
-
-**`accounts`** — Billing entities
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Primary key |
-| `name` | VARCHAR | Account name |
-| `tier` | ENUM | `free`, `starter`, `pro`, `enterprise` |
-| `stripe_customer_id` | VARCHAR | Stripe integration |
-| `created_at` | TIMESTAMPTZ | Creation date |
-
-**`account_members`** — Account membership
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `user_id` | UUID | Foreign key to users |
-| `account_id` | UUID | Foreign key to accounts |
-| `role` | ENUM | `owner`, `admin`, `member` |
-
-**`api_keys`** — API authentication tokens
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Primary key |
-| `account_id` | UUID | Foreign key to accounts |
-| `name` | VARCHAR | Key description |
-| `prefix` | VARCHAR | Visible key prefix (e.g., `sk_live_...`) |
-| `key_hash` | VARCHAR | SHA-256 hash of full key |
-| `last_used_at` | TIMESTAMPTZ | Last API call |
-| `created_at` | TIMESTAMPTZ | Creation date |
-
-### Functions
-
-- **`validate_api_key(key)`** — Validates an API key and returns the associated account with its billing tier
-- **`update_updated_at()`** — Trigger function for automatic timestamp updates
-
-## Kubernetes
-
-The Scrapix Kubernetes base includes a PostgreSQL StatefulSet with the schema loaded via a ConfigMap init script:
-
-```bash
-kubectl apply -k deploy/kubernetes/base/
-```
-
-Production storage: 20Gi PVC.
-
-## Managed Alternatives
+### Managed Alternatives
 
 | Service | Notes |
 |---------|-------|
@@ -106,5 +76,3 @@ Production storage: 20Gi PVC.
 | [Supabase](https://supabase.com) | Managed Postgres with extras. |
 | [AWS RDS](https://aws.amazon.com/rds/postgresql/) | Managed Postgres on AWS. |
 | [Fly Postgres](https://fly.io/docs/postgres/) | Fly.io managed clusters. |
-
-Set `DATABASE_URL` to your managed PostgreSQL connection string.

@@ -8,7 +8,7 @@
 //!   Results are read from the job's index with
 //!   `POST /indexes/{uid}/documents/fetch` filtered on `_crawl_job_id`.
 //! - Jobs the engine runs itself (batch scrape, extract) store one result
-//!   per URL with [`store_page`]: in the `job_results` Postgres table
+//!   per URL with [`store_page`]: in the job store's `job_results` table
 //!   (`seq` = completion order, append-only), or in memory when the engine
 //!   has no database (or could not persist the job row). The cursor is the
 //!   `seq` of the last item read, so paging never skips or repeats an item
@@ -50,9 +50,10 @@ use scrapix_core::{JobState, JobStatus};
 
 use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
 use crate::job_kind::JobKind;
+use crate::job_store::StoreError;
+use crate::meili::MeiliTarget;
 use crate::{
-    check_job_ownership, extract_account_context, is_terminal, jobs_db, AccountContext, ApiError,
-    AppState,
+    check_job_ownership, extract_account_context, is_terminal, AccountContext, ApiError, AppState,
 };
 
 /// Default page size of `GET /job/{id}/results`.
@@ -171,13 +172,6 @@ pub(crate) struct JobResultError {
     pub message: String,
 }
 
-/// Where a crawl job's documents live.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MeiliTarget {
-    pub url: String,
-    pub api_key: Option<String>,
-}
-
 /// Results-layer state kept in `AppState`.
 pub(crate) struct ResultsState {
     /// Client for reading crawl jobs' Meilisearch indexes.
@@ -185,7 +179,7 @@ pub(crate) struct ResultsState {
     /// Meilisearch connection of recent crawl jobs (the persisted job config
     /// has its API key redacted). Insertion-ordered, bounded.
     crawl_targets: RwLock<(HashMap<String, MeiliTarget>, VecDeque<String>)>,
-    /// Results of engine-run jobs that are not persisted in Postgres.
+    /// Results of engine-run jobs that are not persisted in the job store.
     memory: RwLock<MemoryResults>,
 }
 
@@ -286,7 +280,7 @@ pub(crate) fn status_str(status: &JobStatus) -> String {
 // Handler
 // ============================================================================
 
-/// The job `job_id` (in memory, else Postgres), if the caller owns it.
+/// The job `job_id` (in memory, else the job store), if the caller owns it.
 /// Same lookup and ownership rules as `GET /job/{id}/status`.
 pub(crate) async fn find_owned_job(
     state: &AppState,
@@ -295,13 +289,11 @@ pub(crate) async fn find_owned_job(
 ) -> Result<JobState, ApiError> {
     let job = if let Some(job) = state.get_job(job_id) {
         job
-    } else if let Some(ref pool) = state.db_pool {
-        if let Some(ctx) = account_ctx {
-            jobs_db::get_job_for_account(pool, job_id, &ctx.account_id).await
-        } else {
-            jobs_db::get_job_from_db(pool, job_id).await
-        }
-        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
+    } else if let Some(ref store) = state.job_store {
+        store
+            .get_job(job_id, account_ctx.as_ref().map(|c| c.account_id.as_str()))
+            .await
+            .ok_or_else(|| ApiError::new("Job not found", "not_found"))?
     } else {
         return Err(ApiError::new("Job not found", "not_found"));
     };
@@ -336,7 +328,7 @@ pub(crate) async fn job_results(
     Query(query): Query<JobResultsQuery>,
 ) -> Result<Json<JobResultsResponse>, ApiError> {
     let account_ctx =
-        extract_account_context(state.db_pool.as_ref(), &account_ext, &user_ext).await;
+        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
     let job = find_owned_job(&state, &account_ctx, &job_id).await?;
     results_page(&state, &job, query.limit, query.cursor.as_deref())
         .await
@@ -456,14 +448,10 @@ async fn crawl_results(
     })
 }
 
-fn same_url(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
-}
-
 /// Where `job`'s documents live: the connection remembered at creation,
 /// else the Replace-strategy connection persisted with the job, else the
-/// account's engine matching the job's (redacted) config URL, else the
-/// server's own `MEILISEARCH_URL`/`MEILISEARCH_API_KEY`.
+/// resolver's target for the job's (redacted) config URL, else the
+/// resolver's default target.
 async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliTarget, ApiError> {
     if let Some(target) = state.results.crawl_target(&job.job_id) {
         return Ok(target);
@@ -482,68 +470,28 @@ async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliT
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    if let (Some(pool), Some(account)) = (&state.db_pool, &job.account_id) {
-        if let Ok(account_uuid) = account.parse::<uuid::Uuid>() {
-            use sqlx::Row as _;
-            let row = match config_url {
-                Some(ref url) => {
-                    sqlx::query(
-                        "SELECT url, api_key FROM meilisearch_engines \
-                     WHERE account_id = $1 AND rtrim(url, '/') = rtrim($2, '/') \
-                     ORDER BY is_default DESC LIMIT 1",
-                    )
-                    .bind(account_uuid)
-                    .bind(url)
-                    .fetch_optional(pool)
-                    .await
-                }
-                None => {
-                    sqlx::query(
-                        "SELECT url, api_key FROM meilisearch_engines \
-                     WHERE account_id = $1 AND is_default = true LIMIT 1",
-                    )
-                    .bind(account_uuid)
-                    .fetch_optional(pool)
-                    .await
-                }
-            };
-            match row {
-                Ok(Some(row)) => {
-                    let api_key: Option<String> = row.try_get("api_key").ok();
-                    return Ok(MeiliTarget {
-                        url: row.get("url"),
-                        api_key: api_key.filter(|k| !k.is_empty()),
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(job_id = %job.job_id, error = %e, "Engine lookup for job results failed")
-                }
+    let account = job.account_id.as_deref();
+    if let Some(ref url) = config_url {
+        match state.meili.target_for_url(account, url).await {
+            Ok(Some(t)) => return Ok(t),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(job_id = %job.job_id, error = %e.error, "Engine lookup for job results failed")
             }
         }
-    }
-
-    let env_url = std::env::var("MEILISEARCH_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let env_key = std::env::var("MEILISEARCH_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
-    match (config_url, env_url) {
-        (Some(url), Some(env)) if same_url(&url, &env) => Ok(MeiliTarget {
-            url,
-            api_key: env_key,
-        }),
         // An unknown key: try without one (an unsecured instance).
-        (Some(url), _) => Ok(MeiliTarget { url, api_key: None }),
-        (None, Some(url)) => Ok(MeiliTarget {
-            url,
-            api_key: env_key,
-        }),
-        (None, None) => Err(ApiError::new(
+        return Ok(MeiliTarget {
+            url: url.clone(),
+            api_key: None,
+        });
+    }
+    match state.meili.default_target(account).await {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(ApiError::new(
             "The Meilisearch instance of this job is unknown",
             "not_found",
         )),
+        Err(e) => Err(e),
     }
 }
 
@@ -748,7 +696,7 @@ pub(crate) fn document_to_item(doc: &Value) -> JobResultItem {
 /// How many jobs' results the in-memory fallback keeps.
 const MAX_MEMORY_RESULT_JOBS: usize = 50;
 
-/// In-memory results of jobs that are not persisted (no Postgres, or the
+/// In-memory results of jobs that are not persisted (no job store, or the
 /// job row could not be written).
 #[derive(Default)]
 pub(crate) struct MemoryResults {
@@ -758,7 +706,7 @@ pub(crate) struct MemoryResults {
 }
 
 impl ResultsState {
-    /// Keep `job_id`'s results in memory instead of Postgres.
+    /// Keep `job_id`'s results in memory instead of the job store.
     pub(crate) fn use_memory(&self, job_id: &str) {
         let mut m = self.memory.write();
         if m.pages.contains_key(job_id) {
@@ -780,7 +728,7 @@ impl ResultsState {
 }
 
 /// Store result `seq` (1-based, in completion order) of an engine-run job.
-/// A Postgres write is retried; if it keeps failing the item is lost from
+/// A job-store write is retried; if it keeps failing the item is lost from
 /// the results (logged, and counted as a job warning).
 pub(crate) async fn store_page(
     state: &AppState,
@@ -790,29 +738,21 @@ pub(crate) async fn store_page(
     success: bool,
     payload: Value,
 ) {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let mut m = state.results.memory.write();
         if let Some(pages) = m.pages.get_mut(job_id) {
             pages.push(payload);
         }
         return;
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         return;
     };
-    let mut last_error = None;
+    let mut last_error: Option<StoreError> = None;
     for attempt in 0..3u64 {
-        let res = sqlx::query(
-            "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
-             VALUES ($1, $2, 'page', $3, $4, $5) ON CONFLICT (job_id, seq) DO NOTHING",
-        )
-        .bind(job_id)
-        .bind(seq as i32)
-        .bind(url)
-        .bind(success)
-        .bind(&payload)
-        .execute(pool)
-        .await;
+        let res = store
+            .store_result_page(job_id, seq, url, success, &payload)
+            .await;
         match res {
             Ok(_) => return,
             Err(e) => {
@@ -833,26 +773,17 @@ pub(crate) async fn store_page(
 
 /// Store (replace) the summary of an extract job.
 pub(crate) async fn store_summary(state: &AppState, job_id: &str, payload: Value) {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let mut m = state.results.memory.write();
         if m.pages.contains_key(job_id) {
             m.summaries.insert(job_id.to_string(), payload);
         }
         return;
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         return;
     };
-    if let Err(e) = sqlx::query(
-        "INSERT INTO job_results (job_id, seq, kind, url, success, payload) \
-         VALUES ($1, 0, 'extract', NULL, true, $2) \
-         ON CONFLICT (job_id, seq) DO UPDATE SET payload = EXCLUDED.payload",
-    )
-    .bind(job_id)
-    .bind(&payload)
-    .execute(pool)
-    .await
-    {
+    if let Err(e) = store.store_result_summary(job_id, &payload).await {
         tracing::error!(job_id = %job_id, error = %e, "Failed to store an extract result");
     }
 }
@@ -862,16 +793,13 @@ pub(crate) async fn load_summary(state: &AppState, job_id: &str) -> Option<Value
     if state.results.in_memory(job_id) {
         return state.results.memory.read().summaries.get(job_id).cloned();
     }
-    let pool = state.db_pool.as_ref()?;
-    sqlx::query_scalar::<_, Value>(
-        "SELECT payload FROM job_results WHERE job_id = $1 AND kind = 'extract' LIMIT 1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| warn!(job_id = %job_id, error = %e, "Failed to load an extract result"))
-    .ok()
-    .flatten()
+    let store = state.job_store.as_ref()?;
+    store
+        .load_result_summary(job_id)
+        .await
+        .map_err(|e| warn!(job_id = %job_id, error = %e, "Failed to load an extract result"))
+        .ok()
+        .flatten()
 }
 
 /// Stored results of an engine-run job after position `after` (the seq of
@@ -882,7 +810,7 @@ async fn stored_results(
     after: u64,
     limit: usize,
 ) -> Result<ResultsSlice, ApiError> {
-    if state.results.in_memory(job_id) || state.db_pool.is_none() {
+    if state.results.in_memory(job_id) || state.job_store.is_none() {
         let m = state.results.memory.read();
         let pages = m.pages.get(job_id).map(Vec::as_slice).unwrap_or_default();
         let start = (after as usize).min(pages.len());
@@ -894,40 +822,26 @@ async fn stored_results(
             has_more: end < pages.len(),
         });
     }
-    let Some(ref pool) = state.db_pool else {
+    let Some(ref store) = state.job_store else {
         unreachable!("checked above");
     };
-    use sqlx::Row as _;
-    let db_error = |e: sqlx::Error| {
-        warn!(job_id = %job_id, error = %e, "Failed to read job results");
-        ApiError::new("Could not read the job's results", "service_unavailable")
-    };
-    let rows = sqlx::query(
-        "SELECT seq, payload FROM job_results \
-         WHERE job_id = $1 AND kind = 'page' AND seq > $2 ORDER BY seq LIMIT $3",
-    )
-    .bind(job_id)
-    .bind(after.min(i32::MAX as u64) as i32)
-    .bind(limit as i64 + 1)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
-    let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_results WHERE job_id = $1 AND kind = 'page'")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await
-            .map_err(db_error)?;
+    let (rows, total) = store
+        .result_pages(job_id, after, limit + 1)
+        .await
+        .map_err(|e| {
+            warn!(job_id = %job_id, error = %e, "Failed to read job results");
+            ApiError::new("Could not read the job's results", "service_unavailable")
+        })?;
     let has_more = rows.len() > limit;
     let mut end = after;
     let mut data = Vec::with_capacity(rows.len().min(limit));
-    for row in rows.into_iter().take(limit) {
-        end = row.get::<i32, _>("seq") as u64;
-        data.push(row.get::<Value, _>("payload"));
+    for (seq, payload) in rows.into_iter().take(limit) {
+        end = seq;
+        data.push(payload);
     }
     Ok(ResultsSlice {
         data,
-        total: total as u64,
+        total,
         end,
         has_more,
     })
@@ -944,7 +858,7 @@ pub(crate) mod test_support {
 
     use crate::{webhooks, AppConfig, AppState};
 
-    /// An `AppState` without Postgres/ClickHouse/AI whose fetcher may reach
+    /// An `AppState` without a job store/ClickHouse/AI whose fetcher may reach
     /// local test servers.
     pub(crate) fn test_state(bus: &ChannelBus) -> Arc<AppState> {
         test_state_with_ai(bus, None)
@@ -985,6 +899,7 @@ pub(crate) mod test_support {
             fetcher,
             None,
             ai_service,
+            None,
             None,
             None,
             None,

@@ -58,6 +58,7 @@ JWT_SECRET=$(openssl rand -hex 32)
 
 # Build config vars, skipping empty optional ones
 CONFIG_VARS=(
+    "SCRAPIX_MODE=hosted"
     "JWT_SECRET=${JWT_SECRET}"
     "RUST_LOG=info"
 )
