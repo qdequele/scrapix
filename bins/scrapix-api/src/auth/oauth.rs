@@ -4,8 +4,8 @@
 //! registration, PKCE authorize/token/revoke) moved to the Rails app
 //! (`saas/app/controllers/oauth_controller.rb`, SCR-85 phase 8). Both
 //! backends share the `oauth_tokens` table, so the engine keeps only the
-//! hashed-token lookup used by its auth middleware, plus the hourly cleanup
-//! of expired codes and tokens.
+//! hashed-token lookup used by its auth middleware. The expired code/token
+//! sweep is owned by Rails.
 
 use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -57,29 +57,5 @@ pub async fn validate_bearer_token(
         account_id: account_id.to_string(),
         tier,
         api_key_id: None,
-    })
-}
-
-/// Spawn a background task to clean up expired OAuth codes and tokens
-pub fn spawn_token_cleanup(pool: sqlx::PgPool) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // hourly
-        loop {
-            interval.tick().await;
-
-            // Delete expired authorization codes
-            let _ = sqlx::query(
-                "DELETE FROM oauth_authorization_codes WHERE expires_at < now() - INTERVAL '1 hour'",
-            )
-            .execute(&pool)
-            .await;
-
-            // Delete expired and revoked tokens older than 7 days
-            let _ = sqlx::query(
-                "DELETE FROM oauth_tokens WHERE (expires_at < now() - INTERVAL '7 days') OR (revoked = true AND created_at < now() - INTERVAL '7 days')",
-            )
-            .execute(&pool)
-            .await;
-        }
     })
 }

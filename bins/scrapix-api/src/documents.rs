@@ -754,7 +754,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             webhooks::WebhookDispatcher::new(
                 scrapix_crawler::safe_client_builder(None, true)
                     .build()

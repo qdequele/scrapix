@@ -400,7 +400,7 @@ mod tests {
         let e1 = LabEvent::usage("a", None, "map", 2, json!({}), "m".into(), None);
         let e2 = LabEvent::usage("a", None, "map", 2, json!({}), "m".into(), None);
         o.enqueue(&[e1.clone(), e2.clone()]).await.unwrap();
-        o.enqueue(&[e1.clone()]).await.unwrap();
+        o.enqueue(std::slice::from_ref(&e1)).await.unwrap();
         let due = o.due(10).await.unwrap();
         assert_eq!(
             due.iter().map(|e| e.id).collect::<Vec<_>>(),
@@ -431,7 +431,7 @@ mod tests {
             "m".into(),
             None,
         );
-        o.enqueue(&[e.clone()]).await.unwrap();
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
         sqlx::query("UPDATE lab_events SET attempts = 2000")
             .execute(&pool)
             .await
@@ -463,8 +463,8 @@ mod tests {
             json!({"pages_http":5}),
             "Job j".into(),
         );
-        o.enqueue(&[e.clone()]).await.unwrap();
-        o.enqueue(&[e.clone()]).await.unwrap();
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
         let due = o.due(10).await.unwrap();
         assert_eq!(due, vec![e.clone()]);
         assert_eq!(o.pending_stats().await.unwrap().0, 1);

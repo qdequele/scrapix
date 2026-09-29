@@ -402,7 +402,6 @@ fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
         lab_service_token: std::env::var("LAB_SERVICE_TOKEN").ok(),
         meilisearch_url: args.meilisearch_url.clone(),
         meilisearch_api_key: args.meilisearch_key.clone(),
-        stripe_secret_key: std::env::var("STRIPE_SECRET_KEY").ok(),
         max_jobs: 1000,
         job_stall_timeout_secs: env_or("JOB_STALL_TIMEOUT_SECS", 1800),
         completion_grace_ms: env_or("JOB_COMPLETION_GRACE_MS", 3000),

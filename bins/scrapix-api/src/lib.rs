@@ -45,9 +45,7 @@ pub mod auth;
 pub(crate) mod batch;
 pub mod billing;
 pub mod completion;
-pub mod configs;
 pub mod documents;
-pub mod email_scheduler;
 pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
@@ -59,7 +57,6 @@ pub mod openapi;
 pub(crate) mod results;
 pub(crate) mod router;
 pub mod settings;
-pub mod stripe;
 pub mod webhooks;
 
 #[cfg(test)]
@@ -175,10 +172,6 @@ pub struct Args {
     /// API key for the default Meilisearch.
     #[arg(long, env = "MEILISEARCH_API_KEY", hide_env_values = true)]
     pub meilisearch_api_key: Option<String>,
-
-    /// Stripe secret key (enables engine-side auto-topup charges)
-    #[arg(long, env = "STRIPE_SECRET_KEY")]
-    pub stripe_secret_key: Option<String>,
 
     /// Maximum jobs to keep in memory
     #[arg(long, env = "MAX_JOBS", default_value = "10000")]
@@ -342,12 +335,8 @@ struct AppState {
     /// Durable job state and engine-job results (`jobs`, `job_results`).
     pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
     /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
-    /// context, billing, Stripe, saved configs + cron, emails).
+    /// context and the credit pre-check).
     pub(crate) saas_pool: Option<sqlx::PgPool>,
-    /// Optional email client for transactional emails
-    /// Optional Stripe client for payment-backed auto-topup
-    #[allow(dead_code)] // removed in Task 6 (engine-lab boundary)
-    stripe_client: Option<::stripe::Client>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
     /// Delivers `CrawlEvent`s to jobs' subscribed webhooks (SCR-72).
@@ -418,7 +407,6 @@ impl AppState {
         ai_service: Option<Arc<AiService>>,
         saas_pool: Option<sqlx::PgPool>,
         job_store: Option<Arc<dyn job_store::JobStore>>,
-        stripe_client: Option<::stripe::Client>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
         webhook_dispatcher: webhooks::WebhookDispatcher,
     ) -> Self {
@@ -474,7 +462,6 @@ impl AppState {
             auth_disabled_warned_at: parking_lot::Mutex::new(None),
             saas_pool,
             job_store,
-            stripe_client,
             analytics_store,
             webhook_dispatcher,
         }
@@ -4421,7 +4408,7 @@ pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
     warnings
 }
 
-/// Core crawl creation logic, reusable from handler, trigger, and cron scheduler
+/// Core crawl creation logic, reusable from the crawl handlers
 pub(crate) async fn do_create_crawl(
     state: &Arc<AppState>,
     config: CrawlConfig,
@@ -6676,8 +6663,6 @@ async fn init_clickhouse() -> (
 /// What startup wires per mode (see [`wire_mode`]).
 struct ModeWiring {
     auth_mode: auth::AuthMode,
-    /// Hosted only: the Rails Postgres auth state (OAuth token sweep).
-    auth_state: Option<Arc<auth::AuthState>>,
     /// Hosted only: the Rails Postgres, for SaaS features.
     saas_pool: Option<sqlx::PgPool>,
     job_store: Arc<dyn job_store::JobStore>,
@@ -6712,8 +6697,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             let lab_outbox: Arc<dyn lab_events::LabOutbox> =
                 Arc::new(lab_events::PgOutbox::new(pool.clone()));
             Ok(ModeWiring {
-                auth_mode: auth::AuthMode::Saas(auth.clone()),
-                auth_state: Some(auth),
+                auth_mode: auth::AuthMode::Saas(auth),
                 saas_pool: Some(pool.clone()),
                 job_store: Arc::new(job_store::PgJobStore::new(pool.clone())),
                 meili: Arc::new(meili::EngineTableResolver {
@@ -6795,7 +6779,6 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             }
             Ok(ModeWiring {
                 auth_mode,
-                auth_state: None,
                 saas_pool: None,
                 job_store: store,
                 meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
@@ -6833,7 +6816,6 @@ pub async fn run_with_bus(
 
     let ModeWiring {
         auth_mode,
-        auth_state,
         saas_pool,
         job_store,
         meili,
@@ -6906,11 +6888,6 @@ pub async fn run_with_bus(
 
     // Create application state
     let config = AppConfig::from_args(&args);
-    // Stripe auto-topup debits SaaS accounts: hosted only.
-    let stripe_client = saas_pool
-        .as_ref()
-        .and(args.stripe_secret_key.as_ref())
-        .map(::stripe::Client::new);
     if args.allow_private_ips {
         warn!("ALLOW_PRIVATE_IPS is set: SSRF protection for webhook deliveries is off");
     }
@@ -6936,7 +6913,6 @@ pub async fn run_with_bus(
         ai_service,
         saas_pool,
         Some(job_store),
-        stripe_client,
         analytics_state.clone(),
         webhook_dispatcher,
     );
@@ -7174,16 +7150,6 @@ pub async fn run_with_bus(
         "Job completion loop started (exact work accounting)"
     );
 
-    // Cron scheduler: hosted only (fires saved configs from the SaaS pool).
-    let cron_handle = if let Some(ref pool) = state.saas_pool {
-        let handle =
-            configs::spawn_cron_scheduler(state.clone(), pool.clone(), shutdown_rx.clone());
-        info!("Cron scheduler started (30s tick interval)");
-        Some(handle)
-    } else {
-        None
-    };
-
     // Lab event delivery: hosted only (drains the lab outbox to the Lab).
     // The Lab is loopback/private, so a plain client, not the SSRF-safe one.
     let lab_handle = settings.lab.as_ref().zip(lab_outbox).map(|(cfg, outbox)| {
@@ -7197,18 +7163,9 @@ pub async fn run_with_bus(
         Arc::new(sink).spawn(shutdown_rx.clone())
     });
 
-    // Email delivery moved to the Rails app (SolidQueue drains the shared
-    // scheduled_emails queue); the engine only inserts rows.
-
     // Routes, auth guards, request tracing, /openapi.json + /docs and the
     // body-size limits (CORS is added below).
     let mut app = router::build_router(state.clone(), &auth_mode, settings.mode);
-
-    // OAuth token cleanup: both backends validate tokens from the shared
-    // Postgres; the engine hosts the hourly expired-code/token sweep.
-    if let Some(ref auth) = auth_state {
-        auth::oauth::spawn_token_cleanup(auth.pool.clone());
-    }
 
     // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
     // app; the engine only writes events to ClickHouse (batchers above) and
@@ -7328,11 +7285,6 @@ pub async fn run_with_bus(
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Shutting down with JobControls still unpublished"
         );
-    }
-    if let Some(handle) = cron_handle {
-        if let Err(e) = handle.await {
-            warn!("Cron task failed during shutdown: {}", e);
-        }
     }
     if let Some(handle) = lab_handle {
         if let Err(e) = handle.await {
@@ -7998,7 +7950,6 @@ mod lifecycle_tests {
             None,
             None,
             None,
-            None,
             test_webhooks(),
         )
     }
@@ -8025,7 +7976,6 @@ mod lifecycle_tests {
             None,
             None, // saas_pool
             Some(Arc::new(store) as Arc<dyn crate::job_store::JobStore>),
-            None,
             None,
             test_webhooks(),
         );
@@ -8830,7 +8780,6 @@ mod lifecycle_tests {
             None,
             None,
             Some(store.clone() as Arc<dyn job_store::JobStore>),
-            None,
             None,
             test_webhooks(),
         );
