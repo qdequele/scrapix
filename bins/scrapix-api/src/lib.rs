@@ -53,6 +53,7 @@ pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
 pub(crate) mod lab_events;
+pub(crate) mod lab_sink;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
@@ -154,6 +155,18 @@ pub struct Args {
     /// `disabled` turns auth off in standalone (local dev only).
     #[arg(long, env = "SCRAPIX_AUTH")]
     pub auth: Option<String>,
+
+    /// Lab endpoint receiving usage/job events (hosted only; required there).
+    #[arg(long, env = "LAB_EVENTS_URL")]
+    pub lab_events_url: Option<String>,
+
+    /// HMAC key signing event batches sent to the Lab (hosted only, min 32 chars).
+    #[arg(long, env = "LAB_EVENTS_SECRET", hide_env_values = true)]
+    pub lab_events_secret: Option<String>,
+
+    /// Bearer token for the Lab's internal service API (hosted only, min 32 chars).
+    #[arg(long, env = "LAB_SERVICE_TOKEN", hide_env_values = true)]
+    pub lab_service_token: Option<String>,
 
     /// Default Meilisearch for crawls and /search in standalone.
     #[arg(long, env = "MEILISEARCH_URL")]
@@ -314,6 +327,9 @@ struct AppState {
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
+    /// Records usage and job events for the Lab (hosted only; `None` in
+    /// standalone, where nothing is billed or emailed).
+    pub(crate) lab: Option<Arc<lab_events::Lab>>,
     /// Durable job state and engine-job results (`jobs`, `job_results`).
     pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
     /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
@@ -434,6 +450,7 @@ impl AppState {
             browser_renderer,
             ai_service,
             ocr: None,
+            lab: None,
             accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             control_tx,
@@ -6419,6 +6436,8 @@ struct ModeWiring {
     saas_pool: Option<sqlx::PgPool>,
     job_store: Arc<dyn job_store::JobStore>,
     meili: Arc<dyn meili::MeilisearchResolver>,
+    /// Hosted only: the engine's lab-event outbox (in the shared Postgres).
+    lab_outbox: Option<Arc<dyn lab_events::LabOutbox>>,
 }
 
 /// Auth, job store and Meilisearch resolver for `settings.mode`. Every
@@ -6440,6 +6459,8 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             let auth = Arc::new(auth);
             let pool = auth.pool.clone();
             info!("Authentication enabled via the Rails Postgres");
+            let lab_outbox: Arc<dyn lab_events::LabOutbox> =
+                Arc::new(lab_events::PgOutbox::new(pool.clone()));
             Ok(ModeWiring {
                 auth_mode: auth::AuthMode::Saas(auth.clone()),
                 auth_state: Some(auth),
@@ -6449,6 +6470,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                     pool,
                     server: settings.meilisearch.clone(),
                 }),
+                lab_outbox: Some(lab_outbox),
             })
         }
         (settings::Mode::Standalone, auth_setting, store_url) => {
@@ -6527,6 +6549,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 saas_pool: None,
                 job_store: store,
                 meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
+                lab_outbox: None,
             })
         }
         _ => unreachable!("EngineSettings::resolve guarantees a valid mode/auth/store combination"),
@@ -6564,6 +6587,7 @@ pub async fn run_with_bus(
         saas_pool,
         job_store,
         meili,
+        lab_outbox,
     } = wire_mode(&settings).await?;
 
     // Initialize shared HTTP fetcher for /scrape endpoint
@@ -6668,6 +6692,9 @@ pub async fn run_with_bus(
     );
     state.ocr = ocr;
     state.meili = meili;
+    state.lab = lab_outbox
+        .clone()
+        .map(|outbox| Arc::new(lab_events::Lab::new(outbox)));
     state.auth_disabled = matches!(auth_mode, auth::AuthMode::Disabled);
     let state = Arc::new(state);
 
@@ -6899,6 +6926,19 @@ pub async fn run_with_bus(
         None
     };
 
+    // Lab event delivery: hosted only (drains the lab outbox to the Lab).
+    // The Lab is loopback/private, so a plain client, not the SSRF-safe one.
+    let lab_handle = settings.lab.as_ref().zip(lab_outbox).map(|(cfg, outbox)| {
+        let sink = lab_sink::LabSink::new(
+            outbox,
+            reqwest::Client::new(),
+            cfg.events_url.clone(),
+            cfg.events_secret.clone(),
+        );
+        info!("Lab event delivery started");
+        Arc::new(sink).spawn(shutdown_rx.clone())
+    });
+
     // Email delivery moved to the Rails app (SolidQueue drains the shared
     // scheduled_emails queue); the engine only inserts rows.
 
@@ -7034,6 +7074,11 @@ pub async fn run_with_bus(
     if let Some(handle) = cron_handle {
         if let Err(e) = handle.await {
             warn!("Cron task failed during shutdown: {}", e);
+        }
+    }
+    if let Some(handle) = lab_handle {
+        if let Err(e) = handle.await {
+            warn!("Lab event delivery task failed during shutdown: {}", e);
         }
     }
     if let Some(handle) = flush_handle {

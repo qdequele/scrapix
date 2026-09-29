@@ -532,13 +532,17 @@ fn apply_auth(
                 warn!(algorithm = %algorithm, "unsupported HMAC algorithm; sending webhook unsigned");
                 return req;
             }
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
-                .expect("HMAC-SHA256 accepts any key length");
-            mac.update(body);
-            let signature = hex::encode(mac.finalize().into_bytes());
-            req.header(header.as_str(), format!("sha256={signature}"))
+            req.header(header.as_str(), sign_sha256(secret.as_bytes(), body))
         }
     }
+}
+
+/// `sha256=<hex hmac-sha256(body, secret)>` — webhook and lab-event signatures.
+pub(crate) fn sign_sha256(secret: &[u8], body: &[u8]) -> String {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
 fn map_event(event: &CrawlEvent) -> Option<WebhookEvent> {

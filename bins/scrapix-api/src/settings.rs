@@ -8,6 +8,7 @@ use crate::Args;
 
 pub const DEFAULT_SQLITE_URL: &str = "sqlite://./data/scrapix.db";
 const MIN_ADMIN_KEY_LEN: usize = 16;
+const MIN_LAB_SECRET_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -28,12 +29,25 @@ pub enum StoreUrl {
     Postgres(String),
 }
 
+/// Where and how the engine reports usage/job events to the Lab (hosted only).
+#[derive(Debug, Clone)]
+pub struct LabSettings {
+    /// The Lab's `POST /internal/events` endpoint.
+    pub events_url: String,
+    /// HMAC key signing event batches.
+    pub events_secret: String,
+    /// Bearer token for the Lab's internal service API.
+    pub service_token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     pub mode: Mode,
     pub auth: AuthSetting,
     pub store: StoreUrl,
     pub meilisearch: Option<MeiliTarget>,
+    /// `Some` iff hosted.
+    pub lab: Option<LabSettings>,
 }
 
 #[derive(Debug)]
@@ -113,16 +127,47 @@ impl EngineSettings {
                         "SCRAPIX_MODE=hosted requires JWT_SECRET (the same secret the Rails app signs sessions with)",
                     );
                 };
+                let Some(events_url) = non_empty(&args.lab_events_url) else {
+                    return err(
+                        "SCRAPIX_MODE=hosted requires LAB_EVENTS_URL (the Lab's POST /internal/events endpoint)",
+                    );
+                };
+                if !(events_url.starts_with("http://") || events_url.starts_with("https://")) {
+                    return err(format!(
+                        "LAB_EVENTS_URL must start with http:// or https://, got `{events_url}`"
+                    ));
+                }
+                let secret = |name: &str, v: &Option<String>| -> Result<String, ConfigError> {
+                    match non_empty(v) {
+                        Some(s) if s.chars().count() >= MIN_LAB_SECRET_LEN => Ok(s),
+                        Some(_) => err(format!(
+                            "{name} must be at least {MIN_LAB_SECRET_LEN} characters"
+                        )),
+                        None => err(format!("SCRAPIX_MODE=hosted requires {name}")),
+                    }
+                };
+                let lab = LabSettings {
+                    events_url,
+                    events_secret: secret("LAB_EVENTS_SECRET", &args.lab_events_secret)?,
+                    service_token: secret("LAB_SERVICE_TOKEN", &args.lab_service_token)?,
+                };
                 Ok(Self {
                     mode,
                     auth: AuthSetting::Saas { jwt_secret },
                     store: StoreUrl::Postgres(url),
                     meilisearch,
+                    lab: Some(lab),
                 })
             }
             Mode::Standalone => {
                 if non_empty(&args.jwt_secret).is_some() {
                     tracing::info!("JWT_SECRET is ignored in standalone mode");
+                }
+                if non_empty(&args.lab_events_url).is_some()
+                    || non_empty(&args.lab_events_secret).is_some()
+                    || non_empty(&args.lab_service_token).is_some()
+                {
+                    tracing::info!("LAB_* variables are ignored in standalone mode");
                 }
                 let auth = match (non_empty(&args.admin_key), auth_disabled) {
                     (Some(_), true) => {
@@ -166,6 +211,7 @@ impl EngineSettings {
                     auth,
                     store,
                     meilisearch,
+                    lab: None,
                 })
             }
         }
@@ -182,7 +228,7 @@ mod tests {
     /// `Args::parse_from` still reads `env = ...` attributes from the real
     /// process environment for any field not given on argv, so — to keep
     /// this test hermetic — we parse a bare argv (no flags at all) and then
-    /// explicitly assign every one of the seven fields `resolve` reads,
+    /// explicitly assign every one of the ten fields `resolve` reads,
     /// defaulting to `None` (or `"standalone"` for `mode`) when the pair is
     /// absent, instead of trusting parse_from to leave them unset.
     fn args(env: &[(&str, &str)]) -> Args {
@@ -200,10 +246,19 @@ mod tests {
         parsed.jwt_secret = get("JWT_SECRET");
         parsed.meilisearch_url = get("MEILISEARCH_URL");
         parsed.meilisearch_api_key = get("MEILISEARCH_API_KEY");
+        parsed.lab_events_url = get("LAB_EVENTS_URL");
+        parsed.lab_events_secret = get("LAB_EVENTS_SECRET");
+        parsed.lab_service_token = get("LAB_SERVICE_TOKEN");
         parsed
     }
 
     const KEY: &str = "0123456789abcdef";
+    const SECRET32: &str = "0123456789abcdef0123456789abcdef";
+    const LAB_ENV: [(&str, &str); 3] = [
+        ("LAB_EVENTS_URL", "http://127.0.0.1:8091/internal/events"),
+        ("LAB_EVENTS_SECRET", SECRET32),
+        ("LAB_SERVICE_TOKEN", SECRET32),
+    ];
 
     #[test]
     fn standalone_defaults_to_sqlite_and_admin_key() {
@@ -286,13 +341,58 @@ mod tests {
             ("DATABASE_URL", "sqlite://x.db"),
         ]))
         .is_err());
-        let s = EngineSettings::resolve(&args(&[
+        let mut env = vec![
             ("SCRAPIX_MODE", "hosted"),
             ("DATABASE_URL", "postgres://db/x"),
             ("JWT_SECRET", "s3cret"),
+        ];
+        env.extend(LAB_ENV);
+        let s = EngineSettings::resolve(&args(&env)).unwrap();
+        assert!(matches!(s.auth, AuthSetting::Saas { ref jwt_secret } if jwt_secret == "s3cret"));
+    }
+
+    #[test]
+    fn hosted_requires_lab_settings() {
+        let base = [
+            ("SCRAPIX_MODE", "hosted"),
+            ("DATABASE_URL", "postgres://db/x"),
+            ("JWT_SECRET", "s3cret"),
+        ];
+        let e = EngineSettings::resolve(&args(&base)).unwrap_err();
+        assert!(e.0.contains("LAB_EVENTS_URL"), "{}", e.0);
+        let mut full = base.to_vec();
+        full.extend(LAB_ENV);
+        let s = EngineSettings::resolve(&args(&full)).unwrap();
+        let lab = s.lab.unwrap();
+        assert_eq!(lab.events_url, "http://127.0.0.1:8091/internal/events");
+        let mut short = full.clone();
+        short[4] = ("LAB_EVENTS_SECRET", "short");
+        assert!(EngineSettings::resolve(&args(&short))
+            .unwrap_err()
+            .0
+            .contains("LAB_EVENTS_SECRET"));
+        let mut no_token = full.clone();
+        no_token.pop();
+        assert!(EngineSettings::resolve(&args(&no_token))
+            .unwrap_err()
+            .0
+            .contains("LAB_SERVICE_TOKEN"));
+        let mut bad_url = full.clone();
+        bad_url[3] = ("LAB_EVENTS_URL", "127.0.0.1:8091/internal/events");
+        assert!(EngineSettings::resolve(&args(&bad_url))
+            .unwrap_err()
+            .0
+            .contains("LAB_EVENTS_URL"));
+    }
+
+    #[test]
+    fn standalone_ignores_lab_settings() {
+        let s = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_ADMIN_KEY", KEY),
+            ("LAB_EVENTS_URL", "http://x"),
         ]))
         .unwrap();
-        assert!(matches!(s.auth, AuthSetting::Saas { ref jwt_secret } if jwt_secret == "s3cret"));
+        assert!(s.lab.is_none());
     }
 
     #[test]

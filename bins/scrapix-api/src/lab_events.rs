@@ -130,12 +130,10 @@ pub trait LabOutbox: Send + Sync {
     async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError>;
 }
 
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 pub struct PgOutbox {
     pool: sqlx::PgPool,
 }
 
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 impl PgOutbox {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
