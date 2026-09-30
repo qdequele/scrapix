@@ -548,10 +548,14 @@ mod tests {
     /// refused): every check before the query runs for real, and any query
     /// fails fast.
     async fn state_with_unreachable_clickhouse() -> Arc<AppState> {
+        state_with_clickhouse("http://127.0.0.1:1").await
+    }
+
+    async fn state_with_clickhouse(url: &str) -> Arc<AppState> {
         let bus = scrapix_queue::ChannelBus::new();
         let mut state = crate::results::test_support::test_state(&bus);
         let storage = ClickHouseStorage::new(scrapix_storage::clickhouse::ClickHouseConfig {
-            url: "http://127.0.0.1:1".into(),
+            url: url.into(),
             auto_create_tables: false,
             ..Default::default()
         })
@@ -680,5 +684,183 @@ mod tests {
             list(tenant(ACCT), Some("other")).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// A local HTTP server standing in for ClickHouse: it records the SQL of
+    /// every request and answers 200 with an empty body (zero rows). The client
+    /// inlines binds into the SQL, so the recorded text is what ClickHouse
+    /// would run.
+    struct RecordingClickHouse {
+        url: String,
+        sql: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingClickHouse {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let sql = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = sql.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let recorded = recorded.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        // Read headers, then the body: by Content-Length, or
+                        // up to the terminating chunk when chunked.
+                        loop {
+                            let n = socket.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&buf).to_string();
+                            let Some(end) = text.find("\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = text[..end].to_ascii_lowercase();
+                            let body = &text[end + 4..];
+                            let complete = if let Some(len) = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                            {
+                                body.len() >= len
+                            } else if head.contains("transfer-encoding: chunked") {
+                                body.ends_with("0\r\n\r\n")
+                            } else {
+                                true
+                            };
+                            if complete {
+                                break;
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        // The client sends the SQL in the `query` URL parameter
+                        // (GET) or in the body (POST); keep both, decoded.
+                        let target = text
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let in_url = url::Url::parse(&format!("http://clickhouse{target}"))
+                            .map(|u| {
+                                u.query_pairs()
+                                    .filter(|(k, _)| k == "query")
+                                    .map(|(_, v)| v.into_owned())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                        recorded.lock().unwrap().push(format!("{in_url}\n{body}"));
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    });
+                }
+            });
+            Self { url, sql }
+        }
+
+        /// Drain what was recorded since the last call.
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.sql.lock().unwrap())
+        }
+    }
+
+    const ACCOUNT_FILTERED: [&str; 10] = [
+        "top_domains",
+        "domain_stats",
+        "hourly_stats",
+        "daily_stats",
+        "error_distribution",
+        "job_stats",
+        "kpis",
+        "ai_usage",
+        "job_timeline",
+        "job_event_summary",
+    ];
+
+    /// Runs `file` against the recording server; returns the status and the
+    /// SQL that reached it.
+    async fn run_recorded(
+        ch: &RecordingClickHouse,
+        caller: Option<Extension<AuthenticatedAccount>>,
+        file: &str,
+    ) -> (u16, Vec<String>) {
+        let params: Params = [("domain", "example.com"), ("job_id", "job_1")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ch.take();
+        let res = run_pipe(
+            State(state_with_clickhouse(&ch.url).await),
+            caller,
+            Path(file.to_string()),
+            Query(params),
+        )
+        .await;
+        (res.status().as_u16(), ch.take())
+    }
+
+    #[tokio::test]
+    async fn pipes_always_bind_the_tenant_account() {
+        let ch = RecordingClickHouse::start().await;
+        let predicate = format!("account_id = '{ACCT}'");
+        for name in ACCOUNT_FILTERED {
+            let (status, queries) = run_recorded(&ch, tenant(ACCT), &format!("{name}.json")).await;
+            assert_eq!(status, 200, "{name}");
+            assert!(!queries.is_empty(), "{name} sent no SQL");
+            for sql in &queries {
+                assert!(sql.contains("SELECT"), "{name} sent no query: {sql}");
+                assert!(
+                    sql.contains(&predicate),
+                    "{name} is not account-scoped: {sql}"
+                );
+            }
+        }
+        // The account-level pipes read one account by construction.
+        for name in [
+            "account_usage",
+            "account_daily_usage",
+            "account_daily_usage_by_operation",
+            "api_key_usage",
+        ] {
+            let (status, queries) = run_recorded(&ch, tenant(ACCT), &format!("{name}.json")).await;
+            assert_eq!(status, 200, "{name}");
+            assert!(!queries.is_empty(), "{name} sent no SQL");
+            for sql in &queries {
+                assert!(sql.contains("SELECT"), "{name} sent no query: {sql}");
+                assert!(
+                    sql.contains(&predicate),
+                    "{name} is not account-scoped: {sql}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_pipes_without_account_carry_no_account_predicate() {
+        let ch = RecordingClickHouse::start().await;
+        for name in ACCOUNT_FILTERED {
+            let (status, queries) = run_recorded(&ch, None, &format!("{name}.json")).await;
+            assert_eq!(status, 200, "{name}");
+            assert!(!queries.is_empty(), "{name} sent no SQL");
+            for sql in &queries {
+                assert!(sql.contains("SELECT"), "{name} sent no query: {sql}");
+                assert!(
+                    !sql.contains("account_id ="),
+                    "{name} filters an admin call by account: {sql}"
+                );
+            }
+        }
     }
 }
