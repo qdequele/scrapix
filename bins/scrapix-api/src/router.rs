@@ -167,9 +167,16 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode, mode: Mode) ->
         .route("/job/{id}/resume", post(resume_job));
 
     // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
-    // Stripe, analytics pipes, OAuth provider, /mcp) is served by the Rails
-    // app (saas/, SCR-85); the engine keeps only the crawl data plane.
-    let protected = guard(product.merge(management), auth, false);
+    // Stripe, OAuth provider, /mcp) is served by the Rails app (saas/,
+    // SCR-85); the engine keeps the crawl data plane and serves the analytics
+    // pipes over its own ClickHouse, scoped per account.
+    let protected = guard(
+        product
+            .merge(management)
+            .nest("/analytics/v0", analytics_pipes::router()),
+        auth,
+        false,
+    );
 
     // Per-account rate limiting on protected routes was removed — pricing is
     // usage-based (credits), not per-request, so there's nothing to gate on the
@@ -346,6 +353,27 @@ mod tests {
             status(app(admin(), Mode::Standalone), "/stats", Some(KEY)).await,
             200
         );
+    }
+
+    #[tokio::test]
+    async fn analytics_pipes_are_protected_and_404_without_clickhouse() {
+        for uri in ["/analytics/v0/pipes", "/analytics/v0/pipes/kpis.json"] {
+            assert_eq!(
+                status(app(admin(), Mode::Standalone), uri, None).await,
+                401,
+                "{uri}"
+            );
+            assert_eq!(
+                status(app(admin(), Mode::Standalone), uri, Some(KEY)).await,
+                404,
+                "{uri}"
+            );
+            assert_eq!(
+                status(app(saas(), Mode::Hosted), uri, None).await,
+                401,
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]

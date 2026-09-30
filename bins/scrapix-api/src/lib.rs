@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod analytics;
+pub(crate) mod analytics_pipes;
 pub mod auth;
 pub(crate) mod batch;
 pub mod billing;
@@ -7130,10 +7131,6 @@ pub async fn run_with_bus(
     // Routes, auth guards, request tracing, /openapi.json + /docs and the
     // body-size limits (CORS is added below).
     let mut app = router::build_router(state.clone(), &auth_mode, settings.mode);
-
-    // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
-    // app; the engine only writes events to ClickHouse (batchers above) and
-    // reads page-event history for /job/{id}/events/history.
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.

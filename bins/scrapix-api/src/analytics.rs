@@ -1,10 +1,9 @@
 //! ClickHouse analytics backend for the crawl engine.
 //!
-//! The Tinybird-style pipes API (`/analytics/v0/pipes/*`) moved to the Rails
-//! app (`saas/app/controllers/analytics_controller.rb`, SCR-85 phase 3). The
-//! engine keeps the ClickHouse connection: it *writes* the analytics events
-//! (request/page/job batchers in `lib.rs`) and reads page-event history for
-//! `GET /job/{id}/events/history`.
+//! The engine owns the ClickHouse connection: it *writes* the analytics
+//! events (request/page/job batchers in `lib.rs`), reads page-event history
+//! for `GET /job/{id}/events/history`, and serves the Tinybird-style pipes
+//! API (`/analytics/v0/pipes/*`, `analytics_pipes.rs`).
 
 use scrapix_storage::clickhouse::{ClickHouseConfig, ClickHouseStorage};
 use tracing::info;

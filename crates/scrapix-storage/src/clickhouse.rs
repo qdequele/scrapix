@@ -908,12 +908,21 @@ impl ClickHouseStorage {
 
     // ========================================================================
     // Query Operations — request_events
+    //
+    // These back the analytics pipes (`bins/scrapix-api/src/analytics_pipes.rs`)
+    // and mirror the SQL of `saas/app/controllers/analytics_controller.rb`.
+    // `account_id: Some(..)` scopes a query to one account; `None` (standalone
+    // admin) reads every account.
     // ========================================================================
 
     #[instrument(skip(self))]
-    pub async fn get_hourly_stats(&self, hours: u32) -> Result<Vec<HourlyStats>, ClickHouseError> {
+    pub async fn get_hourly_stats(
+        &self,
+        hours: u32,
+        account_id: Option<&str>,
+    ) -> Result<Vec<HourlyStats>, ClickHouseError> {
         let table = self.table_name("request_events");
-        let stats = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -925,22 +934,28 @@ impl ClickHouseStorage {
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
-                WHERE timestamp >= now() - INTERVAL ? HOUR
+                WHERE timestamp >= now() - INTERVAL ? HOUR{}
                 GROUP BY hour
                 ORDER BY hour
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(hours)
+            .bind(hours);
+        let stats = bind_account(query, account_id)
             .fetch_all::<HourlyStats>()
             .await?;
         Ok(stats)
     }
 
     #[instrument(skip(self))]
-    pub async fn get_daily_stats(&self, days: u32) -> Result<Vec<DailyStats>, ClickHouseError> {
+    pub async fn get_daily_stats(
+        &self,
+        days: u32,
+        account_id: Option<&str>,
+    ) -> Result<Vec<DailyStats>, ClickHouseError> {
         let table = self.table_name("request_events");
-        let stats = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -952,13 +967,15 @@ impl ClickHouseStorage {
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
-                WHERE timestamp >= now() - INTERVAL ? DAY
+                WHERE timestamp >= now() - INTERVAL ? DAY{}
                 GROUP BY date
                 ORDER BY date
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(days)
+            .bind(days);
+        let stats = bind_account(query, account_id)
             .fetch_all::<DailyStats>()
             .await?;
         Ok(stats)
@@ -969,9 +986,10 @@ impl ClickHouseStorage {
         &self,
         hours: u32,
         limit: u32,
+        account_id: Option<&str>,
     ) -> Result<Vec<DomainStats>, ClickHouseError> {
         let table = self.table_name("request_events");
-        let stats = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -983,28 +1001,32 @@ impl ClickHouseStorage {
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
-                WHERE timestamp >= now() - INTERVAL ? HOUR
+                WHERE timestamp >= now() - INTERVAL ? HOUR{}
                 GROUP BY domain
                 ORDER BY total_requests DESC
                 LIMIT ?
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(hours)
+            .bind(hours);
+        let stats = bind_account(query, account_id)
             .bind(limit)
             .fetch_all::<DomainStats>()
             .await?;
         Ok(stats)
     }
 
+    /// Stats for one domain; an all-zeros row when it has no data.
     #[instrument(skip(self))]
     pub async fn get_domain_stats(
         &self,
         domain: &str,
         hours: u32,
+        account_id: Option<&str>,
     ) -> Result<DomainStats, ClickHouseError> {
         let table = self.table_name("request_events");
-        let result = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -1016,33 +1038,33 @@ impl ClickHouseStorage {
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
-                WHERE domain = ? AND timestamp >= now() - INTERVAL ? HOUR
+                WHERE domain = ? AND timestamp >= now() - INTERVAL ? HOUR{}
                 GROUP BY domain
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
             .bind(domain)
-            .bind(hours)
-            .fetch_one::<DomainStats>()
-            .await;
+            .bind(hours);
+        let result = bind_account(query, account_id)
+            .fetch_optional::<DomainStats>()
+            .await?;
 
-        match result {
-            Ok(stats) => Ok(stats),
-            Err(_) => Ok(DomainStats {
-                domain: domain.to_string(),
-                total_requests: 0,
-                successful_requests: 0,
-                failed_requests: 0,
-                avg_duration_ms: 0.0,
-                total_bytes: 0,
-            }),
-        }
+        Ok(result.unwrap_or_else(|| DomainStats {
+            domain: domain.to_string(),
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            avg_duration_ms: 0.0,
+            total_bytes: 0,
+        }))
     }
 
     #[instrument(skip(self))]
     pub async fn get_error_distribution(
         &self,
         hours: u32,
+        account_id: Option<&str>,
     ) -> Result<Vec<(u16, u64)>, ClickHouseError> {
         let table = self.table_name("request_events");
 
@@ -1052,20 +1074,22 @@ impl ClickHouseStorage {
             count: u64,
         }
 
-        let results = self
+        let query = self
             .client
             .query(&format!(
                 r#"
                 SELECT status_code, count() as count
                 FROM {}
-                WHERE timestamp >= now() - INTERVAL ? HOUR
+                WHERE timestamp >= now() - INTERVAL ? HOUR{}
                     AND (status_code >= 400 OR error != '')
                 GROUP BY status_code
                 ORDER BY count DESC
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(hours)
+            .bind(hours);
+        let results = bind_account(query, account_id)
             .fetch_all::<StatusCount>()
             .await?;
 
@@ -1124,43 +1148,6 @@ impl ClickHouseStorage {
             ai_prompt_tokens: 0,
             ai_completion_tokens: 0,
         }))
-    }
-
-    #[instrument(skip(self))]
-    pub async fn get_top_accounts(
-        &self,
-        hours: u32,
-        limit: u32,
-    ) -> Result<Vec<AccountUsageStats>, ClickHouseError> {
-        let table = self.table_name("request_events");
-        let stats = self
-            .client
-            .query(&format!(
-                r#"
-                SELECT
-                    account_id,
-                    sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
-                    sum(content_length) as total_bytes,
-                    avg(duration_ms) as avg_duration_ms,
-                    uniqExact(domain) as unique_domains,
-                    countIf(js_rendered) as js_renders,
-                    sum(ai_prompt_tokens) as ai_prompt_tokens,
-                    sum(ai_completion_tokens) as ai_completion_tokens
-                FROM {}
-                WHERE account_id != '' AND timestamp >= now() - INTERVAL ? HOUR
-                GROUP BY account_id
-                ORDER BY total_requests DESC
-                LIMIT ?
-                "#,
-                table
-            ))
-            .bind(hours)
-            .bind(limit)
-            .fetch_all::<AccountUsageStats>()
-            .await?;
-        Ok(stats)
     }
 
     #[instrument(skip(self))]
@@ -1277,21 +1264,24 @@ impl ClickHouseStorage {
         &self,
         job_id: &str,
         limit: u32,
+        account_id: Option<&str>,
     ) -> Result<Vec<JobEvent>, ClickHouseError> {
         let table = self.table_name("job_events");
-        let events = self
+        let query = self
             .client
             .query(&format!(
                 r#"
                 SELECT *
                 FROM {}
-                WHERE job_id = ?
+                WHERE job_id = ?{}
                 ORDER BY timestamp DESC
                 LIMIT ?
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(job_id)
+            .bind(job_id);
+        let events = bind_account(query, account_id)
             .bind(limit)
             .fetch_all::<JobEvent>()
             .await?;
@@ -1303,9 +1293,13 @@ impl ClickHouseStorage {
     // ========================================================================
 
     #[instrument(skip(self))]
-    pub async fn get_job_stats(&self, job_id: &str) -> Result<Option<JobStats>, ClickHouseError> {
+    pub async fn get_job_stats(
+        &self,
+        job_id: &str,
+        account_id: Option<&str>,
+    ) -> Result<Option<JobStats>, ClickHouseError> {
         let table = self.table_name("request_events");
-        let result = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -1320,12 +1314,14 @@ impl ClickHouseStorage {
                     min(timestamp) as started_at,
                     max(timestamp) as last_activity_at
                 FROM {}
-                WHERE job_id = ?
+                WHERE job_id = ?{}
                 GROUP BY job_id
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(job_id)
+            .bind(job_id);
+        let result = bind_account(query, account_id)
             .fetch_optional::<JobStats>()
             .await?;
         Ok(result)
@@ -1335,9 +1331,10 @@ impl ClickHouseStorage {
     pub async fn get_job_event_summary(
         &self,
         job_id: &str,
+        account_id: Option<&str>,
     ) -> Result<Vec<JobEventSummaryRow>, ClickHouseError> {
         let table = self.table_name("job_events");
-        let rows = self
+        let query = self
             .client
             .query(&format!(
                 r#"
@@ -1347,13 +1344,15 @@ impl ClickHouseStorage {
                     min(timestamp) as first_seen,
                     max(timestamp) as last_seen
                 FROM {}
-                WHERE job_id = ?
+                WHERE job_id = ?{}
                 GROUP BY event_type
                 ORDER BY first_seen
                 "#,
-                table
+                table,
+                account_filter(account_id)
             ))
-            .bind(job_id)
+            .bind(job_id);
+        let rows = bind_account(query, account_id)
             .fetch_all::<JobEventSummaryRow>()
             .await?;
         Ok(rows)
@@ -1370,10 +1369,9 @@ impl ClickHouseStorage {
         account_id: Option<&str>,
     ) -> Result<Vec<AiUsageStats>, ClickHouseError> {
         let table = self.table_name("ai_usage_events");
-
-        let has_account = account_id.is_some_and(|a| !a.is_empty());
-        let query = if has_account {
-            format!(
+        let query = self
+            .client
+            .query(&format!(
                 r#"
                 SELECT model, count() as total_calls,
                     sum(prompt_tokens) as total_prompt_tokens,
@@ -1381,33 +1379,16 @@ impl ClickHouseStorage {
                     sum(total_tokens) as total_tokens,
                     avg(duration_ms) as avg_duration_ms
                 FROM {}
-                WHERE timestamp >= now() - INTERVAL ? HOUR AND account_id = ?
+                WHERE timestamp >= now() - INTERVAL ? HOUR{}
                 GROUP BY model ORDER BY total_tokens DESC
                 "#,
-                table
-            )
-        } else {
-            format!(
-                r#"
-                SELECT model, count() as total_calls,
-                    sum(prompt_tokens) as total_prompt_tokens,
-                    sum(completion_tokens) as total_completion_tokens,
-                    sum(total_tokens) as total_tokens,
-                    avg(duration_ms) as avg_duration_ms
-                FROM {}
-                WHERE timestamp >= now() - INTERVAL ? HOUR
-                GROUP BY model ORDER BY total_tokens DESC
-                "#,
-                table
-            )
-        };
-
-        let mut q = self.client.query(&query).bind(hours);
-        if has_account {
-            q = q.bind(account_id.unwrap_or(""));
-        }
-
-        let stats = q.fetch_all::<AiUsageStats>().await?;
+                table,
+                account_filter(account_id)
+            ))
+            .bind(hours);
+        let stats = bind_account(query, account_id)
+            .fetch_all::<AiUsageStats>()
+            .await?;
         Ok(stats)
     }
 
@@ -1543,6 +1524,27 @@ pub type PageEventBatcher = EventBatcher<PageEvent>;
 // Tests
 // ============================================================================
 
+/// `" AND account_id = ?"` when a query is scoped to one account, else
+/// nothing. Pair with [`bind_account`] at the same position in the binds.
+fn account_filter(account_id: Option<&str>) -> &'static str {
+    if account_id.is_some() {
+        " AND account_id = ?"
+    } else {
+        ""
+    }
+}
+
+/// Binds the placeholder [`account_filter`] added, if any.
+fn bind_account(
+    query: clickhouse::query::Query,
+    account_id: Option<&str>,
+) -> clickhouse::query::Query {
+    match account_id {
+        Some(account_id) => query.bind(account_id),
+        None => query,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1571,6 +1573,12 @@ mod tests {
         assert_eq!(event.status_code, 0);
         assert_eq!(event.pages_fetched, 1);
         assert!(!event.js_rendered);
+    }
+
+    #[test]
+    fn account_filter_adds_one_placeholder_only_when_scoped() {
+        assert_eq!(account_filter(Some("acct")), " AND account_id = ?");
+        assert_eq!(account_filter(None), "");
     }
 
     #[test]
