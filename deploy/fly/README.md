@@ -86,8 +86,17 @@ flyctl secrets set \
   DATABASE_URL=... \
   JWT_SECRET=... \
   OPENAI_API_KEY=... \
-  STRIPE_SECRET_KEY=... \
+  LAB_EVENTS_URL=https://<rails-host>/internal/events \
+  LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
+  LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
   --app scrapix-api
+
+# The hosted API refuses to start without LAB_EVENTS_URL, LAB_EVENTS_SECRET
+# and LAB_SERVICE_TOKEN (each secret >= 32 chars). The Rails app needs the
+# SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN (and, once the engine is
+# upgraded, LAB_CRON_ENABLED=true) — see docs/operations/crawl-engine-rollout.mdx.
+# Stripe is configured on the Rails app only; the engine never reads
+# STRIPE_SECRET_KEY.
 
 # Console-only:
 flyctl secrets set \

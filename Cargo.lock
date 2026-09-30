@@ -5628,6 +5628,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "jsonschema",
  "parking_lot",
  "regex",
  "reqwest 0.12.28",

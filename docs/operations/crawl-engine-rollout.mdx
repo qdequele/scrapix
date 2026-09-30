@@ -15,7 +15,129 @@ a checklist, not automation — work through it in order.
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
 - [ ] **Local dev: add `SCRAPIX_MODE=hosted` to an existing `.env`.** `just dev` runs the engine against the Rails stack's Postgres; an `.env` copied from `.env.example` before standalone mode existed lacks the variable, so the API now starts in standalone mode and refuses to run without `SCRAPIX_ADMIN_KEY`. The current `.env.example` already sets it.
 - [ ] **Confirm `JWT_SECRET` is set** on every hosted API's env. Hosted mode now refuses to start without it — it previously fell back to an insecure default.
+- [ ] **Set `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API and the matching secrets on Rails — the hosted engine refuses to start without them. Follow "Engine ↔ Lab boundary rollout" below (Rails first, `LAB_CRON_ENABLED` off until the engine is upgraded).
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
+
+## Engine ↔ Lab boundary rollout
+
+The engine no longer writes the Rails-owned tables. It reports usage and job
+lifecycle as signed **lab events** (see [Lab Events](/api-reference/lab-events)),
+and the Rails app (the "Lab") debits the ledger, runs auto top-up, sends job
+and low-balance emails, fires saved-config cron and sweeps expired OAuth
+rows. Roll it out in this order — **Rails first, engine second, cron last** —
+so no window exists where a charge is lost or a crawl fires twice.
+
+### A. Generate secrets
+
+```bash
+openssl rand -hex 32   # LAB_EVENTS_SECRET
+openssl rand -hex 32   # LAB_SERVICE_TOKEN
+```
+
+Use two different values. Both are needed, with **identical values**, on the
+Rails app and on the engine (`scrapix-api`): `LAB_EVENTS_SECRET` signs the
+engine → Rails event deliveries, `LAB_SERVICE_TOKEN` authenticates Rails →
+engine calls. The engine also needs `LAB_EVENTS_URL`, the Rails
+`POST /internal/events` endpoint (e.g. `https://scrapix.meilisearch.com/internal/events`,
+or `http://localhost:8081/internal/events` when both run on the box). The
+hosted engine **refuses to start** without all three (secrets ≥ 32
+characters); standalone ignores them.
+
+### B. Before the Rails migrations: check for duplicate payment intents
+
+The migration `20260929000003_add_lab_event_id_index_to_transactions` adds a
+**unique index** on `transactions.metadata->>'stripe_payment_intent_id'` (one
+credit grant per Stripe payment) unless it already exists. It fails if
+production already holds duplicates — for example a payment credited twice.
+Check first, in production:
+
+```sql
+SELECT metadata->>'stripe_payment_intent_id' AS payment_intent,
+       count(*)                              AS grants,
+       array_agg(id ORDER BY created_at)     AS transaction_ids,
+       array_agg(account_id)                 AS account_ids
+FROM transactions
+WHERE metadata ? 'stripe_payment_intent_id'
+GROUP BY 1
+HAVING count(*) > 1;
+```
+
+The query must return **no rows**. If it returns any, the account was
+credited more than once for one payment: resolve each case (usually deleting
+or adjusting the duplicate `transactions` row and correcting the balance)
+before migrating. An index of that name that already exists is left alone.
+
+### C. Deploy Rails first, with `LAB_CRON_ENABLED` off
+
+1. Set `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` on the Rails app. Leave
+   `LAB_CRON_ENABLED` **unset** (off): the old engine still runs its own
+   cron scheduler, and enabling both would fire every scheduled crawl twice.
+2. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. This
+   creates `lab_events` (the engine's outbox), `lab_events_received`,
+   `accounts.last_auto_topup_attempt_at` and `crawl_configs.last_error`.
+   Rails **must** be migrated before the new engine starts: the engine writes
+   `lab_events`, and while the table is missing each request's usage event
+   fails to record (logged as `Failed to record lab events`) and is lost.
+3. Check that SolidQueue is running the recurring jobs
+   (`process_lab_events` every 10 s, `run_due_crawl_configs` every 30 s,
+   `cleanup_oauth_tokens` hourly). `run_due_crawl_configs` exits immediately
+   while `LAB_CRON_ENABLED` is off.
+4. Verify the endpoint answers: an unsigned request gets `401`, not `503`
+   (`503` means `LAB_EVENTS_SECRET` is not set on Rails).
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     -H 'Content-Type: application/json' -d '{"events":[]}' \
+     https://<rails-host>/internal/events   # expect 401
+   ```
+
+### D. Deploy the engine
+
+Follow the normal service order in step 4 below (content workers, crawlers,
+frontier, then API), with `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and
+`LAB_SERVICE_TOKEN` set on the API, and with no jobs running (step 0). Also
+update every hosted deploy config you use (Fly secrets, Heroku config vars,
+the Kubernetes `scrapix-secrets` / `scrapix-config`) — they are listed in
+`deploy/`.
+
+After the API starts:
+
+- [ ] `GET /metrics` shows `scrapix_lab_events_pending` (near 0) and
+      `scrapix_lab_events_delivered_total{outcome="accepted"}` growing.
+- [ ] Run a `/scrape` with a test account: a `usage_deduction` row
+      (`scrape: <url> (N credits)`) appears in `GET /account/billing/transactions`
+      within a few seconds, exactly once.
+- [ ] `scrapix_lab_events_delivered_total{outcome="failed"|"rejected"}` stays
+      flat. A growing `scrapix_lab_events_pending`, or an engine warning
+      `Lab events backlog older than 10 minutes`, means Rails is unreachable
+      or rejecting events (check the secret matches, then Rails logs for
+      `Skipping malformed lab event`). Nothing is lost meanwhile: the outbox
+      retries with backoff (max 5 min) forever.
+
+### E. Enable cron
+
+Only once the engine is upgraded (it no longer runs a cron scheduler), set
+`LAB_CRON_ENABLED=true` on Rails and restart. Confirm a saved config with a
+cron schedule fires (`last_run_at` / `last_job_id` set on the config; a
+failure shows in `last_error`). Between D and E, scheduled crawls do not
+fire — keep that window short.
+
+### F. Rollback and caveats
+
+- Rolling the **engine** back to the previous version is safe: it resumes its
+  own direct ledger writes, but any events still pending in `lab_events` are
+  no longer delivered — drain the outbox (`scrapix_lab_events_pending` at 0)
+  before rolling back or those charges are never applied. Turn
+  `LAB_CRON_ENABLED` off first, or scheduled crawls fire twice.
+- **Crash after a cancel.** Cancelling a job persists its terminal state a
+  few seconds after the request (once the charge and the job event are
+  recorded). If the API crashes within that window, the job is recovered as
+  *running* and later ends `FailStalled` (billed for the pages crawled) and
+  sends a "failed" email. The charge is **not** duplicated — the crawl's
+  usage event has a deterministic id.
+- Live job updates (`GET /ws/job/{id}`) still need `SESSION_COOKIE_DOMAIN`
+  (see the pre-deploy checklist above) so the console can present the session
+  cookie to the API.
 
 ## 0. Drain or cancel running jobs first
 
@@ -47,7 +169,7 @@ Before merging to `main`, also run — neither of these ran during
 development because Postgres was down locally:
 
 ```bash
-just saas-test
+cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test
 ```
 
 and one real accounting flush/restore round trip against a live Postgres
@@ -173,7 +295,9 @@ Import the metric names from `crates/scrapix-core/src/metrics.rs`:
 `scrapix_frontier_admissions_total{result}`, `scrapix_frontier_queued{job}`,
 `scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
 `scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
-`scrapix_consumer_uncommitted{topic}`.
+`scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
+`scrapix_lab_events_delivered_total{outcome}`. Alert on
+`scrapix_lab_events_pending` staying above zero for more than a few minutes.
 
 ## 6b. Politeness defaults changed (single-site crawls are slower)
 
@@ -218,7 +342,9 @@ After all services are deployed:
 2. Check that its billing came out right (pages crawled × the credits
    formula in `docs/guides/billing.mdx` — verify against
    `crates/scrapix-billing/src/credits.rs` if anything looks off).
-3. Confirm the completion email was sent (exactly one).
+3. Confirm the completion email was sent (exactly one) and the crawl's
+   single `usage_deduction` row landed in the ledger (it is applied by Rails
+   a few seconds after the job ends).
 4. Cancel a second crawl mid-way and confirm the frontier and workers stop
    dispatching/processing its URLs, and that it's billed for the pages
    crawled before cancellation.

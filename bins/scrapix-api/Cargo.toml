@@ -82,3 +82,4 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 wiremock = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"
+jsonschema = { version = "0.45", default-features = false }

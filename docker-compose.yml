@@ -204,6 +204,11 @@ services:
       CLICKHOUSE_PASSWORD: scrapix
       DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
       JWT_SECRET: dev-jwt-secret-change-in-production
+      # Engine -> Lab boundary (hosted mode requires all three; same values
+      # as the saas service below).
+      LAB_EVENTS_URL: http://saas:8081/internal/events
+      LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
+      LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
@@ -371,6 +376,9 @@ services:
       DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
       JWT_SECRET: dev-jwt-secret-change-in-production
       SCRAPIX_ENGINE_URL: http://scrapix-api:8080
+      LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
+      LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
+      LAB_CRON_ENABLED: "true"
       REDIS_URL: redis://dragonfly:6379
       CONSOLE_URL: http://localhost:3001
       ENVIRONMENT: development

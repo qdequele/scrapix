@@ -17,6 +17,21 @@ All Scrapix services are configured through environment variables. When running 
 | `DATABASE_URL` | `sqlite://./data/scrapix.db` (standalone) | **Standalone:** the engine's own job-history store — SQLite by default, or a `postgres://`/`postgresql://` URL for a dedicated Postgres (the engine applies its own migrations and refuses a database that already has the Rails schema). **Hosted:** required, must be a `postgres://` URL — the Rails-owned Postgres; the engine never migrates it. |
 | `JWT_SECRET` | — | **Hosted only, required.** The same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone mode. |
 
+## Lab Boundary (hosted only)
+
+In hosted mode the engine reports usage and job lifecycle to the Lab (Rails) as signed events and is called back with a service token — see [Lab Events](/api-reference/lab-events). The hosted engine **refuses to start** without the first three variables; standalone ignores them. Generate each secret with `openssl rand -hex 32`.
+
+| Variable | Where | Default | Description |
+|----------|-------|---------|-------------|
+| `LAB_EVENTS_URL` | engine | — | **Required (hosted).** The Lab's event endpoint, e.g. `https://api.scrapix.example.com/internal/events`. Must start with `http://` or `https://`. |
+| `LAB_EVENTS_SECRET` | engine and Rails | — | **Required (hosted).** HMAC-SHA256 key that signs each delivery (`X-Scrapix-Signature`); at least 32 characters, identical on both sides. |
+| `LAB_SERVICE_TOKEN` | engine and Rails | — | **Required (hosted).** Bearer token the Lab presents to call the engine on behalf of an account; at least 32 characters, identical on both sides. |
+| `LAB_CRON_ENABLED` | Rails | off | Set to `true` to fire saved-config cron schedules from Rails. Leave off until the engine is upgraded (see the [rollout](/operations/crawl-engine-rollout)). |
+
+<Note>
+Stripe (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`) is configured on the Rails app only. The engine never talks to Stripe: it reports usage, and Rails debits the ledger and runs auto top-up.
+</Note>
+
 ## API Server
 
 | Variable | Default | Description |

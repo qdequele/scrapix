@@ -104,6 +104,15 @@ just stop         # Stop everything (services + infra)
 - `just dev` is the hosted (Rails) stack: `.env` must set `SCRAPIX_MODE=hosted`
   (`.env.example` does). An older `.env` without it starts the API in
   standalone mode, which refuses to run without `SCRAPIX_ADMIN_KEY`.
+- The hosted engine also needs `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and
+  `LAB_SERVICE_TOKEN` (`.env.example` has dev values; Rails reads the same
+  secret and token). An older `.env` without them makes `just dev` fail at
+  engine startup.
+- **Rails tests:** `cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test`
+  (needs Postgres on :5433, i.e. `just infra`). `just saas-test` runs the same
+  thing but the justfile loads the repo `.env`, so it unsets `RESEND_API_KEY`
+  (a real key there would make the mailer attempt SMTP from tests) and
+  `LAB_CRON_ENABLED` first.
 
 **Individual service commands** (when you only need one):
 ```bash
@@ -255,11 +264,22 @@ The backend is deliberately split into two services sharing one Postgres:
   configs + engines CRUD, analytics pipes, the OAuth 2.1 provider, and the
   MCP server at `/mcp`. Contract-tested by `contracts/`.
 - **Rust crawl engine (`bins/scrapix-api`, port 8080)** — /scrape, /map,
-  /search, /crawl*, jobs, WebSockets, diagnostics, plus the background tasks
-  that belong to the data plane: cron scheduler (fires saved configs), email
-  scheduler (delivers the shared `scheduled_emails` queue via Resend),
-  OAuth token cleanup, and Stripe auto-topup on usage debits. It validates
-  credentials (API keys, Bearer tokens, session JWTs) but issues none.
+  /search, /crawl*, jobs, WebSockets, diagnostics. It validates credentials
+  (API keys, Bearer tokens, session JWTs) but issues none, and it never
+  writes Rails-owned tables (accounts, transactions, crawl_configs,
+  scheduled_emails, OAuth tables, API keys — enforced by
+  `bins/scrapix-api/tests/lab_boundary.rs`). Instead it **reports lab
+  events**: usage (`usage.recorded`) and job lifecycle (`job.completed` /
+  `job.failed`) go to an engine-owned `lab_events` outbox and are delivered,
+  HMAC-signed, to Rails' `POST /internal/events` (contract:
+  `contracts/lab-events.schema.json`, docs `docs/api-reference/lab-events.mdx`).
+  Rails owns everything that follows from them: idempotent credit debits,
+  auto top-up (Stripe, saved card only), low-balance and job emails, the
+  saved-config cron (`RunDueCrawlConfigsJob`, gated by `LAB_CRON_ENABLED`,
+  which calls the engine with `LAB_SERVICE_TOKEN`), and OAuth token cleanup.
+  The hosted engine refuses to start without `LAB_EVENTS_URL`,
+  `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`; the engine never reads
+  `STRIPE_SECRET_KEY`.
 
 The console proxy (`console/src/app/api/scrapix/[...path]/route.ts`) routes
 by path prefix via `SAAS_API_URL` + `SAAS_PREFIXES`; the frozen full-platform
@@ -433,7 +453,8 @@ rename without updating the scrape config there. Current metrics:
 `scrapix_frontier_admissions_total{result}`, `scrapix_frontier_queued{job}`,
 `scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
 `scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
-`scrapix_consumer_uncommitted{topic}`.
+`scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
+`scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`).
 
 ### Webhooks (SCR-72)
 
@@ -594,6 +615,10 @@ GROUP BY date ORDER BY date;
 | `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
 | `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
+| `LAB_EVENTS_URL` | API, hosted only, required: the Rails `POST /internal/events` URL (`http://`/`https://`) the engine delivers lab events to. Ignored in standalone |
+| `LAB_EVENTS_SECRET` | API + Rails, hosted only, required (≥32 chars, same value on both): HMAC-SHA256 key signing lab-event deliveries (`X-Scrapix-Signature`). Generate with `openssl rand -hex 32` |
+| `LAB_SERVICE_TOKEN` | API + Rails, hosted only, required (≥32 chars, same value on both): Bearer token Rails presents (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron, MCP) |
+| `LAB_CRON_ENABLED` | Rails: `true` runs the saved-config cron (default off, so a new Rails deploy can't double-fire crawls while the old engine still runs its own scheduler) |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |

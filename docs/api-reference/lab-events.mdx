@@ -1,0 +1,182 @@
+---
+title: Lab Events
+description: The signed events the hosted engine reports to the Lab for usage billing and job emails
+---
+
+# Lab Events
+
+In **hosted** mode the engine never writes to the Lab's tables (accounts,
+credit ledger, saved configs, emails, OAuth). Instead it reports what
+happened as **lab events** to the Lab (the Rails control plane), which owns
+billing and email. This page is the wire contract between the two; the
+machine-readable schema is
+[`contracts/lab-events.schema.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-events.schema.json)
+(JSON Schema 2020-12), and both the engine and the Rails receiver are tested
+against it.
+
+<Note>
+Hosted mode only. A **standalone** engine emits no lab events and ignores
+`LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`.
+</Note>
+
+## Event envelope
+
+```json
+{
+  "id": "0198a3f2-7c1e-7d3a-9b40-5e2f8a1c6d07",
+  "type": "usage.recorded",
+  "occurred_at": "2026-09-29T14:03:21.418Z",
+  "account_id": "550e8400-e29b-41d4-a716-446655440000",
+  "api_key_id": "key_01H...",
+  "product": "scrapix",
+  "data": { }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Idempotency key — the Lab stores and processes each id once. See [Ids](#ids). |
+| `type` | string | `usage.recorded`, `job.completed` or `job.failed`. |
+| `occurred_at` | RFC 3339 timestamp | When the engine recorded the event. |
+| `account_id` | UUID | The account to bill or notify. |
+| `api_key_id` | string or `null` | The API key that made the request, when there was one. |
+| `product` | string | Always `"scrapix"`. |
+| `data` | object | Type-specific payload (below). |
+
+## Event types
+
+### `usage.recorded`
+
+One billable operation. The Lab debits `credits` from the account's balance.
+
+| `data` field | Type | Description |
+|--------------|------|-------------|
+| `operation` | string | `scrape`, `map`, `search`, `parse`, `ocr`, `extract` or `crawl`. |
+| `credits` | integer ≥ 0 | Credits to debit. Prices are unchanged (`crates/scrapix-billing/src/credits.rs`). |
+| `units` | object | Operation-specific counters (for example `{"formats": ["markdown"]}` for a scrape, `{"pages_http": 10, "pages_browser": 2, "pages_ai": 0, "pages_ocr": 0}` for a crawl). |
+| `description` | string | Text shown on the ledger row. The Lab stores it as `"{operation}: {description}"`. |
+| `job_id` | string, optional | Present for job-scoped usage (a `crawl`, or an `extract` job). |
+
+A crawl is charged **once**, when the job reaches a terminal state, from what
+was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,
+`/map` and `/search` are charged as they complete.
+
+### `job.completed`
+
+| `data` field | Type | Description |
+|--------------|------|-------------|
+| `job_id` | string | The finished crawl job. |
+| `index_uid` | string | Target Meilisearch index. |
+| `pages_crawled` | integer | Pages fetched. |
+| `documents_indexed` | integer | Documents sent to Meilisearch. |
+| `duration_secs` | integer | Wall-clock duration. |
+
+### `job.failed`
+
+| `data` field | Type | Description |
+|--------------|------|-------------|
+| `job_id` | string | The failed crawl job. |
+| `error_message` | string | Why it failed (a stalled job reports its stall reason). |
+| `pages_crawled` | integer | Pages fetched before the failure. |
+
+The Lab turns `job.completed` / `job.failed` into **one** email per job, sent
+to the account owner if they opted in to job emails.
+
+## Ids
+
+| Event | `id` |
+|-------|------|
+| Request usage (`scrape`, `map`, `search`, `parse`, `ocr`, `extract`) | UUIDv7, generated per event |
+| Crawl final usage | UUIDv5(`6f1c3a2e-6b1d-4f6e-9a57-0c3b2a9e5d41`, `"job:{job_id}:final"`) |
+| Job lifecycle (`job.completed` / `job.failed`) | UUIDv5(same namespace, `"job:{job_id}:lifecycle"`) |
+
+Deterministic ids make a crawl's charge and its email idempotent: if the
+engine recovers and re-finalizes a job after a crash, it produces the same
+ids, the outbox skips the duplicates, and the Lab acknowledges without
+processing them again. A job has one lifecycle id whether it completed or
+failed, so it can only ever send one email.
+
+## Delivery
+
+Events are written to the engine-owned `lab_events` outbox table in the same
+Postgres (an insert per event, so nothing is lost if the Lab is down) and
+delivered by a background task once per second.
+
+```http
+POST {LAB_EVENTS_URL}
+Content-Type: application/json
+X-Scrapix-Signature: sha256=<hex hmac-sha256(raw body, LAB_EVENTS_SECRET)>
+
+{"events": [ { ...event... }, { ...event... } ]}
+```
+
+- **Batch** — up to 100 events per request, oldest first.
+- **Signature** — `sha256=` followed by the lowercase hex HMAC-SHA256 of the
+  **raw request body** keyed with `LAB_EVENTS_SECRET`. There is no other
+  authentication on the endpoint.
+- **Acknowledgement** — `200` with `{"accepted": ["<id>", ...]}`. Only
+  acknowledged ids are marked delivered. An event that is not acknowledged
+  (a malformed event is skipped and logged by the Lab; a `4xx`/`5xx`; a
+  timeout) is retried.
+- **Backoff** — a failed event is retried at
+  `now() + min(2^attempts, 300)` seconds. Retries never stop; a backlog older
+  than 10 minutes logs a warning.
+- **Purge** — delivered rows are deleted after 7 days.
+- **Processing is asynchronous** — the Lab stores the event, acknowledges it,
+  and a recurring job (every 10 s) applies it. A scrape shows up on the
+  ledger within seconds.
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Body accepted; read `accepted` for the ids stored. |
+| `400` | Signed body is not a JSON object. |
+| `401` | Missing or wrong signature. |
+| `503` | The Lab has no `LAB_EVENTS_SECRET` configured. |
+
+## Verifying a signature
+
+The signature covers the exact bytes received — verify before parsing.
+
+<CodeGroup>
+
+```ruby Ruby
+expected = "sha256=#{OpenSSL::HMAC.hexdigest('SHA256', ENV.fetch('LAB_EVENTS_SECRET'), request.raw_post)}"
+given = request.headers["X-Scrapix-Signature"].to_s
+ok = ActiveSupport::SecurityUtils.secure_compare(expected, given)
+```
+
+```bash Shell
+# body.json is the raw request body, byte for byte
+printf 'sha256=%s\n' "$(openssl dgst -sha256 -hmac "$LAB_EVENTS_SECRET" -hex < body.json | sed 's/^.*= //')"
+```
+
+</CodeGroup>
+
+## Service calls (Lab → engine)
+
+The Lab calls the engine on behalf of an account (saved-config cron, the MCP
+server) with `Authorization: Bearer <LAB_SERVICE_TOKEN>` and
+`X-Scrapix-Account-Id: <account uuid>`. The engine accepts this only in
+hosted mode.
+
+## Metrics
+
+The engine exposes the outbox state at `GET /metrics`:
+
+| Metric | Description |
+|--------|-------------|
+| `scrapix_lab_events_pending` | Undelivered events in the outbox. Should hover near zero; a growing value means the Lab is unreachable or rejecting events. |
+| `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them) or `failed` (unreachable or unreadable response). |
+
+## Configuration
+
+| Variable | Where | Description |
+|----------|-------|-------------|
+| `LAB_EVENTS_URL` | engine | The Lab's `POST /internal/events` URL (`http://` or `https://`). |
+| `LAB_EVENTS_SECRET` | engine, Rails | Signing secret, at least 32 characters. Same value on both sides. |
+| `LAB_SERVICE_TOKEN` | engine, Rails | Bearer token for Lab → engine calls, at least 32 characters. Same value on both sides. |
+| `LAB_CRON_ENABLED` | Rails | `true` runs the saved-config cron. Off by default. |
+
+The hosted engine refuses to start without the first three. See
+[Environment Variables](/configuration/environment-variables) and the
+[rollout checklist](/operations/crawl-engine-rollout).

@@ -34,3 +34,6 @@ kill_timeout = "30s"
 [env]
   RUST_LOG = "info"
   SCRAPIX_MODE = "hosted"
+  # Secrets (`flyctl secrets set`, see deploy/fly/README.md) that the hosted
+  # engine requires and refuses to start without:
+  #   LAB_EVENTS_URL, LAB_EVENTS_SECRET, LAB_SERVICE_TOKEN

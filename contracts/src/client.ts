@@ -25,7 +25,7 @@ export const OAUTH_BASE_URL =
   process.env.CONTRACT_OAUTH_BASE_URL ?? AUTH_BASE_URL;
 /**
  * The Rust crawl engine, serving the job routes (/crawl, /jobs, /job/*,
- * /batch/*, /extract*). It
+ * /batch/*, /extract*) and /scrape. It
  * validates the Rails session cookie itself.
  */
 export const ENGINE_BASE_URL =
@@ -50,6 +50,7 @@ function baseFor(path: string): string {
     path.startsWith("/jobs?") ||
     path.startsWith("/job/") ||
     path.startsWith("/batch/") ||
+    path === "/scrape" ||
     path === "/extract" ||
     path.startsWith("/extract/")
   ) {

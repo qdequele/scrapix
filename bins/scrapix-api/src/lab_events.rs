@@ -394,6 +394,110 @@ mod tests {
         assert_eq!(e.id.get_version_num(), 7);
     }
 
+    /// The engine's serialized events must satisfy the shared contract
+    /// (`contracts/lab-events.schema.json`), which the Rails receiver is
+    /// also tested against.
+    fn contract_validator() -> jsonschema::Validator {
+        let raw = include_str!("../../../contracts/lab-events.schema.json");
+        let schema: Value = serde_json::from_str(raw).unwrap();
+        jsonschema::validator_for(&schema).unwrap()
+    }
+
+    fn assert_valid(v: &jsonschema::Validator, e: &LabEvent) {
+        let value = serde_json::to_value(e).unwrap();
+        let errors: Vec<String> = v.iter_errors(&value).map(|e| e.to_string()).collect();
+        assert!(
+            errors.is_empty(),
+            "{value} violates the contract: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn events_satisfy_the_contract_schema() {
+        let v = contract_validator();
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        assert_valid(
+            &v,
+            &LabEvent::usage(
+                acct,
+                Some("key_1"),
+                "scrape",
+                3,
+                json!({"formats":["markdown"],"ai_summary":false,"ai_extraction":false}),
+                "https://e.com (3 credits)".into(),
+                None,
+            ),
+        );
+        assert_valid(
+            &v,
+            &LabEvent::usage(
+                acct,
+                None,
+                "extract",
+                2,
+                json!({}),
+                "extract".into(),
+                Some("job-1"),
+            ),
+        );
+        assert_valid(
+            &v,
+            &LabEvent::crawl_final_usage(
+                "job-1",
+                acct,
+                12,
+                json!({"pages_http":10,"pages_browser":2,"pages_ai":0,"pages_ocr":0}),
+                "Job job-1 (10 http + 2 browser pages, 0 AI-enriched)".into(),
+            ),
+        );
+        assert_valid(
+            &v,
+            &LabEvent::job_completed(
+                "job-1",
+                acct,
+                json!({"job_id":"job-1","index_uid":"docs","pages_crawled":12,
+                       "documents_indexed":12,"duration_secs":30}),
+            ),
+        );
+        assert_valid(
+            &v,
+            &LabEvent::job_failed(
+                "job-1",
+                acct,
+                json!({"job_id":"job-1","error_message":"boom","pages_crawled":0}),
+            ),
+        );
+    }
+
+    #[test]
+    fn the_contract_schema_rejects_malformed_events() {
+        let v = contract_validator();
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let good = serde_json::to_value(LabEvent::usage(
+            acct,
+            None,
+            "map",
+            2,
+            json!({}),
+            "m".into(),
+            None,
+        ))
+        .unwrap();
+        assert!(v.is_valid(&good));
+        let mut bad = good.clone();
+        bad["data"]["credits"] = json!(-1);
+        assert!(!v.is_valid(&bad), "negative credits");
+        let mut bad = good.clone();
+        bad["data"]["operation"] = json!("teleport");
+        assert!(!v.is_valid(&bad), "unknown operation");
+        let mut bad = good.clone();
+        bad["account_id"] = json!("acc");
+        assert!(!v.is_valid(&bad), "non-uuid account");
+        let mut bad = good;
+        bad["type"] = json!("job.completed");
+        assert!(!v.is_valid(&bad), "usage data under a job type");
+    }
+
     #[tokio::test]
     async fn memory_outbox_enqueue_is_idempotent_and_due_is_oldest_first() {
         let o = MemoryOutbox::default();

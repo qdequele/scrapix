@@ -28,6 +28,10 @@ diagnostics). The engine no longer serves any SaaS route.
 - `tests/*.contract.test.ts` — live-backend contract tests (vitest).
 - `src/shapes.ts` — the frozen response shapes (snake_case, exact keys —
   extra keys are failures).
+- `lab-events.schema.json` — JSON Schema for the events the engine reports to
+  Rails (`POST /internal/events`). The engine's `lab_events.rs` tests and
+  `saas/test/integration/lab_events_contract_test.rb` both validate against
+  it; change it only together with both sides.
 - `analytics_parity.py` — live diff of the analytics pipes between two
   backends (was used to prove byte parity during the migration).
 
@@ -48,6 +52,11 @@ The job routes (`/crawl`, `/jobs`, `/job/*`, used by
 `tests/jobs.contract.test.ts`) go straight to the engine at
 `CONTRACT_ENGINE_BASE_URL` (default `http://localhost:8080`), which needs its
 pipeline (Kafka + frontier) up to accept a crawl.
+
+`tests/usage.contract.test.ts` exercises the engine → lab events → Rails
+ledger path end to end, so it needs the hosted engine and Rails running with
+matching `LAB_EVENTS_URL` / `LAB_EVENTS_SECRET` / `LAB_SERVICE_TOKEN` (see
+`.env.example`), plus outbound access to example.com.
 
 Each test file signs up fresh throwaway users (`contract-*@example.com`), so
 runs are self-contained; no seeding or cleanup required. Analytics tests

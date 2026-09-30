@@ -42,4 +42,4 @@ images:
 #   - name: scrapix-secrets
 #     behavior: replace
 #     envs:
-#       - secrets.env
+#       - secrets.env   # must include JWT_SECRET, LAB_EVENTS_SECRET, LAB_SERVICE_TOKEN

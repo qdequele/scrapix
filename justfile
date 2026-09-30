@@ -87,9 +87,12 @@ console:
 saas:
     cd saas && bin/rails db:prepare && SOLID_QUEUE_IN_PUMA=1 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES bin/rails server
 
-# Rails-native test suite (isolated scrapix_test DB; fast, no live services)
+# Rails-native test suite (isolated scrapix_test DB; fast, no live services).
+# `set dotenv-load` puts the repo .env in the environment; unset the vars that
+# would make tests reach outside (a real RESEND_API_KEY makes the mailer
+# initializer use SMTP) or change behavior (LAB_CRON_ENABLED).
 saas-test:
-    cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test
+    cd saas && env -u RESEND_API_KEY -u LAB_CRON_ENABLED bin/rails db:prepare RAILS_ENV=test && env -u RESEND_API_KEY -u LAB_CRON_ENABLED bin/rails test
 
 # ---------------------------------------------------------------------------
 # Build & Test
