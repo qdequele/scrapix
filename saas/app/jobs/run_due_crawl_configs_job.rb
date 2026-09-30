@@ -3,7 +3,13 @@
 # overlapping runs (several Puma/SolidQueue processes) never fire it twice.
 class RunDueCrawlConfigsJob < ApplicationJob
   queue_as :default
+  # One run at a time (like ProcessLabEventsJob): the row lock already keeps
+  # a config from firing twice, this just stops overlapping sweeps piling up.
+  limits_concurrency to: 1, key: "run_due_crawl_configs", duration: 5.minutes, on_conflict: :discard
   MAX_PER_RUN = 50
+  # Shown to the account for errors that aren't the engine's own answer;
+  # the real error (hosts, internals) goes to the log only.
+  UNREACHABLE = "The crawl engine could not be reached; the run will retry at the next schedule".freeze
 
   def perform
     return unless ENV["LAB_CRON_ENABLED"] == "true"
@@ -33,6 +39,7 @@ class RunDueCrawlConfigsJob < ApplicationJob
     invalid = e.status == 400 && e.body.is_a?(Hash) && e.body["code"] == "validation_error"
     cfg.update_columns(last_error: message, next_run_at: next_run, cron_enabled: invalid ? false : cfg.cron_enabled)
   rescue StandardError => e
-    cfg.update_columns(last_error: e.message.truncate(500), next_run_at: next_run)
+    Rails.logger.error("Scheduled run of crawl config #{cfg.id} failed: #{e.class}: #{e.message}")
+    cfg.update_columns(last_error: UNREACHABLE, next_run_at: next_run)
   end
 end

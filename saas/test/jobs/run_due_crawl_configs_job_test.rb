@@ -46,6 +46,25 @@ class RunDueCrawlConfigsJobTest < ActiveJob::TestCase
     refute @cfg.reload.cron_enabled
   end
 
+  test "an unexpected error records a generic last_error and logs the real one" do
+    logged = []
+    with_stub(Rails.logger, :error, ->(msg = nil, &blk) { logged << (msg || blk&.call) }) do
+      boom = ->(*) { raise Errno::ECONNREFUSED, "connect(2) for 10.0.0.7:8090 (secret-host)" }
+      with_stub(ScrapixEngine, :create_crawl, boom) { RunDueCrawlConfigsJob.perform_now }
+    end
+    @cfg.reload
+    assert_equal "The crawl engine could not be reached; the run will retry at the next schedule", @cfg.last_error
+    assert @cfg.next_run_at > Time.current
+    assert @cfg.cron_enabled
+    assert(logged.any? { |m| m.to_s.include?("secret-host") && m.to_s.include?(@cfg.id.to_s) }, logged.inspect)
+  end
+
+  test "one run at a time" do
+    assert_equal 1, RunDueCrawlConfigsJob.concurrency_limit
+    assert_equal "RunDueCrawlConfigsJob/run_due_crawl_configs", RunDueCrawlConfigsJob.new.concurrency_key
+    assert_equal :discard, RunDueCrawlConfigsJob.concurrency_on_conflict
+  end
+
   test "does nothing unless LAB_CRON_ENABLED" do
     ENV["LAB_CRON_ENABLED"] = nil
     with_stub(ScrapixEngine, :create_crawl, ->(*) { flunk "must not fire" }) { RunDueCrawlConfigsJob.perform_now }
