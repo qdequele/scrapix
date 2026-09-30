@@ -66,11 +66,12 @@ pub(crate) struct LabMeilisearchResolver {
 }
 
 fn lab_err(e: crate::lab_client::LabError) -> ApiError {
-    tracing::warn!(error = %e, "Lab unavailable during Meilisearch lookup");
+    crate::lab_client::log_lab_error(&e, "Meilisearch lookup");
     ApiError::new(
         "Meilisearch configuration unavailable, retry shortly",
         "service_unavailable",
     )
+    .with_retry_after(5)
 }
 
 /// Table-miss decision, factored out so it can be unit tested without a
@@ -238,7 +239,10 @@ mod tests {
         );
         lab.set_down(true);
         let other = "22222222-2222-2222-2222-222222222222";
-        assert!(r.default_target(Some(other)).await.is_err());
+        let err = r.default_target(Some(other)).await.unwrap_err();
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{AuthState, AuthenticatedAccount};
 use crate::lab_client::{CredentialKind, Identity, LabError};
@@ -71,7 +71,7 @@ fn resolved(
         Ok(Some(id)) => Ok(id),
         Ok(None) => Err(AuthError::new(msg, code)),
         Err(e) => {
-            warn!(error = %e, "Lab lookup failed during authentication");
+            crate::lab_client::log_lab_error(&e, "authentication");
             Err(AuthError::unavailable())
         }
     }

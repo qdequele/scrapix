@@ -166,6 +166,13 @@ impl EngineSettings {
                     events_secret: secret("LAB_EVENTS_SECRET", &args.lab_events_secret)?,
                     service_token: secret("LAB_SERVICE_TOKEN", &args.lab_service_token)?,
                 };
+                if database_url.is_none() {
+                    tracing::warn!(
+                        "SCRAPIX_MODE=hosted without DATABASE_URL: the engine uses its default SQLite \
+                         file ({DEFAULT_SQLITE_URL}). Undelivered Lab events (usage to bill) and job \
+                         history live there: keep it on persistent storage, or set DATABASE_URL"
+                    );
+                }
                 Ok(Self {
                     mode,
                     auth: AuthSetting::Lab,
