@@ -241,6 +241,9 @@ function MeilisearchEngineCard() {
     (msUrl !== defaultEngine.url || msApiKey !== "");
 
   const isNew = engines.length === 0 && !isLoading;
+  // The Lab refuses a URL change that would reuse the stored key elsewhere.
+  const urlChangeNeedsKey =
+    !!defaultEngine?.has_api_key && msUrl.trim() !== defaultEngine.url && msApiKey === "";
 
   const handleSave = async () => {
     if (!msUrl.trim()) {
@@ -324,7 +327,10 @@ function MeilisearchEngineCard() {
               />
               <p className="text-xs text-muted-foreground">
                 Use a key with read and write permissions on all indexes.
-                {defaultEngine?.has_api_key && " Leave blank to keep the current key."}
+                {defaultEngine?.has_api_key &&
+                  (urlChangeNeedsKey
+                    ? " Changing the URL requires re-entering the API key."
+                    : " Leave blank to keep the current key.")}
               </p>
             </div>
           </>
@@ -333,7 +339,7 @@ function MeilisearchEngineCard() {
       <CardFooter>
         <Button
           onClick={handleSave}
-          disabled={saving || (!isNew && !hasChanges)}
+          disabled={saving || (!isNew && !hasChanges) || urlChangeNeedsKey}
         >
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {isNew ? "Connect Engine" : "Save Changes"}
