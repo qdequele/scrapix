@@ -129,4 +129,10 @@ class InternalApiTest < ActionDispatch::IntegrationTest
     get "/internal/accounts/not-a-uuid", headers: service
     assert_equal({ "active" => false }, response.parsed_body)
   end
+
+  test "the request log never carries the introspected credential" do
+    filter = ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters)
+    assert_equal({ "credential" => "[FILTERED]", "kind" => "api_key" },
+                 filter.filter("credential" => ACME_KEY, "kind" => "api_key"))
+  end
 end
