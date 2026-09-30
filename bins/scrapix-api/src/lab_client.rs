@@ -42,6 +42,9 @@ pub(crate) struct Identity {
 pub(crate) enum LabError {
     Unavailable(String),
     ServiceTokenRejected,
+    /// Lab answered a 4xx other than 401: reachable but refusing the request.
+    /// Never served stale.
+    BadResponse(u16),
 }
 
 impl std::fmt::Display for LabError {
@@ -49,6 +52,7 @@ impl std::fmt::Display for LabError {
         match self {
             Self::Unavailable(m) => write!(f, "Lab unavailable: {m}"),
             Self::ServiceTokenRejected => f.write_str("Lab rejected LAB_SERVICE_TOKEN"),
+            Self::BadResponse(code) => write!(f, "Lab answered HTTP {code}"),
         }
     }
 }
@@ -235,13 +239,18 @@ impl LabClient {
             Err(e) => Err(LabError::Unavailable(e.to_string())),
             Ok(resp) => match resp.status().as_u16() {
                 401 => Err(LabError::ServiceTokenRejected),
+                // The Meilisearch lookup's 404 means "no engine", handled by the caller.
+                404 if endpoint == "meilisearch" => Ok(resp),
+                c @ 400..=499 => Err(LabError::BadResponse(c)),
                 s if s >= 500 => Err(LabError::Unavailable(format!("HTTP {s}"))),
                 _ => Ok(resp),
             },
         };
         match &result {
             Err(LabError::Unavailable(_)) => count(endpoint, "unavailable"),
-            Err(LabError::ServiceTokenRejected) => count(endpoint, "rejected"),
+            Err(LabError::ServiceTokenRejected | LabError::BadResponse(_)) => {
+                count(endpoint, "rejected")
+            }
             Ok(_) => {}
         }
         result
@@ -384,9 +393,18 @@ impl LabClient {
                         .get(format!("{}/internal/accounts/{account_id}", self.base)),
                 )
                 .await?;
-            Ok(self.to_identity("account", a))
+            let (identity, ttl) = self.to_identity("account", a);
+            if identity.is_none() {
+                self.forget_balance(account_id);
+            }
+            Ok((identity, ttl))
         })
         .await
+    }
+
+    /// An inactive account must never keep a positive balance snapshot.
+    fn forget_balance(&self, account_id: &str) {
+        self.balances.lock().unwrap().remove(account_id);
     }
 
     pub(crate) fn note_usage(&self, account_id: &str, credits: i64) {
@@ -416,6 +434,7 @@ impl LabClient {
             Ok(a) => {
                 let (id, _) = self.to_identity("account", a);
                 if id.is_none() {
+                    self.forget_balance(account_id);
                     return Ok(None);
                 }
                 Ok(self
@@ -535,6 +554,8 @@ pub(crate) mod testing {
         pub down: AtomicBool,
         pub slow_ms: AtomicUsize,
         pub malformed: AtomicBool,
+        /// Non-zero: every gated route answers this status (after the down check).
+        pub status_override: AtomicUsize,
         pub calls: AtomicUsize,
     }
 
@@ -556,6 +577,10 @@ pub(crate) mod testing {
         }
         if s.down.load(Ordering::SeqCst) {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let forced = s.status_override.load(Ordering::SeqCst);
+        if forced != 0 {
+            return Err(StatusCode::from_u16(forced as u16).unwrap());
         }
         if !authorized(h) {
             return Err(StatusCode::UNAUTHORIZED);
@@ -928,6 +953,74 @@ mod tests {
             Some(70),
             "fresh snapshot, local usage reset"
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_account_never_regains_a_balance_from_the_stale_snapshot() {
+        let (lab, c) = setup().await;
+        let active =
+            json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}});
+        lab.set_account(ACCT, active.clone());
+        assert_eq!(c.available_credits(ACCT).await.unwrap(), Some(100));
+        lab.set_account(ACCT, json!({"active": false}));
+        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl
+        assert_eq!(c.available_credits(ACCT).await.unwrap(), None);
+        lab.set_down(true);
+        let r = c.available_credits(ACCT).await;
+        assert!(
+            matches!(r, Ok(None) | Err(LabError::Unavailable(_))),
+            "deactivated account must not get a balance back: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_inactive_answer_drops_the_balance_snapshot() {
+        let (lab, c) = setup().await;
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}}),
+        );
+        assert!(c.account(ACCT).await.unwrap().is_some());
+        lab.set_account(ACCT, json!({"active": false}));
+        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl
+        assert!(c.account(ACCT).await.unwrap().is_none());
+        lab.set_down(true);
+        let r = c.available_credits(ACCT).await;
+        assert!(
+            matches!(r, Ok(None) | Err(LabError::Unavailable(_))),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lab_4xx_is_bad_response_and_never_served_stale() {
+        let (lab, c) = setup().await;
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap();
+        lab.state
+            .status_override
+            .store(400, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl, inside grace
+        assert_eq!(
+            c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                .await,
+            Err(LabError::BadResponse(400))
+        );
+        assert_eq!(
+            LabError::BadResponse(400).to_string(),
+            "Lab answered HTTP 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_404_is_bad_response() {
+        let (lab, c) = setup().await;
+        lab.state
+            .status_override
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(c.ping().await, Err(LabError::BadResponse(404)));
     }
 
     #[tokio::test]
