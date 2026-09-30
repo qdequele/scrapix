@@ -397,6 +397,7 @@ fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
         mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
         admin_key: std::env::var("SCRAPIX_ADMIN_KEY").ok(),
         auth: std::env::var("SCRAPIX_AUTH").ok(),
+        lab_url: std::env::var("LAB_URL").ok(),
         lab_events_url: std::env::var("LAB_EVENTS_URL").ok(),
         lab_events_secret: std::env::var("LAB_EVENTS_SECRET").ok(),
         lab_service_token: std::env::var("LAB_SERVICE_TOKEN").ok(),

@@ -1,5 +1,5 @@
-//! PostgreSQL job store: the Rails-owned `jobs` and `job_results` tables
-//! (hosted mode).
+//! PostgreSQL job store: `jobs`, `job_results` and `lab_events` in the
+//! engine's own database, in both modes (never the Lab's database).
 
 use scrapix_core::JobState;
 use tracing::{debug, warn};
@@ -32,14 +32,13 @@ impl PgJobStore {
     }
 }
 
-/// Standalone-only migrations: the engine's own `jobs`/`job_results` schema,
-/// tracked in `_sqlx_migrations`. Never run in hosted mode, where Rails owns
-/// the schema.
+/// Migrations of the engine's own database, in both modes (`jobs`,
+/// `job_results`, `lab_events`), tracked in `_sqlx_migrations`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
 impl PgJobStore {
-    /// Standalone only: apply the engine's own schema (tracked in
-    /// `_sqlx_migrations`). Never called in hosted mode, where Rails owns it.
+    /// Apply the schema of the engine's own database, in both modes
+    /// (tracked in `_sqlx_migrations`).
     pub async fn migrate(&self) -> Result<(), StoreError> {
         MIGRATOR
             .run(&self.pool)
@@ -103,6 +102,10 @@ fn row_to_job_state(row: &sqlx::postgres::PgRow) -> JobState {
 impl JobStore for PgJobStore {
     fn backend(&self) -> &'static str {
         "postgres"
+    }
+
+    fn lab_outbox(&self) -> std::sync::Arc<dyn crate::lab_events::LabOutbox> {
+        std::sync::Arc::new(crate::lab_events::PgOutbox::new(self.pool.clone()))
     }
 
     // ========================================================================
@@ -603,7 +606,7 @@ pub(crate) async fn test_store() -> Option<std::sync::Arc<dyn JobStore>> {
 
 #[cfg(test)]
 mod tests {
-    use super::test_pg_store;
+    use super::{test_empty_pg_pool, test_pg_store, PgJobStore};
 
     #[test]
     fn schema_missing_sqlstates() {
@@ -625,5 +628,20 @@ mod tests {
             .await
             .unwrap();
         assert!(pg.is_rails_database().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rails_database_is_refused_for_the_engine_store() {
+        let Some(pool) = test_empty_pg_pool().await else {
+            eprintln!("skipped");
+            return;
+        };
+        let store = PgJobStore::new(pool.clone());
+        assert!(!store.is_rails_database().await.unwrap());
+        sqlx::query("CREATE TABLE schema_migrations (version text)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.is_rails_database().await.unwrap());
     }
 }

@@ -20,7 +20,8 @@ pub enum Mode {
 pub enum AuthSetting {
     AdminKey(String),
     Disabled,
-    Saas { jwt_secret: String },
+    /// Hosted: credentials are resolved by the Lab.
+    Lab,
 }
 
 #[derive(Debug, Clone)]
@@ -32,8 +33,9 @@ pub enum StoreUrl {
 /// Where and how the engine reports usage/job events to the Lab (hosted only).
 #[derive(Debug, Clone)]
 pub struct LabSettings {
-    /// The Lab's `POST /internal/events` endpoint.
-    pub events_url: String,
+    /// The Lab base URL (no trailing `/`): events go to
+    /// `{url}/internal/events`, lookups to `{url}/internal/*`.
+    pub url: String,
     /// HMAC key signing event batches.
     pub events_secret: String,
     /// Bearer token for the Lab's internal service API.
@@ -73,6 +75,17 @@ fn non_empty(v: &Option<String>) -> Option<String> {
 
 fn is_postgres(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+/// The engine's own job store, in both modes: SQLite by default, or a
+/// dedicated Postgres.
+fn store_from(database_url: Option<String>) -> Result<StoreUrl, ConfigError> {
+    match database_url {
+        None => Ok(StoreUrl::Sqlite(DEFAULT_SQLITE_URL.to_string())),
+        Some(u) if u.starts_with("sqlite:") => Ok(StoreUrl::Sqlite(u)),
+        Some(u) if is_postgres(&u) => Ok(StoreUrl::Postgres(u)),
+        Some(_) => err("DATABASE_URL must be sqlite: or postgres://"),
+    }
 }
 
 impl EngineSettings {
@@ -116,26 +129,28 @@ impl EngineSettings {
                 if auth_disabled {
                     return err("SCRAPIX_AUTH=disabled is not allowed with SCRAPIX_MODE=hosted");
                 }
-                let Some(url) = database_url else {
-                    return err("SCRAPIX_MODE=hosted requires DATABASE_URL (the Rails Postgres)");
+                let url = match (non_empty(&args.lab_url), non_empty(&args.lab_events_url)) {
+                    (Some(u), _) => u,
+                    (None, Some(e)) => {
+                        tracing::warn!(
+                            "LAB_EVENTS_URL is deprecated: set LAB_URL to the Lab base URL"
+                        );
+                        crate::lab_client::LabClient::base_from_events_url(&e)
+                    }
+                    (None, None) => {
+                        return err(
+                            "SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL, e.g. http://127.0.0.1:8091)",
+                        )
+                    }
                 };
-                if !is_postgres(&url) {
-                    return err("SCRAPIX_MODE=hosted requires a postgres:// DATABASE_URL");
-                }
-                let Some(jwt_secret) = non_empty(&args.jwt_secret) else {
-                    return err(
-                        "SCRAPIX_MODE=hosted requires JWT_SECRET (the same secret the Rails app signs sessions with)",
-                    );
-                };
-                let Some(events_url) = non_empty(&args.lab_events_url) else {
-                    return err(
-                        "SCRAPIX_MODE=hosted requires LAB_EVENTS_URL (the Lab's POST /internal/events endpoint)",
-                    );
-                };
-                if !(events_url.starts_with("http://") || events_url.starts_with("https://")) {
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return err(format!(
-                        "LAB_EVENTS_URL must start with http:// or https://, got `{events_url}`"
+                        "LAB_URL must start with http:// or https://, got `{url}`"
                     ));
+                }
+                let url = url.trim_end_matches('/').to_string();
+                if non_empty(&args.jwt_secret).is_some() {
+                    tracing::info!("JWT_SECRET is ignored: the Lab verifies sessions");
                 }
                 let secret = |name: &str, v: &Option<String>| -> Result<String, ConfigError> {
                     match non_empty(v) {
@@ -147,14 +162,14 @@ impl EngineSettings {
                     }
                 };
                 let lab = LabSettings {
-                    events_url,
+                    url,
                     events_secret: secret("LAB_EVENTS_SECRET", &args.lab_events_secret)?,
                     service_token: secret("LAB_SERVICE_TOKEN", &args.lab_service_token)?,
                 };
                 Ok(Self {
                     mode,
-                    auth: AuthSetting::Saas { jwt_secret },
-                    store: StoreUrl::Postgres(url),
+                    auth: AuthSetting::Lab,
+                    store: store_from(database_url)?,
                     meilisearch,
                     lab: Some(lab),
                 })
@@ -163,7 +178,8 @@ impl EngineSettings {
                 if non_empty(&args.jwt_secret).is_some() {
                     tracing::info!("JWT_SECRET is ignored in standalone mode");
                 }
-                if non_empty(&args.lab_events_url).is_some()
+                if non_empty(&args.lab_url).is_some()
+                    || non_empty(&args.lab_events_url).is_some()
                     || non_empty(&args.lab_events_secret).is_some()
                     || non_empty(&args.lab_service_token).is_some()
                 {
@@ -196,20 +212,10 @@ impl EngineSettings {
                         ));
                     }
                 };
-                let store = match database_url {
-                    None => StoreUrl::Sqlite(DEFAULT_SQLITE_URL.to_string()),
-                    Some(u) if u.starts_with("sqlite:") => StoreUrl::Sqlite(u),
-                    Some(u) if is_postgres(&u) => StoreUrl::Postgres(u),
-                    Some(_) => {
-                        return err(
-                            "DATABASE_URL must be sqlite: or postgres:// in standalone mode",
-                        )
-                    }
-                };
                 Ok(Self {
                     mode,
                     auth,
-                    store,
+                    store: store_from(database_url)?,
                     meilisearch,
                     lab: None,
                 })
@@ -246,6 +252,7 @@ mod tests {
         parsed.jwt_secret = get("JWT_SECRET");
         parsed.meilisearch_url = get("MEILISEARCH_URL");
         parsed.meilisearch_api_key = get("MEILISEARCH_API_KEY");
+        parsed.lab_url = get("LAB_URL");
         parsed.lab_events_url = get("LAB_EVENTS_URL");
         parsed.lab_events_secret = get("LAB_EVENTS_SECRET");
         parsed.lab_service_token = get("LAB_SERVICE_TOKEN");
@@ -254,11 +261,18 @@ mod tests {
 
     const KEY: &str = "0123456789abcdef";
     const SECRET32: &str = "0123456789abcdef0123456789abcdef";
-    const LAB_ENV: [(&str, &str); 3] = [
-        ("LAB_EVENTS_URL", "http://127.0.0.1:8091/internal/events"),
+    const LAB: [(&str, &str); 3] = [
+        ("LAB_URL", "http://127.0.0.1:8091"),
         ("LAB_EVENTS_SECRET", SECRET32),
         ("LAB_SERVICE_TOKEN", SECRET32),
     ];
+
+    fn hosted(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut v = vec![("SCRAPIX_MODE", "hosted")];
+        v.extend(LAB);
+        v.extend_from_slice(extra);
+        v
+    }
 
     #[test]
     fn standalone_defaults_to_sqlite_and_admin_key() {
@@ -286,12 +300,8 @@ mod tests {
     fn auth_disabled_is_allowed_in_standalone_only() {
         let s = EngineSettings::resolve(&args(&[("SCRAPIX_AUTH", "disabled")])).unwrap();
         assert!(matches!(s.auth, AuthSetting::Disabled));
-        let e = EngineSettings::resolve(&args(&[
-            ("SCRAPIX_MODE", "hosted"),
-            ("SCRAPIX_AUTH", "disabled"),
-            ("DATABASE_URL", "postgres://db/x"),
-        ]))
-        .unwrap_err();
+        let e =
+            EngineSettings::resolve(&args(&hosted(&[("SCRAPIX_AUTH", "disabled")]))).unwrap_err();
         assert!(e.0.contains("SCRAPIX_AUTH=disabled"), "{}", e.0);
     }
 
@@ -334,55 +344,73 @@ mod tests {
     }
 
     #[test]
-    fn hosted_requires_postgres_and_reads_jwt() {
-        assert!(EngineSettings::resolve(&args(&[("SCRAPIX_MODE", "hosted")])).is_err());
-        assert!(EngineSettings::resolve(&args(&[
-            ("SCRAPIX_MODE", "hosted"),
-            ("DATABASE_URL", "sqlite://x.db"),
-        ]))
-        .is_err());
-        let mut env = vec![
-            ("SCRAPIX_MODE", "hosted"),
-            ("DATABASE_URL", "postgres://db/x"),
-            ("JWT_SECRET", "s3cret"),
-        ];
-        env.extend(LAB_ENV);
-        let s = EngineSettings::resolve(&args(&env)).unwrap();
-        assert!(matches!(s.auth, AuthSetting::Saas { ref jwt_secret } if jwt_secret == "s3cret"));
+    fn hosted_needs_no_jwt_secret_and_defaults_to_its_own_sqlite() {
+        let s = EngineSettings::resolve(&args(&hosted(&[]))).unwrap();
+        assert!(matches!(s.auth, AuthSetting::Lab));
+        assert!(matches!(s.store, StoreUrl::Sqlite(ref u) if u == DEFAULT_SQLITE_URL));
+        assert_eq!(s.lab.unwrap().url, "http://127.0.0.1:8091");
     }
 
     #[test]
-    fn hosted_requires_lab_settings() {
-        let base = [
+    fn hosted_accepts_its_own_postgres_and_ignores_jwt_secret() {
+        let s = EngineSettings::resolve(&args(&hosted(&[
+            ("DATABASE_URL", "postgres://db/scrapix_engine"),
+            ("JWT_SECRET", "x"),
+        ])))
+        .unwrap();
+        assert!(matches!(s.store, StoreUrl::Postgres(_)));
+    }
+
+    #[test]
+    fn hosted_falls_back_to_lab_events_url_and_derives_the_base() {
+        let env = [
             ("SCRAPIX_MODE", "hosted"),
-            ("DATABASE_URL", "postgres://db/x"),
-            ("JWT_SECRET", "s3cret"),
+            ("LAB_EVENTS_URL", "http://127.0.0.1:8091/internal/events"),
+            ("LAB_EVENTS_SECRET", SECRET32),
+            ("LAB_SERVICE_TOKEN", SECRET32),
         ];
-        let e = EngineSettings::resolve(&args(&base)).unwrap_err();
-        assert!(e.0.contains("LAB_EVENTS_URL"), "{}", e.0);
-        let mut full = base.to_vec();
-        full.extend(LAB_ENV);
-        let s = EngineSettings::resolve(&args(&full)).unwrap();
-        let lab = s.lab.unwrap();
-        assert_eq!(lab.events_url, "http://127.0.0.1:8091/internal/events");
-        let mut short = full.clone();
-        short[4] = ("LAB_EVENTS_SECRET", "short");
+        assert_eq!(
+            EngineSettings::resolve(&args(&env))
+                .unwrap()
+                .lab
+                .unwrap()
+                .url,
+            "http://127.0.0.1:8091"
+        );
+    }
+
+    #[test]
+    fn hosted_requires_lab_url_secret_and_token() {
+        let e = EngineSettings::resolve(&args(&[("SCRAPIX_MODE", "hosted")])).unwrap_err();
+        assert!(e.0.contains("LAB_URL"), "{}", e.0);
+        let mut short = hosted(&[]);
+        short[2] = ("LAB_EVENTS_SECRET", "short");
         assert!(EngineSettings::resolve(&args(&short))
             .unwrap_err()
             .0
             .contains("LAB_EVENTS_SECRET"));
-        let mut no_token = full.clone();
-        no_token.pop();
+        let mut bad = hosted(&[]);
+        bad[1] = ("LAB_URL", "127.0.0.1:8091");
+        assert!(EngineSettings::resolve(&args(&bad))
+            .unwrap_err()
+            .0
+            .contains("LAB_URL"));
+        let mut no_token = hosted(&[]);
+        no_token.retain(|(k, _)| *k != "LAB_SERVICE_TOKEN");
         assert!(EngineSettings::resolve(&args(&no_token))
             .unwrap_err()
             .0
             .contains("LAB_SERVICE_TOKEN"));
-        let mut bad_url = full.clone();
-        bad_url[3] = ("LAB_EVENTS_URL", "127.0.0.1:8091/internal/events");
-        assert!(EngineSettings::resolve(&args(&bad_url))
-            .unwrap_err()
-            .0
-            .contains("LAB_EVENTS_URL"));
+    }
+
+    #[test]
+    fn standalone_ignores_lab_url() {
+        let s = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_ADMIN_KEY", KEY),
+            ("LAB_URL", "http://x"),
+        ]))
+        .unwrap();
+        assert!(s.lab.is_none());
     }
 
     #[test]
@@ -393,23 +421,6 @@ mod tests {
         ]))
         .unwrap();
         assert!(s.lab.is_none());
-    }
-
-    #[test]
-    fn hosted_requires_jwt_secret() {
-        let e = EngineSettings::resolve(&args(&[
-            ("SCRAPIX_MODE", "hosted"),
-            ("DATABASE_URL", "postgres://db/x"),
-        ]))
-        .unwrap_err();
-        assert!(e.0.contains("JWT_SECRET"), "{}", e.0);
-        let e = EngineSettings::resolve(&args(&[
-            ("SCRAPIX_MODE", "hosted"),
-            ("DATABASE_URL", "postgres://db/x"),
-            ("JWT_SECRET", "   "),
-        ]))
-        .unwrap_err();
-        assert!(e.0.contains("JWT_SECRET"), "{}", e.0);
     }
 
     #[test]

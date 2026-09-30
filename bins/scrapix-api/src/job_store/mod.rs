@@ -1,9 +1,10 @@
 //! Durable job state (`jobs`) and engine-job results (`job_results`).
 //!
 //! Write-through cache: the in-memory maps in `AppState` stay the primary
-//! read path; a store gives durability across restarts. Hosted mode uses
-//! the Rails-owned Postgres schema; standalone uses engine-owned migrations
-//! (SQLite by default, or a dedicated Postgres).
+//! read path; a store gives durability across restarts. The database is the
+//! engine's own in both modes, with engine-owned migrations (SQLite by
+//! default, or a dedicated Postgres); hosted mode also keeps its lab-event
+//! outbox there.
 
 #[cfg(test)]
 mod conformance;
@@ -66,6 +67,8 @@ pub(crate) fn str_to_status(s: &str) -> JobStatus {
 pub trait JobStore: Send + Sync {
     /// `"postgres"` or `"sqlite"` (for logs).
     fn backend(&self) -> &'static str;
+    /// The lab-event outbox in the same database (used in hosted mode).
+    fn lab_outbox(&self) -> std::sync::Arc<dyn crate::lab_events::LabOutbox>;
     /// Insert a new job row; an existing row with the same id is kept.
     async fn insert_job(&self, job: &JobState) -> Result<(), StoreError>;
     /// Full update of a job's mutable fields (lifecycle events: complete,

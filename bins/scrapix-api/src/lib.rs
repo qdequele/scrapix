@@ -136,12 +136,12 @@ pub struct Args {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: Option<String>,
 
-    /// JWT secret for session tokens (required when DATABASE_URL is set)
+    /// JWT_SECRET: ignored by the engine (the Lab verifies sessions).
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
     /// Deployment mode: `standalone` (default, self-hosted, admin key) or
-    /// `hosted` (Rails control plane, shared Postgres).
+    /// `hosted` (Lab control plane; the engine keeps its own database).
     #[arg(long, env = "SCRAPIX_MODE", default_value = "standalone")]
     pub mode: String,
 
@@ -154,7 +154,11 @@ pub struct Args {
     #[arg(long, env = "SCRAPIX_AUTH")]
     pub auth: Option<String>,
 
-    /// Lab endpoint receiving usage/job events (hosted only; required there).
+    /// Hosted: the Lab base URL — events go to {LAB_URL}/internal/events, lookups to {LAB_URL}/internal/*.
+    #[arg(long, env = "LAB_URL")]
+    pub lab_url: Option<String>,
+
+    /// Lab endpoint receiving usage/job events (deprecated: set LAB_URL).
     #[arg(long, env = "LAB_EVENTS_URL")]
     pub lab_events_url: Option<String>,
 
@@ -6613,67 +6617,85 @@ struct ModeWiring {
     auth_mode: auth::AuthMode,
     job_store: Arc<dyn job_store::JobStore>,
     meili: Arc<dyn meili::MeilisearchResolver>,
-    /// Hosted only: the engine's lab-event outbox (in the shared Postgres).
+    /// Hosted only: the engine's lab-event outbox (in the engine's own database).
     lab_outbox: Option<Arc<dyn lab_events::LabOutbox>>,
     /// Hosted only: the Lab's internal API (auth, credit pre-check, Meilisearch).
     lab_api: Option<Arc<lab_client::LabClient>>,
 }
 
-/// Connects to a Postgres URL, adding `sslmode=prefer` when the URL sets none.
-async fn connect_pg(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
-    // Heroku Postgres requires SSL but doesn't include sslmode in DATABASE_URL,
-    // while local dev Postgres has no TLS at all. sslmode=prefer negotiates TLS
-    // when the server supports it and falls back to plaintext otherwise.
-    let url = if !database_url.contains("sslmode=") {
-        let sep = if database_url.contains('?') { "&" } else { "?" };
-        format!("{database_url}{sep}sslmode=prefer")
-    } else {
-        database_url.to_string()
-    };
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&url)
-        .await
+/// The engine's own job store (both modes): opens SQLite, or connects to a
+/// dedicated Postgres, refuses a Rails (Lab) database and migrates it.
+async fn open_store(store: &settings::StoreUrl) -> anyhow::Result<Arc<dyn job_store::JobStore>> {
+    Ok(match store {
+        settings::StoreUrl::Sqlite(url) => Arc::new(
+            job_store::SqliteJobStore::open(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+        settings::StoreUrl::Postgres(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(10)
+                .connect(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot connect to DATABASE_URL: {e}"))?;
+            let pg = job_store::PgJobStore::new(pool);
+            if pg
+                .is_rails_database()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot inspect DATABASE_URL: {e}"))?
+            {
+                anyhow::bail!(
+                    "DATABASE_URL points at a Rails (Lab) database; the engine needs its own database"
+                );
+            }
+            pg.migrate()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot migrate DATABASE_URL: {e}"))?;
+            Arc::new(pg)
+        }
+    })
 }
 
 /// Auth, job store and Meilisearch resolver for `settings.mode`. Every
 /// failure aborts startup: an unreachable database never disables auth.
 async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWiring> {
     match (&settings.mode, &settings.auth, &settings.store) {
-        (
-            settings::Mode::Hosted,
-            settings::AuthSetting::Saas { .. },
-            settings::StoreUrl::Postgres(url),
-        ) => {
-            // Credentials are resolved by the Lab over HTTP; the Rails
-            // Postgres below still backs the job store and the lab-event
-            // outbox until they move too.
+        (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
             let lab_api = Arc::new(lab_client::LabClient::new(
-                &lab_client::LabClient::base_from_events_url(&lab_cfg.events_url),
+                &lab_cfg.url,
                 &lab_cfg.service_token,
             ));
-            let auth = Arc::new(auth::AuthState::new(
-                lab_api.clone(),
-                Some(lab_cfg.service_token.clone()),
-            ));
-            // The schema is owned by the Rails app (saas/db/migrate,
-            // `rails db:prepare`); the engine never migrates it.
-            let pool = connect_pg(url).await.map_err(|e| {
-                anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
-            })?;
-            lab_events::ensure_outbox_table(&pool).await?;
-            info!("Authentication enabled via the Lab");
-            let lab_outbox: Arc<dyn lab_events::LabOutbox> =
-                Arc::new(lab_events::PgOutbox::new(pool.clone()));
+            match lab_api.ping().await {
+                Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
+                Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
+                    "the Lab at {} rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab",
+                    lab_cfg.url
+                ),
+                Err(lab_client::LabError::BadResponse(code)) => anyhow::bail!(
+                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL \
+                     (a wrong URL typically 404s)",
+                    lab_cfg.url
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    url = %lab_cfg.url,
+                    "Lab unreachable at startup; serving 503s until it answers"
+                ),
+            }
+            let store = open_store(store_url).await?;
+            info!(backend = store.backend(), "Job store ready (engine-owned)");
             Ok(ModeWiring {
-                auth_mode: auth::AuthMode::Saas(auth),
-                job_store: Arc::new(job_store::PgJobStore::new(pool)),
+                auth_mode: auth::AuthMode::Saas(Arc::new(auth::AuthState::new(
+                    lab_api.clone(),
+                    Some(lab_cfg.service_token.clone()),
+                ))),
+                lab_outbox: Some(store.lab_outbox()),
+                job_store: store,
                 meili: Arc::new(meili::LabMeilisearchResolver {
                     lab: lab_api.clone(),
                     server: settings.meilisearch.clone(),
                 }),
-                lab_outbox: Some(lab_outbox),
                 lab_api: Some(lab_api),
             })
         }
@@ -6689,39 +6711,11 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                     );
                     auth::AuthMode::Disabled
                 }
-                settings::AuthSetting::Saas { .. } => {
-                    unreachable!("EngineSettings::resolve never pairs Saas with standalone")
+                settings::AuthSetting::Lab => {
+                    unreachable!("EngineSettings::resolve never pairs Lab auth with standalone")
                 }
             };
-            let store: Arc<dyn job_store::JobStore> = match store_url {
-                settings::StoreUrl::Sqlite(url) => Arc::new(
-                    job_store::SqliteJobStore::open(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                ),
-                settings::StoreUrl::Postgres(url) => {
-                    let pool = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(10)
-                        .connect(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot connect to DATABASE_URL: {e}"))?;
-                    let pg = job_store::PgJobStore::new(pool);
-                    if pg
-                        .is_rails_database()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot inspect DATABASE_URL: {e}"))?
-                    {
-                        anyhow::bail!(
-                            "DATABASE_URL points at a Rails (hosted) database; set \
-                             SCRAPIX_MODE=hosted, or give standalone a dedicated database"
-                        );
-                    }
-                    pg.migrate()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot migrate DATABASE_URL: {e}"))?;
-                    Arc::new(pg)
-                }
-            };
+            let store = open_store(store_url).await?;
             info!(backend = store.backend(), "Job store ready");
             if let Some(ref m) = settings.meilisearch {
                 let health = format!("{}/health", m.url);
@@ -7126,7 +7120,7 @@ pub async fn run_with_bus(
         let sink = lab_sink::LabSink::new(
             outbox,
             reqwest::Client::new(),
-            cfg.events_url.clone(),
+            format!("{}/internal/events", cfg.url),
             cfg.events_secret.clone(),
         );
         info!("Lab event delivery started");
@@ -7872,6 +7866,111 @@ mod tests {
         // in-memory delivery.
         assert_eq!(cfg.webhooks[0].url, "https://example.com/hook");
     }
+
+    // ========================================================================
+    // wire_mode
+    // ========================================================================
+
+    fn hosted_settings(
+        lab_url: &str,
+        token: &str,
+        store: settings::StoreUrl,
+    ) -> settings::EngineSettings {
+        settings::EngineSettings {
+            mode: settings::Mode::Hosted,
+            auth: settings::AuthSetting::Lab,
+            store,
+            meilisearch: None,
+            lab: Some(settings::LabSettings {
+                url: lab_url.into(),
+                events_secret: "s".repeat(32),
+                service_token: token.into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_runs_on_its_own_sqlite_store() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let w = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .unwrap();
+        assert!(w.lab_api.is_some());
+        assert!(w.lab_outbox.is_some());
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_wrong_service_token() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            &"wrong".repeat(8),
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("LAB_SERVICE_TOKEN"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_lab_url_that_answers_4xx() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.state
+            .status_override
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("LAB_URL"), "{msg}");
+        assert!(msg.contains("404"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_starts_while_the_lab_is_down() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.set_down(true);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        assert!(wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url)
+        ))
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn standalone_builds_no_lab_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = settings::EngineSettings {
+            mode: settings::Mode::Standalone,
+            auth: settings::AuthSetting::AdminKey("k".repeat(16)),
+            store: settings::StoreUrl::Sqlite(format!("sqlite://{}/s.db", dir.path().display())),
+            meilisearch: None,
+            lab: None,
+        };
+        let w = wire_mode(&s).await.unwrap();
+        assert!(w.lab_api.is_none());
+        assert!(w.lab_outbox.is_none());
+    }
 }
 
 /// Job lifecycle (R5/R9) tests on a DB-less `AppState` over the in-process bus.
@@ -8124,6 +8223,9 @@ mod lifecycle_tests {
     impl job_store::JobStore for SeedOrderStore {
         fn backend(&self) -> &'static str {
             "test"
+        }
+        fn lab_outbox(&self) -> Arc<dyn lab_events::LabOutbox> {
+            Arc::new(lab_events::MemoryOutbox::default())
         }
         async fn insert_job(&self, job: &JobState) -> Result<(), job_store::StoreError> {
             let seed_published = self
@@ -8397,6 +8499,9 @@ mod lifecycle_tests {
     impl job_store::JobStore for TerminalStore {
         fn backend(&self) -> &'static str {
             "test"
+        }
+        fn lab_outbox(&self) -> Arc<dyn lab_events::LabOutbox> {
+            Arc::new(lab_events::MemoryOutbox::default())
         }
         async fn insert_job(&self, _: &JobState) -> Result<(), job_store::StoreError> {
             Ok(())
