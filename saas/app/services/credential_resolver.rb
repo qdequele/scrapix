@@ -26,7 +26,7 @@ module CredentialResolver
   def session_user(raw)
     claims, = JWT.decode(raw.to_s, ENV.fetch("JWT_SECRET"), true, algorithm: "HS256")
     return nil unless claims["sub"].to_s.match?(UUID)
-    { user_id: claims["sub"], email: claims["email"] }
+    { user_id: claims["sub"], email: claims["email"], expires_at: claims["exp"] && Time.at(claims["exp"].to_i) }
   rescue JWT::DecodeError
     nil
   end

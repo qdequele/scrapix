@@ -305,7 +305,7 @@
           },
           "cache_ttl": {
             "type": "integer",
-            "description": "Seconds the engine may cache this answer (default 30)"
+            "description": "Seconds the engine may cache this answer: 30, or fewer for a session or OAuth token that expires sooner (never past the credential's expiry; 0 = do not cache)"
           }
         }
       },

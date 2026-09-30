@@ -22,11 +22,18 @@ module Internal
       render json: {
         active: true, account_id: account.id, tier: account.tier, role: identity[:role],
         api_key_id: identity[:api_key_id], principal: identity[:principal],
-        credits: { balance: account.effective_credits_balance }, cache_ttl: CACHE_TTL
+        credits: { balance: account.effective_credits_balance }, cache_ttl: cache_ttl(identity[:expires_at])
       }
     end
 
     private
+
+    # Never cache a credential past its own expiry (session JWT exp, OAuth
+    # token expires_at): min(CACHE_TTL, seconds left), floor 0.
+    def cache_ttl(expires_at)
+      return CACHE_TTL unless expires_at
+      (expires_at - Time.current).floor.clamp(0, CACHE_TTL)
+    end
 
     def resolve(kind, credential, account_id)
       case kind
@@ -36,13 +43,13 @@ module Internal
                                  principal: { type: "api_key", user_id: nil } }
       when "bearer"
         holder = CredentialResolver.oauth(credential)
-        holder && { account_id: holder[:account_id], api_key_id: nil, role: nil,
+        holder && { account_id: holder[:account_id], api_key_id: nil, role: nil, expires_at: holder[:expires_at],
                     principal: { type: "oauth", user_id: holder[:user_id] } }
       when "session"
         user = CredentialResolver.session_user(credential)
         member = user && CredentialResolver.membership(user[:user_id], account_id)
         member && { account_id: member[:account_id], api_key_id: nil, role: member[:role],
-                    principal: { type: "session", user_id: user[:user_id] } }
+                    expires_at: user[:expires_at], principal: { type: "session", user_id: user[:user_id] } }
       end
     end
   end

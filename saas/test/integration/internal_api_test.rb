@@ -102,6 +102,24 @@ class InternalApiTest < ActionDispatch::IntegrationTest
     assert_equal({ "active" => false }, introspect("bearer", raw))
   end
 
+  test "a session or OAuth token is never cached past its own expiry" do
+    soon = JWT.encode({ sub: users(:quentin).id, email: users(:quentin).email, exp: 10.seconds.from_now.to_i },
+                      ENV.fetch("JWT_SECRET"), "HS256")
+    assert_includes 9..10, introspect("session", soon)["cache_ttl"]
+    later = SessionToken.encode(users(:quentin).id, users(:quentin).email)
+    assert_equal 30, introspect("session", later)["cache_ttl"]
+
+    client = OauthClient.create!(client_id: "sxc_#{'c' * 32}", redirect_uris: [ "http://localhost/cb" ])
+    raw = "sxat_#{'d' * 48}"
+    token = OauthToken.create!(token_hash: Digest::SHA256.hexdigest(raw), token_type: "access",
+                               client_id: client.client_id, user_id: users(:quentin).id, expires_at: 5.seconds.from_now)
+    assert_includes 4..5, introspect("bearer", raw)["cache_ttl"]
+    token.update!(expires_at: 1.hour.from_now)
+    assert_equal 30, introspect("bearer", raw)["cache_ttl"]
+    token.update!(expires_at: Time.current + 0.5)
+    assert_equal 0, introspect("bearer", raw)["cache_ttl"], "floored, never negative"
+  end
+
   test "an unknown kind or a missing credential is a 400" do
     post "/internal/auth/introspect", params: { kind: "magic", credential: "x" }, headers: service, as: :json
     assert_response :bad_request
