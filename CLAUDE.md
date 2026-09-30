@@ -404,8 +404,9 @@ never deletes a document whose page returned `304` in this job.
 ### Job accounting schema
 
 The engine migrates its own schema in both modes (`bins/scrapix-api/migrations`),
-so the `jobs.accounting` column is always present and there is no degraded,
-in-memory-only accounting mode.
+so the `jobs.accounting` column is always present: the degraded,
+in-memory-only accounting mode is unreachable (the engine migrates its own
+schema) and is removed in the cleanup release.
 
 ### Durability, controls and rollout caveats
 
