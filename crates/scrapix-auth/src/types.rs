@@ -1,11 +1,14 @@
 //! Shared authentication types.
 
-/// Account information extracted from a validated API key.
+/// The account a request acts as, whatever the credential (API key, OAuth
+/// Bearer, session or service call).
 #[derive(Debug, Clone)]
 pub struct AuthenticatedAccount {
     pub account_id: String,
     pub tier: String,
     pub api_key_id: Option<String>,
+    /// Member role for session/OAuth principals (`owner`/`admin`/`member`/`viewer`); None for API keys and service calls.
+    pub role: Option<String>,
 }
 
 /// User information extracted from a validated JWT session.

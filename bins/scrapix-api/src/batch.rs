@@ -30,7 +30,7 @@ use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::config::WebhookConfig;
 use scrapix_extractor::SelectorDefinition;
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
 use crate::results::{JobResultError, JobResultItem};
@@ -234,11 +234,9 @@ fn credits_per_url(request: &ScrapeRequest) -> i64 {
 pub(crate) async fn batch_scrape(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(body): Json<Value>,
 ) -> Result<Json<BatchScrapeResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     let batch = parse_batch_body(body)?;
     start_batch(&state, &account_ctx, batch).await.map(Json)

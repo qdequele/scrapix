@@ -2558,74 +2558,28 @@ impl IntoResponse for ApiError {
 // Account context helpers
 // ============================================================================
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 
-/// Resolved account context from either API key or session auth
+/// Resolved account context for an authenticated request (any credential)
 pub(crate) struct AccountContext {
     pub account_id: String,
     pub api_key_id: Option<String>,
     pub tier: String,
-    /// User role in this account (None for API key auth — API keys are account-scoped).
+    /// User role in this account (None for API keys and service calls — they are account-scoped).
     pub user_role: Option<String>,
 }
 
-/// Extract account context from request extensions.
-/// Returns `None` when auth is not configured (no DATABASE_URL), preserving backward compatibility.
+/// Account context for the request: API key, OAuth, session or service call — the auth
+/// middleware resolves them all into `AuthenticatedAccount`. `None` when auth is off (standalone).
 async fn extract_account_context(
-    db_pool: Option<&sqlx::PgPool>,
     account_ext: &Option<Extension<AuthenticatedAccount>>,
-    user_ext: &Option<Extension<AuthenticatedUser>>,
 ) -> Option<AccountContext> {
-    // API key path — no per-user role (API keys are account-scoped)
-    if let Some(Extension(acct)) = account_ext {
-        return Some(AccountContext {
-            account_id: acct.account_id.clone(),
-            api_key_id: acct.api_key_id.clone(),
-            tier: acct.tier.clone(),
-            user_role: None,
-        });
-    }
-
-    // Session path: look up account_id + tier + role via DB
-    if let (Some(Extension(user)), Some(pool)) = (user_ext, db_pool) {
-        let query = if let Some(selected_id) = user.selected_account_id {
-            sqlx::query(
-                "SELECT a.id, a.tier, m.role FROM account_members m \
-                 JOIN accounts a ON a.id = m.account_id \
-                 WHERE m.user_id = $1 AND m.account_id = $2",
-            )
-            .bind(user.user_id)
-            .bind(selected_id)
-            .fetch_optional(pool)
-            .await
-        } else {
-            sqlx::query(
-                "SELECT a.id, a.tier, m.role FROM account_members m \
-                 JOIN accounts a ON a.id = m.account_id \
-                 WHERE m.user_id = $1 LIMIT 1",
-            )
-            .bind(user.user_id)
-            .fetch_optional(pool)
-            .await
-        };
-        let row = query.ok().flatten();
-
-        if let Some(row) = row {
-            use sqlx::Row;
-            let account_id: uuid::Uuid = row.get("id");
-            let tier: String = row.get("tier");
-            let role: String = row.get("role");
-            return Some(AccountContext {
-                account_id: account_id.to_string(),
-                api_key_id: None,
-                tier,
-                user_role: Some(role),
-            });
-        }
-    }
-
-    // No auth configured or no valid credentials
-    None
+    account_ext.as_ref().map(|Extension(acct)| AccountContext {
+        account_id: acct.account_id.clone(),
+        api_key_id: acct.api_key_id.clone(),
+        tier: acct.tier.clone(),
+        user_role: acct.role.clone(),
+    })
 }
 
 /// Check that the user's role allows write operations (scrape, map, search, crawl).
@@ -3402,11 +3356,9 @@ fn preprocess_html(
 async fn scrape_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     perform_scrape(&state, &account_ctx, &request)
         .await
@@ -4973,11 +4925,9 @@ async fn map_fetch_page(
 async fn map_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<MapRequest>,
 ) -> Result<Json<MapResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check (map costs 2 credits)
@@ -5409,11 +5359,9 @@ struct SearchRequest {
 async fn search_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check
@@ -5586,11 +5534,9 @@ async fn search_url(
 async fn create_crawl(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<CreateCrawlResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     Ok(Json(
         do_create_crawl(&state, config, account_ctx.as_ref()).await?,
@@ -5605,12 +5551,10 @@ async fn create_crawl(
 async fn create_crawl_sync(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Query(sync_query): Query<results::CrawlSyncQuery>,
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     // First create the async job
     let response = do_create_crawl(&state, config, account_ctx.as_ref()).await?;
@@ -5676,11 +5620,9 @@ async fn create_crawl_sync(
 async fn create_crawl_bulk(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(configs): Json<Vec<CrawlConfig>>,
 ) -> Result<Json<BulkCrawlResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     let total = configs.len();
@@ -5716,11 +5658,9 @@ async fn create_crawl_bulk(
 async fn job_status(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Try in-memory first, fall back to the job store for historical jobs
     let job = if let Some(job) = state.get_job(&job_id) {
@@ -5743,11 +5683,9 @@ async fn job_status(
 async fn job_events(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Check if job exists and ownership
     let job = state
@@ -5847,12 +5785,10 @@ impl From<ClickHousePageEvent> for PageEventRow {
 async fn get_job_events_history(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
     Query(params): Query<JobEventsHistoryParams>,
 ) -> Result<Json<JobEventsHistoryResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Verify the job exists (check in-memory then the job store)
     let job = if let Some(job) = state.get_job(&job_id) {
@@ -6266,7 +6202,6 @@ async fn ws_job_handler(
     Path(job_id): Path<String>,
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Check if job exists
     let job = state
@@ -6274,8 +6209,7 @@ async fn ws_job_handler(
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
 
     // Verify account ownership if auth is enabled
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     if let Some(ref ctx) = account_ctx {
         if let Some(ref job_account_id) = job.account_id {
             if job_account_id != &ctx.account_id {
@@ -6375,10 +6309,9 @@ async fn handle_job_ws_connection(socket: WebSocket, state: Arc<AppState>, job_i
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.cancel(&job_id)?.into()))
 }
 
@@ -6390,10 +6323,9 @@ async fn cancel_job(
 async fn pause_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.pause(&job_id)?.into()))
 }
 
@@ -6404,10 +6336,9 @@ async fn pause_job(
 async fn resume_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.resume(&job_id)?.into()))
 }
 
@@ -6415,11 +6346,9 @@ async fn resume_job(
 async fn owned_job(
     state: &AppState,
     account_ext: &Option<Extension<AuthenticatedAccount>>,
-    user_ext: &Option<Extension<AuthenticatedUser>>,
     job_id: &str,
 ) -> Result<JobState, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), account_ext, user_ext).await;
+    let account_ctx = extract_account_context(account_ext).await;
     let existing = state
         .get_job(job_id)
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
@@ -6432,11 +6361,9 @@ async fn owned_job(
 async fn list_jobs(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<ListJobsQuery>,
 ) -> Json<Vec<JobStatusResponse>> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // With a job store, query it for full history (survives restarts)
     // and overlay in-memory data for running jobs (fresher counters).
@@ -6671,6 +6598,25 @@ struct ModeWiring {
     meili: Arc<dyn meili::MeilisearchResolver>,
     /// Hosted only: the engine's lab-event outbox (in the shared Postgres).
     lab_outbox: Option<Arc<dyn lab_events::LabOutbox>>,
+    /// Hosted only: the Lab's internal API (auth; billing and Meilisearch next).
+    lab_api: Option<Arc<lab_client::LabClient>>,
+}
+
+/// Connects to a Postgres URL, adding `sslmode=prefer` when the URL sets none.
+async fn connect_pg(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
+    // Heroku Postgres requires SSL but doesn't include sslmode in DATABASE_URL,
+    // while local dev Postgres has no TLS at all. sslmode=prefer negotiates TLS
+    // when the server supports it and falls back to plaintext otherwise.
+    let url = if !database_url.contains("sslmode=") {
+        let sep = if database_url.contains('?') { "&" } else { "?" };
+        format!("{database_url}{sep}sslmode=prefer")
+    } else {
+        database_url.to_string()
+    };
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&url)
+        .await
 }
 
 /// Auth, job store and Meilisearch resolver for `settings.mode`. Every
@@ -6679,24 +6625,28 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
     match (&settings.mode, &settings.auth, &settings.store) {
         (
             settings::Mode::Hosted,
-            settings::AuthSetting::Saas { jwt_secret },
+            settings::AuthSetting::Saas { .. },
             settings::StoreUrl::Postgres(url),
         ) => {
+            // Credentials are resolved by the Lab over HTTP; the Rails
+            // Postgres below still backs the job store, the lab-event outbox
+            // and the Meilisearch/billing lookups until they move too.
+            let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
+            let lab_api = Arc::new(lab_client::LabClient::new(
+                &lab_client::LabClient::base_from_events_url(&lab_cfg.events_url),
+                &lab_cfg.service_token,
+            ));
+            let auth = Arc::new(auth::AuthState::new(
+                lab_api.clone(),
+                Some(lab_cfg.service_token.clone()),
+            ));
             // The schema is owned by the Rails app (saas/db/migrate,
             // `rails db:prepare`); the engine never migrates it.
-            let auth = auth::AuthState::new(
-                url,
-                jwt_secret.clone(),
-                settings.lab.as_ref().map(|l| l.service_token.clone()),
-            )
-            .await
-            .map_err(|e| {
+            let pool = connect_pg(url).await.map_err(|e| {
                 anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
             })?;
-            let auth = Arc::new(auth);
-            let pool = auth.pool.clone();
             lab_events::ensure_outbox_table(&pool).await?;
-            info!("Authentication enabled via the Rails Postgres");
+            info!("Authentication enabled via the Lab");
             let lab_outbox: Arc<dyn lab_events::LabOutbox> =
                 Arc::new(lab_events::PgOutbox::new(pool.clone()));
             Ok(ModeWiring {
@@ -6708,6 +6658,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                     server: settings.meilisearch.clone(),
                 }),
                 lab_outbox: Some(lab_outbox),
+                lab_api: Some(lab_api),
             })
         }
         (settings::Mode::Standalone, auth_setting, store_url) => {
@@ -6786,6 +6737,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 job_store: store,
                 meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
                 lab_outbox: None,
+                lab_api: None,
             })
         }
         _ => unreachable!("EngineSettings::resolve guarantees a valid mode/auth/store combination"),
@@ -6823,6 +6775,7 @@ pub async fn run_with_bus(
         job_store,
         meili,
         lab_outbox,
+        lab_api: _lab_api,
     } = wire_mode(&settings).await?;
 
     // Initialize shared HTTP fetcher for /scrape endpoint

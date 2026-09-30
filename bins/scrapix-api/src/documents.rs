@@ -35,7 +35,7 @@ use scrapix_ocr::{OcrReport, OcrRequest};
 use scrapix_parser::{document::markdown_links, DocumentKind, ParseOptions, ParsedDocument};
 use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
     billing, check_write_permission, extract_account_context, extract_domain, run_ai_enrichment,
@@ -534,11 +534,9 @@ pub(crate) struct ParseUpload {
 pub(crate) async fn parse_upload(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     mut multipart: Multipart,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     let start_time = Instant::now();
     let max_bytes = max_document_bytes();
@@ -1007,7 +1005,7 @@ mod tests {
         );
         let request: crate::ScrapeRequest =
             serde_json::from_value(serde_json::json!({ "url": url })).unwrap();
-        let Json(response) = crate::scrape_url(State(state(None)), None, None, Json(request))
+        let Json(response) = crate::scrape_url(State(state(None)), None, Json(request))
             .await
             .unwrap_or_else(|e| panic!("{}", e.error));
         let body = serde_json::to_value(&response).unwrap();

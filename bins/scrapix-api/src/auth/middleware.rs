@@ -1,33 +1,42 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use axum_extra::extract::CookieJar;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use super::{AuthState, AuthenticatedAccount, AuthenticatedUser};
-use scrapix_auth::jwt;
+use super::{AuthState, AuthenticatedAccount};
+use crate::lab_client::{CredentialKind, Identity, LabError};
 
 /// Header naming the account a Rails service call acts as (hosted only,
 /// together with `Authorization: Bearer <LAB_SERVICE_TOKEN>`).
 pub(crate) const SERVICE_ACCOUNT_HEADER: &str = "X-Scrapix-Account-Id";
 
+/// Longest credential ever sent to the Lab; anything longer is rejected
+/// locally with the credential's usual 401.
+const MAX_CREDENTIAL_LEN: usize = 4096;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AuthError {
     error: String,
     code: String,
+    #[serde(skip)]
+    status: StatusCode,
 }
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        (StatusCode::UNAUTHORIZED, Json(self)).into_response()
+        let mut resp = (self.status, Json(&self)).into_response();
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            resp.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        resp
     }
 }
 
@@ -36,15 +45,36 @@ impl AuthError {
         Self {
             error: error.into(),
             code: code.into(),
+            status: StatusCode::UNAUTHORIZED,
+        }
+    }
+
+    /// The Lab could not answer: fail closed with a retryable 503.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            error: "Authentication service unavailable".into(),
+            code: "auth_service_unavailable".into(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
 
-/// Hash an API key using SHA-256
-fn hash_api_key(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    hex::encode(hasher.finalize())
+/// A Lab answer as the middleware sees it: an identity, a 401 with the
+/// credential's usual `msg`/`code` when the Lab says inactive, or a 503 for
+/// any Lab error (unreachable, token rejected, unexpected 4xx).
+fn resolved(
+    r: Result<Option<Identity>, LabError>,
+    msg: &'static str,
+    code: &'static str,
+) -> Result<Identity, AuthError> {
+    match r {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Err(AuthError::new(msg, code)),
+        Err(e) => {
+            warn!(error = %e, "Lab lookup failed during authentication");
+            Err(AuthError::unavailable())
+        }
+    }
 }
 
 /// Hosted WebSocket routes only, layered in front of
@@ -65,14 +95,17 @@ pub(crate) async fn ws_query_token_as_api_key(mut request: Request, next: Next) 
     next.run(request).await
 }
 
-/// Middleware: accept API key (X-API-Key), Bearer token (Authorization: Bearer), or session cookie.
-/// This allows external API clients, CLI (OAuth), and the console to access protected routes.
+/// Middleware: accept API key (X-API-Key), Bearer token (Authorization: Bearer),
+/// session cookie, or a Lab service call. Every credential is resolved by the
+/// Lab; a Lab outage is a 503, never a pass.
 pub(crate) async fn validate_api_key_or_session(
     State(auth_state): State<Arc<AuthState>>,
     jar: CookieJar,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    let lab = &auth_state.lab;
+
     // Try Bearer token (OAuth access token) first
     if let Some(bearer) = request
         .headers()
@@ -98,46 +131,41 @@ pub(crate) async fn validate_api_key_or_session(
                             "invalid_service_call",
                         )
                     })?;
-                let tier: Option<String> =
-                    sqlx::query_scalar("SELECT tier FROM accounts WHERE id = $1 AND active = true")
-                        .bind(account)
-                        .fetch_optional(&auth_state.pool)
-                        .await
-                        .map_err(|e| {
-                            warn!(error = %e, "Database error during service-call account lookup");
-                            AuthError::new(
-                                "Authentication service unavailable",
-                                "auth_service_error",
-                            )
-                        })?;
-                let tier = tier.ok_or_else(|| {
-                    AuthError::new("Unknown or inactive account", "invalid_service_call")
-                })?;
-                debug!(account_id = %account, tier = %tier, "Service call authenticated");
+                let id = resolved(
+                    lab.account(&account.to_string()).await,
+                    "Unknown or inactive account",
+                    "invalid_service_call",
+                )?;
+                debug!(account_id = %id.account_id, tier = %id.tier, "Service call authenticated");
                 request.extensions_mut().insert(AuthenticatedAccount {
-                    account_id: account.to_string(),
-                    tier,
+                    account_id: id.account_id,
+                    tier: id.tier,
                     api_key_id: None,
+                    role: None,
                 });
                 return Ok(next.run(request).await);
             }
         }
 
-        debug!("Validating Bearer token");
-
-        match super::oauth::validate_bearer_token(&auth_state.pool, &bearer).await {
-            Ok(account) => {
-                debug!(account_id = %account.account_id, tier = %account.tier, "Bearer token validated");
-                request.extensions_mut().insert(account);
-                return Ok(next.run(request).await);
-            }
-            Err(_) => {
-                return Err(AuthError {
-                    error: "Invalid or expired Bearer token".to_string(),
-                    code: "invalid_bearer_token".to_string(),
-                });
-            }
+        if bearer.len() > MAX_CREDENTIAL_LEN {
+            return Err(AuthError::new(
+                "Invalid or expired Bearer token",
+                "invalid_bearer_token",
+            ));
         }
+        let id = resolved(
+            lab.introspect(CredentialKind::Bearer, &bearer, None).await,
+            "Invalid or expired Bearer token",
+            "invalid_bearer_token",
+        )?;
+        debug!(account_id = %id.account_id, tier = %id.tier, "Bearer token validated");
+        request.extensions_mut().insert(AuthenticatedAccount {
+            account_id: id.account_id,
+            tier: id.tier,
+            api_key_id: None,
+            role: id.role,
+        });
+        return Ok(next.run(request).await);
     }
 
     // Try API key
@@ -146,60 +174,25 @@ pub(crate) async fn validate_api_key_or_session(
         .get("X-API-Key")
         .and_then(|h| h.to_str().ok())
     {
-        if !api_key.starts_with("sk_live_") && !api_key.starts_with("sk_test_") {
-            return Err(AuthError {
-                error: "Invalid API key format".to_string(),
-                code: "invalid_api_key".to_string(),
-            });
+        if (!api_key.starts_with("sk_live_") && !api_key.starts_with("sk_test_"))
+            || api_key.len() > MAX_CREDENTIAL_LEN
+        {
+            return Err(AuthError::new("Invalid API key format", "invalid_api_key"));
         }
 
-        let key_hash = hash_api_key(api_key);
         debug!(prefix = %api_key.get(..12).unwrap_or("???"), "Validating API key");
-
-        let row =
-            sqlx::query("SELECT account_id, tier, active, api_key_id FROM validate_api_key($1)")
-                .bind(&key_hash)
-                .fetch_optional(&auth_state.pool)
-                .await
-                .map_err(|e| {
-                    warn!(error = %e, "Database error during API key validation");
-                    AuthError {
-                        error: "Authentication service unavailable".to_string(),
-                        code: "auth_service_error".to_string(),
-                    }
-                })?
-                .ok_or_else(|| AuthError {
-                    error: "Invalid or inactive API key".to_string(),
-                    code: "invalid_api_key".to_string(),
-                })?;
-
-        let account_id: uuid::Uuid = row.try_get("account_id").map_err(|_| AuthError {
-            error: "Invalid API key".to_string(),
-            code: "invalid_api_key".to_string(),
-        })?;
-        let tier: String = row.try_get("tier").map_err(|_| AuthError {
-            error: "Invalid API key".to_string(),
-            code: "invalid_api_key".to_string(),
-        })?;
-        let api_key_id: uuid::Uuid = row.try_get("api_key_id").map_err(|_| AuthError {
-            error: "Invalid API key".to_string(),
-            code: "invalid_api_key".to_string(),
-        })?;
-        let active: bool = row.try_get("active").unwrap_or(false);
-        if !active {
-            return Err(AuthError {
-                error: "Account is inactive".to_string(),
-                code: "account_inactive".to_string(),
-            });
-        }
-
-        debug!(account_id = %account_id, tier = %tier, api_key_id = %api_key_id, "API key validated");
+        let id = resolved(
+            lab.introspect(CredentialKind::ApiKey, api_key, None).await,
+            "Invalid or inactive API key",
+            "invalid_api_key",
+        )?;
+        debug!(account_id = %id.account_id, tier = %id.tier, "API key validated");
         request.extensions_mut().insert(AuthenticatedAccount {
-            account_id: account_id.to_string(),
-            tier,
-            api_key_id: Some(api_key_id.to_string()),
+            account_id: id.account_id,
+            tier: id.tier,
+            api_key_id: id.api_key_id,
+            role: None,
         });
-
         return Ok(next.run(request).await);
     }
 
@@ -207,32 +200,34 @@ pub(crate) async fn validate_api_key_or_session(
     let token = jar
         .get("scrapix_session")
         .map(|c| c.value().to_string())
-        .ok_or_else(|| AuthError {
-            error: "Missing API key or session".to_string(),
-            code: "not_authenticated".to_string(),
-        })?;
+        .ok_or_else(|| AuthError::new("Missing API key or session", "not_authenticated"))?;
+    if token.len() > MAX_CREDENTIAL_LEN {
+        return Err(AuthError::new(
+            "Invalid or expired session",
+            "invalid_session",
+        ));
+    }
 
-    let claims = jwt::decode_jwt(&token, &auth_state.jwt_secret).map_err(|_| AuthError {
-        error: "Invalid or expired session".to_string(),
-        code: "invalid_session".to_string(),
-    })?;
-
-    let user_id: uuid::Uuid = claims.sub.parse().map_err(|_| AuthError {
-        error: "Invalid session".to_string(),
-        code: "invalid_session".to_string(),
-    })?;
-
-    // Read optional X-Account-Id header for account switching
-    let selected_account_id = request
+    // Optional X-Account-Id header for account switching
+    let selected = request
         .headers()
         .get("X-Account-Id")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<uuid::Uuid>().ok());
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        .map(|u| u.to_string());
 
-    request.extensions_mut().insert(AuthenticatedUser {
-        user_id,
-        email: claims.email,
-        selected_account_id,
+    let id = resolved(
+        lab.introspect(CredentialKind::Session, &token, selected.as_deref())
+            .await,
+        "Invalid or expired session",
+        "invalid_session",
+    )?;
+    debug!(account_id = %id.account_id, tier = %id.tier, "Session validated");
+    request.extensions_mut().insert(AuthenticatedAccount {
+        account_id: id.account_id,
+        tier: id.tier,
+        api_key_id: None,
+        role: id.role,
     });
 
     Ok(next.run(request).await)
@@ -241,28 +236,28 @@ pub(crate) async fn validate_api_key_or_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lab_client::{
+        testing::{FakeLab, TOKEN},
+        LabClient,
+    };
     use axum::{
         body::Body, http::Request as HttpRequest, middleware, routing::get, Extension, Router,
     };
+    use serde_json::json;
     use tower::ServiceExt;
 
-    #[test]
-    fn test_hash_api_key() {
-        let key = "sk_live_test123";
-        let hash = hash_api_key(key);
-        assert_eq!(hash.len(), 64);
-        assert_eq!(hash_api_key(key), hash);
-        assert_ne!(hash_api_key("sk_live_other"), hash);
-    }
-
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const SERVICE: &str = "0123456789abcdef0123456789abcdef";
+    const ACCT: &str = "11111111-1111-1111-1111-111111111111";
 
     fn app(state: Arc<AuthState>) -> Router {
         Router::new()
             .route(
                 "/p",
-                get(|acct: Option<Extension<AuthenticatedAccount>>| async move {
-                    acct.map(|Extension(a)| a.account_id).unwrap_or_default()
+                get(|a: Option<Extension<AuthenticatedAccount>>| async move {
+                    a.map(|Extension(a)| {
+                        format!("{}|{}|{}", a.account_id, a.tier, a.role.unwrap_or_default())
+                    })
+                    .unwrap_or_default()
                 }),
             )
             .route_layer(middleware::from_fn_with_state(
@@ -271,122 +266,182 @@ mod tests {
             ))
     }
 
-    fn lazy_state() -> Arc<AuthState> {
-        // Unreachable: a DB-backed check fails fast instead of waiting out
-        // the default 30 s acquire timeout.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(std::time::Duration::from_millis(500))
-            .connect_lazy("postgres://x@127.0.0.1:1/x")
-            .unwrap();
-        Arc::new(AuthState {
-            pool,
-            jwt_secret: "s".into(),
-            service_token: Some(crate::auth::AdminKey::new(TOKEN.into())),
-        })
+    async fn state() -> (FakeLab, Arc<AuthState>) {
+        let lab = FakeLab::start().await;
+        let client = Arc::new(LabClient::new(&lab.url, TOKEN));
+        (lab, Arc::new(AuthState::new(client, Some(SERVICE.into()))))
     }
 
-    /// Status and the `code` field of the JSON error body.
-    async fn status_and_code(app: Router, req: HttpRequest<Body>) -> (u16, String) {
+    async fn call(app: Router, req: HttpRequest<Body>) -> (u16, String) {
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status().as_u16();
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        (status, v["code"].as_str().unwrap_or_default().to_string())
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
     }
 
     #[tokio::test]
-    async fn service_token_without_account_header_is_401() {
+    async fn api_key_resolves_through_the_lab() {
+        let (lab, s) = state().await;
+        lab.set_credential("api_key", "sk_live_abc", FakeLab::identity(ACCT, "pro", 10));
         let r = HttpRequest::get("/p")
-            .header("Authorization", format!("Bearer {TOKEN}"))
+            .header("X-API-Key", "sk_live_abc")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(
-            status_and_code(app(lazy_state()), r).await,
-            (401, "invalid_service_call".to_string())
-        );
+        assert_eq!(call(app(s), r).await, (200, format!("{ACCT}|pro|")));
     }
 
     #[tokio::test]
-    async fn service_token_with_malformed_account_is_401() {
+    async fn api_key_format_is_checked_locally() {
+        let (lab, s) = state().await;
         let r = HttpRequest::get("/p")
-            .header("Authorization", format!("Bearer {TOKEN}"))
-            .header(SERVICE_ACCOUNT_HEADER, "not-a-uuid")
+            .header("X-API-Key", "nope")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(
-            status_and_code(app(lazy_state()), r).await,
-            (401, "invalid_service_call".to_string())
-        );
+        let (status, body) = call(app(s), r).await;
+        assert_eq!(status, 401);
+        assert!(body.contains("invalid_api_key"));
+        assert_eq!(lab.calls(), 0);
     }
 
     #[tokio::test]
-    async fn service_token_resolves_the_account() {
-        let Some(pool) = crate::job_store::postgres::test_rails_like_pool().await else {
-            eprintln!("skipped: postgres backend unavailable");
-            return;
-        };
-        let account = uuid::Uuid::new_v4();
-        sqlx::query(include_str!("../../tests/fixtures/rails_like_account.sql"))
-            .bind(account)
-            .execute(&pool)
+    async fn oversized_credential_is_rejected_without_a_lab_call() {
+        let (lab, s) = state().await;
+        let r = HttpRequest::get("/p")
+            .header("X-API-Key", format!("sk_live_{}", "a".repeat(5000)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app(s.clone()), r).await.0, 401);
+        let r = HttpRequest::get("/p")
+            .header("Authorization", format!("Bearer {}", "b".repeat(5000)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app(s.clone()), r).await.0, 401);
+        let r = HttpRequest::get("/p")
+            .header("Cookie", format!("scrapix_session={}", "c".repeat(5000)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app(s), r).await.0, 401);
+        assert_eq!(lab.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn inactive_credentials_keep_todays_error_codes() {
+        let (_lab, s) = state().await;
+        let cases = [
+            (
+                HttpRequest::get("/p").header("X-API-Key", "sk_live_unknown"),
+                "invalid_api_key",
+            ),
+            (
+                HttpRequest::get("/p").header("Authorization", "Bearer unknown"),
+                "invalid_bearer_token",
+            ),
+            (
+                HttpRequest::get("/p").header("Cookie", "scrapix_session=unknown"),
+                "invalid_session",
+            ),
+        ];
+        for (req, code) in cases {
+            let (status, body) = call(app(s.clone()), req.body(Body::empty()).unwrap()).await;
+            assert_eq!(status, 401, "{code}");
+            assert!(body.contains(code), "{body}");
+        }
+        let (status, body) =
+            call(app(s), HttpRequest::get("/p").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, 401);
+        assert!(body.contains("not_authenticated"));
+    }
+
+    #[tokio::test]
+    async fn session_passes_the_selected_account_and_carries_the_role() {
+        let (lab, s) = state().await;
+        let mut v = FakeLab::identity(ACCT, "free", 1);
+        v["role"] = json!("viewer");
+        lab.set_credential("session", "jwt1", v);
+        let r = HttpRequest::get("/p")
+            .header("Cookie", "scrapix_session=jwt1")
+            .header("X-Account-Id", ACCT)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app(s), r).await, (200, format!("{ACCT}|free|viewer")));
+    }
+
+    #[tokio::test]
+    async fn lab_down_is_503_with_retry_after() {
+        let (lab, s) = state().await;
+        lab.set_down(true);
+        let resp = app(s)
+            .oneshot(
+                HttpRequest::get("/p")
+                    .header("X-API-Key", "sk_live_x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let state = Arc::new(AuthState {
-            pool,
-            jwt_secret: "s".into(),
-            service_token: Some(crate::auth::AdminKey::new(TOKEN.into())),
-        });
-        let r = HttpRequest::get("/p")
-            .header("Authorization", format!("Bearer {TOKEN}"))
-            .header(SERVICE_ACCOUNT_HEADER, account.to_string())
-            .body(Body::empty())
-            .unwrap();
-        let resp = app(state.clone()).oneshot(r).await.unwrap();
-        assert_eq!(resp.status(), 200);
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), account.to_string());
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+    }
 
-        // An unknown account is rejected even with the right token.
-        let r = HttpRequest::get("/p")
-            .header("Authorization", format!("Bearer {TOKEN}"))
-            .header(SERVICE_ACCOUNT_HEADER, uuid::Uuid::new_v4().to_string())
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            status_and_code(app(state), r).await,
-            (401, "invalid_service_call".to_string())
+    #[tokio::test]
+    async fn lab_rejections_are_503_never_a_pass() {
+        // 401 = the Lab rejects our service token; 400 = any other 4xx.
+        for forced in [401, 400] {
+            let (lab, s) = state().await;
+            lab.set_credential("api_key", "sk_live_abc", FakeLab::identity(ACCT, "pro", 10));
+            lab.state
+                .status_override
+                .store(forced, std::sync::atomic::Ordering::SeqCst);
+            let resp = app(s)
+                .oneshot(
+                    HttpRequest::get("/p")
+                        .header("X-API-Key", "sk_live_abc")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 503, "Lab {forced}");
+            assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("auth_service_unavailable"));
+        }
+    }
+
+    #[tokio::test]
+    async fn service_token_uses_the_account_lookup() {
+        let (lab, s) = state().await;
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 5}}),
         );
-    }
-
-    #[tokio::test]
-    async fn other_bearer_tokens_still_go_to_oauth() {
-        // wrong token -> OAuth path -> lazy pool unreachable -> 401 invalid_bearer_token
         let r = HttpRequest::get("/p")
-            .header("Authorization", "Bearer nope")
+            .header("Authorization", format!("Bearer {SERVICE}"))
+            .header(SERVICE_ACCOUNT_HEADER, ACCT)
             .body(Body::empty())
             .unwrap();
-        let resp = app(lazy_state()).oneshot(r).await.unwrap();
-        assert_eq!(resp.status(), 401);
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(std::str::from_utf8(&body)
-            .unwrap()
-            .contains("invalid_bearer_token"));
-    }
-
-    #[tokio::test]
-    async fn without_a_configured_token_the_account_header_is_ignored() {
-        let mut state = lazy_state();
-        Arc::get_mut(&mut state).unwrap().service_token = None;
+        assert_eq!(call(app(s.clone()), r).await, (200, format!("{ACCT}|pro|")));
         let r = HttpRequest::get("/p")
-            .header("Authorization", format!("Bearer {TOKEN}"))
+            .header("Authorization", format!("Bearer {SERVICE}"))
             .header(SERVICE_ACCOUNT_HEADER, uuid::Uuid::new_v4().to_string())
             .body(Body::empty())
             .unwrap();
-        let resp = app(state).oneshot(r).await.unwrap();
-        assert_eq!(resp.status(), 401);
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(std::str::from_utf8(&body)
-            .unwrap()
-            .contains("invalid_bearer_token"));
+        let (status, body) = call(app(s), r).await;
+        assert_eq!(status, 401);
+        assert!(body.contains("invalid_service_call"));
+    }
+
+    #[tokio::test]
+    async fn service_token_without_or_with_bad_account_header_is_401() {
+        let (_lab, s) = state().await;
+        for header in [None, Some("not-a-uuid")] {
+            let mut r = HttpRequest::get("/p").header("Authorization", format!("Bearer {SERVICE}"));
+            if let Some(h) = header {
+                r = r.header(SERVICE_ACCOUNT_HEADER, h);
+            }
+            let (status, body) = call(app(s.clone()), r.body(Body::empty()).unwrap()).await;
+            assert_eq!(status, 401);
+            assert!(body.contains("invalid_service_call"));
+        }
     }
 }

@@ -249,17 +249,13 @@ mod tests {
     }
 
     fn saas() -> AuthMode {
-        // Unreachable: a DB-backed check fails fast instead of waiting out
-        // the default 30 s acquire timeout.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(std::time::Duration::from_millis(500))
-            .connect_lazy("postgres://x@127.0.0.1:1/x")
-            .unwrap();
-        AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState {
-            pool,
-            jwt_secret: "s".into(),
-            service_token: None,
-        }))
+        // Unreachable Lab (connection refused): any credential that reaches
+        // the Lab fails fast with a 503 instead of passing.
+        let lab = std::sync::Arc::new(crate::lab_client::LabClient::new(
+            "http://127.0.0.1:1",
+            "unused-service-token",
+        ));
+        AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState::new(lab, None)))
     }
 
     const THREE_MB: usize = 3 * 1024 * 1024;
@@ -371,24 +367,39 @@ mod tests {
         assert_eq!(status(app(saas(), Mode::Hosted), "/stats", None).await, 200);
     }
 
-    /// The 401 body's `error` for a request to `uri` with `headers`.
-    async fn auth_error(app: Router, uri: &str, headers: &[(&str, &str)]) -> String {
+    /// Status and body `error` of a rejected request to `uri` with `headers`.
+    async fn rejection(app: Router, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
         let mut req = Request::get(uri);
         for (name, value) in headers {
             req = req.header(*name, *value);
         }
         let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), 401, "{uri}");
+        let status = res.status().as_u16();
         let body = axum::body::to_bytes(res.into_body(), 1 << 16)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        json["error"].as_str().unwrap_or_default().to_string()
+        (
+            status,
+            json["error"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// The 401 body's `error` for a request to `uri` with `headers`.
+    async fn auth_error(app: Router, uri: &str, headers: &[(&str, &str)]) -> String {
+        let (status, error) = rejection(app, uri, headers).await;
+        assert_eq!(status, 401, "{uri}");
+        error
+    }
+
+    /// What an unreachable Lab answers for a credential that reached it.
+    fn lab_unavailable() -> (u16, String) {
+        (503, "Authentication service unavailable".to_string())
     }
 
     #[tokio::test]
     async fn hosted_ws_reads_query_token_as_api_key() {
-        // A malformed key is rejected on format before any DB lookup, so the
+        // A malformed key is rejected on format before any Lab lookup, so the
         // error proves `?token=` reached the SaaS middleware as an API key
         // (without it the request is "Missing API key or session").
         for uri in ["/ws?token=not-a-key", "/ws/job/x?token=not-a-key"] {
@@ -404,10 +415,10 @@ mod tests {
         );
         // Percent-decoded, like standalone's `?token=`: `%73k_live_...` is
         // `sk_live_...`, which passes the format check and reaches the
-        // (unreachable) database.
+        // (unreachable) Lab.
         assert_eq!(
-            auth_error(app(saas(), Mode::Hosted), "/ws?token=%73k_live_x", &[]).await,
-            "Authentication service unavailable"
+            rejection(app(saas(), Mode::Hosted), "/ws?token=%73k_live_x", &[]).await,
+            lab_unavailable()
         );
     }
 
@@ -424,16 +435,16 @@ mod tests {
             .await,
             "Invalid API key format"
         );
-        // Authorization present: the Bearer token is validated, `?token=`
-        // is ignored.
+        // Authorization present: the Bearer token is sent to the
+        // (unreachable) Lab; `?token=` (malformed, a local 401) is ignored.
         assert_eq!(
-            auth_error(
+            rejection(
                 app(saas(), Mode::Hosted),
                 "/ws?token=not-a-key",
                 &[("Authorization", "Bearer abc")]
             )
             .await,
-            "Invalid or expired Bearer token"
+            lab_unavailable()
         );
     }
 

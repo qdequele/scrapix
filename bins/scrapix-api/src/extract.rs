@@ -39,7 +39,7 @@ use scrapix_core::config::WebhookConfig;
 use scrapix_core::url_glob::matches_glob;
 use scrapix_crawler::{is_non_page_url, SitemapParser};
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
 use crate::results::{self, find_owned_job, status_str};
@@ -406,11 +406,9 @@ fn token_count(model: &str) -> impl Fn(&str) -> usize + '_ {
 pub(crate) async fn create_extract(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<ExtractRequest>,
 ) -> Result<Json<CreateExtractResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     start_extract(&state, &account_ctx, request).await.map(Json)
 }
@@ -540,11 +538,9 @@ pub(crate) async fn start_extract(
 pub(crate) async fn get_extract(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<ExtractStatusResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     let job = find_owned_job(&state, &account_ctx, &job_id).await?;
     if JobKind::of(&job) != JobKind::Extract {
         return Err(ApiError::new("Extract job not found", "not_found"));

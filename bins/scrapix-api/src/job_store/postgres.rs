@@ -590,18 +590,6 @@ pub(crate) async fn test_empty_pg_pool() -> Option<sqlx::PgPool> {
     Some(pool)
 }
 
-/// [`test_pg_pool`] plus the minimal Rails-owned tables the engine reads
-/// (DDL in `tests/fixtures/rails_like.sql`, never inline in Rust sources).
-#[cfg(test)]
-pub(crate) async fn test_rails_like_pool() -> Option<sqlx::PgPool> {
-    let pool = test_pg_pool().await?;
-    sqlx::raw_sql(include_str!("../../tests/fixtures/rails_like.sql"))
-        .execute(&pool)
-        .await
-        .ok()?;
-    Some(pool)
-}
-
 /// Throwaway Postgres for the conformance suite.
 #[cfg(test)]
 pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
