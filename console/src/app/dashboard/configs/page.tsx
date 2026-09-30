@@ -255,23 +255,38 @@ export default function ConfigsPage() {
                       )}
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground hidden md:table-cell">
-                      {config.last_run_at ? (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span>
-                              {formatDistanceToNow(
-                                new Date(config.last_run_at),
-                                { addSuffix: true }
-                              )}
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            {new Date(config.last_run_at).toLocaleString()}
-                          </TooltipContent>
-                        </Tooltip>
-                      ) : (
-                        "Never"
-                      )}
+                      <div className="flex items-center gap-1.5">
+                        {config.last_run_at ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span>
+                                {formatDistanceToNow(
+                                  new Date(config.last_run_at),
+                                  { addSuffix: true }
+                                )}
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {new Date(config.last_run_at).toLocaleString()}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          "Never"
+                        )}
+                        {config.last_error && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <AlertCircle
+                                className="h-4 w-4 text-destructive"
+                                aria-label="Last scheduled run failed"
+                              />
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-xs">
+                              {config.last_error}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                      </div>
                     </TableCell>
                     <TableCell className="text-sm text-muted-foreground hidden sm:table-cell">
                       {formatDistanceToNow(new Date(config.created_at), {

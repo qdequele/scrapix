@@ -199,7 +199,8 @@ impl JobStore for SqliteJobStore {
             let result = sqlx::query(
                 "UPDATE jobs SET status = ?, pages_crawled = ?, pages_indexed = ?, documents_sent = ?,
                     errors = ?, bytes_downloaded = ?, crawl_rate = ?, eta_seconds = ?
-                 WHERE job_id = ? AND status NOT IN ('completed','failed','cancelled')",
+                 WHERE job_id = ? AND status NOT IN ('completed','failed','cancelled')
+                   AND ? NOT IN ('completed','failed','cancelled')",
             )
             .bind(status_to_str(&j.status))
             .bind(j.pages_crawled as i64)
@@ -210,6 +211,7 @@ impl JobStore for SqliteJobStore {
             .bind(j.crawl_rate)
             .bind(j.eta_seconds.map(|v| v as i64))
             .bind(&j.job_id)
+            .bind(status_to_str(&j.status))
             .execute(&mut *tx)
             .await;
             match result {
@@ -325,12 +327,12 @@ impl JobStore for SqliteJobStore {
             })
     }
 
-    async fn count_active_jobs(&self, account_id: &str) -> Result<i64, StoreError> {
+    async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError> {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE account_id = ? AND status IN ('pending','running')",
+            "SELECT job_id FROM jobs WHERE account_id = ? AND status IN ('pending','running')",
         )
         .bind(account_id)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(other)
     }

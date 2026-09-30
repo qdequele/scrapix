@@ -258,6 +258,7 @@ mod tests {
         AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState {
             pool,
             jwt_secret: "s".into(),
+            service_token: None,
         }))
     }
 

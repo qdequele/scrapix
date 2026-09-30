@@ -65,6 +65,21 @@ pub(super) async fn stale_counters_never_regress_terminal(s: Arc<dyn JobStore>) 
     assert_eq!(got.pages_crawled, 9);
 }
 
+/// A terminal snapshot in a counter flush never writes the terminal status
+/// (only `update_job_full` does, after the job's Lab events are recorded).
+pub(super) async fn terminal_snapshot_counters_leave_the_row_active(s: Arc<dyn JobStore>) {
+    let mut j = job("tc-1");
+    j.start();
+    s.insert_job(&j).await.unwrap();
+    j.status = JobStatus::Cancelled;
+    j.pages_crawled = 4;
+    s.flush_job_counters(std::slice::from_ref(&j))
+        .await
+        .unwrap();
+    let got = s.get_job("tc-1", None).await.unwrap();
+    assert!(matches!(got.status, JobStatus::Running));
+}
+
 pub(super) async fn accounting_and_active_recovery(s: Arc<dyn JobStore>) {
     let mut running = job("ac-run");
     running.start();
@@ -123,7 +138,7 @@ pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {
     assert_eq!(mine, vec!["ls-owned"]);
     assert!(s.get_job("ls-0", Some(account)).await.is_none());
     assert!(s.get_job("ls-owned", Some(account)).await.is_some());
-    assert_eq!(s.count_active_jobs(account).await.unwrap(), 1);
+    assert_eq!(s.active_job_ids(account).await.unwrap(), vec!["ls-owned"]);
 }
 
 pub(super) async fn job_results_pages_and_summary(s: Arc<dyn JobStore>) {
@@ -180,6 +195,7 @@ macro_rules! conformance_tests {
             case!(insert_get_roundtrip);
             case!(counters_and_terminal_update);
             case!(stale_counters_never_regress_terminal);
+            case!(terminal_snapshot_counters_leave_the_row_active);
             case!(accounting_and_active_recovery);
             case!(list_newest_first_and_account_filter);
             case!(job_results_pages_and_summary);

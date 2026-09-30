@@ -29,11 +29,18 @@ class ScrapixEngine
 
     request = Net::HTTP::Post.new(uri)
     request["Content-Type"] = "application/json"
-    request["X-API-Key"] = credentials[:api_key] if credentials[:api_key].present?
-    request["Authorization"] = credentials[:bearer] if credentials[:bearer].present?
-    request["X-Account-Id"] = credentials[:account_id] if credentials[:account_id].present?
-    if credentials[:session_cookie].present?
-      request["Cookie"] = "scrapix_session=#{credentials[:session_cookie]}"
+    if credentials[:service_account_id].present?
+      # Scheduled runs have no caller: authenticate as the platform on
+      # behalf of the config's account.
+      request["Authorization"] = "Bearer #{ENV.fetch('LAB_SERVICE_TOKEN')}"
+      request["X-Scrapix-Account-Id"] = credentials[:service_account_id]
+    else
+      request["X-API-Key"] = credentials[:api_key] if credentials[:api_key].present?
+      request["Authorization"] = credentials[:bearer] if credentials[:bearer].present?
+      request["X-Account-Id"] = credentials[:account_id] if credentials[:account_id].present?
+      if credentials[:session_cookie].present?
+        request["Cookie"] = "scrapix_session=#{credentials[:session_cookie]}"
+      end
     end
     request.body = config.to_json
 

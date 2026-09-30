@@ -80,7 +80,6 @@ fn state_with(renderer: Option<Arc<CdpRenderer>>) -> AppState {
         None,
         None,
         None,
-        None,
         webhooks::WebhookDispatcher::new(
             scrapix_crawler::safe_client_builder(None, true)
                 .build()

@@ -128,6 +128,7 @@ CREATE TABLE public.accounts (
     monthly_spend_limit bigint,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
     updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    last_auto_topup_attempt_at timestamp with time zone,
     CONSTRAINT accounts_tier_check CHECK ((tier = ANY (ARRAY['free'::text, 'starter'::text, 'pro'::text, 'enterprise'::text])))
 );
 
@@ -176,7 +177,8 @@ CREATE TABLE public.crawl_configs (
     next_run_at timestamp with time zone,
     last_job_id text,
     created_at timestamp(6) without time zone DEFAULT now() NOT NULL,
-    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL
+    updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
+    last_error text
 );
 
 
@@ -246,6 +248,40 @@ CREATE TABLE public.jobs (
     updated_at timestamp(6) without time zone DEFAULT now() NOT NULL,
     accounting jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'paused'::text])))
+);
+
+
+--
+-- Name: lab_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lab_events (
+    id uuid NOT NULL,
+    type text NOT NULL,
+    account_id uuid NOT NULL,
+    payload jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    delivered_at timestamp with time zone
+);
+
+
+--
+-- Name: lab_events_received; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lab_events_received (
+    id uuid NOT NULL,
+    type text NOT NULL,
+    account_id uuid NOT NULL,
+    payload jsonb NOT NULL,
+    occurred_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    processed_at timestamp with time zone,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone,
+    error text
 );
 
 
@@ -1000,6 +1036,22 @@ ALTER TABLE ONLY public.jobs
 
 
 --
+-- Name: lab_events lab_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lab_events
+    ADD CONSTRAINT lab_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lab_events_received lab_events_received_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lab_events_received
+    ADD CONSTRAINT lab_events_received_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: meilisearch_engines meilisearch_engines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1616,10 +1668,45 @@ CREATE INDEX index_transactions_on_created_at ON public.transactions USING btree
 
 
 --
+-- Name: index_transactions_on_lab_event_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_transactions_on_lab_event_id ON public.transactions USING btree (((metadata ->> 'lab_event_id'::text))) WHERE (metadata ? 'lab_event_id'::text);
+
+
+--
+-- Name: index_transactions_on_stripe_payment_intent_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_transactions_on_stripe_payment_intent_id ON public.transactions USING btree (((metadata ->> 'stripe_payment_intent_id'::text))) WHERE (metadata ? 'stripe_payment_intent_id'::text);
+
+
+--
 -- Name: index_users_on_email; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX index_users_on_email ON public.users USING btree (email);
+
+
+--
+-- Name: lab_events_delivered_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lab_events_delivered_idx ON public.lab_events USING btree (delivered_at) WHERE (delivered_at IS NOT NULL);
+
+
+--
+-- Name: lab_events_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lab_events_due_idx ON public.lab_events USING btree (next_attempt_at) WHERE (delivered_at IS NULL);
+
+
+--
+-- Name: lab_events_received_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lab_events_received_pending_idx ON public.lab_events_received USING btree (occurred_at) WHERE (processed_at IS NULL);
 
 
 --
@@ -1884,6 +1971,11 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260929000005'),
+('20260929000004'),
+('20260929000003'),
+('20260929000002'),
+('20260929000001'),
 ('20260927000001'),
 ('20260926000001'),
 ('20260817160001'),

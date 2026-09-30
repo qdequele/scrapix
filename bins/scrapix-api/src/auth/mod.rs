@@ -37,10 +37,18 @@ pub enum AuthMode {
 pub struct AuthState {
     pub pool: PgPool,
     pub jwt_secret: String,
+    /// Hosted only: the Lab's `LAB_SERVICE_TOKEN`. A Bearer equal to it plus
+    /// an `X-Scrapix-Account-Id` header acts as that account (Rails → engine
+    /// server-to-server calls).
+    pub service_token: Option<AdminKey>,
 }
 
 impl AuthState {
-    pub async fn new(database_url: &str, jwt_secret: String) -> Result<Self, sqlx::Error> {
+    pub async fn new(
+        database_url: &str,
+        jwt_secret: String,
+        service_token: Option<String>,
+    ) -> Result<Self, sqlx::Error> {
         // Heroku Postgres requires SSL but doesn't include sslmode in DATABASE_URL,
         // while local dev Postgres has no TLS at all. sslmode=prefer negotiates TLS
         // when the server supports it and falls back to plaintext otherwise.
@@ -54,6 +62,11 @@ impl AuthState {
             .max_connections(10)
             .connect(&url)
             .await?;
-        Ok(Self { pool, jwt_secret })
+        Ok(Self {
+            pool,
+            jwt_secret,
+            // An empty token would match an empty Bearer: never accept one.
+            service_token: service_token.filter(|t| !t.is_empty()).map(AdminKey::new),
+        })
     }
 }

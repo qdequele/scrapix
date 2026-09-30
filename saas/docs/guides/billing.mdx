@@ -222,6 +222,29 @@ If instead all 10 pages had been AI-enriched, the AI surcharge would be
 `10 × 5 = 50`, for a total of `8 + 4 + 50 = 62` — the point being that the AI
 surcharge tracks pages actually enriched, not pages merely eligible.
 
+### When credits are debited
+
+The engine only *checks* your balance (the `402` below); it never writes to
+your ledger. Each billable operation is reported to the Lab as a usage event
+and debited **asynchronously — usually within a few seconds** of the
+request. A `/scrape` therefore returns before its transaction appears in
+`GET /account/billing/transactions`, and the balance reflects it a moment
+later. Each event is debited exactly once, even if delivery is retried, and
+the ledger row carries the engine's description (`scrape: https://example.com/
+(3 credits)`). If the Lab is briefly unreachable, usage queues in the engine
+and is debited when it recovers — nothing is lost. The
+event contract is documented in the product docs (`api-reference/lab-events`).
+
+### Auto top-up
+
+When auto top-up is enabled and a debit takes the balance below your
+threshold, the Lab charges the **saved card** on your Stripe customer and
+adds credits only after the payment succeeds. Without a saved card, when the
+monthly spend limit would be exceeded, or when the payment fails, nothing is
+charged or granted and you are emailed (at most once a day); the Lab does not
+retry the charge for an hour after a failed attempt. A "low balance" email is
+sent when a debit takes the balance from above 10 credits to 10 or fewer.
+
 ### Insufficient Credits
 
 If your account doesn't have enough credits, requests return a `402` error:

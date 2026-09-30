@@ -1792,6 +1792,7 @@ export interface components {
             cron_expression?: string | null;
             description?: string | null;
             id: string;
+            last_error?: string | null;
             last_job_id?: string | null;
             last_run_at?: string | null;
             name: string;

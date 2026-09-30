@@ -68,10 +68,7 @@ pub(crate) async fn preflight(
     billing::check_credits(pool, &ctx.account_id, required_credits.max(1)).await?;
     let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
     let max_concurrent = tier.max_concurrent_jobs() as i64;
-    let active_count: i64 = match state.job_store {
-        Some(ref store) => store.count_active_jobs(&ctx.account_id).await.unwrap_or(0),
-        None => 0,
-    };
+    let active_count = state.active_job_count(&ctx.account_id).await;
     if active_count >= max_concurrent {
         return Err(ApiError::new(
             format!(

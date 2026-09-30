@@ -25,6 +25,29 @@ class Account < ApplicationRecord
     end
   end
 
+  # Debit usage reported by an engine. Idempotent on the event id (unique
+  # index on transactions.metadata->>'lab_event_id'). The balance may go
+  # negative (the engine pre-checks before work; charges land after it).
+  # Returns [balance_before, balance_after], or nil if already debited.
+  def debit_usage!(credits, lab_event_id:, operation:, description:)
+    with_lock do
+      return nil if transactions.where("metadata->>'lab_event_id' = ?", lab_event_id).exists?
+
+      before = credits_balance
+      update!(credits_balance: before - credits)
+      transactions.create!(type: "usage_deduction", amount: -credits, balance_after: credits_balance,
+                           description: "#{operation}: #{description}",
+                           metadata: { lab_event_id: lab_event_id, operation: operation })
+      [ before, credits_balance ]
+    end
+  rescue ActiveRecord::RecordNotUnique
+    nil
+  end
+
+  def owner_email
+    account_members.find_by(role: "owner")&.user&.email
+  end
+
   # Mirrors scrapix_billing::check_spend_limit: this calendar month's top-ups
   # plus the requested amount must stay within monthly_spend_limit.
   def spend_limit_exceeded?(amount)

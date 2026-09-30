@@ -4314,6 +4314,12 @@
           "id": {
             "type": "string"
           },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "last_job_id": {
             "type": [
               "string",

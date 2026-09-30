@@ -58,7 +58,7 @@ pub(crate) fn str_to_status(s: &str) -> JobStatus {
 ///
 /// Methods returning `Result` hand the error back so the caller can retry
 /// or degrade; most of them also log the failure before returning it.
-/// Exceptions, left to the caller to log if it cares: `count_active_jobs`
+/// Exceptions, left to the caller to log if it cares: `active_job_ids`
 /// and the four `job_results` methods (`store_result_page`,
 /// `store_result_summary`, `load_result_summary`, `result_pages`). `get_job`
 /// returns `Option`, not `Result`, and never logs either way.
@@ -87,8 +87,9 @@ pub trait JobStore: Send + Sync {
     async fn get_job(&self, job_id: &str, account_id: Option<&str>) -> Option<JobState>;
     /// Jobs newest first, scoped to `account_id` when given.
     async fn list_jobs(&self, account_id: Option<&str>, limit: i64, offset: i64) -> Vec<JobState>;
-    /// Pending/running jobs of an account (concurrent-job quota).
-    async fn count_active_jobs(&self, account_id: &str) -> Result<i64, StoreError>;
+    /// Ids of an account's pending/running jobs (concurrent-job quota;
+    /// see `AppState::active_job_count`).
+    async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError>;
     /// Store result `seq` of an engine-run job (an existing `seq` is kept).
     async fn store_result_page(
         &self,

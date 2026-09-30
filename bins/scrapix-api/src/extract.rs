@@ -607,21 +607,19 @@ impl ExtractRunner {
 
     /// Charge `credits` for `operation` (after the work, like /scrape).
     async fn charge(&self, credits: i64, operation: &str, description: &str) {
-        let (Some(pool), Some(ctx)) = (&self.state.saas_pool, self.account_ctx.as_ref()) else {
+        let Some(ctx) = self.account_ctx.as_ref().as_ref() else {
             return;
         };
-        if let Err(e) = billing::check_credits_and_deduct(
-            pool,
-            &ctx.account_id,
-            credits,
-            operation,
-            description,
-            self.state.stripe_client.as_ref(),
-        )
-        .await
-        {
-            warn!(job_id = %self.job_id, error = ?e, operation, "Failed to deduct extract credits");
-        }
+        self.state
+            .record_usage(
+                ctx,
+                operation,
+                credits,
+                serde_json::json!({}),
+                description.to_string(),
+                Some(&self.job_id),
+            )
+            .await;
     }
 
     /// Enough credits for one more AI call?
@@ -1287,5 +1285,39 @@ mod tests {
             Some("None of the pages could be fetched")
         );
         assert!(llm.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn charge_records_a_usage_event_for_the_job() {
+        let bus = scrapix_queue::ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        let llm = llm("{}").await;
+        let runner = ExtractRunner {
+            state,
+            account_ctx: Arc::new(Some(AccountContext {
+                account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
+                api_key_id: Some("k".into()),
+                tier: "free".into(),
+                user_role: None,
+            })),
+            job_id: "job-1".into(),
+            options: Arc::new(Map::new()),
+            instruction: String::new(),
+            ai: ai(&llm),
+        };
+        runner.charge(3, "extract", "extract: 3 pages").await;
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "extract",
+                "credits": 3,
+                "units": {},
+                "description": "extract: 3 pages",
+                "job_id": "job-1",
+            })
+        );
     }
 }

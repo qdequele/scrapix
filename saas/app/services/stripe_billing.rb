@@ -5,8 +5,9 @@
 # purchases go through real Invoices (finalize + pay) so customers get PDFs,
 # and credits are granted idempotently keyed on the payment intent id.
 #
-# The engine-side auto-topup (charge_auto_topup, triggered by usage debits)
-# intentionally stays in Rust — it belongs to the data plane.
+# Auto top-up (triggered by usage debits the engine reports as lab events)
+# lives in AutoTopup, which uses create_and_pay_invoice and
+# add_credits_for_payment below.
 module StripeBilling
   class StripeUnavailable < StandardError; end
 
@@ -65,23 +66,27 @@ module StripeBilling
     customer.id
   end
 
-  # Invoice item -> draft invoice -> finalize -> pay (expanding the payment
-  # intent so the caller can check its status). Same flow as the Rust
-  # create_and_pay_invoice.
-  def self.create_and_pay_invoice(customer_id:, account_id:, payment_method_id:, credits:, amount_cents:, purchase_type:)
+  # Draft invoice -> invoice item attached to it -> finalize -> pay
+  # (expanding the payment intent so the caller can check its status). The
+  # invoice is created first, excluding pending items, and the item is
+  # attached to it: an item created on its own would sit pending on the
+  # customer if the invoice call then failed, and be swept into (and paid by)
+  # the next invoice, charging twice for one credit grant. If attaching the
+  # item fails, the empty draft is deleted (best effort). With void_unpaid,
+  # an invoice whose /pay raises (e.g. a declined card) is voided before
+  # re-raising, so unattended retries (auto top-up) don't leave open
+  # invoices behind.
+  def self.create_and_pay_invoice(customer_id:, account_id:, payment_method_id:, credits:, amount_cents:, purchase_type:,
+                                  void_unpaid: false)
     description = "Scrapix: #{credits} credits"
-    client.v1.invoice_items.create(
-      customer: customer_id, amount: amount_cents, currency: "usd",
-      description: description
-    )
-
     invoice = client.v1.invoices.create(
       customer: customer_id,
+      currency: "usd",
       collection_method: "charge_automatically",
       auto_advance: false,
       default_payment_method: payment_method_id,
       description: description,
-      pending_invoice_items_behavior: "include",
+      pending_invoice_items_behavior: "exclude",
       metadata: {
         scrapix_account_id: account_id,
         credits: credits.to_s,
@@ -89,17 +94,51 @@ module StripeBilling
       }
     )
 
-    invoice = client.v1.invoices.finalize_invoice(invoice.id, { auto_advance: false })
-    # With collection_method=charge_automatically and a default payment method,
-    # finalize can charge immediately; the explicit pay then 400s with
-    # "Invoice is already paid" even though the customer WAS charged. Treat
-    # that as success and re-fetch to continue the ledger-crediting flow.
-    # (Ports the fix/stripe-invoice-already-paid branch from the Rust API.)
-    client.v1.invoices.pay(invoice.id, { expand: [ "payment_intent" ] })
-  rescue Stripe::InvalidRequestError => e
-    raise unless e.message.include?("already paid")
+    begin
+      client.v1.invoice_items.create(
+        customer: customer_id, invoice: invoice.id, amount: amount_cents, currency: "usd",
+        description: description
+      )
+    rescue StandardError
+      delete_draft_invoice(invoice.id)
+      raise
+    end
 
-    client.v1.invoices.retrieve(invoice.id, { expand: [ "payment_intent" ] })
+    invoice = client.v1.invoices.finalize_invoice(invoice.id, { auto_advance: false })
+    begin
+      client.v1.invoices.pay(invoice.id, { expand: [ "payment_intent" ] })
+    rescue Stripe::StripeError => e
+      # With collection_method=charge_automatically and a default payment
+      # method, finalize can charge immediately; the explicit pay then 400s
+      # with "Invoice is already paid" even though the customer WAS charged.
+      # Treat that as success and re-fetch to continue the ledger-crediting
+      # flow. (Ports the fix/stripe-invoice-already-paid branch from the Rust API.)
+      if e.is_a?(Stripe::InvalidRequestError) && e.message.include?("already paid")
+        return client.v1.invoices.retrieve(invoice.id, { expand: [ "payment_intent" ] })
+      end
+
+      void_invoice(invoice.id) if void_unpaid
+      raise
+    end
+  end
+
+  # Best-effort delete of a draft invoice (never raises; drafts can't be
+  # voided). A failure is only logged: the draft holds at most its own item,
+  # never a pending one, so it can't be charged by a later invoice.
+  def self.delete_draft_invoice(invoice_id)
+    client.v1.invoices.delete(invoice_id)
+  rescue StandardError => e
+    Rails.logger.warn("Could not delete draft Stripe invoice #{invoice_id}: #{e.message}")
+    nil
+  end
+
+  # Best-effort void of an unpaid invoice (never raises): a failure is only
+  # logged — Stripe refuses to void a paid invoice, which is the safe outcome.
+  def self.void_invoice(invoice_id)
+    client.v1.invoices.void_invoice(invoice_id)
+  rescue StandardError => e
+    Rails.logger.warn("Could not void Stripe invoice #{invoice_id}: #{e.message}")
+    nil
   end
 
   # Idempotent credit grant keyed on the Stripe payment intent id — mirrors
@@ -111,13 +150,14 @@ module StripeBilling
                         .exists?
     if exists
       Rails.logger.info("Payment #{payment_intent_id} already processed, skipping")
-      return
+      return false
     end
 
     Account.find(account_id).credit!(
       credits, type: "manual_topup", description: description,
       metadata: { stripe_payment_intent_id: payment_intent_id }
     )
+    true
   end
 
   # First member's email for the account (payment receipts) — mirrors

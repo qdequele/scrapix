@@ -135,7 +135,7 @@ init-topics:
 
 For running Docker Compose in production on a single server:
 
-1. **Change default passwords** — Update `MEILI_MASTER_KEY`, `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `JWT_SECRET`
+1. **Change default passwords** — Update `MEILI_MASTER_KEY`, `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `JWT_SECRET`, `LAB_EVENTS_SECRET`, `LAB_SERVICE_TOKEN` (the hosted stack signs engine → Rails usage events with the first and authenticates Rails → engine calls with the second; keep each identical on the `scrapix-api` and `saas` services)
 2. **Add a reverse proxy** — Use Caddy, Nginx, or Traefik in front of the API
 3. **Enable TLS** — Via the reverse proxy
 4. **Set resource limits** — Add `deploy.resources.limits` to each service

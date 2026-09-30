@@ -36,6 +36,11 @@ CLICKHOUSE_DATABASE="scrapix_prod"
 CLICKHOUSE_USER="default"
 CLICKHOUSE_PASSWORD=""
 
+# Lab (Rails control plane): the hosted engine reports usage events there and
+# refuses to start without LAB_EVENTS_URL. Rails needs the SAME
+# LAB_EVENTS_SECRET / LAB_SERVICE_TOKEN (printed at the end of this script).
+LAB_EVENTS_URL=""         # e.g. https://saas.example.com/internal/events
+
 # AI enrichment (optional)
 AI_PROVIDER="anthropic"
 ANTHROPIC_API_KEY=""
@@ -43,6 +48,23 @@ ANTHROPIC_API_KEY=""
 # CORS — the console URL will be added automatically
 # Add extra origins here (comma-separated), *.meilisearch.com is always allowed
 CORS_ORIGINS=""
+
+# ---------------------------------------------------------------------------
+# Validate configuration — before any `heroku` call, so a missing value never
+# leaves a half-created app or a paid add-on behind
+# ---------------------------------------------------------------------------
+case "${LAB_EVENTS_URL}" in
+    http://*|https://*) ;;
+    *)
+        echo "LAB_EVENTS_URL must be set to the Rails app's http(s) /internal/events URL" >&2
+        echo "(the hosted engine refuses to start without it). Edit the config block above." >&2
+        exit 1
+        ;;
+esac
+
+JWT_SECRET=$(openssl rand -hex 32)
+LAB_EVENTS_SECRET=$(openssl rand -hex 32)
+LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
 
 # ---------------------------------------------------------------------------
 # Create API app
@@ -54,12 +76,14 @@ echo "==> Adding Postgres addon"
 heroku addons:create heroku-postgresql:essential-0 -a "${API_APP_NAME}"
 
 echo "==> Setting API config vars"
-JWT_SECRET=$(openssl rand -hex 32)
 
 # Build config vars, skipping empty optional ones
 CONFIG_VARS=(
     "SCRAPIX_MODE=hosted"
     "JWT_SECRET=${JWT_SECRET}"
+    "LAB_EVENTS_URL=${LAB_EVENTS_URL}"
+    "LAB_EVENTS_SECRET=${LAB_EVENTS_SECRET}"
+    "LAB_SERVICE_TOKEN=${LAB_SERVICE_TOKEN}"
     "RUST_LOG=info"
 )
 
@@ -119,6 +143,9 @@ echo ""
 echo "  3. Check logs:"
 echo "     heroku logs -a ${API_APP_NAME} --tail"
 echo "     heroku logs -a ${CONSOLE_APP_NAME} --tail"
+echo ""
+echo "  Set the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN on the Rails app:"
+echo "     heroku config -a ${API_APP_NAME} | grep LAB_"
 echo ""
 echo "  API URL:     ${API_URL}"
 echo "  Console URL: ${CONSOLE_URL}"

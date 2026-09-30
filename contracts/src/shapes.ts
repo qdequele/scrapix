@@ -112,6 +112,7 @@ export const SAVED_CONFIG: Spec = {
   last_run_at: "timestamp|null",
   next_run_at: "timestamp|null",
   last_job_id: "string|null",
+  last_error: "string|null",
   created_at: "timestamp",
   updated_at: "timestamp",
 };

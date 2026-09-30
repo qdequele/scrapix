@@ -208,7 +208,9 @@ impl JobStore for PgJobStore {
     ///
     /// Rows already terminal are skipped: a counter snapshot taken before a
     /// job finished must not overwrite its terminal row, which only
-    /// [`update_job_full`](JobStore::update_job_full) writes.
+    /// [`update_job_full`](JobStore::update_job_full) writes. Terminal
+    /// snapshots are skipped too, for the same reason: the terminal status
+    /// is persisted only by `update_job_full` (after the job's Lab events).
     async fn flush_job_counters(&self, snapshots: &[JobState]) -> Result<(), StoreError> {
         if snapshots.is_empty() {
             return Ok(());
@@ -253,7 +255,8 @@ impl JobStore for PgJobStore {
                 crawl_rate, eta_seconds
             )
         ) AS d
-        WHERE j.job_id = d.job_id AND j.status NOT IN ('completed', 'failed', 'cancelled')",
+        WHERE j.job_id = d.job_id AND j.status NOT IN ('completed', 'failed', 'cancelled')
+          AND d.status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&ids)
         .bind(&statuses)
@@ -443,12 +446,12 @@ impl JobStore for PgJobStore {
     }
 
     /// Pending/running jobs of an account (per-tier concurrent job limit).
-    async fn count_active_jobs(&self, account_id: &str) -> Result<i64, StoreError> {
+    async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError> {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
+            "SELECT job_id FROM jobs WHERE account_id = $1 AND status IN ('pending', 'running')",
         )
         .bind(uuid::Uuid::parse_str(account_id).ok())
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(store_err)
     }
@@ -548,10 +551,18 @@ impl JobStore for PgJobStore {
     }
 }
 
-/// Throwaway Postgres for the conformance suite; each call gets a fresh,
-/// migrated schema so tests don't see each other's rows.
+/// Throwaway Postgres pool with a fresh schema and the engine migrations
+/// applied; each call gets its own schema so tests don't see each other's rows.
 #[cfg(test)]
-pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
+pub(crate) async fn test_pg_pool() -> Option<sqlx::PgPool> {
+    let pool = test_empty_pg_pool().await?;
+    PgJobStore::new(pool.clone()).migrate().await.ok()?;
+    Some(pool)
+}
+
+/// Throwaway Postgres pool on a fresh, empty schema (no migrations).
+#[cfg(test)]
+pub(crate) async fn test_empty_pg_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("JOBSTORE_TEST_DATABASE_URL").ok()?;
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::PgPool::connect(&url).await.ok()?;
@@ -576,9 +587,25 @@ pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
         .connect(&url)
         .await
         .ok()?;
-    let store = PgJobStore::new(pool);
-    store.migrate().await.ok()?;
-    Some(store)
+    Some(pool)
+}
+
+/// [`test_pg_pool`] plus the minimal Rails-owned tables the engine reads
+/// (DDL in `tests/fixtures/rails_like.sql`, never inline in Rust sources).
+#[cfg(test)]
+pub(crate) async fn test_rails_like_pool() -> Option<sqlx::PgPool> {
+    let pool = test_pg_pool().await?;
+    sqlx::raw_sql(include_str!("../../tests/fixtures/rails_like.sql"))
+        .execute(&pool)
+        .await
+        .ok()?;
+    Some(pool)
+}
+
+/// Throwaway Postgres for the conformance suite.
+#[cfg(test)]
+pub(crate) async fn test_pg_store() -> Option<PgJobStore> {
+    Some(PgJobStore::new(test_pg_pool().await?))
 }
 
 #[cfg(test)]

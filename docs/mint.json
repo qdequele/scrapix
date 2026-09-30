@@ -92,6 +92,7 @@
         "api-reference/jobs",
         "api-reference/authentication",
         "api-reference/diagnostics",
+        "api-reference/lab-events",
         "api-reference/websockets"
       ]
     },

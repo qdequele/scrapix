@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use prometheus::{Counter, CounterVec, GaugeVec, Histogram, HistogramOpts, Opts, Registry};
+use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, Opts, Registry};
 
 /// The single process-wide registry. All collectors in this module register
 /// against it exactly once (via `OnceLock`).
@@ -53,6 +53,14 @@ fn register_counter(name: &'static str, help: &'static str) -> Counter {
         tracing::warn!(error = %e, metric = name, "failed to register counter");
     }
     c
+}
+
+fn register_gauge(name: &'static str, help: &'static str) -> Gauge {
+    let g = Gauge::new(name, help).expect("static metric definition must be valid");
+    if let Err(e) = registry().register(Box::new(g.clone())) {
+        tracing::warn!(error = %e, metric = name, "failed to register gauge");
+    }
+    g
 }
 
 fn register_gauge_vec(name: &'static str, help: &'static str, labels: &[&str]) -> GaugeVec {
@@ -188,6 +196,29 @@ pub fn consumer_uncommitted() -> &'static GaugeVec {
             "scrapix_consumer_uncommitted",
             "In-flight (unacked) message count per topic",
             &["topic"],
+        )
+    })
+}
+
+/// `scrapix_lab_events_pending` — undelivered events in the engine's lab outbox.
+pub fn lab_events_pending() -> &'static Gauge {
+    static METRIC: OnceLock<Gauge> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        register_gauge(
+            "scrapix_lab_events_pending",
+            "Undelivered events in the lab outbox",
+        )
+    })
+}
+
+/// `scrapix_lab_events_delivered_total{outcome}` — accepted | rejected | failed.
+pub fn lab_events_delivered_total() -> &'static CounterVec {
+    static METRIC: OnceLock<CounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        register_counter_vec(
+            "scrapix_lab_events_delivered_total",
+            "Lab event delivery outcomes",
+            &["outcome"],
         )
     })
 }

@@ -72,13 +72,6 @@ hex = "0.4"
 axum-extra = { version = "0.10", features = ["cookie"] }
 subtle = "2.6"
 
-# Cron scheduling
-croner = "3"
-
-# Stripe payments
-# "billing" alone doesn't compile in async-stripe 0.38 (its quote resource
-# references checkout types), so checkout stays enabled alongside it.
-async-stripe = { version = "0.38", default-features = false, features = ["runtime-tokio-hyper", "checkout", "billing"] }
 hmac = "0.12"
 
 # OpenAPI
@@ -89,3 +82,4 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 wiremock = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"
+jsonschema = { version = "0.45", default-features = false }

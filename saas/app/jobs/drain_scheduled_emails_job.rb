@@ -1,5 +1,6 @@
-# Drains the shared `scheduled_emails` queue (rows inserted by the Rust
-# engine) and delivers via ActionMailer. Runs every 30 seconds (see
+# Drains the `scheduled_emails` queue (rows inserted by Rails, including
+# the ones LabEvents::Processor queues for engine events) and delivers via
+# ActionMailer. Runs every 30 seconds (see
 # config/recurring.yml). Failed deliveries retry with exponential backoff
 # (30s, 60s, 120s, ... — up to ScheduledEmail::MAX_ATTEMPTS).
 class DrainScheduledEmailsJob < ApplicationJob

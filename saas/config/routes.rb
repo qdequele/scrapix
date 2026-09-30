@@ -57,6 +57,11 @@ Rails.application.routes.draw do
   # Stripe webhook (signature-verified, no session auth).
   post "webhooks/stripe", to: "stripe_webhooks#receive"
 
+  # Product engines report usage/job events here (HMAC-signed, no user auth).
+  namespace :internal do
+    post "events", to: "events#create"
+  end
+
   # Phase 8: OAuth 2.1 provider (RFC 8414/7591/7636/7009) + MCP.
   get "/.well-known/oauth-authorization-server", to: "oauth#metadata", format: false
   get "/.well-known/oauth-protected-resource", to: "oauth#protected_resource", format: false
