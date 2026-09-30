@@ -284,13 +284,13 @@ async fn prepare<'a>(
     state: &'a AppState,
     account_ext: &Option<Extension<AuthenticatedAccount>>,
     params: &Params,
-) -> Result<(&'a ClickHouseStorage, Option<String>), Response> {
+) -> Result<(&'a ClickHouseStorage, Option<String>), Box<Response>> {
     let Some(analytics) = state.analytics_store.as_ref() else {
-        return Err(not_found());
+        return Err(Box::new(not_found()));
     };
     let ctx = extract_account_context(account_ext).await;
     let account = scope(&ctx, params.get("account_id").map(String::as_str))
-        .map_err(IntoResponse::into_response)?;
+        .map_err(|e| Box::new(e.into_response()))?;
     Ok((&analytics.storage, account))
 }
 
@@ -312,7 +312,7 @@ pub(crate) async fn list_pipes(
 ) -> Response {
     match prepare(&state, &account_ext, &params).await {
         Ok(_) => Json(pipes_catalog()).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -328,7 +328,7 @@ async fn run_pipe(
     };
     let (ch, account) = match prepare(&state, &account_ext, &params).await {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let p = Pipe {
         ch,
