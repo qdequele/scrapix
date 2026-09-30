@@ -373,7 +373,6 @@ function CreateConfigDialog({
   const [startUrls, setStartUrls] = useState("https://example.com");
   const [crawlState, setCrawlState] = useState<CrawlState>({
     ...defaultCrawlState,
-    index_uid: "my-crawl",
     max_pages: "100",
     max_depth: "3",
   });
@@ -417,7 +416,6 @@ function CreateConfigDialog({
       setStartUrls("https://example.com");
       setCrawlState({
         ...defaultCrawlState,
-        index_uid: "my-crawl",
         max_pages: "100",
         max_depth: "3",
       });

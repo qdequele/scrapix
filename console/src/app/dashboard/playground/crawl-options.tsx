@@ -1064,8 +1064,25 @@ export function CrawlOptions({ state, onChange }: CrawlOptionsProps) {
                 Indexing
               </p>
               <p className="text-xs text-muted-foreground">
-                Index UID and Meilisearch connection are auto-configured from your account settings.
+                The Meilisearch connection is auto-configured from your account settings.
               </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="index-uid" className="text-sm font-medium">
+                Index UID
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Leave empty to derive it from the first start URL. Search by URL
+                only finds indexes named that way.
+              </p>
+              <Input
+                id="index-uid"
+                placeholder="Auto-generated from URL"
+                value={state.index_uid}
+                onChange={(e) => set("index_uid", e.target.value)}
+                className="font-mono text-xs"
+              />
             </div>
 
             <div className="space-y-1.5">

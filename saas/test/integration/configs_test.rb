@@ -19,6 +19,33 @@ class ConfigsTest < ActionDispatch::IntegrationTest
     assert_includes body["config"].keys, "max_depth"
   end
 
+  test "keeps index_uid, source and document/OCR features on create" do
+    post "/configs", params: {
+      name: "named-index",
+      config: {
+        start_urls: [ "https://example.org" ],
+        index_uid: "my-custom-index",
+        source: "docs",
+        features: { documents: { enabled: true }, ocr: { mode: "auto" } }
+      }
+    }, as: :json
+    assert_response :created
+    config = response.parsed_body["config"]
+    assert_equal "my-custom-index", config["index_uid"]
+    assert_equal "docs", config["source"]
+    assert_equal({ "enabled" => true }, config["features"]["documents"])
+    assert_equal({ "mode" => "auto" }, config["features"]["ocr"])
+  end
+
+  test "updates index_uid" do
+    record = crawl_configs(:daily_docs)
+    patch "/configs/#{record.id}", params: {
+      config: { start_urls: [ "https://example.org" ], index_uid: "renamed-index" }
+    }, as: :json
+    assert_response :success
+    assert_equal "renamed-index", record.reload.config["index_uid"]
+  end
+
   test "rejects duplicate names per account" do
     post "/configs", params: {
       name: "daily-docs", config: { start_urls: [ "https://example.org" ], index_uid: "x" }
