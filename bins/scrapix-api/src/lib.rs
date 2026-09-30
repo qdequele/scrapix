@@ -50,7 +50,6 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
-#[allow(dead_code)] // wired in by Tasks 4-5
 pub(crate) mod lab_client;
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
@@ -336,9 +335,9 @@ struct AppState {
     pub(crate) lab: Option<Arc<lab_events::Lab>>,
     /// Durable job state and engine-job results (`jobs`, `job_results`).
     pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
-    /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
-    /// context and the credit pre-check).
-    pub(crate) saas_pool: Option<sqlx::PgPool>,
+    /// The Lab's internal API (hosted only): credit pre-check and
+    /// Meilisearch lookups. `None` in standalone.
+    pub(crate) lab_api: Option<Arc<lab_client::LabClient>>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
     /// Delivers `CrawlEvent`s to jobs' subscribed webhooks (SCR-72).
@@ -407,7 +406,7 @@ impl AppState {
         fetcher: Arc<HttpFetcher>,
         browser_renderer: Option<Arc<CdpRenderer>>,
         ai_service: Option<Arc<AiService>>,
-        saas_pool: Option<sqlx::PgPool>,
+        lab_api: Option<Arc<lab_client::LabClient>>,
         job_store: Option<Arc<dyn job_store::JobStore>>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
         webhook_dispatcher: webhooks::WebhookDispatcher,
@@ -462,7 +461,7 @@ impl AppState {
             meili: Arc::new(crate::meili::EnvResolver(None)),
             auth_disabled: false,
             auth_disabled_warned_at: parking_lot::Mutex::new(None),
-            saas_pool,
+            lab_api,
             job_store,
             analytics_store,
             webhook_dispatcher,
@@ -600,8 +599,12 @@ impl AppState {
     fn record_unowned_lab_events(&self, job_id: &str) {
         let events = self.take_pending_lab_events(job_id);
         if let (false, Some(lab)) = (events.is_empty(), self.lab.clone()) {
+            let lab_api = self.lab_api.clone();
             tokio::spawn(async move {
-                let _ = lab.record(&events).await; // logged by `Lab::record`
+                // Failures are logged by `Lab::record`.
+                if lab.record(&events).await.is_ok() {
+                    note_recorded_usage(lab_api.as_deref(), &events);
+                }
             });
         }
     }
@@ -730,7 +733,10 @@ impl AppState {
             return true; // not reachable: events are only owed with a Lab
         };
         match lab.record(&events).await {
-            Ok(()) => true,
+            Ok(()) => {
+                note_recorded_usage(self.lab_api.as_deref(), &events);
+                true
+            }
             Err(_) => {
                 // Logged by `Lab::record`.
                 self.requeue_pending_lab_events(job_id, events);
@@ -3392,7 +3398,20 @@ impl AppState {
     /// a Lab). Failures are logged by `Lab::record`.
     pub(crate) async fn record_events(&self, events: &[lab_events::LabEvent]) {
         let Some(ref lab) = self.lab else { return };
-        let _ = lab.record(events).await;
+        if lab.record(events).await.is_ok() {
+            note_recorded_usage(self.lab_api.as_deref(), events);
+        }
+    }
+}
+
+/// Feed recorded usage back to the Lab client so the balance pre-check
+/// counts credits the Lab has not yet folded into the balance it reports.
+fn note_recorded_usage(api: Option<&lab_client::LabClient>, events: &[lab_events::LabEvent]) {
+    let Some(api) = api else { return };
+    for e in events {
+        if let Some(credits) = e.usage_credits() {
+            api.note_usage(&e.account_id, credits);
+        }
     }
 }
 
@@ -3491,8 +3510,8 @@ pub(crate) async fn perform_scrape(
         billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
 
     // Pre-flight credit check (soft UX check; real deduction is atomic below)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, scrape_cost).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, scrape_cost).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -4417,8 +4436,8 @@ pub(crate) async fn do_create_crawl(
     let warnings = crawl_config_warnings(&config);
 
     // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, 1).await?;
+    if let (Some(ref lab), Some(ctx)) = (&state.lab_api, account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, 1).await?;
 
         // Enforce max concurrent jobs per billing tier
         let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
@@ -4931,8 +4950,8 @@ async fn map_url(
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check (map costs 2 credits)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, billing::MAP_CREDITS).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, billing::MAP_CREDITS).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -5365,8 +5384,8 @@ async fn search_url(
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, billing::SEARCH_CREDITS).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, billing::SEARCH_CREDITS).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -6592,13 +6611,11 @@ async fn init_clickhouse() -> (
 /// What startup wires per mode (see [`wire_mode`]).
 struct ModeWiring {
     auth_mode: auth::AuthMode,
-    /// Hosted only: the Rails Postgres, for SaaS features.
-    saas_pool: Option<sqlx::PgPool>,
     job_store: Arc<dyn job_store::JobStore>,
     meili: Arc<dyn meili::MeilisearchResolver>,
     /// Hosted only: the engine's lab-event outbox (in the shared Postgres).
     lab_outbox: Option<Arc<dyn lab_events::LabOutbox>>,
-    /// Hosted only: the Lab's internal API (auth; billing and Meilisearch next).
+    /// Hosted only: the Lab's internal API (auth, credit pre-check, Meilisearch).
     lab_api: Option<Arc<lab_client::LabClient>>,
 }
 
@@ -6629,8 +6646,8 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             settings::StoreUrl::Postgres(url),
         ) => {
             // Credentials are resolved by the Lab over HTTP; the Rails
-            // Postgres below still backs the job store, the lab-event outbox
-            // and the Meilisearch/billing lookups until they move too.
+            // Postgres below still backs the job store and the lab-event
+            // outbox until they move too.
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
             let lab_api = Arc::new(lab_client::LabClient::new(
                 &lab_client::LabClient::base_from_events_url(&lab_cfg.events_url),
@@ -6651,10 +6668,9 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 Arc::new(lab_events::PgOutbox::new(pool.clone()));
             Ok(ModeWiring {
                 auth_mode: auth::AuthMode::Saas(auth),
-                saas_pool: Some(pool.clone()),
-                job_store: Arc::new(job_store::PgJobStore::new(pool.clone())),
-                meili: Arc::new(meili::EngineTableResolver {
-                    pool,
+                job_store: Arc::new(job_store::PgJobStore::new(pool)),
+                meili: Arc::new(meili::LabMeilisearchResolver {
+                    lab: lab_api.clone(),
                     server: settings.meilisearch.clone(),
                 }),
                 lab_outbox: Some(lab_outbox),
@@ -6733,7 +6749,6 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             }
             Ok(ModeWiring {
                 auth_mode,
-                saas_pool: None,
                 job_store: store,
                 meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
                 lab_outbox: None,
@@ -6771,11 +6786,10 @@ pub async fn run_with_bus(
 
     let ModeWiring {
         auth_mode,
-        saas_pool,
         job_store,
         meili,
         lab_outbox,
-        lab_api: _lab_api,
+        lab_api,
     } = wire_mode(&settings).await?;
 
     // Initialize shared HTTP fetcher for /scrape endpoint
@@ -6867,7 +6881,7 @@ pub async fn run_with_bus(
         fetcher,
         browser_renderer,
         ai_service,
-        saas_pool,
+        lab_api,
         Some(job_store),
         analytics_state.clone(),
         webhook_dispatcher,
@@ -7930,13 +7944,13 @@ mod lifecycle_tests {
             test_fetcher(),
             None,
             None,
-            None, // saas_pool
+            None, // lab_api
             Some(Arc::new(store) as Arc<dyn crate::job_store::JobStore>),
             None,
             test_webhooks(),
         );
         assert!(state.accounting_persisted());
-        assert!(state.saas_pool.is_none());
+        assert!(state.lab_api.is_none());
     }
 
     fn ctx() -> AccountContext {

@@ -270,10 +270,10 @@ pub(crate) async fn document_response(
                 // Pre-flight with the planned OCR pages (cache hits and the
                 // daily budget can only lower the final cost).
                 let planned = engine.plan(&parsed, ocr_mode, job.parsers.ocr_max_pages);
-                if let (Some(pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
+                if let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) {
                     let estimate =
                         job.base_cost + scrapix_billing::ocr_credits(planned.len() as u64);
-                    billing::check_credits(pool, &ctx.account_id, estimate).await?;
+                    billing::check_credits(lab, &ctx.account_id, estimate).await?;
                 }
                 let request = OcrRequest {
                     mode: ocr_mode,
@@ -611,8 +611,8 @@ pub(crate) async fn parse_upload(
     let has_ai_summary = options.ai.as_ref().is_some_and(|ai| ai.summary);
     let has_ai_extraction = options.ai.as_ref().is_some_and(|ai| ai.extract.is_some());
     let base_cost = billing::scrape_credits(&options.formats, has_ai_summary, has_ai_extraction);
-    if let (Some(pool), Some(ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, base_cost).await?;
+    if let (Some(lab), Some(ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, base_cost).await?;
     }
 
     let label = format!("upload://{}", filename.as_deref().unwrap_or("document"));

@@ -353,6 +353,7 @@ impl LabClient {
         )
     }
 
+    #[allow(dead_code)] // startup check, wired in by Task 6
     pub(crate) async fn ping(&self) -> Result<(), LabError> {
         let resp = self
             .send(

@@ -88,6 +88,13 @@ impl LabEvent {
         )
     }
 
+    /// Credits of a `usage.recorded` event (None for other types).
+    pub(crate) fn usage_credits(&self) -> Option<i64> {
+        (self.kind == "usage.recorded")
+            .then(|| self.data.get("credits").and_then(|c| c.as_i64()))
+            .flatten()
+    }
+
     #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn crawl_final_usage(
         job_id: &str,
@@ -388,6 +395,18 @@ impl LabOutbox for MemoryOutbox {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_credits_only_for_usage_events() {
+        let u = LabEvent::usage("acc", None, "scrape", 7, json!({}), "d".into(), None);
+        assert_eq!(u.usage_credits(), Some(7));
+        let f = LabEvent::crawl_final_usage("job-1", "acc", 12, json!({}), "d".into());
+        assert_eq!(f.usage_credits(), Some(12));
+        assert_eq!(
+            LabEvent::job_completed("job-1", "acc", json!({"credits": 5})).usage_credits(),
+            None
+        );
+    }
 
     #[test]
     fn crawl_final_and_lifecycle_ids_are_deterministic_and_distinct() {

@@ -620,10 +620,10 @@ impl ExtractRunner {
 
     /// Enough credits for one more AI call?
     async fn can_afford_ai(&self) -> Result<(), String> {
-        let (Some(pool), Some(ctx)) = (&self.state.saas_pool, self.account_ctx.as_ref()) else {
+        let (Some(lab), Some(ctx)) = (&self.state.lab_api, self.account_ctx.as_ref()) else {
             return Ok(());
         };
-        billing::check_credits(pool, &ctx.account_id, billing::extract_ai_call_credits())
+        billing::check_credits(lab, &ctx.account_id, billing::extract_ai_call_credits())
             .await
             .map(|_| ())
             .map_err(|e| e.error)

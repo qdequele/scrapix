@@ -25,12 +25,29 @@ impl From<scrapix_billing::BillingError> for ApiError {
 // Public API (delegates to scrapix_billing)
 // ============================================================================
 
+/// Credit pre-check against the Lab's effective balance minus usage this
+/// engine recorded since that balance was fetched (spec: Lab split §3.2).
 pub(crate) async fn check_credits(
-    pool: &sqlx::PgPool,
+    lab: &crate::lab_client::LabClient,
     account_id: &str,
     required_amount: i64,
 ) -> Result<i64, ApiError> {
-    Ok(scrapix_billing::check_credits(pool, account_id, required_amount).await?)
+    match lab.available_credits(account_id).await {
+        Ok(Some(available)) if available >= required_amount => Ok(available),
+        Ok(Some(available)) => Err(scrapix_billing::BillingError::InsufficientCredits {
+            available,
+            required: required_amount,
+        }
+        .into()),
+        Ok(None) => Err(scrapix_billing::BillingError::AccountNotFound.into()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Lab unavailable during credit check");
+            Err(ApiError::new(
+                "Billing service unavailable, retry shortly",
+                "service_unavailable",
+            ))
+        }
+    }
 }
 
 // ============================================================================
@@ -233,5 +250,63 @@ mod tests {
     #[test]
     fn test_map_credits_constant() {
         assert_eq!(MAP_CREDITS, 2);
+    }
+}
+
+#[cfg(test)]
+mod lab_balance_tests {
+    use super::check_credits;
+    use crate::lab_client::{
+        testing::{FakeLab, TOKEN},
+        LabClient,
+    };
+    use serde_json::json;
+
+    const ACCT: &str = "11111111-1111-1111-1111-111111111111";
+
+    #[tokio::test]
+    async fn service_call_balance_uses_account_lookup() {
+        let lab = FakeLab::start().await;
+        let c = LabClient::new(&lab.url, TOKEN);
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": 0}}),
+        );
+        assert_eq!(
+            check_credits(&c, ACCT, 1).await.unwrap_err().code,
+            "insufficient_credits"
+        );
+    }
+
+    #[tokio::test]
+    async fn enough_credits_then_local_usage_runs_out() {
+        let lab = FakeLab::start().await;
+        let c = LabClient::new(&lab.url, TOKEN);
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": 10}}),
+        );
+        assert_eq!(check_credits(&c, ACCT, 3).await.unwrap(), 10);
+        c.note_usage(ACCT, 8);
+        assert_eq!(
+            check_credits(&c, ACCT, 3).await.unwrap_err().code,
+            "insufficient_credits"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_account_is_not_found_and_lab_down_is_503() {
+        let lab = FakeLab::start().await;
+        let c = LabClient::new(&lab.url, TOKEN);
+        assert_eq!(
+            check_credits(&c, ACCT, 1).await.unwrap_err().code,
+            "not_found"
+        );
+        lab.set_down(true);
+        let other = "22222222-2222-2222-2222-222222222222";
+        assert_eq!(
+            check_credits(&c, other, 1).await.unwrap_err().code,
+            "service_unavailable"
+        );
     }
 }

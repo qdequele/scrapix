@@ -17,7 +17,7 @@ pub fn same_url(a: &str, b: &str) -> bool {
 
 /// Resolves which Meilisearch instance a crawl/search/results request
 /// should use, in standalone mode (env-configured) or hosted mode (the
-/// account's rows in the Rails-owned `meilisearch_engines` table).
+/// account's engines, from the Lab).
 #[async_trait::async_trait]
 pub(crate) trait MeilisearchResolver: Send + Sync {
     /// The default target for `account` (None when unauthenticated/standalone).
@@ -55,26 +55,22 @@ impl MeilisearchResolver for EnvResolver {
     }
 }
 
-/// Hosted: the account's rows in the Rails-owned `meilisearch_engines`
-/// table, falling back to the operator's own server only when its URL
-/// matches the one being looked up (never as a tenant's default — a
-/// tenant's crawl must not land in the operator's Meilisearch).
-pub struct EngineTableResolver {
-    pub pool: sqlx::PgPool,
-    pub server: Option<MeiliTarget>,
+/// Hosted: the account's engines as the Lab reports them
+/// (`GET /internal/accounts/{id}/meilisearch`), falling back to the
+/// operator's own server only when its URL matches the one being looked up
+/// (never as a tenant's default — a tenant's crawl must not land in the
+/// operator's Meilisearch).
+pub(crate) struct LabMeilisearchResolver {
+    pub(crate) lab: std::sync::Arc<crate::lab_client::LabClient>,
+    pub(crate) server: Option<MeiliTarget>,
 }
 
-fn db_err(e: sqlx::Error) -> ApiError {
-    ApiError::new(format!("Database error: {e}"), "internal_error")
-}
-
-fn row_target(row: sqlx::postgres::PgRow) -> MeiliTarget {
-    use sqlx::Row as _;
-    let api_key: Option<String> = row.try_get("api_key").ok();
-    MeiliTarget {
-        url: row.get("url"),
-        api_key: api_key.filter(|k| !k.is_empty()),
-    }
+fn lab_err(e: crate::lab_client::LabError) -> ApiError {
+    tracing::warn!(error = %e, "Lab unavailable during Meilisearch lookup");
+    ApiError::new(
+        "Meilisearch configuration unavailable, retry shortly",
+        "service_unavailable",
+    )
 }
 
 /// Table-miss decision, factored out so it can be unit tested without a
@@ -85,43 +81,30 @@ fn server_fallback(server: &Option<MeiliTarget>, url: &str) -> Option<MeiliTarge
 }
 
 #[async_trait::async_trait]
-impl MeilisearchResolver for EngineTableResolver {
+impl MeilisearchResolver for LabMeilisearchResolver {
     async fn default_target(
         &self,
         account_id: Option<&str>,
     ) -> Result<Option<MeiliTarget>, ApiError> {
-        let Some(account) = account_id.and_then(|a| a.parse::<uuid::Uuid>().ok()) else {
+        let Some(account) = account_id else {
             return Ok(None);
         };
-        sqlx::query(
-            "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1 AND is_default = true LIMIT 1",
-        )
-        .bind(account)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|r| r.map(row_target))
-        .map_err(db_err)
+        self.lab.meilisearch(account, None).await.map_err(lab_err)
     }
     async fn target_for_url(
         &self,
         account_id: Option<&str>,
         url: &str,
     ) -> Result<Option<MeiliTarget>, ApiError> {
-        let Some(account) = account_id.and_then(|a| a.parse::<uuid::Uuid>().ok()) else {
+        let Some(account) = account_id else {
             return Ok(server_fallback(&self.server, url));
         };
-        let row = sqlx::query(
-            "SELECT url, api_key FROM meilisearch_engines \
-             WHERE account_id = $1 AND rtrim(url, '/') = rtrim($2, '/') \
-             ORDER BY is_default DESC LIMIT 1",
-        )
-        .bind(account)
-        .bind(url)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|r| r.map(row_target))
-        .map_err(db_err)?;
-        Ok(row.or_else(|| server_fallback(&self.server, url)))
+        let found = self
+            .lab
+            .meilisearch(account, Some(url))
+            .await
+            .map_err(lab_err)?;
+        Ok(found.or_else(|| server_fallback(&self.server, url)))
     }
     fn missing_message(&self) -> &'static str {
         "No Meilisearch engine configured. Add one in Settings."
@@ -209,6 +192,53 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "validation_error");
+    }
+
+    #[tokio::test]
+    async fn lab_resolver_default_url_and_fallback() {
+        use crate::lab_client::{
+            testing::{FakeLab, TOKEN},
+            LabClient,
+        };
+        let lab = FakeLab::start().await;
+        let acct = "11111111-1111-1111-1111-111111111111";
+        lab.state.meili.lock().unwrap().insert(
+            format!("{acct}|"),
+            serde_json::json!({"id": "e", "url": "http://m:7700", "api_key": "k"}),
+        );
+        let server = Some(MeiliTarget {
+            url: "http://ops:7700".into(),
+            api_key: Some("ops".into()),
+        });
+        let r = LabMeilisearchResolver {
+            lab: std::sync::Arc::new(LabClient::new(&lab.url, TOKEN)),
+            server,
+        };
+        assert_eq!(
+            r.default_target(Some(acct)).await.unwrap().unwrap().url,
+            "http://m:7700"
+        );
+        assert_eq!(r.default_target(None).await.unwrap(), None);
+        assert_eq!(
+            r.target_for_url(Some(acct), "http://ops:7700/")
+                .await
+                .unwrap()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("ops")
+        );
+        assert_eq!(
+            r.target_for_url(None, "http://ops:7700")
+                .await
+                .unwrap()
+                .unwrap()
+                .url,
+            "http://ops:7700"
+        );
+        lab.set_down(true);
+        let other = "22222222-2222-2222-2222-222222222222";
+        assert!(r.default_target(Some(other)).await.is_err());
     }
 
     #[test]
