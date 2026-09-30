@@ -324,6 +324,7 @@ class CrawlConfigRecord(BaseModel):
     cron_expression: Optional[str] = None
     description: Optional[str] = None
     id: str
+    last_error: Optional[str] = None
     last_job_id: Optional[str] = None
     last_run_at: Optional[str] = None
     name: str
