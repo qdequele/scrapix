@@ -47,7 +47,7 @@ class EnginesController < ApplicationController
     api_error!("Name cannot be empty", "validation_error") if new_name.strip.empty?
     new_url = params.key?(:url) ? params[:url].to_s : record.url
     api_error!("URL cannot be empty", "validation_error") if new_url.strip.empty?
-    new_api_key = params.key?(:api_key) ? params[:api_key].to_s : record.api_key
+    new_api_key = MeilisearchEngine.keep_key?(params[:api_key]) ? record.api_key : params[:api_key].to_s
 
     record.update!(name: new_name.strip, url: new_url.strip, api_key: new_api_key)
     render json: record

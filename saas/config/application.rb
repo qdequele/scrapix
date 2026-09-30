@@ -49,5 +49,15 @@ module Saas
     # The schema carries a PL/pgSQL function (validate_api_key, shared with
     # the Rust engine) and partial indexes — schema.rb can't express those.
     config.active_record.schema_format = :sql
+
+    # Active Record encryption (meilisearch_engines.api_key). Keys come from
+    # the environment (qdq-server: /etc/scrapix/scrapix.env); generate with
+    # `bin/rails db:encryption:init`.
+    config.active_record.encryption.primary_key = ENV["ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY"]
+    config.active_record.encryption.deterministic_key = ENV["ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY"]
+    config.active_record.encryption.key_derivation_salt = ENV["ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT"]
+    # Rows written before encryption was enabled stay readable until the
+    # data migration re-saves them.
+    config.active_record.encryption.support_unencrypted_data = true
   end
 end

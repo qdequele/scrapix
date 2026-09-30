@@ -1971,6 +1971,7 @@ ALTER TABLE ONLY public.meilisearch_engines
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
+('20260930000001'),
 ('20260929000005'),
 ('20260929000004'),
 ('20260929000003'),

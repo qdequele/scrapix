@@ -98,6 +98,57 @@
           }
         }
       }
+    },
+    "/internal/accounts/{account_id}/meilisearch": {
+      "get": {
+        "operationId": "getAccountMeilisearch",
+        "summary": "The account's Meilisearch target (decrypted key)",
+        "description": "With `url`, the account's engine whose URL matches (trailing slash ignored); without it, the default engine. `api_key` is the decrypted key, `\"\"` when none is set. 404 `{\"error\":\"not_found\"}` when nothing matches or the account id is not a UUID.",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "url",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Meilisearch target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeilisearchTarget"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No matching engine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFound"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -312,6 +363,39 @@
             "$ref": "#/components/schemas/Inactive"
           }
         ]
+      },
+      "MeilisearchTarget": {
+        "type": "object",
+        "required": [
+          "id",
+          "url",
+          "api_key"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Decrypted Meilisearch API key; empty string when none is set"
+          }
+        }
+      },
+      "NotFound": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "not_found"
+          }
+        }
       }
     }
   }

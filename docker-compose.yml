@@ -379,6 +379,10 @@ services:
       LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
       LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
       LAB_CRON_ENABLED: "true"
+      # dev only — generate real ones with `cd saas && bin/rails db:encryption:init` for production
+      ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: dev-only-primary-key-000000000000
+      ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY: dev-only-deterministic-key-0000000
+      ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: dev-only-key-derivation-salt-00000
       REDIS_URL: redis://dragonfly:6379
       CONSOLE_URL: http://localhost:3001
       ENVIRONMENT: development
