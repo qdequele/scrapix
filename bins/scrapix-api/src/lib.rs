@@ -50,6 +50,8 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
+#[allow(dead_code)] // wired in by Tasks 4-5
+pub(crate) mod lab_client;
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
 pub mod meili;

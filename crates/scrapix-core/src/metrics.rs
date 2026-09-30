@@ -223,6 +223,20 @@ pub fn lab_events_delivered_total() -> &'static CounterVec {
     })
 }
 
+/// `scrapix_lab_requests_total{endpoint,outcome}` — the engine's calls to the
+/// Lab's internal API. endpoint: ping | introspect | account | meilisearch;
+/// outcome: ok | inactive | unavailable | rejected | stale.
+pub fn lab_requests_total() -> &'static CounterVec {
+    static METRIC: OnceLock<CounterVec> = OnceLock::new();
+    METRIC.get_or_init(|| {
+        register_counter_vec(
+            "scrapix_lab_requests_total",
+            "Engine to Lab internal API request outcomes",
+            &["endpoint", "outcome"],
+        )
+    })
+}
+
 /// Set `gauge` to reflect only the top `limit` entries in `entries` by value
 /// (descending), clearing any label set in `previous` that fell out of the
 /// top set. `previous` is updated in place to the label set that now has a
