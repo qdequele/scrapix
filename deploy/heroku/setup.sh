@@ -50,6 +50,23 @@ ANTHROPIC_API_KEY=""
 CORS_ORIGINS=""
 
 # ---------------------------------------------------------------------------
+# Validate configuration — before any `heroku` call, so a missing value never
+# leaves a half-created app or a paid add-on behind
+# ---------------------------------------------------------------------------
+case "${LAB_EVENTS_URL}" in
+    http://*|https://*) ;;
+    *)
+        echo "LAB_EVENTS_URL must be set to the Rails app's http(s) /internal/events URL" >&2
+        echo "(the hosted engine refuses to start without it). Edit the config block above." >&2
+        exit 1
+        ;;
+esac
+
+JWT_SECRET=$(openssl rand -hex 32)
+LAB_EVENTS_SECRET=$(openssl rand -hex 32)
+LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+
+# ---------------------------------------------------------------------------
 # Create API app
 # ---------------------------------------------------------------------------
 echo "==> Creating API app: ${API_APP_NAME}"
@@ -59,13 +76,6 @@ echo "==> Adding Postgres addon"
 heroku addons:create heroku-postgresql:essential-0 -a "${API_APP_NAME}"
 
 echo "==> Setting API config vars"
-JWT_SECRET=$(openssl rand -hex 32)
-LAB_EVENTS_SECRET=$(openssl rand -hex 32)
-LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
-if [ -z "${LAB_EVENTS_URL}" ]; then
-    echo "LAB_EVENTS_URL is required (the hosted engine refuses to start without it)." >&2
-    exit 1
-fi
 
 # Build config vars, skipping empty optional ones
 CONFIG_VARS=(
