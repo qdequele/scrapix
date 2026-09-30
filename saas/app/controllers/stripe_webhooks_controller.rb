@@ -21,6 +21,20 @@ class StripeWebhooksController < ApplicationController
       return render plain: "Webhook signature verification failed", status: :bad_request
     end
 
+    begin
+      handle_event(event)
+    rescue Stripe::StripeError => e
+      # Couldn't read what we need from Stripe: fail so Stripe redelivers.
+      Rails.logger.error("Stripe webhook #{event.type} failed: #{e.message}")
+      return render plain: "Stripe API error", status: :internal_server_error
+    end
+
+    head :ok
+  end
+
+  private
+
+  def handle_event(event)
     case event.type
     when "invoice.paid"
       handle_invoice_paid(event.data.object)
@@ -31,11 +45,7 @@ class StripeWebhooksController < ApplicationController
     when "setup_intent.succeeded"
       handle_setup_intent_succeeded(event.data.object)
     end
-
-    head :ok
   end
-
-  private
 
   def handle_invoice_paid(invoice)
     account_id = invoice.metadata&.[]("scrapix_account_id")
@@ -48,11 +58,27 @@ class StripeWebhooksController < ApplicationController
     end
     return unless valid_uuid?(account_id)
 
-    pi_id = payment_intent_id(invoice.payment_intent) || invoice.id
+    # Credits are keyed on the payment intent id, the same key the purchase
+    # flow and AutoTopup credit under, so a webhook for an invoice they
+    # already credited is a no-op. Since API 2025-03-31 the webhook payload
+    # carries no `payment_intent`, so re-read the invoice through the pinned
+    # client. Never fall back to the invoice id: that key differs from the
+    # one the other paths use, and would credit the same payment twice.
+    pi_id = invoice_payment_intent_id(invoice.id)
+    if pi_id.blank?
+      Rails.logger.warn("Invoice #{invoice.id} has no payment intent; not crediting from the webhook")
+      return
+    end
+
     StripeBilling.add_credits_for_payment(account_id, credits, pi_id, "Credit purchase (Invoice)")
     queue_receipt(account_id, credits, invoice.amount_paid || 0)
   rescue ActiveRecord::ActiveRecordError => e
     Rails.logger.error("Failed to add credits from invoice webhook: #{e.message}")
+  end
+
+  def invoice_payment_intent_id(invoice_id)
+    fresh = StripeBilling.client.v1.invoices.retrieve(invoice_id, { expand: [ "payment_intent" ] })
+    payment_intent_id(fresh.payment_intent)
   end
 
   def handle_payment_intent_succeeded(pi)
