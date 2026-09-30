@@ -11,8 +11,16 @@
 #   is no data; job_stats returns zero rows.
 # - kpis aggregates the top_domains query (limit 10000) in application code.
 # - daily_stats dates stay "YYYY-MM-DD".
+#
+# Every pipe requires authentication and is scoped to the caller's account
+# (API key, OAuth token, or session + X-Account-Id): each query filters on
+# `account_id`, and an `account_id` parameter naming another account is
+# refused. The ClickHouse tables hold every tenant's events, so an unscoped
+# pipe would leak other accounts' crawl data.
 class AnalyticsController < ApplicationController
+  before_action :authenticate_api_key_or_session!
   before_action :require_clickhouse
+  before_action :scope_to_account
 
   rescue_from ClickhouseClient::QueryError do |e|
     Rails.logger.error("analytics query failed: #{e.message}")
@@ -58,14 +66,14 @@ class AnalyticsController < ApplicationController
   def domain_stats
     started = monotonic_now
     domain = params.require(:domain)
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { domain: domain, hours: hours_param })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(domain: domain, hours: hours_param))
       SELECT
           domain,
           #{REQUEST_AGG},
           avg(duration_ms) as avg_duration_ms,
           sum(content_length) as total_bytes
       FROM request_events
-      WHERE domain = {domain:String} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
+      WHERE #{ACCOUNT_FILTER} AND domain = {domain:String} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
       GROUP BY domain
     SQL
     row = rows.first || {
@@ -77,7 +85,7 @@ class AnalyticsController < ApplicationController
 
   def hourly_stats
     started = monotonic_now
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { hours: hours_param })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(hours: hours_param))
       SELECT
           toStartOfHour(timestamp) as hour,
           sum(pages_fetched) as requests,
@@ -86,7 +94,7 @@ class AnalyticsController < ApplicationController
           avg(duration_ms) as avg_duration_ms,
           sum(content_length) as total_bytes
       FROM request_events
-      WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR
+      WHERE #{ACCOUNT_FILTER} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
       GROUP BY hour
       ORDER BY hour
     SQL
@@ -113,7 +121,7 @@ class AnalyticsController < ApplicationController
 
   def daily_stats
     started = monotonic_now
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { days: days_param })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(days: days_param))
       SELECT
           toDate(timestamp) as date,
           sum(pages_fetched) as requests,
@@ -122,7 +130,7 @@ class AnalyticsController < ApplicationController
           avg(duration_ms) as avg_duration_ms,
           sum(content_length) as total_bytes
       FROM request_events
-      WHERE timestamp >= now() - INTERVAL {days:UInt32} DAY
+      WHERE #{ACCOUNT_FILTER} AND timestamp >= now() - INTERVAL {days:UInt32} DAY
       GROUP BY date
       ORDER BY date
     SQL
@@ -149,10 +157,10 @@ class AnalyticsController < ApplicationController
 
   def error_distribution
     started = monotonic_now
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { hours: hours_param })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(hours: hours_param))
       SELECT status_code, count() as count
       FROM request_events
-      WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR
+      WHERE #{ACCOUNT_FILTER} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
           AND (status_code >= 400 OR error != '')
       GROUP BY status_code
       ORDER BY count DESC
@@ -174,7 +182,7 @@ class AnalyticsController < ApplicationController
   def job_stats
     started = monotonic_now
     job_id = params.require(:job_id)
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { job_id: job_id })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(job_id: job_id))
       SELECT
           job_id,
           #{REQUEST_AGG},
@@ -184,7 +192,7 @@ class AnalyticsController < ApplicationController
           min(timestamp) as started_at,
           max(timestamp) as last_activity_at
       FROM request_events
-      WHERE job_id = {job_id:String}
+      WHERE #{ACCOUNT_FILTER} AND job_id = {job_id:String}
       GROUP BY job_id
     SQL
     data = rows.first(1).map do |r|
@@ -247,18 +255,14 @@ class AnalyticsController < ApplicationController
 
   def ai_usage
     started = monotonic_now
-    account_id = params[:account_id]
-    account_filter = account_id.present? ? "AND account_id = {account_id:String}" : ""
-    bind = { hours: hours_param }
-    bind[:account_id] = account_id if account_id.present?
-    rows = ClickhouseClient.instance.query(<<~SQL, params: bind)
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(hours: hours_param))
       SELECT model, count() as total_calls,
           sum(prompt_tokens) as total_prompt_tokens,
           sum(completion_tokens) as total_completion_tokens,
           sum(total_tokens) as total_tokens,
           avg(duration_ms) as avg_duration_ms
       FROM ai_usage_events
-      WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR #{account_filter}
+      WHERE #{ACCOUNT_FILTER} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
       GROUP BY model ORDER BY total_tokens DESC
     SQL
     data = rows.map do |r|
@@ -283,10 +287,10 @@ class AnalyticsController < ApplicationController
   def job_timeline
     started = monotonic_now
     job_id = params.require(:job_id)
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { job_id: job_id, limit: limit_param(100) })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(job_id: job_id, limit: limit_param(100)))
       SELECT *
       FROM job_events
-      WHERE job_id = {job_id:String}
+      WHERE #{ACCOUNT_FILTER} AND job_id = {job_id:String}
       ORDER BY timestamp DESC
       LIMIT {limit:UInt32}
     SQL
@@ -317,14 +321,14 @@ class AnalyticsController < ApplicationController
   def job_event_summary
     started = monotonic_now
     job_id = params.require(:job_id)
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { job_id: job_id })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(job_id: job_id))
       SELECT
           event_type,
           count() as event_count,
           min(timestamp) as first_seen,
           max(timestamp) as last_seen
       FROM job_events
-      WHERE job_id = {job_id:String}
+      WHERE #{ACCOUNT_FILTER} AND job_id = {job_id:String}
       GROUP BY event_type
       ORDER BY first_seen
     SQL
@@ -345,7 +349,7 @@ class AnalyticsController < ApplicationController
 
   def account_usage
     started = monotonic_now
-    account_id = params.require(:account_id)
+    account_id = @account_id
     rows = ClickhouseClient.instance.query(<<~SQL, params: { account_id: account_id, hours: hours_param })
       SELECT
           account_id,
@@ -388,7 +392,7 @@ class AnalyticsController < ApplicationController
 
   def account_daily_usage
     started = monotonic_now
-    account_id = params.require(:account_id)
+    account_id = @account_id
     rows = ClickhouseClient.instance.query(<<~SQL, params: { account_id: account_id, days: days_param })
       SELECT
           toDate(timestamp) as date,
@@ -423,7 +427,7 @@ class AnalyticsController < ApplicationController
 
   def account_daily_usage_by_operation
     started = monotonic_now
-    account_id = params.require(:account_id)
+    account_id = @account_id
     rows = ClickhouseClient.instance.query(<<~SQL, params: { account_id: account_id, days: days_param })
       SELECT
           toDate(timestamp) as date,
@@ -461,7 +465,7 @@ class AnalyticsController < ApplicationController
 
   def api_key_usage
     started = monotonic_now
-    account_id = params.require(:account_id)
+    account_id = @account_id
     rows = ClickhouseClient.instance.query(<<~SQL, params: { account_id: account_id, hours: hours_param })
       SELECT
           api_key_id,
@@ -505,6 +509,20 @@ class AnalyticsController < ApplicationController
     head :not_found unless ClickhouseClient.configured?
   end
 
+  ACCOUNT_FILTER = "account_id = {account_id:String}".freeze
+
+  # The caller's account. An `account_id` parameter is still accepted (the
+  # console and older clients send it) but must name that same account.
+  def scope_to_account
+    @account_id = resolve_account_id!.to_s
+    requested = params[:account_id].presence
+    raise_account_not_found if requested && requested.to_s != @account_id
+  end
+
+  def scoped(bind)
+    bind.merge(account_id: @account_id)
+  end
+
   def render_envelope(meta, data, started)
     render json: {
       meta: meta,
@@ -519,14 +537,14 @@ class AnalyticsController < ApplicationController
   end
 
   def top_domains_rows(hours, limit)
-    rows = ClickhouseClient.instance.query(<<~SQL, params: { hours: hours, limit: limit })
+    rows = ClickhouseClient.instance.query(<<~SQL, params: scoped(hours: hours, limit: limit))
       SELECT
           domain,
           #{REQUEST_AGG},
           avg(duration_ms) as avg_duration_ms,
           sum(content_length) as total_bytes
       FROM request_events
-      WHERE timestamp >= now() - INTERVAL {hours:UInt32} HOUR
+      WHERE #{ACCOUNT_FILTER} AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR
       GROUP BY domain
       ORDER BY total_requests DESC
       LIMIT {limit:UInt32}
@@ -652,7 +670,7 @@ class AnalyticsController < ApplicationController
       name: "account_usage",
       description: "Account usage summary (requests, bandwidth, JS renders, AI tokens)",
       parameters: [
-        { name: "account_id", type: "string", required: true, default: nil },
+        { name: "account_id", type: "string", required: false, default: nil },
         { name: "hours", type: "integer", required: false, default: "24" }
       ],
       endpoint: "/analytics/v0/pipes/account_usage.json"
@@ -661,7 +679,7 @@ class AnalyticsController < ApplicationController
       name: "account_daily_usage",
       description: "Daily usage breakdown for an account",
       parameters: [
-        { name: "account_id", type: "string", required: true, default: nil },
+        { name: "account_id", type: "string", required: false, default: nil },
         { name: "days", type: "integer", required: false, default: "30" }
       ],
       endpoint: "/analytics/v0/pipes/account_daily_usage.json"
@@ -670,7 +688,7 @@ class AnalyticsController < ApplicationController
       name: "account_daily_usage_by_operation",
       description: "Daily usage breakdown per operation (scrape/map/crawl) for an account",
       parameters: [
-        { name: "account_id", type: "string", required: true, default: nil },
+        { name: "account_id", type: "string", required: false, default: nil },
         { name: "days", type: "integer", required: false, default: "30" }
       ],
       endpoint: "/analytics/v0/pipes/account_daily_usage_by_operation.json"
@@ -679,7 +697,7 @@ class AnalyticsController < ApplicationController
       name: "api_key_usage",
       description: "Per-API-key usage breakdown for an account",
       parameters: [
-        { name: "account_id", type: "string", required: true, default: nil },
+        { name: "account_id", type: "string", required: false, default: nil },
         { name: "hours", type: "integer", required: false, default: "24" }
       ],
       endpoint: "/analytics/v0/pipes/api_key_usage.json"

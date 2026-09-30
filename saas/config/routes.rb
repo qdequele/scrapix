@@ -86,8 +86,8 @@ Rails.application.routes.draw do
     end
   end
 
-  # Phase 3: Tinybird-style analytics pipes (ClickHouse-backed, unauthenticated
-  # to match the Rust API; 404 when ClickHouse is not configured).
+  # Phase 3: Tinybird-style analytics pipes (ClickHouse-backed; authenticated
+  # and scoped to the caller's account; 404 when ClickHouse is not configured).
   scope "analytics/v0", controller: :analytics, format: false do
     get "pipes", action: :pipes
     %w[
