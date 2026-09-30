@@ -66,32 +66,42 @@ module StripeBilling
     customer.id
   end
 
-  # Invoice item -> draft invoice -> finalize -> pay (expanding the payment
-  # intent so the caller can check its status). Same flow as the Rust
-  # create_and_pay_invoice. With void_unpaid, an invoice whose /pay raises
-  # (e.g. a declined card) is voided before re-raising, so unattended
-  # retries (auto top-up) don't leave open invoices behind.
+  # Draft invoice -> invoice item attached to it -> finalize -> pay
+  # (expanding the payment intent so the caller can check its status). The
+  # invoice is created first, excluding pending items, and the item is
+  # attached to it: an item created on its own would sit pending on the
+  # customer if the invoice call then failed, and be swept into (and paid by)
+  # the next invoice, charging twice for one credit grant. If attaching the
+  # item fails, the empty draft is deleted (best effort). With void_unpaid,
+  # an invoice whose /pay raises (e.g. a declined card) is voided before
+  # re-raising, so unattended retries (auto top-up) don't leave open
+  # invoices behind.
   def self.create_and_pay_invoice(customer_id:, account_id:, payment_method_id:, credits:, amount_cents:, purchase_type:,
                                   void_unpaid: false)
     description = "Scrapix: #{credits} credits"
-    client.v1.invoice_items.create(
-      customer: customer_id, amount: amount_cents, currency: "usd",
-      description: description
-    )
-
     invoice = client.v1.invoices.create(
       customer: customer_id,
       collection_method: "charge_automatically",
       auto_advance: false,
       default_payment_method: payment_method_id,
       description: description,
-      pending_invoice_items_behavior: "include",
+      pending_invoice_items_behavior: "exclude",
       metadata: {
         scrapix_account_id: account_id,
         credits: credits.to_s,
         type: purchase_type
       }
     )
+
+    begin
+      client.v1.invoice_items.create(
+        customer: customer_id, invoice: invoice.id, amount: amount_cents, currency: "usd",
+        description: description
+      )
+    rescue StandardError
+      delete_draft_invoice(invoice.id)
+      raise
+    end
 
     invoice = client.v1.invoices.finalize_invoice(invoice.id, { auto_advance: false })
     begin
@@ -109,6 +119,16 @@ module StripeBilling
       void_invoice(invoice.id) if void_unpaid
       raise
     end
+  end
+
+  # Best-effort delete of a draft invoice (never raises; drafts can't be
+  # voided). A failure is only logged: the draft holds at most its own item,
+  # never a pending one, so it can't be charged by a later invoice.
+  def self.delete_draft_invoice(invoice_id)
+    client.v1.invoices.delete(invoice_id)
+  rescue StandardError => e
+    Rails.logger.warn("Could not delete draft Stripe invoice #{invoice_id}: #{e.message}")
+    nil
   end
 
   # Best-effort void of an unpaid invoice (never raises): a failure is only
