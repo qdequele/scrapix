@@ -17,7 +17,7 @@ use crate::lab_client::{CredentialKind, Identity, LabError};
 /// together with `Authorization: Bearer <LAB_SERVICE_TOKEN>`).
 pub(crate) const SERVICE_ACCOUNT_HEADER: &str = "X-Scrapix-Account-Id";
 
-/// Longest credential ever sent to the Lab; anything longer is rejected
+/// Longest credential ever sent to the Lab; an empty or longer one is rejected
 /// locally with the credential's usual 401.
 const MAX_CREDENTIAL_LEN: usize = 4096;
 
@@ -147,7 +147,7 @@ pub(crate) async fn validate_api_key_or_session(
             }
         }
 
-        if bearer.len() > MAX_CREDENTIAL_LEN {
+        if bearer.is_empty() || bearer.len() > MAX_CREDENTIAL_LEN {
             return Err(AuthError::new(
                 "Invalid or expired Bearer token",
                 "invalid_bearer_token",
@@ -201,7 +201,7 @@ pub(crate) async fn validate_api_key_or_session(
         .get("scrapix_session")
         .map(|c| c.value().to_string())
         .ok_or_else(|| AuthError::new("Missing API key or session", "not_authenticated"))?;
-    if token.len() > MAX_CREDENTIAL_LEN {
+    if token.is_empty() || token.len() > MAX_CREDENTIAL_LEN {
         return Err(AuthError::new(
             "Invalid or expired session",
             "invalid_session",
@@ -321,6 +321,27 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(call(app(s), r).await.0, 401);
+        assert_eq!(lab.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_credential_is_rejected_without_a_lab_call() {
+        let (lab, s) = state().await;
+        let cases = [
+            (
+                HttpRequest::get("/p").header("Authorization", "Bearer "),
+                "invalid_bearer_token",
+            ),
+            (
+                HttpRequest::get("/p").header("Cookie", "scrapix_session="),
+                "invalid_session",
+            ),
+        ];
+        for (req, code) in cases {
+            let (status, body) = call(app(s.clone()), req.body(Body::empty()).unwrap()).await;
+            assert_eq!(status, 401, "{code}");
+            assert!(body.contains(code), "{body}");
+        }
         assert_eq!(lab.calls(), 0);
     }
 
