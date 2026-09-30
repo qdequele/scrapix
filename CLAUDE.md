@@ -278,7 +278,8 @@ The backend is deliberately split into two services sharing one Postgres:
   saved-config cron (`RunDueCrawlConfigsJob`, gated by `LAB_CRON_ENABLED`,
   which calls the engine with `LAB_SERVICE_TOKEN`), and OAuth token cleanup.
   The hosted engine refuses to start without `LAB_EVENTS_URL`,
-  `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`; the engine never reads
+  `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`, or before the Rails migration
+  that creates `lab_events` has run; the engine never reads
   `STRIPE_SECRET_KEY`.
 
 The console proxy (`console/src/app/api/scrapix/[...path]/route.ts`) routes
