@@ -143,6 +143,9 @@ pub trait LabOutbox: Send + Sync {
     /// Undelivered count and the creation time of the oldest one.
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError>;
     async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError>;
+    /// Credits of `account_id`'s `usage.recorded` events not yet accepted by
+    /// the Lab (so not yet in the balance it reports). 0 for a non-uuid id.
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError>;
 }
 
 pub struct PgOutbox {
@@ -244,6 +247,21 @@ impl LabOutbox for PgOutbox {
         .execute(&self.pool)
         .await
         .map(|r| r.rows_affected())
+        .map_err(db)
+    }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        let Ok(account) = account_id.parse::<Uuid>() else {
+            return Ok(0);
+        };
+        sqlx::query_scalar(
+            "SELECT COALESCE(SUM((payload->'data'->>'credits')::bigint), 0)::bigint \
+             FROM lab_events \
+             WHERE account_id = $1 AND type = 'usage.recorded' AND delivered_at IS NULL",
+        )
+        .bind(account)
+        .fetch_one(&self.pool)
+        .await
         .map_err(db)
     }
 }
@@ -373,6 +391,21 @@ impl LabOutbox for SqliteOutbox {
             .map(|r| r.rows_affected())
             .map_err(db)
     }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        let Ok(account) = account_id.parse::<Uuid>() else {
+            return Ok(0);
+        };
+        sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CAST(json_extract(payload, '$.data.credits') AS INTEGER)), 0) \
+             FROM lab_events \
+             WHERE account_id = ? AND type = 'usage.recorded' AND delivered_at IS NULL",
+        )
+        .bind(account.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)
+    }
 }
 
 /// Records events; the only entry point handlers use.
@@ -499,6 +532,16 @@ impl LabOutbox for MemoryOutbox {
         let before = rows.len();
         rows.retain(|r| !r.delivered);
         Ok((before - rows.len()) as u64)
+    }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .rows
+            .lock()
+            .iter()
+            .filter(|r| !r.delivered && r.event.account_id == account_id)
+            .filter_map(|r| r.event.usage_credits())
+            .sum())
     }
 }
 
@@ -760,6 +803,45 @@ mod tests {
     #[tokio::test]
     async fn memory_outbox_roundtrip() {
         outbox_roundtrip(&MemoryOutbox::default()).await;
+    }
+
+    /// Only this account's undelivered `usage.recorded` credits count.
+    async fn undelivered_usage(o: &dyn LabOutbox) {
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let other = "7f1c2a8e-0000-4000-8000-000000000002";
+        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 0);
+        let a = LabEvent::usage(acct, None, "scrape", 3, json!({}), "s".into(), None);
+        let b = LabEvent::crawl_final_usage("j", acct, 10, json!({}), "Job j".into());
+        let delivered = LabEvent::usage(acct, None, "map", 100, json!({}), "m".into(), None);
+        let mail = LabEvent::job_completed("j", acct, json!({"credits": 1000}));
+        let theirs = LabEvent::usage(other, None, "map", 7, json!({}), "m".into(), None);
+        o.enqueue(&[a, b, delivered.clone(), mail, theirs])
+            .await
+            .unwrap();
+        o.mark_delivered(&[delivered.id]).await.unwrap();
+        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 13);
+        assert_eq!(o.undelivered_usage_credits(other).await.unwrap(), 7);
+        assert_eq!(o.undelivered_usage_credits("not-a-uuid").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_outbox_undelivered_usage() {
+        undelivered_usage(&MemoryOutbox::default()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_undelivered_usage() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        undelivered_usage(&SqliteOutbox::new(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn pg_outbox_undelivered_usage() {
+        let Some(pool) = crate::job_store::postgres::test_pg_pool().await else {
+            eprintln!("skipped");
+            return;
+        };
+        undelivered_usage(&PgOutbox::new(pool)).await;
     }
 
     #[tokio::test]

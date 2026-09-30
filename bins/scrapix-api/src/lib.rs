@@ -2527,7 +2527,10 @@ pub(crate) struct ApiError {
     pub(crate) error: String,
     pub(crate) code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<serde_json::Value>,
+    details: Option<Box<serde_json::Value>>,
+    /// `Retry-After` seconds (a header, never in the body).
+    #[serde(skip)]
+    retry_after: Option<u32>,
 }
 
 impl ApiError {
@@ -2536,11 +2539,18 @@ impl ApiError {
             error: error.into(),
             code: code.into(),
             details: None,
+            retry_after: None,
         }
     }
 
+    /// Send `Retry-After: <secs>` with the response.
+    pub(crate) fn with_retry_after(mut self, secs: u32) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+
     fn with_details(mut self, details: serde_json::Value) -> Self {
-        self.details = Some(details);
+        self.details = Some(Box::new(details));
         self
     }
 }
@@ -2562,7 +2572,13 @@ impl IntoResponse for ApiError {
             "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(self)).into_response()
+        let retry_after = self.retry_after;
+        let mut resp = (status, Json(self)).into_response();
+        if let Some(secs) = retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        resp
     }
 }
 
@@ -6664,10 +6680,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
     match (&settings.mode, &settings.auth, &settings.store) {
         (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
-            let lab_api = Arc::new(lab_client::LabClient::new(
-                &lab_cfg.url,
-                &lab_cfg.service_token,
-            ));
+            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.service_token);
             match lab_api.ping().await {
                 Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
                 Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
@@ -6687,6 +6700,8 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             }
             let store = open_store(store_url).await?;
             info!(backend = store.backend(), "Job store ready (engine-owned)");
+            // Balance snapshots count usage still waiting in the outbox.
+            let lab_api = Arc::new(lab_api.with_undelivered_usage(store.lab_outbox()));
             Ok(ModeWiring {
                 auth_mode: auth::AuthMode::Saas(Arc::new(auth::AuthState::new(
                     lab_api.clone(),
@@ -7955,6 +7970,74 @@ mod tests {
         .is_ok());
     }
 
+    /// Minor 12 (PG-gated): the Rails-schema guard, through `wire_mode` →
+    /// `open_store` on a real Postgres. Refused before anything is migrated.
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_rails_postgres_database() {
+        let Ok(url) = std::env::var("JOBSTORE_TEST_DATABASE_URL") else {
+            eprintln!("skipped");
+            return;
+        };
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        let scoped = |schema: &str| {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}options=-c%20search_path%3D{schema}")
+        };
+        let tables = |schema: String| {
+            let admin = admin.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT table_name::text FROM information_schema.tables \
+                     WHERE table_schema = $1 ORDER BY 1",
+                )
+                .bind(schema)
+                .fetch_all(&admin)
+                .await
+                .unwrap()
+            }
+        };
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let wire = |store: String| {
+            let lab_url = lab.url.clone();
+            async move {
+                wire_mode(&hosted_settings(
+                    &lab_url,
+                    crate::lab_client::testing::TOKEN,
+                    settings::StoreUrl::Postgres(store),
+                ))
+                .await
+            }
+        };
+
+        let rails = format!("t_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {rails}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE {rails}.schema_migrations (version text)"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let err = wire(scoped(&rails)).await.err().unwrap();
+        assert!(err.to_string().contains("Rails (Lab) database"), "{err}");
+        assert_eq!(
+            tables(rails).await,
+            vec!["schema_migrations".to_string()],
+            "nothing migrated into it"
+        );
+
+        // Control: an empty database of its own is accepted and migrated.
+        let own = format!("t_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {own}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        assert!(wire(scoped(&own)).await.is_ok());
+        assert!(tables(own).await.contains(&"lab_events".to_string()));
+    }
+
     #[tokio::test]
     async fn standalone_builds_no_lab_client() {
         let dir = tempfile::tempdir().unwrap();
@@ -8616,6 +8699,12 @@ mod lifecycle_tests {
         ) -> Result<u64, job_store::StoreError> {
             self.inner.purge_delivered(older_than_secs).await
         }
+        async fn undelivered_usage_credits(
+            &self,
+            account_id: &str,
+        ) -> Result<i64, job_store::StoreError> {
+            self.inner.undelivered_usage_credits(account_id).await
+        }
     }
 
     /// Drive `job_id` (one seed, one page) to a balanced, completed state.
@@ -8833,6 +8922,88 @@ mod lifecycle_tests {
         assert_eq!(events_of(&outbox, "job.completed").len(), 1);
         assert!(state.crawl.pending_lab_events.lock().is_empty());
         assert!(state.crawl.terminal_pending.read().is_empty());
+    }
+
+    /// Important 1 (b): each record site feeds the recorded credits to the
+    /// Lab client's balance snapshot: request usage (`record_events`), a
+    /// crawl's final charge (`record_owed_lab_events`, via the flush) and a
+    /// terminal event for an unknown job (`record_unowned_lab_events`).
+    #[tokio::test]
+    async fn every_record_site_feeds_the_balance_snapshot() {
+        use crate::lab_client::{testing, LabClient};
+        let lab = testing::FakeLab::start().await;
+        lab.set_account(
+            ACCT,
+            serde_json::json!({"active": true, "account_id": ACCT, "tier": "free",
+                               "credits": {"balance": 100}}),
+        );
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        let api = Arc::new(LabClient::new(&lab.url, testing::TOKEN));
+        state.lab_api = Some(api.clone());
+        let available = || {
+            let api = api.clone();
+            async move { api.available_credits(ACCT).await.unwrap().unwrap().credits }
+        };
+        assert_eq!(available().await, 100);
+
+        state
+            .record_events(&[lab_events::LabEvent::usage(
+                ACCT,
+                None,
+                "scrape",
+                3,
+                serde_json::json!({}),
+                "s".into(),
+                None,
+            )])
+            .await;
+        assert_eq!(available().await, 97, "record_events");
+
+        let store = TerminalStore::watching(&outbox);
+        complete_one_page_job(&state, "j1").await;
+        state.flush_to_db(&store).await;
+        let crawl: i64 = events_of(&outbox, "usage.recorded")
+            .iter()
+            .filter(|e| e.data["job_id"] == "j1")
+            .map(|e| e.usage_credits().unwrap())
+            .sum();
+        assert!(crawl > 0);
+        assert_eq!(available().await, 97 - crawl, "crawl final charge");
+
+        state.process_event(
+            "ghost",
+            &CrawlEvent::JobCompleted {
+                job_id: "ghost".into(),
+                account_id: Some(ACCT.into()),
+                pages_crawled: 2,
+                documents_indexed: 2,
+                errors: 0,
+                bytes_downloaded: 0,
+                duration_secs: 1,
+                timestamp: 0,
+            },
+        );
+        let ghost = || -> i64 {
+            events_of(&outbox, "usage.recorded")
+                .iter()
+                .filter(|e| e.data["job_id"] == "ghost")
+                .map(|e| e.usage_credits().unwrap())
+                .sum()
+        };
+        for _ in 0..100 {
+            if ghost() > 0 && available().await == 97 - crawl - ghost() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ghost() > 0);
+        assert_eq!(
+            available().await,
+            97 - crawl - ghost(),
+            "unowned terminal charge"
+        );
     }
 
     /// Standalone (no Lab): nothing is recorded, the job still finalizes and

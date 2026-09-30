@@ -32,7 +32,15 @@ pub(crate) async fn check_credits(
     account_id: &str,
     required_amount: i64,
 ) -> Result<i64, ApiError> {
-    match lab.available_credits(account_id).await {
+    let answer = match lab.available_credits(account_id).await {
+        // About to refuse on a cached snapshot: refresh once, so a top-up
+        // made since counts immediately.
+        Ok(Some(a)) if a.cached && a.credits < required_amount => {
+            lab.refresh_credits(account_id).await
+        }
+        other => other,
+    };
+    match answer.map(|a| a.map(|a| a.credits)) {
         Ok(Some(available)) if available >= required_amount => Ok(available),
         Ok(Some(available)) => Err(scrapix_billing::BillingError::InsufficientCredits {
             available,
@@ -41,11 +49,12 @@ pub(crate) async fn check_credits(
         .into()),
         Ok(None) => Err(scrapix_billing::BillingError::AccountNotFound.into()),
         Err(e) => {
-            tracing::warn!(error = %e, "Lab unavailable during credit check");
+            crate::lab_client::log_lab_error(&e, "credit check");
             Err(ApiError::new(
                 "Billing service unavailable, retry shortly",
                 "service_unavailable",
-            ))
+            )
+            .with_retry_after(5))
         }
     }
 }
@@ -280,18 +289,71 @@ mod lab_balance_tests {
 
     #[tokio::test]
     async fn enough_credits_then_local_usage_runs_out() {
+        use crate::lab_events::{LabEvent, LabOutbox, MemoryOutbox};
         let lab = FakeLab::start().await;
-        let c = LabClient::new(&lab.url, TOKEN);
+        let outbox = std::sync::Arc::new(MemoryOutbox::default());
+        let c = LabClient::new(&lab.url, TOKEN).with_undelivered_usage(outbox.clone());
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": 10}}),
         );
         assert_eq!(check_credits(&c, ACCT, 3).await.unwrap(), 10);
+        // Recorded (not yet delivered to the Lab), then noted.
+        outbox
+            .enqueue(&[LabEvent::usage(
+                ACCT,
+                None,
+                "scrape",
+                8,
+                json!({}),
+                "s".into(),
+                None,
+            )])
+            .await
+            .unwrap();
         c.note_usage(ACCT, 8);
+        // The refresh before the 402 still counts the undelivered 8.
+        let err = check_credits(&c, ACCT, 3).await.unwrap_err();
+        assert_eq!(err.code, "insufficient_credits");
+    }
+
+    #[tokio::test]
+    async fn a_top_up_counts_before_a_402_with_one_refresh_per_check() {
+        let lab = FakeLab::start().await;
+        let c = LabClient::new(&lab.url, TOKEN);
+        let account = |balance: i64| json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": balance}});
+        lab.set_account(ACCT, account(1));
+        assert_eq!(check_credits(&c, ACCT, 1).await.unwrap(), 1);
+        let calls = lab.calls();
+        assert_eq!(check_credits(&c, ACCT, 1).await.unwrap(), 1);
+        assert_eq!(lab.calls(), calls, "enough on the snapshot: no Lab call");
+
+        lab.set_account(ACCT, account(10)); // topped up, snapshot still says 1
+        assert_eq!(check_credits(&c, ACCT, 5).await.unwrap(), 10);
+        assert_eq!(lab.calls(), calls + 1, "one refresh");
+
+        lab.set_account(ACCT, account(2));
+        c.note_usage(ACCT, 8); // snapshot: 10 - 8 = 2
+        let calls = lab.calls();
         assert_eq!(
-            check_credits(&c, ACCT, 3).await.unwrap_err().code,
+            check_credits(&c, ACCT, 5).await.unwrap_err().code,
             "insufficient_credits"
         );
+        assert_eq!(lab.calls(), calls + 1, "still short: exactly one refresh");
+    }
+
+    #[tokio::test]
+    async fn billing_unavailable_is_503_with_retry_after() {
+        use axum::response::IntoResponse;
+        let lab = FakeLab::start().await;
+        let c = LabClient::new(&lab.url, TOKEN);
+        lab.set_down(true);
+        let resp = check_credits(&c, ACCT, 1)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
     }
 
     #[tokio::test]
