@@ -6693,6 +6693,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             })?;
             let auth = Arc::new(auth);
             let pool = auth.pool.clone();
+            lab_events::ensure_outbox_table(&pool).await?;
             info!("Authentication enabled via the Rails Postgres");
             let lab_outbox: Arc<dyn lab_events::LabOutbox> =
                 Arc::new(lab_events::PgOutbox::new(pool.clone()));

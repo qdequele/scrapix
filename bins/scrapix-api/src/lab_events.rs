@@ -145,6 +145,22 @@ fn db(e: impl std::fmt::Display) -> StoreError {
     StoreError::Other(e.to_string())
 }
 
+/// Hosted startup check: the Rails migration that creates `lab_events` must
+/// have run, or every charge and crawl terminal write would fail to enqueue.
+pub async fn ensure_outbox_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let present: bool = sqlx::query_scalar("SELECT to_regclass('lab_events') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot inspect DATABASE_URL: {e}"))?;
+    if !present {
+        anyhow::bail!(
+            "SCRAPIX_MODE=hosted: lab_events table missing from DATABASE_URL; run the \
+             Rails migrations first (cd saas && bin/rails db:migrate)"
+        );
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl LabOutbox for PgOutbox {
     async fn enqueue(&self, events: &[LabEvent]) -> Result<(), StoreError> {
@@ -551,6 +567,20 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, 2001);
         assert!((290.0..=310.0).contains(&secs), "backoff was {secs}s");
+    }
+
+    #[tokio::test]
+    async fn hosted_startup_requires_the_lab_events_table() {
+        let Some(empty) = crate::job_store::postgres::test_empty_pg_pool().await else {
+            eprintln!("skipped");
+            return;
+        };
+        let err = ensure_outbox_table(&empty).await.unwrap_err().to_string();
+        assert!(err.contains("lab_events table missing"), "{err}");
+        assert!(err.contains("bin/rails db:migrate"), "{err}");
+
+        let migrated = crate::job_store::postgres::test_pg_pool().await.unwrap();
+        ensure_outbox_table(&migrated).await.unwrap();
     }
 
     #[tokio::test]

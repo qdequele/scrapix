@@ -555,6 +555,14 @@ impl JobStore for PgJobStore {
 /// applied; each call gets its own schema so tests don't see each other's rows.
 #[cfg(test)]
 pub(crate) async fn test_pg_pool() -> Option<sqlx::PgPool> {
+    let pool = test_empty_pg_pool().await?;
+    PgJobStore::new(pool.clone()).migrate().await.ok()?;
+    Some(pool)
+}
+
+/// Throwaway Postgres pool on a fresh, empty schema (no migrations).
+#[cfg(test)]
+pub(crate) async fn test_empty_pg_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("JOBSTORE_TEST_DATABASE_URL").ok()?;
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::PgPool::connect(&url).await.ok()?;
@@ -579,7 +587,6 @@ pub(crate) async fn test_pg_pool() -> Option<sqlx::PgPool> {
         .connect(&url)
         .await
         .ok()?;
-    PgJobStore::new(pool.clone()).migrate().await.ok()?;
     Some(pool)
 }
 
