@@ -43,6 +43,13 @@ fn event(
     }
 }
 
+/// Descriptions embed caller input (a search `q`, a map URL): drop control
+/// characters (NUL included, which Postgres `jsonb` rejects) so the ledger
+/// line and the outbox row stay clean.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn usage_data(
     operation: &str,
     credits: i64,
@@ -54,7 +61,7 @@ fn usage_data(
         "operation": operation,
         "credits": credits,
         "units": units,
-        "description": description,
+        "description": strip_control_chars(&description),
     });
     if let Some(j) = job_id {
         d["job_id"] = json!(j);
@@ -269,6 +276,19 @@ impl Lab {
         let r = self.outbox.enqueue(events).await;
         if let Err(ref e) = r {
             tracing::warn!(error = %e, count = events.len(), "Failed to record lab events");
+            // One line per event so a lost charge can be reconstructed from logs.
+            for ev in events {
+                let operation = ev.data.get("operation").and_then(|v| v.as_str());
+                let credits = ev.data.get("credits").and_then(|v| v.as_i64());
+                tracing::warn!(
+                    event_id = %ev.id,
+                    account_id = %ev.account_id,
+                    event_type = %ev.kind,
+                    operation,
+                    credits,
+                    "Lab event not recorded"
+                );
+            }
         }
         r
     }
@@ -408,6 +428,22 @@ mod tests {
         assert_eq!(v["data"]["description"], "https://e.com (3 credits)");
         assert!(v["data"].get("job_id").is_none());
         assert_eq!(e.id.get_version_num(), 7);
+    }
+
+    #[test]
+    fn usage_description_is_stripped_of_control_characters() {
+        let e = LabEvent::usage(
+            "acc",
+            None,
+            "search",
+            1,
+            json!({}),
+            "Search 'a\0b\nc\u{7}d\u{9b}e' (1 credit)".into(),
+            None,
+        );
+        assert_eq!(e.data["description"], "Search 'abcde' (1 credit)");
+        let f = LabEvent::crawl_final_usage("j", "acc", 1, json!({}), "Job\r\n j\0".into());
+        assert_eq!(f.data["description"], "Job j");
     }
 
     /// The engine's serialized events must satisfy the shared contract
