@@ -112,12 +112,16 @@ Update an engine's configuration.
 |-------|------|-------------|
 | `name` | string | Engine name |
 | `url` | string | Meilisearch URL |
-| `api_key` | string | Meilisearch API key |
+| `api_key` | string | Meilisearch API key. Omit it, send `""`, or echo back the masked value to keep the stored key |
 | `description` | string | Description |
 
 ### Response
 
 Returns the full updated engine record.
+
+<Note>
+Engine keys are encrypted at rest and never returned. Responses carry `api_key` as a masked hint (`"••••"` plus the last 4 characters, or `""` when unset) and a boolean `has_api_key`.
+</Note>
 
 ---
 

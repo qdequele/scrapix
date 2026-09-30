@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod analytics;
+pub(crate) mod analytics_pipes;
 pub mod auth;
 pub(crate) mod batch;
 pub mod billing;
@@ -50,6 +51,7 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
+pub(crate) mod lab_client;
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
 pub mod meili;
@@ -135,12 +137,12 @@ pub struct Args {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: Option<String>,
 
-    /// JWT secret for session tokens (required when DATABASE_URL is set)
+    /// JWT_SECRET: ignored by the engine (the Lab verifies sessions).
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
     /// Deployment mode: `standalone` (default, self-hosted, admin key) or
-    /// `hosted` (Rails control plane, shared Postgres).
+    /// `hosted` (Lab control plane; the engine keeps its own database).
     #[arg(long, env = "SCRAPIX_MODE", default_value = "standalone")]
     pub mode: String,
 
@@ -153,7 +155,11 @@ pub struct Args {
     #[arg(long, env = "SCRAPIX_AUTH")]
     pub auth: Option<String>,
 
-    /// Lab endpoint receiving usage/job events (hosted only; required there).
+    /// Hosted: the Lab base URL — events go to {LAB_URL}/internal/events, lookups to {LAB_URL}/internal/*.
+    #[arg(long, env = "LAB_URL")]
+    pub lab_url: Option<String>,
+
+    /// Lab endpoint receiving usage/job events (deprecated: set LAB_URL).
     #[arg(long, env = "LAB_EVENTS_URL")]
     pub lab_events_url: Option<String>,
 
@@ -334,9 +340,9 @@ struct AppState {
     pub(crate) lab: Option<Arc<lab_events::Lab>>,
     /// Durable job state and engine-job results (`jobs`, `job_results`).
     pub(crate) job_store: Option<Arc<dyn job_store::JobStore>>,
-    /// The Rails SaaS Postgres pool, used **only** by SaaS features (auth
-    /// context and the credit pre-check).
-    pub(crate) saas_pool: Option<sqlx::PgPool>,
+    /// The Lab's internal API (hosted only): credit pre-check and
+    /// Meilisearch lookups. `None` in standalone.
+    pub(crate) lab_api: Option<Arc<lab_client::LabClient>>,
     /// Optional ClickHouse analytics store (used for event history queries)
     analytics_store: Option<Arc<analytics::AnalyticsState>>,
     /// Delivers `CrawlEvent`s to jobs' subscribed webhooks (SCR-72).
@@ -405,7 +411,7 @@ impl AppState {
         fetcher: Arc<HttpFetcher>,
         browser_renderer: Option<Arc<CdpRenderer>>,
         ai_service: Option<Arc<AiService>>,
-        saas_pool: Option<sqlx::PgPool>,
+        lab_api: Option<Arc<lab_client::LabClient>>,
         job_store: Option<Arc<dyn job_store::JobStore>>,
         analytics_store: Option<Arc<analytics::AnalyticsState>>,
         webhook_dispatcher: webhooks::WebhookDispatcher,
@@ -460,7 +466,7 @@ impl AppState {
             meili: Arc::new(crate::meili::EnvResolver(None)),
             auth_disabled: false,
             auth_disabled_warned_at: parking_lot::Mutex::new(None),
-            saas_pool,
+            lab_api,
             job_store,
             analytics_store,
             webhook_dispatcher,
@@ -598,8 +604,12 @@ impl AppState {
     fn record_unowned_lab_events(&self, job_id: &str) {
         let events = self.take_pending_lab_events(job_id);
         if let (false, Some(lab)) = (events.is_empty(), self.lab.clone()) {
+            let lab_api = self.lab_api.clone();
             tokio::spawn(async move {
-                let _ = lab.record(&events).await; // logged by `Lab::record`
+                // Failures are logged by `Lab::record`.
+                if lab.record(&events).await.is_ok() {
+                    note_recorded_usage(lab_api.as_deref(), &events);
+                }
             });
         }
     }
@@ -728,7 +738,10 @@ impl AppState {
             return true; // not reachable: events are only owed with a Lab
         };
         match lab.record(&events).await {
-            Ok(()) => true,
+            Ok(()) => {
+                note_recorded_usage(self.lab_api.as_deref(), &events);
+                true
+            }
             Err(_) => {
                 // Logged by `Lab::record`.
                 self.requeue_pending_lab_events(job_id, events);
@@ -1420,7 +1433,8 @@ impl AppState {
     ///   owed terminal write failed (kept held, write retried next flush).
     /// - Transient accounting failure: keep everything held, the jobs dirty
     ///   and the terminal writes owed, for the next attempt.
-    /// - Missing `accounting` column (the Rails migration has not run):
+    /// - Missing `accounting` column or `jobs` table (the engine's own
+    ///   migrations did not apply, or the database was altered by hand):
     ///   non-retryable. Accounting persistence and ack deferral are turned
     ///   off for this process and every held ack is released, degrading to
     ///   in-memory accounting instead of blocking consumption forever.
@@ -1445,9 +1459,9 @@ impl AppState {
                 // In this degraded mode nothing is persisted, so jobs still
                 // running at a restart end as FailStalled after the stall timeout.
                 error!(
-                    "jobs.accounting column is missing (Rails migration \
-                     20260926000001_add_accounting_to_jobs not applied): job accounting is \
-                     kept in memory only and events are acked immediately for this process"
+                    "jobs.accounting column is missing (the engine's own migrations did not \
+                     apply): job accounting is kept in memory only and events are acked \
+                     immediately for this process"
                 );
                 self.accounting_persisted
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2096,7 +2110,7 @@ enum AccountingFlush {
     /// Transient failure: retry next flush, keep acks held.
     Retry,
     /// The `jobs.accounting` column / `jobs` table does not exist: the
-    /// Rails migration has not run. Not retryable.
+    /// engine's own migrations did not apply. Not retryable.
     SchemaMissing,
 }
 
@@ -2513,7 +2527,10 @@ pub(crate) struct ApiError {
     pub(crate) error: String,
     pub(crate) code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<serde_json::Value>,
+    details: Option<Box<serde_json::Value>>,
+    /// `Retry-After` seconds (a header, never in the body).
+    #[serde(skip)]
+    retry_after: Option<u32>,
 }
 
 impl ApiError {
@@ -2522,11 +2539,18 @@ impl ApiError {
             error: error.into(),
             code: code.into(),
             details: None,
+            retry_after: None,
         }
     }
 
+    /// Send `Retry-After: <secs>` with the response.
+    pub(crate) fn with_retry_after(mut self, secs: u32) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+
     fn with_details(mut self, details: serde_json::Value) -> Self {
-        self.details = Some(details);
+        self.details = Some(Box::new(details));
         self
     }
 }
@@ -2548,7 +2572,13 @@ impl IntoResponse for ApiError {
             "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(self)).into_response()
+        let retry_after = self.retry_after;
+        let mut resp = (status, Json(self)).into_response();
+        if let Some(secs) = retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        resp
     }
 }
 
@@ -2556,74 +2586,28 @@ impl IntoResponse for ApiError {
 // Account context helpers
 // ============================================================================
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 
-/// Resolved account context from either API key or session auth
+/// Resolved account context for an authenticated request (any credential)
 pub(crate) struct AccountContext {
     pub account_id: String,
     pub api_key_id: Option<String>,
     pub tier: String,
-    /// User role in this account (None for API key auth — API keys are account-scoped).
+    /// User role in this account (None for API keys and service calls — they are account-scoped).
     pub user_role: Option<String>,
 }
 
-/// Extract account context from request extensions.
-/// Returns `None` when auth is not configured (no DATABASE_URL), preserving backward compatibility.
+/// Account context for the request: API key, OAuth, session or service call — the auth
+/// middleware resolves them all into `AuthenticatedAccount`. `None` when auth is off (standalone).
 async fn extract_account_context(
-    db_pool: Option<&sqlx::PgPool>,
     account_ext: &Option<Extension<AuthenticatedAccount>>,
-    user_ext: &Option<Extension<AuthenticatedUser>>,
 ) -> Option<AccountContext> {
-    // API key path — no per-user role (API keys are account-scoped)
-    if let Some(Extension(acct)) = account_ext {
-        return Some(AccountContext {
-            account_id: acct.account_id.clone(),
-            api_key_id: acct.api_key_id.clone(),
-            tier: acct.tier.clone(),
-            user_role: None,
-        });
-    }
-
-    // Session path: look up account_id + tier + role via DB
-    if let (Some(Extension(user)), Some(pool)) = (user_ext, db_pool) {
-        let query = if let Some(selected_id) = user.selected_account_id {
-            sqlx::query(
-                "SELECT a.id, a.tier, m.role FROM account_members m \
-                 JOIN accounts a ON a.id = m.account_id \
-                 WHERE m.user_id = $1 AND m.account_id = $2",
-            )
-            .bind(user.user_id)
-            .bind(selected_id)
-            .fetch_optional(pool)
-            .await
-        } else {
-            sqlx::query(
-                "SELECT a.id, a.tier, m.role FROM account_members m \
-                 JOIN accounts a ON a.id = m.account_id \
-                 WHERE m.user_id = $1 LIMIT 1",
-            )
-            .bind(user.user_id)
-            .fetch_optional(pool)
-            .await
-        };
-        let row = query.ok().flatten();
-
-        if let Some(row) = row {
-            use sqlx::Row;
-            let account_id: uuid::Uuid = row.get("id");
-            let tier: String = row.get("tier");
-            let role: String = row.get("role");
-            return Some(AccountContext {
-                account_id: account_id.to_string(),
-                api_key_id: None,
-                tier,
-                user_role: Some(role),
-            });
-        }
-    }
-
-    // No auth configured or no valid credentials
-    None
+    account_ext.as_ref().map(|Extension(acct)| AccountContext {
+        account_id: acct.account_id.clone(),
+        api_key_id: acct.api_key_id.clone(),
+        tier: acct.tier.clone(),
+        user_role: acct.role.clone(),
+    })
 }
 
 /// Check that the user's role allows write operations (scrape, map, search, crawl).
@@ -3400,11 +3384,9 @@ fn preprocess_html(
 async fn scrape_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     perform_scrape(&state, &account_ctx, &request)
         .await
@@ -3438,7 +3420,20 @@ impl AppState {
     /// a Lab). Failures are logged by `Lab::record`.
     pub(crate) async fn record_events(&self, events: &[lab_events::LabEvent]) {
         let Some(ref lab) = self.lab else { return };
-        let _ = lab.record(events).await;
+        if lab.record(events).await.is_ok() {
+            note_recorded_usage(self.lab_api.as_deref(), events);
+        }
+    }
+}
+
+/// Feed recorded usage back to the Lab client so the balance pre-check
+/// counts credits the Lab has not yet folded into the balance it reports.
+fn note_recorded_usage(api: Option<&lab_client::LabClient>, events: &[lab_events::LabEvent]) {
+    let Some(api) = api else { return };
+    for e in events {
+        if let Some(credits) = e.usage_credits() {
+            api.note_usage(&e.account_id, credits);
+        }
     }
 }
 
@@ -3537,8 +3532,8 @@ pub(crate) async fn perform_scrape(
         billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
 
     // Pre-flight credit check (soft UX check; real deduction is atomic below)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, scrape_cost).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, scrape_cost).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -4463,8 +4458,8 @@ pub(crate) async fn do_create_crawl(
     let warnings = crawl_config_warnings(&config);
 
     // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref pool), Some(ctx)) = (&state.saas_pool, account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, 1).await?;
+    if let (Some(ref lab), Some(ctx)) = (&state.lab_api, account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, 1).await?;
 
         // Enforce max concurrent jobs per billing tier
         let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
@@ -4971,16 +4966,14 @@ async fn map_fetch_page(
 async fn map_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<MapRequest>,
 ) -> Result<Json<MapResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check (map costs 2 credits)
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, billing::MAP_CREDITS).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, billing::MAP_CREDITS).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -5407,16 +5400,14 @@ struct SearchRequest {
 async fn search_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     // Pre-flight credit check
-    if let (Some(ref pool), Some(ref ctx)) = (&state.saas_pool, &account_ctx) {
-        billing::check_credits(pool, &ctx.account_id, billing::SEARCH_CREDITS).await?;
+    if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
+        billing::check_credits(lab, &ctx.account_id, billing::SEARCH_CREDITS).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -5584,11 +5575,9 @@ async fn search_url(
 async fn create_crawl(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<CreateCrawlResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     Ok(Json(
         do_create_crawl(&state, config, account_ctx.as_ref()).await?,
@@ -5603,12 +5592,10 @@ async fn create_crawl(
 async fn create_crawl_sync(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Query(sync_query): Query<results::CrawlSyncQuery>,
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
     // First create the async job
     let response = do_create_crawl(&state, config, account_ctx.as_ref()).await?;
@@ -5674,11 +5661,9 @@ async fn create_crawl_sync(
 async fn create_crawl_bulk(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Json(configs): Json<Vec<CrawlConfig>>,
 ) -> Result<Json<BulkCrawlResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
     let total = configs.len();
@@ -5714,11 +5699,9 @@ async fn create_crawl_bulk(
 async fn job_status(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Try in-memory first, fall back to the job store for historical jobs
     let job = if let Some(job) = state.get_job(&job_id) {
@@ -5741,11 +5724,9 @@ async fn job_status(
 async fn job_events(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Check if job exists and ownership
     let job = state
@@ -5845,12 +5826,10 @@ impl From<ClickHousePageEvent> for PageEventRow {
 async fn get_job_events_history(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
     Query(params): Query<JobEventsHistoryParams>,
 ) -> Result<Json<JobEventsHistoryResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // Verify the job exists (check in-memory then the job store)
     let job = if let Some(job) = state.get_job(&job_id) {
@@ -6264,7 +6243,6 @@ async fn ws_job_handler(
     Path(job_id): Path<String>,
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Check if job exists
     let job = state
@@ -6272,8 +6250,7 @@ async fn ws_job_handler(
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
 
     // Verify account ownership if auth is enabled
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     if let Some(ref ctx) = account_ctx {
         if let Some(ref job_account_id) = job.account_id {
             if job_account_id != &ctx.account_id {
@@ -6373,10 +6350,9 @@ async fn handle_job_ws_connection(socket: WebSocket, state: Arc<AppState>, job_i
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.cancel(&job_id)?.into()))
 }
 
@@ -6388,10 +6364,9 @@ async fn cancel_job(
 async fn pause_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.pause(&job_id)?.into()))
 }
 
@@ -6402,10 +6377,9 @@ async fn pause_job(
 async fn resume_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobStatusResponse>, ApiError> {
-    owned_job(&state, &account_ext, &user_ext, &job_id).await?;
+    owned_job(&state, &account_ext, &job_id).await?;
     Ok(Json(state.resume(&job_id)?.into()))
 }
 
@@ -6413,11 +6387,9 @@ async fn resume_job(
 async fn owned_job(
     state: &AppState,
     account_ext: &Option<Extension<AuthenticatedAccount>>,
-    user_ext: &Option<Extension<AuthenticatedUser>>,
     job_id: &str,
 ) -> Result<JobState, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), account_ext, user_ext).await;
+    let account_ctx = extract_account_context(account_ext).await;
     let existing = state
         .get_job(job_id)
         .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
@@ -6430,11 +6402,9 @@ async fn owned_job(
 async fn list_jobs(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Query(params): Query<ListJobsQuery>,
 ) -> Json<Vec<JobStatusResponse>> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
 
     // With a job store, query it for full history (survives restarts)
     // and overlay in-memory data for running jobs (fresher counters).
@@ -6663,49 +6633,87 @@ async fn init_clickhouse() -> (
 /// What startup wires per mode (see [`wire_mode`]).
 struct ModeWiring {
     auth_mode: auth::AuthMode,
-    /// Hosted only: the Rails Postgres, for SaaS features.
-    saas_pool: Option<sqlx::PgPool>,
     job_store: Arc<dyn job_store::JobStore>,
     meili: Arc<dyn meili::MeilisearchResolver>,
-    /// Hosted only: the engine's lab-event outbox (in the shared Postgres).
+    /// Hosted only: the engine's lab-event outbox (in the engine's own database).
     lab_outbox: Option<Arc<dyn lab_events::LabOutbox>>,
+    /// Hosted only: the Lab's internal API (auth, credit pre-check, Meilisearch).
+    lab_api: Option<Arc<lab_client::LabClient>>,
+}
+
+/// The engine's own job store (both modes): opens SQLite, or connects to a
+/// dedicated Postgres, refuses a Rails (Lab) database and migrates it.
+async fn open_store(store: &settings::StoreUrl) -> anyhow::Result<Arc<dyn job_store::JobStore>> {
+    Ok(match store {
+        settings::StoreUrl::Sqlite(url) => Arc::new(
+            job_store::SqliteJobStore::open(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+        settings::StoreUrl::Postgres(url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(10)
+                .connect(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot connect to DATABASE_URL: {e}"))?;
+            let pg = job_store::PgJobStore::new(pool);
+            if pg
+                .is_rails_database()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot inspect DATABASE_URL: {e}"))?
+            {
+                anyhow::bail!(
+                    "DATABASE_URL points at a Rails (Lab) database; the engine needs its own database"
+                );
+            }
+            pg.migrate()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot migrate DATABASE_URL: {e}"))?;
+            Arc::new(pg)
+        }
+    })
 }
 
 /// Auth, job store and Meilisearch resolver for `settings.mode`. Every
 /// failure aborts startup: an unreachable database never disables auth.
 async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWiring> {
     match (&settings.mode, &settings.auth, &settings.store) {
-        (
-            settings::Mode::Hosted,
-            settings::AuthSetting::Saas { jwt_secret },
-            settings::StoreUrl::Postgres(url),
-        ) => {
-            // The schema is owned by the Rails app (saas/db/migrate,
-            // `rails db:prepare`); the engine never migrates it.
-            let auth = auth::AuthState::new(
-                url,
-                jwt_secret.clone(),
-                settings.lab.as_ref().map(|l| l.service_token.clone()),
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot connect to DATABASE_URL: {e}")
-            })?;
-            let auth = Arc::new(auth);
-            let pool = auth.pool.clone();
-            lab_events::ensure_outbox_table(&pool).await?;
-            info!("Authentication enabled via the Rails Postgres");
-            let lab_outbox: Arc<dyn lab_events::LabOutbox> =
-                Arc::new(lab_events::PgOutbox::new(pool.clone()));
+        (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
+            let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
+            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.service_token);
+            match lab_api.ping().await {
+                Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
+                Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
+                    "the Lab at {} rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab",
+                    lab_cfg.url
+                ),
+                Err(lab_client::LabError::BadResponse(code)) => anyhow::bail!(
+                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL \
+                     (a wrong URL typically 404s)",
+                    lab_cfg.url
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    url = %lab_cfg.url,
+                    "Lab unreachable at startup; serving 503s until it answers"
+                ),
+            }
+            let store = open_store(store_url).await?;
+            info!(backend = store.backend(), "Job store ready (engine-owned)");
+            // Balance snapshots count usage still waiting in the outbox.
+            let lab_api = Arc::new(lab_api.with_undelivered_usage(store.lab_outbox()));
             Ok(ModeWiring {
-                auth_mode: auth::AuthMode::Saas(auth),
-                saas_pool: Some(pool.clone()),
-                job_store: Arc::new(job_store::PgJobStore::new(pool.clone())),
-                meili: Arc::new(meili::EngineTableResolver {
-                    pool,
+                auth_mode: auth::AuthMode::Saas(Arc::new(auth::AuthState::new(
+                    lab_api.clone(),
+                    Some(lab_cfg.service_token.clone()),
+                ))),
+                lab_outbox: Some(store.lab_outbox()),
+                job_store: store,
+                meili: Arc::new(meili::LabMeilisearchResolver {
+                    lab: lab_api.clone(),
                     server: settings.meilisearch.clone(),
                 }),
-                lab_outbox: Some(lab_outbox),
+                lab_api: Some(lab_api),
             })
         }
         (settings::Mode::Standalone, auth_setting, store_url) => {
@@ -6720,39 +6728,11 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                     );
                     auth::AuthMode::Disabled
                 }
-                settings::AuthSetting::Saas { .. } => {
-                    unreachable!("EngineSettings::resolve never pairs Saas with standalone")
+                settings::AuthSetting::Lab => {
+                    unreachable!("EngineSettings::resolve never pairs Lab auth with standalone")
                 }
             };
-            let store: Arc<dyn job_store::JobStore> = match store_url {
-                settings::StoreUrl::Sqlite(url) => Arc::new(
-                    job_store::SqliteJobStore::open(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                ),
-                settings::StoreUrl::Postgres(url) => {
-                    let pool = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(10)
-                        .connect(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot connect to DATABASE_URL: {e}"))?;
-                    let pg = job_store::PgJobStore::new(pool);
-                    if pg
-                        .is_rails_database()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot inspect DATABASE_URL: {e}"))?
-                    {
-                        anyhow::bail!(
-                            "DATABASE_URL points at a Rails (hosted) database; set \
-                             SCRAPIX_MODE=hosted, or give standalone a dedicated database"
-                        );
-                    }
-                    pg.migrate()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("cannot migrate DATABASE_URL: {e}"))?;
-                    Arc::new(pg)
-                }
-            };
+            let store = open_store(store_url).await?;
             info!(backend = store.backend(), "Job store ready");
             if let Some(ref m) = settings.meilisearch {
                 let health = format!("{}/health", m.url);
@@ -6780,10 +6760,10 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             }
             Ok(ModeWiring {
                 auth_mode,
-                saas_pool: None,
                 job_store: store,
                 meili: Arc::new(meili::EnvResolver(settings.meilisearch.clone())),
                 lab_outbox: None,
+                lab_api: None,
             })
         }
         _ => unreachable!("EngineSettings::resolve guarantees a valid mode/auth/store combination"),
@@ -6817,10 +6797,10 @@ pub async fn run_with_bus(
 
     let ModeWiring {
         auth_mode,
-        saas_pool,
         job_store,
         meili,
         lab_outbox,
+        lab_api,
     } = wire_mode(&settings).await?;
 
     // Initialize shared HTTP fetcher for /scrape endpoint
@@ -6912,7 +6892,7 @@ pub async fn run_with_bus(
         fetcher,
         browser_renderer,
         ai_service,
-        saas_pool,
+        lab_api,
         Some(job_store),
         analytics_state.clone(),
         webhook_dispatcher,
@@ -7068,7 +7048,7 @@ pub async fn run_with_bus(
                     }
                     // A terminal write gated on Lab events became owed:
                     // record its events and persist it now (the quota and
-                    // the Rails app read the job's row).
+                    // the job history read the job's row).
                     _ = flush_state.crawl.terminal_flush_wake.notified() => {
                         if let Some(ref store) = flush_state.job_store {
                             flush_state.flush_to_db(store.as_ref()).await;
@@ -7157,7 +7137,7 @@ pub async fn run_with_bus(
         let sink = lab_sink::LabSink::new(
             outbox,
             reqwest::Client::new(),
-            cfg.events_url.clone(),
+            format!("{}/internal/events", cfg.url),
             cfg.events_secret.clone(),
         );
         info!("Lab event delivery started");
@@ -7167,10 +7147,6 @@ pub async fn run_with_bus(
     // Routes, auth guards, request tracing, /openapi.json + /docs and the
     // body-size limits (CORS is added below).
     let mut app = router::build_router(state.clone(), &auth_mode, settings.mode);
-
-    // The analytics pipes API (/analytics/v0/pipes) is served by the Rails
-    // app; the engine only writes events to ClickHouse (batchers above) and
-    // reads page-event history for /job/{id}/events/history.
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.
@@ -7903,6 +7879,179 @@ mod tests {
         // in-memory delivery.
         assert_eq!(cfg.webhooks[0].url, "https://example.com/hook");
     }
+
+    // ========================================================================
+    // wire_mode
+    // ========================================================================
+
+    fn hosted_settings(
+        lab_url: &str,
+        token: &str,
+        store: settings::StoreUrl,
+    ) -> settings::EngineSettings {
+        settings::EngineSettings {
+            mode: settings::Mode::Hosted,
+            auth: settings::AuthSetting::Lab,
+            store,
+            meilisearch: None,
+            lab: Some(settings::LabSettings {
+                url: lab_url.into(),
+                events_secret: "s".repeat(32),
+                service_token: token.into(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_runs_on_its_own_sqlite_store() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let w = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .unwrap();
+        assert!(w.lab_api.is_some());
+        assert!(w.lab_outbox.is_some());
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_wrong_service_token() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            &"wrong".repeat(8),
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("LAB_SERVICE_TOKEN"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_lab_url_that_answers_4xx() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.state
+            .status_override
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("LAB_URL"), "{msg}");
+        assert!(msg.contains("404"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_starts_while_the_lab_is_down() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.set_down(true);
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        assert!(wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::TOKEN,
+            settings::StoreUrl::Sqlite(url)
+        ))
+        .await
+        .is_ok());
+    }
+
+    /// Minor 12 (PG-gated): the Rails-schema guard, through `wire_mode` →
+    /// `open_store` on a real Postgres. Refused before anything is migrated.
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_rails_postgres_database() {
+        let Ok(url) = std::env::var("JOBSTORE_TEST_DATABASE_URL") else {
+            eprintln!("skipped");
+            return;
+        };
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        let scoped = |schema: &str| {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}options=-c%20search_path%3D{schema}")
+        };
+        let tables = |schema: String| {
+            let admin = admin.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT table_name::text FROM information_schema.tables \
+                     WHERE table_schema = $1 ORDER BY 1",
+                )
+                .bind(schema)
+                .fetch_all(&admin)
+                .await
+                .unwrap()
+            }
+        };
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let wire = |store: String| {
+            let lab_url = lab.url.clone();
+            async move {
+                wire_mode(&hosted_settings(
+                    &lab_url,
+                    crate::lab_client::testing::TOKEN,
+                    settings::StoreUrl::Postgres(store),
+                ))
+                .await
+            }
+        };
+
+        let rails = format!("t_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {rails}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE TABLE {rails}.schema_migrations (version text)"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+        let err = wire(scoped(&rails)).await.err().unwrap();
+        assert!(err.to_string().contains("Rails (Lab) database"), "{err}");
+        assert_eq!(
+            tables(rails).await,
+            vec!["schema_migrations".to_string()],
+            "nothing migrated into it"
+        );
+
+        // Control: an empty database of its own is accepted and migrated.
+        let own = format!("t_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {own}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        assert!(wire(scoped(&own)).await.is_ok());
+        assert!(tables(own).await.contains(&"lab_events".to_string()));
+    }
+
+    #[tokio::test]
+    async fn standalone_builds_no_lab_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = settings::EngineSettings {
+            mode: settings::Mode::Standalone,
+            auth: settings::AuthSetting::AdminKey("k".repeat(16)),
+            store: settings::StoreUrl::Sqlite(format!("sqlite://{}/s.db", dir.path().display())),
+            meilisearch: None,
+            lab: None,
+        };
+        let w = wire_mode(&s).await.unwrap();
+        assert!(w.lab_api.is_none());
+        assert!(w.lab_outbox.is_none());
+    }
 }
 
 /// Job lifecycle (R5/R9) tests on a DB-less `AppState` over the in-process bus.
@@ -7975,13 +8124,13 @@ mod lifecycle_tests {
             test_fetcher(),
             None,
             None,
-            None, // saas_pool
+            None, // lab_api
             Some(Arc::new(store) as Arc<dyn crate::job_store::JobStore>),
             None,
             test_webhooks(),
         );
         assert!(state.accounting_persisted());
-        assert!(state.saas_pool.is_none());
+        assert!(state.lab_api.is_none());
     }
 
     fn ctx() -> AccountContext {
@@ -8155,6 +8304,9 @@ mod lifecycle_tests {
     impl job_store::JobStore for SeedOrderStore {
         fn backend(&self) -> &'static str {
             "test"
+        }
+        fn lab_outbox(&self) -> Arc<dyn lab_events::LabOutbox> {
+            Arc::new(lab_events::MemoryOutbox::default())
         }
         async fn insert_job(&self, job: &JobState) -> Result<(), job_store::StoreError> {
             let seed_published = self
@@ -8429,6 +8581,9 @@ mod lifecycle_tests {
         fn backend(&self) -> &'static str {
             "test"
         }
+        fn lab_outbox(&self) -> Arc<dyn lab_events::LabOutbox> {
+            Arc::new(lab_events::MemoryOutbox::default())
+        }
         async fn insert_job(&self, _: &JobState) -> Result<(), job_store::StoreError> {
             Ok(())
         }
@@ -8543,6 +8698,12 @@ mod lifecycle_tests {
             older_than_secs: i64,
         ) -> Result<u64, job_store::StoreError> {
             self.inner.purge_delivered(older_than_secs).await
+        }
+        async fn undelivered_usage_credits(
+            &self,
+            account_id: &str,
+        ) -> Result<i64, job_store::StoreError> {
+            self.inner.undelivered_usage_credits(account_id).await
         }
     }
 
@@ -8761,6 +8922,88 @@ mod lifecycle_tests {
         assert_eq!(events_of(&outbox, "job.completed").len(), 1);
         assert!(state.crawl.pending_lab_events.lock().is_empty());
         assert!(state.crawl.terminal_pending.read().is_empty());
+    }
+
+    /// Important 1 (b): each record site feeds the recorded credits to the
+    /// Lab client's balance snapshot: request usage (`record_events`), a
+    /// crawl's final charge (`record_owed_lab_events`, via the flush) and a
+    /// terminal event for an unknown job (`record_unowned_lab_events`).
+    #[tokio::test]
+    async fn every_record_site_feeds_the_balance_snapshot() {
+        use crate::lab_client::{testing, LabClient};
+        let lab = testing::FakeLab::start().await;
+        lab.set_account(
+            ACCT,
+            serde_json::json!({"active": true, "account_id": ACCT, "tier": "free",
+                               "credits": {"balance": 100}}),
+        );
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        let api = Arc::new(LabClient::new(&lab.url, testing::TOKEN));
+        state.lab_api = Some(api.clone());
+        let available = || {
+            let api = api.clone();
+            async move { api.available_credits(ACCT).await.unwrap().unwrap().credits }
+        };
+        assert_eq!(available().await, 100);
+
+        state
+            .record_events(&[lab_events::LabEvent::usage(
+                ACCT,
+                None,
+                "scrape",
+                3,
+                serde_json::json!({}),
+                "s".into(),
+                None,
+            )])
+            .await;
+        assert_eq!(available().await, 97, "record_events");
+
+        let store = TerminalStore::watching(&outbox);
+        complete_one_page_job(&state, "j1").await;
+        state.flush_to_db(&store).await;
+        let crawl: i64 = events_of(&outbox, "usage.recorded")
+            .iter()
+            .filter(|e| e.data["job_id"] == "j1")
+            .map(|e| e.usage_credits().unwrap())
+            .sum();
+        assert!(crawl > 0);
+        assert_eq!(available().await, 97 - crawl, "crawl final charge");
+
+        state.process_event(
+            "ghost",
+            &CrawlEvent::JobCompleted {
+                job_id: "ghost".into(),
+                account_id: Some(ACCT.into()),
+                pages_crawled: 2,
+                documents_indexed: 2,
+                errors: 0,
+                bytes_downloaded: 0,
+                duration_secs: 1,
+                timestamp: 0,
+            },
+        );
+        let ghost = || -> i64 {
+            events_of(&outbox, "usage.recorded")
+                .iter()
+                .filter(|e| e.data["job_id"] == "ghost")
+                .map(|e| e.usage_credits().unwrap())
+                .sum()
+        };
+        for _ in 0..100 {
+            if ghost() > 0 && available().await == 97 - crawl - ghost() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ghost() > 0);
+        assert_eq!(
+            available().await,
+            97 - crawl - ghost(),
+            "unowned terminal charge"
+        );
     }
 
     /// Standalone (no Lab): nothing is recorded, the job still finalizes and

@@ -85,7 +85,7 @@ curl https://your-scrapix-app-abc123.herokuapp.com/health
 heroku addons:create heroku-postgresql:essential-0
 ```
 
-Heroku sets `DATABASE_URL` automatically. Scrapix picks it up for auth and job persistence.
+Heroku sets `DATABASE_URL` automatically. Scrapix picks it up as the engine's own job-history store.
 
 ### Redis
 

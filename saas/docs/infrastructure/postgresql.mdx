@@ -48,11 +48,10 @@ cd saas && bin/rails db:prepare   # Creates/migrates the shared database
 ```
 
 `just saas` (and the Docker Compose saas service) run `db:prepare`
-automatically before starting the server. The engine (`bins/scrapix-api`)
-never migrates this database — in hosted mode (`SCRAPIX_MODE=hosted`) it only
-reads and writes rows in the schema the Rails migration created, and refuses
-to start if the `jobs.accounting` column (or any other schema the current
-engine expects) is missing.
+automatically before starting the server. The crawl engine (`bins/scrapix-api`)
+does not touch this database: it has its own (`scrapix_engine`), which it
+migrates itself, and it refuses to start against a database that holds the
+Rails schema. It reaches the Lab only over HTTP (`LAB_URL`).
 
 ## Database Schema
 
@@ -123,5 +122,7 @@ Production storage: 20Gi PVC.
 | [AWS RDS](https://aws.amazon.com/rds/postgresql/) | Managed Postgres on AWS. |
 | [Fly Postgres](https://fly.io/docs/postgres/) | Fly.io managed clusters. |
 
-Set `DATABASE_URL` to your managed PostgreSQL connection string, and make
-sure `SCRAPIX_MODE=hosted` is set on every engine instance pointed at it.
+Set `DATABASE_URL` on the Rails app to your managed PostgreSQL connection
+string. The crawl engine does **not** share it: give it a separate database
+(`scrapix_engine`) and set `SCRAPIX_MODE=hosted` and `LAB_URL` on every engine
+instance.

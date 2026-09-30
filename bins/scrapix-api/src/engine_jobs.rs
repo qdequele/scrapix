@@ -62,10 +62,10 @@ pub(crate) async fn preflight(
     account_ctx: &Option<AccountContext>,
     required_credits: i64,
 ) -> Result<(), ApiError> {
-    let (Some(pool), Some(ctx)) = (&state.saas_pool, account_ctx) else {
+    let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) else {
         return Ok(());
     };
-    billing::check_credits(pool, &ctx.account_id, required_credits.max(1)).await?;
+    billing::check_credits(lab, &ctx.account_id, required_credits.max(1)).await?;
     let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
     let max_concurrent = tier.max_concurrent_jobs() as i64;
     let active_count = state.active_job_count(&ctx.account_id).await;

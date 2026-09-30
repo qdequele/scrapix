@@ -47,7 +47,7 @@ class EnginesController < ApplicationController
     api_error!("Name cannot be empty", "validation_error") if new_name.strip.empty?
     new_url = params.key?(:url) ? params[:url].to_s : record.url
     api_error!("URL cannot be empty", "validation_error") if new_url.strip.empty?
-    new_api_key = params.key?(:api_key) ? params[:api_key].to_s : record.api_key
+    new_api_key = updated_api_key(record, url_changed: new_url.strip != record.url)
 
     record.update!(name: new_name.strip, url: new_url.strip, api_key: new_api_key)
     render json: record
@@ -93,6 +93,20 @@ class EnginesController < ApplicationController
   end
 
   private
+
+  # The stored key follows the engine's URL: pointing an engine at another
+  # host must never send the stored key there, so a URL change needs the key
+  # re-entered (or "" to clear it). Without a URL change, a blank or masked
+  # value keeps the stored key.
+  def updated_api_key(record, url_changed:)
+    raw = params[:api_key]
+    return "" if url_changed && raw == ""
+    return raw.to_s unless MeilisearchEngine.keep_key?(raw)
+    if url_changed && record.api_key.present?
+      api_error!("Changing the URL requires re-entering the API key", "validation_error")
+    end
+    record.api_key
+  end
 
   def find_engine!
     account_id = resolve_account_id!

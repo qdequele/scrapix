@@ -106,6 +106,8 @@ services:
       POSTGRES_PASSWORD: scrapix
     volumes:
       - pg_data:/var/lib/postgresql/data
+      # Creates the engine's own database (`scrapix_engine`) on first start.
+      - ./deploy/docker/postgres-init/10-scrapix-engine.sql:/docker-entrypoint-initdb.d/10-scrapix-engine.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U scrapix -d scrapix"]
       interval: 5s
@@ -202,11 +204,11 @@ services:
       CLICKHOUSE_DATABASE: scrapix
       CLICKHOUSE_USER: scrapix
       CLICKHOUSE_PASSWORD: scrapix
-      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
-      JWT_SECRET: dev-jwt-secret-change-in-production
-      # Engine -> Lab boundary (hosted mode requires all three; same values
-      # as the saas service below).
-      LAB_EVENTS_URL: http://saas:8081/internal/events
+      # The engine's own database; it never touches the Lab's `scrapix`.
+      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix_engine
+      # Engine -> Lab boundary (hosted mode requires all of these; the secrets
+      # are the same values as the saas service below).
+      LAB_URL: http://saas:8081
       LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
       LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
     volumes:
@@ -379,6 +381,10 @@ services:
       LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
       LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
       LAB_CRON_ENABLED: "true"
+      # dev only — generate real ones with `cd saas && bin/rails db:encryption:init` for production
+      ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: dev-only-primary-key-000000000000
+      ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY: dev-only-deterministic-key-0000000
+      ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: dev-only-key-derivation-salt-00000
       REDIS_URL: redis://dragonfly:6379
       CONSOLE_URL: http://localhost:3001
       ENVIRONMENT: development
@@ -434,7 +440,7 @@ services:
       NEXT_PUBLIC_SCRAPIX_API_URL: http://localhost:8080
       SCRAPIX_API_URL: http://scrapix-api:8080
       SAAS_API_URL: http://saas:8081
-      SAAS_PREFIXES: analytics,configs,engines,auth,account,webhooks,oauth,.well-known,mcp
+      SAAS_PREFIXES: configs,engines,auth,account,webhooks,oauth,.well-known,mcp
     volumes:
       - console-node-modules:/app/node_modules
       - console-next:/app/.next

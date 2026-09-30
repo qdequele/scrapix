@@ -1,0 +1,402 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Meilisearch Lab internal API",
+    "version": "1",
+    "description": "Service API the Rust crawl engine calls on the Lab (Rails) control plane instead of reading the Lab database. Every endpoint requires `Authorization: Bearer <LAB_SERVICE_TOKEN>`; a missing or wrong token gets 401."
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/internal/ping": {
+      "get": {
+        "operationId": "ping",
+        "summary": "Liveness and service-token check",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ping"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/internal/auth/introspect": {
+      "post": {
+        "operationId": "introspectCredential",
+        "summary": "Resolve a client credential to an account (RFC 7662 style)",
+        "description": "Always 200 with `{\"active\":false}` for any invalid credential. 400 for an unknown `kind` or a missing `credential`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IntrospectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Introspection result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Introspection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown kind or missing credential"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/internal/accounts/{id}": {
+      "get": {
+        "operationId": "getAccount",
+        "summary": "Tier and spendable balance of an account",
+        "description": "200 with `{\"active\":false}` for an unknown or inactive account, or a non-UUID id.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account lookup",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountLookup"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/internal/accounts/{account_id}/meilisearch": {
+      "get": {
+        "operationId": "getAccountMeilisearch",
+        "summary": "The account's Meilisearch target (decrypted key)",
+        "description": "With `url`, the account's engine whose URL matches (trailing slash ignored); without it, the default engine. `api_key` is the decrypted key, `\"\"` when none is set. 404 `{\"error\":\"not_found\"}` when nothing matches or the account id is not a UUID.",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "url",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Meilisearch target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeilisearchTarget"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No matching engine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFound"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "LAB_SERVICE_TOKEN (at least 32 characters)"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or wrong service token"
+      }
+    },
+    "schemas": {
+      "Ping": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "Inactive": {
+        "type": "object",
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "const": false
+          }
+        }
+      },
+      "Credits": {
+        "type": "object",
+        "required": [
+          "balance"
+        ],
+        "properties": {
+          "balance": {
+            "type": "integer",
+            "description": "Stored balance minus usage received but not yet debited"
+          }
+        }
+      },
+      "IntrospectionRequest": {
+        "type": "object",
+        "required": [
+          "kind",
+          "credential"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "api_key",
+              "bearer",
+              "session"
+            ]
+          },
+          "credential": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Session only: the selected account (X-Account-Id). Defaults to the first membership."
+          }
+        }
+      },
+      "Principal": {
+        "type": "object",
+        "required": [
+          "type",
+          "user_id"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "api_key",
+              "oauth",
+              "session"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "IntrospectionActive": {
+        "type": "object",
+        "required": [
+          "active",
+          "account_id",
+          "tier",
+          "role",
+          "api_key_id",
+          "principal",
+          "credits",
+          "cache_ttl"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "const": true
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "starter",
+              "pro",
+              "enterprise"
+            ]
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Membership role for sessions, null otherwise"
+          },
+          "api_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "principal": {
+            "$ref": "#/components/schemas/Principal"
+          },
+          "credits": {
+            "$ref": "#/components/schemas/Credits"
+          },
+          "cache_ttl": {
+            "type": "integer",
+            "description": "Seconds the engine may cache this answer: 30, or fewer for a session or OAuth token that expires sooner (never past the credential's expiry; 0 = do not cache)"
+          }
+        }
+      },
+      "Introspection": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/IntrospectionActive"
+          },
+          {
+            "$ref": "#/components/schemas/Inactive"
+          }
+        ]
+      },
+      "AccountActive": {
+        "type": "object",
+        "required": [
+          "active",
+          "account_id",
+          "tier",
+          "credits",
+          "cache_ttl"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "const": true
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "starter",
+              "pro",
+              "enterprise"
+            ]
+          },
+          "credits": {
+            "$ref": "#/components/schemas/Credits"
+          },
+          "cache_ttl": {
+            "type": "integer"
+          }
+        }
+      },
+      "AccountLookup": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AccountActive"
+          },
+          {
+            "$ref": "#/components/schemas/Inactive"
+          }
+        ]
+      },
+      "MeilisearchTarget": {
+        "type": "object",
+        "required": [
+          "id",
+          "url",
+          "api_key"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "Decrypted Meilisearch API key; empty string when none is set"
+          }
+        }
+      },
+      "NotFound": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "not_found"
+          }
+        }
+      }
+    }
+  }
+}

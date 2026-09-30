@@ -123,6 +123,7 @@ export const ENGINE: Spec = {
   name: "string",
   url: "string",
   api_key: "string",
+  has_api_key: "boolean",
   is_default: "boolean",
   created_at: "timestamp",
   updated_at: "timestamp",

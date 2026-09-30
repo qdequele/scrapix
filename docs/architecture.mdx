@@ -32,7 +32,7 @@ graph LR
 
 | Service | Binary | Purpose | Stateful? |
 |---------|--------|---------|-----------|
-| API Server | `scrapix api` | REST API, WebSocket, job management | No (accounting persists to Postgres when the Rails `accounting` migration has run) |
+| API Server | `scrapix api` | REST API, WebSocket, job management | No (job accounting persists to the engine's own database) |
 | Frontier | `scrapix frontier` | URL deduplication, priority scheduling, rate limiting, politeness | `FrontierStore`: Redis in production (`REDIS_URL`), in-memory for tests and `scrapix all` |
 | Crawler | `scrapix crawler` | HTTP fetching, link extraction, robots.txt | RocksDB (URL cache, DNS, robots) |
 | Content | `scrapix content` | HTML parsing, extraction, Meilisearch indexing | No |

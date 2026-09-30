@@ -93,6 +93,9 @@ metadata:
     app.kubernetes.io/part-of: scrapix
 data:
   init.sql: |
+    -- The engine's own database (Lab split); the API's DATABASE_URL points here.
+    CREATE DATABASE scrapix_engine;
+
     -- Enable UUID generation
     CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 

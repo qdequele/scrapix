@@ -48,7 +48,7 @@ use tracing::warn;
 
 use scrapix_core::{JobState, JobStatus};
 
-use crate::auth::{AuthenticatedAccount, AuthenticatedUser};
+use crate::auth::AuthenticatedAccount;
 use crate::job_kind::JobKind;
 use crate::job_store::StoreError;
 use crate::meili::MeiliTarget;
@@ -323,12 +323,10 @@ pub(crate) async fn find_owned_job(
 pub(crate) async fn job_results(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
-    user_ext: Option<Extension<AuthenticatedUser>>,
     Path(job_id): Path<String>,
     Query(query): Query<JobResultsQuery>,
 ) -> Result<Json<JobResultsResponse>, ApiError> {
-    let account_ctx =
-        extract_account_context(state.saas_pool.as_ref(), &account_ext, &user_ext).await;
+    let account_ctx = extract_account_context(&account_ext).await;
     let job = find_owned_job(&state, &account_ctx, &job_id).await?;
     results_page(&state, &job, query.limit, query.cursor.as_deref())
         .await

@@ -9,7 +9,7 @@
 module McpToolset
   # Route groups served by Rails — keep in sync with SAAS_PREFIXES in
   # Procfile.dev / console proxy routing.
-  SAAS_PREFIXES = %w[analytics configs engines auth account webhooks oauth].freeze
+  SAAS_PREFIXES = %w[configs engines auth account webhooks oauth].freeze
 
   class << self
     def tools

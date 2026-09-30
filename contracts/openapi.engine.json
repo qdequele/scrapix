@@ -23,6 +23,759 @@
     }
   ],
   "paths": {
+    "/analytics/v0/pipes": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "List the available pipes and their parameters.",
+        "operationId": "list_pipes",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PipeInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/account_daily_usage.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Daily usage for one account.",
+        "operationId": "account_daily_usage",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Defaults to the caller's account; required with the standalone admin key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "description": "Look-back window in days (default 30)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "No account: the admin key must pass `account_id`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/account_daily_usage_by_operation.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Daily usage per operation (scrape/map/crawl) for one account.",
+        "operationId": "account_daily_usage_by_operation",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Defaults to the caller's account; required with the standalone admin key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "description": "Look-back window in days (default 30)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "No account: the admin key must pass `account_id`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/account_usage.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Usage summary for one account (an all-zeros row when it has no data).",
+        "operationId": "account_usage",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Defaults to the caller's account; required with the standalone admin key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "No account: the admin key must pass `account_id`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/ai_usage.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "AI/LLM token usage per model.",
+        "operationId": "ai_usage",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/api_key_usage.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Usage per API key for one account.",
+        "operationId": "api_key_usage",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Defaults to the caller's account; required with the standalone admin key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "No account: the admin key must pass `account_id`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/daily_stats.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Daily crawl statistics.",
+        "operationId": "daily_stats",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "description": "Look-back window in days (default 30)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/domain_stats.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Statistics for one domain (an all-zeros row when it has no data).",
+        "operationId": "domain_stats",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "Domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "`domain` is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/error_distribution.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Error breakdown by status code.",
+        "operationId": "error_distribution",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/hourly_stats.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Hourly crawl statistics.",
+        "operationId": "hourly_stats",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/job_event_summary.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Event type counts for one job.",
+        "operationId": "job_event_summary",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "query",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "`job_id` is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/job_stats.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Statistics for one job (zero rows when it has no data).",
+        "operationId": "job_stats",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "query",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "`job_id` is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/job_timeline.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Job lifecycle events, newest first. `meta` declares 3 of the 12 fields\n(preserved for compatibility).",
+        "operationId": "job_timeline",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "query",
+            "description": "Job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows (default 100)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "400": {
+            "description": "`job_id` is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/kpis.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Key performance indicators, aggregated from `top_domains` (limit 10 000).",
+        "operationId": "kpis",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/analytics/v0/pipes/top_domains.json": {
+      "get": {
+        "tags": [
+          "analytics"
+        ],
+        "summary": "Top domains by request count.",
+        "operationId": "top_domains",
+        "parameters": [
+          {
+            "name": "hours",
+            "in": "query",
+            "description": "Look-back window in hours (default 24)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows (default 20)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "account_id",
+            "in": "query",
+            "description": "Account filter; hosted callers may only name their own account",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tinybird envelope: meta, data, rows, statistics"
+          },
+          "404": {
+            "description": "ClickHouse is not configured, or `account_id` names another account"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/batch/scrape": {
       "post": {
         "tags": [
@@ -3394,6 +4147,31 @@
           "force"
         ]
       },
+      "ParamInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "required"
+        ],
+        "properties": {
+          "default": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
       "ParseRequestOptions": {
         "type": "object",
         "description": "Options part of a `/parse` upload (the `options` multipart field, JSON).",
@@ -3514,6 +4292,32 @@
             "format": "int64",
             "description": "Maximum PDF size in megabytes. PDFs larger than this are rejected.\nWhen `None`, the global fetcher `max_body_size` applies.",
             "minimum": 0
+          }
+        }
+      },
+      "PipeInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "description",
+          "parameters",
+          "endpoint"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParamInfo"
+            }
           }
         }
       },
@@ -4676,6 +5480,10 @@
     {
       "name": "jobs",
       "description": "Job management"
+    },
+    {
+      "name": "analytics",
+      "description": "Tinybird-style analytics pipes over ClickHouse, scoped per account"
     }
   ]
 }

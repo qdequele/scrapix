@@ -20,7 +20,7 @@ class SerializationTest < ActiveSupport::TestCase
 
   test "engine shape" do
     json = meilisearch_engines(:acme_default).as_json
-    assert_equal %i[id account_id name url api_key is_default created_at updated_at], json.keys
+    assert_equal %i[id account_id name url api_key has_api_key is_default created_at updated_at], json.keys
   end
 
   test "invite shape" do

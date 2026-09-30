@@ -1,6 +1,6 @@
 [package]
 name = "scrapix-billing"
-description = "Credit pricing and the read-only credit pre-check for Scrapix"
+description = "Credit pricing for Scrapix"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,5 @@ license.workspace = true
 [dependencies]
 scrapix-core = { path = "../scrapix-core" }
 
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "tls-rustls"] }
-uuid = { workspace = true }
 thiserror = { workspace = true }
 

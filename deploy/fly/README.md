@@ -84,14 +84,15 @@ done
 # API-only secrets:
 flyctl secrets set \
   DATABASE_URL=... \
-  JWT_SECRET=... \
   OPENAI_API_KEY=... \
-  LAB_EVENTS_URL=https://<rails-host>/internal/events \
+  LAB_URL=https://<rails-host> \
   LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
   LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
   --app scrapix-api
 
-# The hosted API refuses to start without LAB_EVENTS_URL, LAB_EVENTS_SECRET
+# DATABASE_URL is the engine's OWN database (`scrapix_engine`), never the Rails
+# one; the engine does not read JWT_SECRET (the Lab verifies sessions).
+# The hosted API refuses to start without LAB_URL, LAB_EVENTS_SECRET
 # and LAB_SERVICE_TOKEN (each secret >= 32 chars). The Rails app needs the
 # SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN (and, once the engine is
 # upgraded, LAB_CRON_ENABLED=true) — see docs/operations/crawl-engine-rollout.mdx.

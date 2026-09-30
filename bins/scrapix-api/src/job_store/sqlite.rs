@@ -1,4 +1,4 @@
-//! SQLite job store: the standalone default (`sqlite://./data/scrapix.db`).
+//! SQLite job store: the default in both modes (`sqlite://./data/scrapix.db`).
 
 use std::str::FromStr;
 
@@ -12,8 +12,8 @@ use tracing::{debug, warn};
 
 use super::{status_to_str, str_to_status, JobStore, StoreError};
 
-/// Standalone-only migrations: the engine's own `jobs`/`job_results` schema,
-/// tracked in `_sqlx_migrations`.
+/// The engine's own schema (`jobs`, `job_results`, `lab_events`), tracked in
+/// `_sqlx_migrations`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
 /// [`JobStore`] over a SQLite pool.
@@ -25,11 +25,11 @@ fn other(e: impl std::fmt::Display) -> StoreError {
     StoreError::Other(e.to_string())
 }
 
-fn ts(v: Option<chrono::DateTime<chrono::Utc>>) -> Option<String> {
+pub(crate) fn ts(v: Option<chrono::DateTime<chrono::Utc>>) -> Option<String> {
     v.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-fn parse_ts(v: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_ts(v: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
     v.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|t| t.with_timezone(&chrono::Utc))
 }
@@ -116,6 +116,10 @@ impl SqliteJobStore {
 impl JobStore for SqliteJobStore {
     fn backend(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn lab_outbox(&self) -> std::sync::Arc<dyn crate::lab_events::LabOutbox> {
+        std::sync::Arc::new(crate::lab_events::SqliteOutbox::new(self.pool.clone()))
     }
 
     // ========================================================================
@@ -423,6 +427,15 @@ impl JobStore for SqliteJobStore {
             .collect();
         Ok((data, total as u64))
     }
+}
+
+/// A migrated SQLite pool in a fresh temp directory (kept alive by the guard).
+#[cfg(test)]
+pub(crate) async fn test_sqlite_pool() -> (tempfile::TempDir, SqlitePool) {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("t.db").display());
+    let store = SqliteJobStore::open(&url).await.unwrap();
+    (dir, store.pool)
 }
 
 #[cfg(test)]

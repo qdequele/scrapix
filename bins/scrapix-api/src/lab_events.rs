@@ -88,6 +88,13 @@ impl LabEvent {
         )
     }
 
+    /// Credits of a `usage.recorded` event (None for other types).
+    pub(crate) fn usage_credits(&self) -> Option<i64> {
+        (self.kind == "usage.recorded")
+            .then(|| self.data.get("credits").and_then(|c| c.as_i64()))
+            .flatten()
+    }
+
     #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn crawl_final_usage(
         job_id: &str,
@@ -136,6 +143,9 @@ pub trait LabOutbox: Send + Sync {
     /// Undelivered count and the creation time of the oldest one.
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError>;
     async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError>;
+    /// Credits of `account_id`'s `usage.recorded` events not yet accepted by
+    /// the Lab (so not yet in the balance it reports). 0 for a non-uuid id.
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError>;
 }
 
 pub struct PgOutbox {
@@ -150,22 +160,6 @@ impl PgOutbox {
 
 fn db(e: impl std::fmt::Display) -> StoreError {
     StoreError::Other(e.to_string())
-}
-
-/// Hosted startup check: the Rails migration that creates `lab_events` must
-/// have run, or every charge and crawl terminal write would fail to enqueue.
-pub async fn ensure_outbox_table(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    let present: bool = sqlx::query_scalar("SELECT to_regclass('lab_events') IS NOT NULL")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("SCRAPIX_MODE=hosted: cannot inspect DATABASE_URL: {e}"))?;
-    if !present {
-        anyhow::bail!(
-            "SCRAPIX_MODE=hosted: lab_events table missing from DATABASE_URL; run the \
-             Rails migrations first (cd saas && bin/rails db:migrate)"
-        );
-    }
-    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -253,6 +247,163 @@ impl LabOutbox for PgOutbox {
         .execute(&self.pool)
         .await
         .map(|r| r.rows_affected())
+        .map_err(db)
+    }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        let Ok(account) = account_id.parse::<Uuid>() else {
+            return Ok(0);
+        };
+        sqlx::query_scalar(
+            "SELECT COALESCE(SUM((payload->'data'->>'credits')::bigint), 0)::bigint \
+             FROM lab_events \
+             WHERE account_id = $1 AND type = 'usage.recorded' AND delivered_at IS NULL",
+        )
+        .bind(account)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)
+    }
+}
+
+/// Retry delay after a failed delivery, given the attempts made so far:
+/// `min(2^min(attempts + 1, 9), 300)` seconds, the same rule as
+/// [`PgOutbox::reschedule`].
+fn backoff_secs(attempts: i64) -> i64 {
+    2i64.pow(attempts.saturating_add(1).clamp(0, 9) as u32)
+        .min(300)
+}
+
+/// [`LabOutbox`] over the engine's SQLite database (same semantics as
+/// [`PgOutbox`]; timestamps are RFC 3339 text, compared as strings).
+pub struct SqliteOutbox {
+    pool: sqlx::SqlitePool,
+}
+
+impl SqliteOutbox {
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+fn sqlite_ts(t: DateTime<Utc>) -> String {
+    crate::job_store::sqlite::ts(Some(t)).unwrap_or_default()
+}
+
+#[async_trait::async_trait]
+impl LabOutbox for SqliteOutbox {
+    async fn enqueue(&self, events: &[LabEvent]) -> Result<(), StoreError> {
+        let now = sqlite_ts(Utc::now());
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        for e in events {
+            let account: Uuid = e
+                .account_id
+                .parse()
+                .map_err(|_| db(format!("invalid account_id {}", e.account_id)))?;
+            sqlx::query(
+                "INSERT INTO lab_events (id, type, account_id, payload, created_at, next_attempt_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(e.id.to_string())
+            .bind(&e.kind)
+            .bind(account.to_string())
+            .bind(serde_json::to_string(e).map_err(db)?)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
+    }
+
+    async fn due(&self, limit: i64) -> Result<Vec<LabEvent>, StoreError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM lab_events \
+             WHERE delivered_at IS NULL AND next_attempt_at <= ? \
+             ORDER BY created_at, rowid LIMIT ?",
+        )
+        .bind(sqlite_ts(Utc::now()))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|v| serde_json::from_str(v).map_err(db))
+            .collect()
+    }
+
+    async fn mark_delivered(&self, ids: &[Uuid]) -> Result<(), StoreError> {
+        let now = sqlite_ts(Utc::now());
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        for id in ids {
+            sqlx::query("UPDATE lab_events SET delivered_at = ? WHERE id = ?")
+                .bind(&now)
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
+    }
+
+    async fn reschedule(&self, ids: &[Uuid]) -> Result<(), StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        for id in ids {
+            let attempts: Option<i64> = sqlx::query_scalar(
+                "SELECT attempts FROM lab_events WHERE id = ? AND delivered_at IS NULL",
+            )
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+            let Some(attempts) = attempts else { continue };
+            let next = now + chrono::Duration::seconds(backoff_secs(attempts));
+            sqlx::query(
+                "UPDATE lab_events SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?",
+            )
+            .bind(sqlite_ts(next))
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
+    }
+
+    async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError> {
+        let (count, oldest): (i64, Option<String>) = sqlx::query_as(
+            "SELECT count(*), min(created_at) FROM lab_events WHERE delivered_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok((count, crate::job_store::sqlite::parse_ts(oldest)))
+    }
+
+    async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than_secs);
+        sqlx::query("DELETE FROM lab_events WHERE delivered_at IS NOT NULL AND delivered_at < ?")
+            .bind(sqlite_ts(cutoff))
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(db)
+    }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        let Ok(account) = account_id.parse::<Uuid>() else {
+            return Ok(0);
+        };
+        sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CAST(json_extract(payload, '$.data.credits') AS INTEGER)), 0) \
+             FROM lab_events \
+             WHERE account_id = ? AND type = 'usage.recorded' AND delivered_at IS NULL",
+        )
+        .bind(account.to_string())
+        .fetch_one(&self.pool)
+        .await
         .map_err(db)
     }
 }
@@ -382,12 +533,34 @@ impl LabOutbox for MemoryOutbox {
         rows.retain(|r| !r.delivered);
         Ok((before - rows.len()) as u64)
     }
+
+    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .rows
+            .lock()
+            .iter()
+            .filter(|r| !r.delivered && r.event.account_id == account_id)
+            .filter_map(|r| r.event.usage_credits())
+            .sum())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_credits_only_for_usage_events() {
+        let u = LabEvent::usage("acc", None, "scrape", 7, json!({}), "d".into(), None);
+        assert_eq!(u.usage_credits(), Some(7));
+        let f = LabEvent::crawl_final_usage("job-1", "acc", 12, json!({}), "d".into());
+        assert_eq!(f.usage_credits(), Some(12));
+        assert_eq!(
+            LabEvent::job_completed("job-1", "acc", json!({"credits": 5})).usage_credits(),
+            None
+        );
+    }
 
     #[test]
     fn crawl_final_and_lifecycle_ids_are_deterministic_and_distinct() {
@@ -605,18 +778,70 @@ mod tests {
         assert!((290.0..=310.0).contains(&secs), "backoff was {secs}s");
     }
 
+    /// Shared outbox semantics: idempotent enqueue, oldest-first `due`,
+    /// reschedule hides an event, delivery clears it from the pending stats,
+    /// purge removes it.
+    async fn outbox_roundtrip(o: &dyn LabOutbox) {
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let e = LabEvent::crawl_final_usage("j", acct, 5, json!({"pages_http":5}), "Job j".into());
+        let u = LabEvent::usage(acct, Some("k"), "map", 2, json!({}), "m".into(), None);
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
+        o.enqueue(&[e.clone(), u.clone()]).await.unwrap();
+        assert_eq!(o.due(10).await.unwrap(), vec![e.clone(), u.clone()]);
+        assert_eq!(o.due(1).await.unwrap(), vec![e.clone()]);
+        let (pending, oldest) = o.pending_stats().await.unwrap();
+        assert_eq!(pending, 2);
+        assert!(oldest.is_some());
+        o.reschedule(&[e.id]).await.unwrap();
+        assert_eq!(o.due(10).await.unwrap(), vec![u.clone()]);
+        o.mark_delivered(&[e.id, u.id]).await.unwrap();
+        assert!(o.due(10).await.unwrap().is_empty());
+        assert_eq!(o.pending_stats().await.unwrap(), (0, None));
+        assert_eq!(o.purge_delivered(-1).await.unwrap(), 2);
+    }
+
     #[tokio::test]
-    async fn hosted_startup_requires_the_lab_events_table() {
-        let Some(empty) = crate::job_store::postgres::test_empty_pg_pool().await else {
+    async fn memory_outbox_roundtrip() {
+        outbox_roundtrip(&MemoryOutbox::default()).await;
+    }
+
+    /// Only this account's undelivered `usage.recorded` credits count.
+    async fn undelivered_usage(o: &dyn LabOutbox) {
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let other = "7f1c2a8e-0000-4000-8000-000000000002";
+        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 0);
+        let a = LabEvent::usage(acct, None, "scrape", 3, json!({}), "s".into(), None);
+        let b = LabEvent::crawl_final_usage("j", acct, 10, json!({}), "Job j".into());
+        let delivered = LabEvent::usage(acct, None, "map", 100, json!({}), "m".into(), None);
+        let mail = LabEvent::job_completed("j", acct, json!({"credits": 1000}));
+        let theirs = LabEvent::usage(other, None, "map", 7, json!({}), "m".into(), None);
+        o.enqueue(&[a, b, delivered.clone(), mail, theirs])
+            .await
+            .unwrap();
+        o.mark_delivered(&[delivered.id]).await.unwrap();
+        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 13);
+        assert_eq!(o.undelivered_usage_credits(other).await.unwrap(), 7);
+        assert_eq!(o.undelivered_usage_credits("not-a-uuid").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_outbox_undelivered_usage() {
+        undelivered_usage(&MemoryOutbox::default()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_undelivered_usage() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        undelivered_usage(&SqliteOutbox::new(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn pg_outbox_undelivered_usage() {
+        let Some(pool) = crate::job_store::postgres::test_pg_pool().await else {
             eprintln!("skipped");
             return;
         };
-        let err = ensure_outbox_table(&empty).await.unwrap_err().to_string();
-        assert!(err.contains("lab_events table missing"), "{err}");
-        assert!(err.contains("bin/rails db:migrate"), "{err}");
-
-        let migrated = crate::job_store::postgres::test_pg_pool().await.unwrap();
-        ensure_outbox_table(&migrated).await.unwrap();
+        undelivered_usage(&PgOutbox::new(pool)).await;
     }
 
     #[tokio::test]
@@ -625,23 +850,93 @@ mod tests {
             eprintln!("skipped");
             return;
         };
-        let o = PgOutbox::new(pool);
-        let e = LabEvent::crawl_final_usage(
-            "j",
-            "7f1c2a8e-0000-4000-8000-000000000001",
-            5,
-            json!({"pages_http":5}),
-            "Job j".into(),
-        );
-        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
-        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
-        let due = o.due(10).await.unwrap();
-        assert_eq!(due, vec![e.clone()]);
-        assert_eq!(o.pending_stats().await.unwrap().0, 1);
-        o.reschedule(&[e.id]).await.unwrap();
-        assert!(o.due(10).await.unwrap().is_empty());
-        o.mark_delivered(&[e.id]).await.unwrap();
+        outbox_roundtrip(&PgOutbox::new(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_roundtrip() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        outbox_roundtrip(&SqliteOutbox::new(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_rejects_a_non_uuid_account_like_postgres() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        let o = SqliteOutbox::new(pool);
+        let e = LabEvent::usage("acc", None, "map", 1, json!({}), "m".into(), None);
+        assert!(o.enqueue(&[e]).await.is_err());
         assert_eq!(o.pending_stats().await.unwrap().0, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_reschedule_caps_backoff_and_survives_huge_attempt_counts() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        let o = SqliteOutbox::new(pool.clone());
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let e = LabEvent::usage(acct, None, "map", 1, json!({}), "m".into(), None);
+        let next = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                let (attempts, at): (i64, String) =
+                    sqlx::query_as("SELECT attempts, next_attempt_at FROM lab_events WHERE id = ?")
+                        .bind(id.to_string())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let at = DateTime::parse_from_rfc3339(&at)
+                    .unwrap()
+                    .with_timezone(&Utc);
+                (
+                    attempts,
+                    (at - Utc::now()).num_milliseconds() as f64 / 1000.0,
+                )
+            }
+        };
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
+        o.reschedule(&[e.id]).await.unwrap();
+        let (attempts, secs) = next(e.id).await;
+        assert_eq!(attempts, 1);
+        assert!((1.0..=2.5).contains(&secs), "first backoff was {secs}s");
+        sqlx::query("UPDATE lab_events SET attempts = 2000")
+            .execute(&pool)
+            .await
+            .unwrap();
+        o.reschedule(&[e.id]).await.unwrap();
+        let (attempts, secs) = next(e.id).await;
+        assert_eq!(attempts, 2001);
+        assert!((290.0..=310.0).contains(&secs), "backoff was {secs}s");
+        o.mark_delivered(&[e.id]).await.unwrap();
+        o.reschedule(&[e.id]).await.unwrap();
+        assert_eq!(
+            next(e.id).await.0,
+            2001,
+            "a delivered event is never rescheduled"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_keeps_recently_delivered_events() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        let o = SqliteOutbox::new(pool);
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let e = LabEvent::usage(acct, None, "map", 1, json!({}), "m".into(), None);
+        o.enqueue(std::slice::from_ref(&e)).await.unwrap();
+        assert_eq!(
+            o.purge_delivered(-1).await.unwrap(),
+            0,
+            "undelivered is never purged"
+        );
+        o.mark_delivered(&[e.id]).await.unwrap();
+        assert_eq!(o.purge_delivered(3600).await.unwrap(), 0);
         assert_eq!(o.purge_delivered(-1).await.unwrap(), 1);
+    }
+
+    #[test]
+    fn backoff_matches_the_postgres_rule() {
+        assert_eq!(backoff_secs(0), 2);
+        assert_eq!(backoff_secs(1), 4);
+        assert_eq!(backoff_secs(7), 256);
+        assert_eq!(backoff_secs(8), 300);
+        assert_eq!(backoff_secs(2000), 300);
     }
 }

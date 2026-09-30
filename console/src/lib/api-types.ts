@@ -269,7 +269,9 @@ export interface MeilisearchEngine {
   account_id: string;
   name: string;
   url: string;
+  /** Masked hint ("••••" + last 4 characters), "" when no key is set. */
   api_key: string;
+  has_api_key: boolean;
   is_default: boolean;
   created_at: string;
   updated_at: string;

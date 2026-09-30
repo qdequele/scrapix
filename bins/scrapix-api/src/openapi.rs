@@ -3,9 +3,9 @@
 //! Generates an OpenAPI 3.1 spec from annotated handlers and types, served at
 //! `/openapi.json` with a Scalar UI at `/docs`.
 //!
-//! This spec covers the engine surface only. The SaaS control plane (auth,
-//! account/team, configs/engines CRUD, billing, analytics pipes, OAuth,
-//! MCP) is served by the Rails app; the frozen full-platform public spec is
+//! This spec covers the engine surface only (including the analytics pipes).
+//! The SaaS control plane (auth, account/team, configs/engines CRUD, billing,
+//! OAuth, MCP) is served by the Rails app; the frozen full-platform public spec is
 //! `contracts/openapi.json`, and the engine-only snapshot pinned by
 //! `tests/openapi_snapshot.rs` is `contracts/openapi.engine.json`.
 
@@ -33,7 +33,8 @@ use utoipa::OpenApi;
         (name = "search", description = "Search indexed content"),
         (name = "extract", description = "Structured extraction over one or many pages"),
         (name = "crawl", description = "Distributed crawl jobs"),
-        (name = "jobs", description = "Job management")
+        (name = "jobs", description = "Job management"),
+        (name = "analytics", description = "Tinybird-style analytics pipes over ClickHouse, scoped per account")
     ),
     paths(
         // Health & diagnostics
@@ -60,6 +61,22 @@ use utoipa::OpenApi;
         crate::cancel_job,
         crate::pause_job,
         crate::resume_job,
+        // Analytics pipes
+        crate::analytics_pipes::list_pipes,
+        crate::analytics_pipes::pipes::top_domains,
+        crate::analytics_pipes::pipes::domain_stats,
+        crate::analytics_pipes::pipes::hourly_stats,
+        crate::analytics_pipes::pipes::daily_stats,
+        crate::analytics_pipes::pipes::error_distribution,
+        crate::analytics_pipes::pipes::job_stats,
+        crate::analytics_pipes::pipes::kpis,
+        crate::analytics_pipes::pipes::ai_usage,
+        crate::analytics_pipes::pipes::job_timeline,
+        crate::analytics_pipes::pipes::job_event_summary,
+        crate::analytics_pipes::pipes::account_usage,
+        crate::analytics_pipes::pipes::account_daily_usage,
+        crate::analytics_pipes::pipes::account_daily_usage_by_operation,
+        crate::analytics_pipes::pipes::api_key_usage,
     ),
     components(schemas(
         // Core API types
@@ -115,6 +132,9 @@ use utoipa::OpenApi;
         crate::ErrorRecord,
         crate::DomainsResponse,
         crate::DomainInfo,
+        // Analytics pipes
+        crate::analytics_pipes::PipeInfo,
+        crate::analytics_pipes::ParamInfo,
     )),
     security(
         ("api_key" = [])

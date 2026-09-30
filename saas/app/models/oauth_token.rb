@@ -16,6 +16,6 @@ class OauthToken < ApplicationRecord
                               .pick("accounts.id", "accounts.tier")
     return nil unless membership
 
-    { account_id: membership[0], tier: membership[1], user_id: token.user_id }
+    { account_id: membership[0], tier: membership[1], user_id: token.user_id, expires_at: token.expires_at }
   end
 end

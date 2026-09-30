@@ -5693,9 +5693,7 @@ name = "scrapix-billing"
 version = "0.1.0"
 dependencies = [
  "scrapix-core",
- "sqlx",
  "thiserror 1.0.69",
- "uuid",
 ]
 
 [[package]]

@@ -233,15 +233,17 @@ function MeilisearchEngineCard() {
   useEffect(() => {
     if (engineInitialized || !defaultEngine) return;
     setMsUrl(defaultEngine.url);
-    setMsApiKey(defaultEngine.api_key);
     setEngineInitialized(true);
   }, [defaultEngine, engineInitialized]);
 
   const hasChanges =
     defaultEngine &&
-    (msUrl !== defaultEngine.url || msApiKey !== defaultEngine.api_key);
+    (msUrl !== defaultEngine.url || msApiKey !== "");
 
   const isNew = engines.length === 0 && !isLoading;
+  // The Lab refuses a URL change that would reuse the stored key elsewhere.
+  const urlChangeNeedsKey =
+    !!defaultEngine?.has_api_key && msUrl.trim() !== defaultEngine.url && msApiKey === "";
 
   const handleSave = async () => {
     if (!msUrl.trim()) {
@@ -254,13 +256,13 @@ function MeilisearchEngineCard() {
       if (defaultEngine) {
         await updateEngine(defaultEngine.id, {
           url: msUrl.trim(),
-          api_key: msApiKey,
+          ...(msApiKey !== "" && { api_key: msApiKey }),
         });
       } else {
         await createEngine({
           name: "Default",
           url: msUrl.trim(),
-          api_key: msApiKey || undefined,
+          ...(msApiKey !== "" && { api_key: msApiKey }),
           is_default: true,
         });
       }
@@ -314,13 +316,21 @@ function MeilisearchEngineCard() {
               <Input
                 id="ms-api-key"
                 type="password"
-                placeholder="Enter your Meilisearch API key"
+                placeholder={
+                  defaultEngine?.has_api_key
+                    ? defaultEngine.api_key
+                    : "Enter your Meilisearch API key"
+                }
                 value={msApiKey}
                 onChange={(e) => setMsApiKey(e.target.value)}
                 className="font-mono text-sm"
               />
               <p className="text-xs text-muted-foreground">
                 Use a key with read and write permissions on all indexes.
+                {defaultEngine?.has_api_key &&
+                  (urlChangeNeedsKey
+                    ? " Changing the URL requires re-entering the API key."
+                    : " Leave blank to keep the current key.")}
               </p>
             </div>
           </>
@@ -329,7 +339,7 @@ function MeilisearchEngineCard() {
       <CardFooter>
         <Button
           onClick={handleSave}
-          disabled={saving || (!isNew && !hasChanges)}
+          disabled={saving || (!isNew && !hasChanges) || urlChangeNeedsKey}
         >
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {isNew ? "Connect Engine" : "Save Changes"}

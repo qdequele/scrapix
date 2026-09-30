@@ -1,5 +1,5 @@
-//! The engine must not write Rails-owned tables (spec 2a). Reads for auth and
-//! the credit pre-check are allowed; writes go through lab events.
+//! The engine must not touch Lab-owned tables at all (Lab split spec §4.5): it
+//! reaches the Lab only over HTTP (`lab_client.rs`, `lab_sink.rs`).
 //!
 //! Scan scope: every `.rs` file under `bins/` and `crates/` (this file
 //! excluded), skipping `target/` and `migrations/` directories. SQL `.sql`
@@ -16,12 +16,17 @@ use std::path::{Path, PathBuf};
 
 const RAILS_TABLES: &[&str] = &[
     "accounts",
+    "account_members",
+    "users",
+    "api_keys",
     "transactions",
     "crawl_configs",
     "scheduled_emails",
     "oauth_tokens",
     "oauth_authorization_codes",
-    "api_keys",
+    "oauth_clients",
+    "meilisearch_engines",
+    "lab_events_received",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -78,10 +83,11 @@ fn normalize(text: &str) -> (String, Vec<usize>) {
     (out, lines)
 }
 
-/// Returns `(line, matched text)` for every write to a Rails-owned table.
-fn find_rails_writes(text: &str) -> Vec<(usize, String)> {
+/// Returns `(line, matched text)` for every reference to a Rails-owned table
+/// (write, read or join) and every call of `validate_api_key(`.
+fn find_rails_references(text: &str) -> Vec<(usize, String)> {
     let pattern = regex::Regex::new(&format!(
-        r#"(?is)\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE(\s+TABLE)?)\s+(ONLY\s+)?("?public"?\.)?"?({})"?\b"#,
+        r#"(?is)(\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE(\s+TABLE)?|FROM|JOIN)\s+(ONLY\s+)?("?public"?\.)?"?({})"?\b)|\bvalidate_api_key\s*\("#,
         RAILS_TABLES.join("|")
     ))
     .unwrap();
@@ -98,7 +104,7 @@ fn find_rails_writes(text: &str) -> Vec<(usize, String)> {
 }
 
 #[test]
-fn engine_never_writes_rails_tables() {
+fn engine_never_names_lab_tables() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     rust_files(&root.join("bins"), &mut files);
@@ -110,23 +116,23 @@ fn engine_never_writes_rails_tables() {
             continue;
         }
         let text = std::fs::read_to_string(&f).unwrap();
-        for (line, m) in find_rails_writes(&text) {
+        for (line, m) in find_rails_references(&text) {
             hits.push(format!("{}:{}: {}", f.display(), line, m));
         }
     }
     assert!(
         hits.is_empty(),
-        "engine writes Rails-owned tables:\n{}",
+        "engine code references Lab-owned tables:\n{}",
         hits.join("\n")
     );
 }
 
 #[cfg(test)]
 mod detector {
-    use super::find_rails_writes;
+    use super::find_rails_references;
 
     fn flagged(s: &str) -> bool {
-        !find_rails_writes(s).is_empty()
+        !find_rails_references(s).is_empty()
     }
 
     #[test]
@@ -148,15 +154,31 @@ mod detector {
     #[test]
     fn reports_the_line_of_a_continued_statement() {
         let text = "a\nb\nquery(\"UPDATE \\\n    accounts SET x = 1\")";
-        assert_eq!(find_rails_writes(text)[0].0, 3);
+        assert_eq!(find_rails_references(text)[0].0, 3);
     }
 
     #[test]
-    fn ignores_other_tables_and_reads() {
+    fn flags_reads() {
+        assert!(flagged(
+            "SELECT credits_balance FROM accounts WHERE id = $1"
+        ));
+        assert!(flagged(
+            "SELECT a.id FROM account_members m JOIN accounts a ON a.id = m.account_id"
+        ));
+        assert!(flagged(
+            "SELECT url, api_key FROM meilisearch_engines WHERE account_id = $1"
+        ));
+        assert!(flagged("SELECT account_id FROM validate_api_key($1)"));
+        assert!(flagged("SELECT 1 FROM \"public\".\"oauth_tokens\""));
+    }
+
+    #[test]
+    fn ignores_engine_tables_and_prose() {
         assert!(!flagged("UPDATE lab_events SET attempts = 1"));
         assert!(!flagged("INSERT INTO jobs (id) VALUES (1)"));
-        assert!(!flagged("SELECT * FROM accounts"));
-        assert!(!flagged("UPDATE account_members_view SET x = 1"));
-        assert!(!flagged("UPDATE accounts_archive SET x = 1"));
+        assert!(!flagged("SELECT * FROM job_results"));
+        assert!(!flagged("SELECT * FROM accounts_archive"));
+        assert!(!flagged("let from = accounts;"));
+        assert!(!flagged("// credits come from the Lab's accounts endpoint"));
     }
 }

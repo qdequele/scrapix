@@ -19,9 +19,6 @@ pub enum BillingError {
     #[error("Invalid account ID: {0}")]
     InvalidAccountId(String),
 
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
     #[error("Payment error: {0}")]
     Payment(String),
 }
@@ -34,7 +31,6 @@ impl BillingError {
             BillingError::AccountNotFound => "not_found",
             BillingError::SpendLimitExceeded => "spend_limit_exceeded",
             BillingError::InvalidAccountId(_) => "internal_error",
-            BillingError::Database(_) => "internal_error",
             BillingError::Payment(_) => "payment_error",
         }
     }

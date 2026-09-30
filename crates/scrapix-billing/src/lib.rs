@@ -1,11 +1,10 @@
 //! Scrapix Billing
 //!
-//! Credit pricing and the read-only credit pre-check used by the engine.
+//! Credit pricing; the balance pre-check lives in the engine (via the Lab).
 //! Ledger writes and payments live in the Rails control plane.
 
 pub mod credits;
 pub mod error;
-pub mod ledger;
 pub mod pricing;
 
 // Re-export key types at the crate root for convenience.
@@ -14,5 +13,4 @@ pub use credits::{
     OCR_PAGE_CREDITS, SEARCH_CREDITS,
 };
 pub use error::BillingError;
-pub use ledger::check_credits;
 pub use pricing::calculate_price_cents;

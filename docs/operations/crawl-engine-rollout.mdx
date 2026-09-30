@@ -14,18 +14,29 @@ a checklist, not automation — work through it in order.
 
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
 - [ ] **Local dev: add `SCRAPIX_MODE=hosted` to an existing `.env`.** `just dev` runs the engine against the Rails stack's Postgres; an `.env` copied from `.env.example` before standalone mode existed lacks the variable, so the API now starts in standalone mode and refuses to run without `SCRAPIX_ADMIN_KEY`. The current `.env.example` already sets it.
-- [ ] **Confirm `JWT_SECRET` is set** on every hosted API's env. Hosted mode now refuses to start without it — it previously fell back to an insecure default.
-- [ ] **Set `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API and the matching secrets on Rails — the hosted engine refuses to start without them. Follow "Engine ↔ Lab boundary rollout" below (Rails first, `LAB_CRON_ENABLED` off until the engine is upgraded).
+- [ ] **Set `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API and the matching secrets on Rails — the hosted engine refuses to start without them. If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
 
 ## Engine ↔ Lab boundary rollout
+
+<Warning>
+If production has not done this rollout yet, **do A and B, then skip C and D
+and follow "Lab split phase 1" below as one ordered rollout.** It stops the old
+engine before Rails is deployed, which C and D on their own would not, and it
+carries the parts of C, D and E it needs (the Rails secrets, the cron switch,
+the checks). B (the duplicate-payment-intent check) must run before the Rails
+migrations. Sections C and D are kept for the record, and for readers whose
+production already ran them.
+</Warning>
 
 The engine no longer writes the Rails-owned tables. It reports usage and job
 lifecycle as signed **lab events** (see [Lab Events](/api-reference/lab-events)),
 and the Rails app (the "Lab") debits the ledger, runs auto top-up, sends job
 and low-balance emails, fires saved-config cron and sweeps expired OAuth
-rows. Roll it out in this order — **Rails first, engine second, cron last** —
-so no window exists where a charge is lost or a crawl fires twice.
+rows. Its original order was **Rails first, engine second, cron last**, so no
+window exists where a charge is lost or a crawl fires twice. (The Lab split
+changes the Rails-versus-engine order: see the warning above and "Lab split
+phase 1".)
 
 ### A. Generate secrets
 
@@ -37,11 +48,14 @@ openssl rand -hex 32   # LAB_SERVICE_TOKEN
 Use two different values. Both are needed, with **identical values**, on the
 Rails app and on the engine (`scrapix-api`): `LAB_EVENTS_SECRET` signs the
 engine → Rails event deliveries, `LAB_SERVICE_TOKEN` authenticates Rails →
-engine calls. The engine also needs `LAB_EVENTS_URL`, the Rails
-`POST /internal/events` endpoint (e.g. `https://scrapix.meilisearch.com/internal/events`,
-or `http://127.0.0.1:8091/internal/events` when both run on the box). The
-hosted engine **refuses to start** without all three (secrets ≥ 32
-characters); standalone ignores them.
+engine calls (and, since the Lab split, the engine's own `/internal/*` calls).
+The engine also needs `LAB_URL`, the Lab's base URL (e.g.
+`https://scrapix.meilisearch.com`, or `http://127.0.0.1:8091` when both run on
+the box); events go to `{LAB_URL}/internal/events`. The hosted engine
+**refuses to start** without `LAB_URL` and both secrets (secrets ≥ 32
+characters); standalone ignores them. (Before the Lab split this was
+`LAB_EVENTS_URL`, the full `…/internal/events` URL; it still works as a
+deprecated fallback.)
 
 ### B. Before the Rails migrations: check for duplicate payment intents
 
@@ -82,13 +96,17 @@ before migrating. An index of that name that already exists is left alone.
    belongs to LUMEN and the engine is at `http://127.0.0.1:8090`. (Rails logs
    a warning at boot when `LAB_CRON_ENABLED=true` and `LAB_SERVICE_TOKEN` or
    `SCRAPIX_ENGINE_URL` is unset.)
-3. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. This
-   creates `lab_events` (the engine's outbox), `lab_events_received`,
-   `accounts.last_auto_topup_attempt_at` and `crawl_configs.last_error`.
-   Rails **must** be migrated before the new engine starts: the engine writes
-   `lab_events` and never migrates the Rails database, so the hosted engine
-   refuses to start while the table is missing (`lab_events table missing
-   … bin/rails db:migrate`).
+3. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. **Not
+   while an engine from before the Lab split is running:** `db:migrate` now
+   includes `20260930000001_encrypt_meilisearch_engine_api_keys`, which
+   encrypts `meilisearch_engines.api_key`, the column such an engine reads
+   directly, so it would send the ciphertext to Meilisearch as the key. Stop
+   that engine first (this is why "Lab split phase 1" is one ordered rollout).
+   The migrations create `lab_events` (the engine's outbox),
+   `lab_events_received`, `accounts.last_auto_topup_attempt_at` and
+   `crawl_configs.last_error`. (From phase 1 on, the engine keeps `lab_events`
+   in its own database and migrates it itself, so nothing on the engine side
+   depends on this.)
 4. Check that SolidQueue is running the recurring jobs
    (`process_lab_events` every 10 s, `run_due_crawl_configs` every 30 s,
    `cleanup_oauth_tokens` hourly). `run_due_crawl_configs` exits immediately
@@ -104,8 +122,13 @@ before migrating. An index of that name that already exists is left alone.
 
 ### D. Deploy the engine
 
-Follow the normal service order in step 4 below (content workers, crawlers,
-frontier, then API), with `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and
+The engine build that contains this rollout also needs its own database
+(`scrapix_engine`) and `LAB_URL`, and refuses a Rails database: set those up
+with steps 3 to 6 of "Lab split phase 1", not by pointing it at the Rails
+`DATABASE_URL`.
+
+Follow the normal service order in "4. Deploy order" below (content workers,
+crawlers, frontier, then API), with `LAB_URL`, `LAB_EVENTS_SECRET` and
 `LAB_SERVICE_TOKEN` set on the API, and with no jobs running (step 0). Also
 update every hosted deploy config you use (Fly secrets, Heroku config vars,
 the Kubernetes `scrapix-secrets` / `scrapix-config`) — they are listed in
@@ -151,7 +174,8 @@ fire — keep that window short.
   ```
 
   If it isn't 0, restart the new engine until it delivers them. Turn
-  `LAB_CRON_ENABLED` off first, or scheduled crawls fire twice.
+  `LAB_CRON_ENABLED` off first, or scheduled crawls fire twice. (For rolling
+  back the Lab split itself, use "Phase 1 rollback" below.)
 - **Crash after a cancel.** Cancelling a job persists its terminal state a
   few seconds after the request (once the charge and the job event are
   recorded). If the API crashes within that window, the job is recovered as
@@ -161,6 +185,219 @@ fire — keep that window short.
 - Live job updates (`GET /ws/job/{id}`) still need `SESSION_COOKIE_DOMAIN`
   (see the pre-deploy checklist above) so the console can present the session
   cookie to the API.
+
+## Lab split phase 1
+
+The engine stops touching the Lab's database. It gets its own database
+(`scrapix_engine`, migrated by the engine itself in both modes), asks the Lab's
+`/internal/*` API for credentials, credits and Meilisearch targets through
+`LAB_URL`, and serves the analytics pipes itself. Spec:
+`docs/superpowers/specs/2026-09-30-lab-split-design.md` §8. Reference:
+[Lab Events](/api-reference/lab-events#lab-internal-api).
+
+**The order is deliberate: drain and stop the old engine first, then deploy
+Rails.** The Rails release encrypts `meilisearch_engines.api_key` in place, and
+the old engine reads that column directly, so an old engine left running would
+send the ciphertext to Meilisearch as the key. Expect the public API to be down
+from step 1 to step 6; pick a quiet window. (Numbered steps here are this
+section's; "0. Drain…" and "4. Deploy order" further down are the general
+sections of this page.)
+
+1. **Take the public API out of Caddy, then drain and stop the old engine.**
+   Remove the public API route (`api.scrapix.meilisearch.com` → 8090) from
+   Caddy, or make it answer 503, and reload Caddy: the new engine is started
+   once in step 4 only to migrate its database, and must not serve a request
+   then (a job or a charge written before the data move makes the move script
+   refuse to run, see step 5). Then follow "0. Drain or cancel running jobs
+   first" below and stop `scrapix-api`. The frontier and workers can stay up,
+   but no crawl may be running.
+2. **Generate and set the encryption secrets, then deploy Rails.**
+   - Generate the three Active Record encryption values:
+
+     ```bash
+     cd saas && bin/rails db:encryption:init
+     ```
+
+     Put `ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY`,
+     `ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY` and
+     `ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT` in
+     `/etc/scrapix/scrapix.env` **before** the deploy, and back them up: without
+     them the stored Meilisearch keys cannot be read again.
+   - Set `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` on Rails (section A) and
+     check `SCRAPIX_ENGINE_URL` (section C.2). Leave `LAB_CRON_ENABLED` unset
+     until step 6 is done.
+   - Set `RAILS_MAX_THREADS` to at least `5` on Rails (the Puma default is
+     3; the database pool follows it). Every credential the engine has not
+     cached is now a Rails request (`/internal/auth/introspect`), and the
+     engine runs up to 32 of them at once.
+   - Deploy Rails and run its migrations (section B first). A data migration
+     encrypts the existing Meilisearch engine keys. The release only adds things
+     (the internal endpoints, encryption), so nothing else changes for users.
+   - Check the internal API answers with the service token:
+
+     ```bash
+     curl -s -H "Authorization: Bearer $LAB_SERVICE_TOKEN" \
+       http://127.0.0.1:8091/internal/ping   # {"ok":true}
+     ```
+   - Check that SolidQueue runs the recurring jobs (`process_lab_events` every
+     10 s, `run_due_crawl_configs` every 30 s, `cleanup_oauth_tokens` hourly;
+     section C.4), and that an unsigned event batch is refused with `401`, not
+     `503` (`503` means `LAB_EVENTS_SECRET` is not set on Rails; section C.5):
+
+     ```bash
+     curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+       -H 'Content-Type: application/json' -d '{"events":[]}' \
+       http://127.0.0.1:8091/internal/events   # expect 401
+     ```
+3. **Create the engine database and its role** on the existing PostgreSQL:
+
+   ```sql
+   CREATE ROLE scrapix_engine LOGIN PASSWORD '<generated>';
+   CREATE DATABASE scrapix_engine OWNER scrapix_engine;
+   ```
+4. **Give the engine its own environment, start it once so it migrates, then
+   stop it.** On qdq-server the engine and Rails share
+   `/etc/scrapix/scrapix.env`, which holds Rails' `DATABASE_URL` and
+   `JWT_SECRET`. Do **not** edit those lines: scope the change to the engine's
+   unit with a second `EnvironmentFile` (later files win, and this one only
+   affects `scrapix-api`):
+
+   ```ini
+   # /etc/systemd/system/scrapix-api.service.d/lab-split.conf
+   [Service]
+   EnvironmentFile=/etc/scrapix/scrapix-engine.env
+   ```
+
+   ```bash
+   # /etc/scrapix/scrapix-engine.env (mode 600)
+   DATABASE_URL=postgres://scrapix_engine:<password>@127.0.0.1:5432/scrapix_engine
+   LAB_URL=http://127.0.0.1:8091
+   ```
+
+   Run `systemctl daemon-reload`. The engine still reads `LAB_EVENTS_SECRET` and
+   `LAB_SERVICE_TOKEN` from the shared file, ignores its `JWT_SECRET`, and
+   ignores a leftover `LAB_EVENTS_URL` once `LAB_URL` is set, so nothing needs
+   removing from it. With the public route still out of Caddy (step 1), start
+   the new binary; once the log shows it is serving, stop it. The data-move
+   script refuses to run against tables that do not exist yet.
+5. **Move the data.** One time, with the engine stopped:
+
+   ```bash
+   deploy/lab-split/move-engine-data.sh \
+     "postgres://<admin>@127.0.0.1:5432/scrapix" \
+     "postgres://scrapix_engine:<password>@127.0.0.1:5432/scrapix_engine"
+   ```
+
+   It copies `jobs`, `job_results` and `lab_events` (so undelivered charges move
+   with the data), compares row counts, and refuses to run twice. The Lab's
+   copies are left in place: they are the rollback path and are dropped only by
+   the cleanup release.
+
+   If it refuses with `engine table … already has N rows` (the step 4 start
+   served traffic after all), look at what is there first: an undelivered row
+   in the engine's `lab_events` is a real charge. Let the engine deliver it
+   (start it with the public route still out, wait until
+   `SELECT count(*) FROM lab_events WHERE delivered_at IS NULL` is 0 on
+   `scrapix_engine`, stop it), then empty the engine tables and run the
+   script again:
+
+   ```sql
+   -- on scrapix_engine, engine stopped
+   TRUNCATE jobs, job_results, lab_events RESTART IDENTITY;
+   ```
+
+   Jobs created during that start are lost from the history; nothing else is.
+6. **Start the engine** with the drop-in from step 4 in place (`LAB_URL`
+   `http://127.0.0.1:8091` and the `scrapix_engine` `DATABASE_URL`; it does not
+   use `JWT_SECRET`). If the other services also run the new build, follow the
+   service order in "4. Deploy order" below. Put the public API route back in
+   Caddy once the checks below pass. Then check:
+   - the log shows the Lab ping succeeded (a wrong token or `LAB_URL` stops the
+     engine at startup instead);
+   - `GET /metrics` shows `scrapix_lab_requests_total{endpoint="ping",outcome="ok"}`
+     and `scrapix_lab_events_pending` draining to near 0.
+
+   Then set `LAB_CRON_ENABLED=true` on Rails and restart it (section E).
+7. **Verify.** Run `verify.sh` (signup, key, billed scrape, a crawl, job
+   history) and check analytics through the engine. With a real API key:
+
+   ```bash
+   curl -s -H "X-API-Key: $KEY" \
+     "http://127.0.0.1:8090/analytics/v0/pipes/kpis.json?hours=24"
+
+   python3 contracts/analytics_parity.py \
+     --rails http://127.0.0.1:8091 --engine http://127.0.0.1:8090 --api-key "$KEY"
+   # expect: OK: N paths identical
+   ```
+
+   The parity script lists its accepted differences in its header.
+8. **Move analytics to the engine.** In Caddy, send the `analytics` path prefix
+   to 8090, and remove `analytics` from `SAAS_PREFIXES` (the console proxy).
+   Reload both.
+9. **After a clean week,** the cleanup release drops `jobs`, `job_results` and
+   `lab_events` from the Lab database and deletes Rails' analytics code. The
+   engine's `LAB_EVENTS_URL` fallback stays one release longer.
+
+### Phase 1 rollback
+
+Possible until the cleanup release, because the Lab's tables are still there.
+The old engine needs its old environment back, and the new engine must deliver
+its pending events before it is stopped: delivery only happens while it runs.
+
+1. **Stop new traffic, but keep the new engine running.** First turn
+   `LAB_CRON_ENABLED` off on Rails and restart it, so no scheduled crawl starts
+   while you drain. Then take the public API route out of Caddy (or return 503
+   there), cancel any running jobs, and wait until nothing is left to deliver
+   on `scrapix_engine`:
+
+   ```sql
+   SELECT count(*) FROM lab_events WHERE delivered_at IS NULL;  -- must reach 0
+   ```
+
+   If it does not fall, Rails is rejecting or unreachable: fix that first
+   (`scrapix_lab_events_pending` and the delivered-total metric show it). Only
+   then stop `scrapix-api`.
+2. **Restore the old environment.** Remove the drop-in
+   (`rm /etc/systemd/system/scrapix-api.service.d/lab-split.conf`, then
+   `systemctl daemon-reload`) so the unit reads only the shared
+   `/etc/scrapix/scrapix.env` again. Check that file still has what the old
+   binary refuses to start without: the old `DATABASE_URL` (the Rails
+   database), `JWT_SECRET`, and for the engine from the boundary rollout
+   `LAB_EVENTS_URL=http://127.0.0.1:8091/internal/events` (the full URL, not the
+   base), `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`. Rails keeps its own
+   `JWT_SECRET` throughout; never delete it from the shared file. Leave
+   `LAB_CRON_ENABLED` off (step 1) if the old engine runs its own cron
+   scheduler, or scheduled crawls fire twice; turn it back on only if it
+   does not.
+3. **Decrypt the Meilisearch keys, then roll Rails back (required).** The old
+   engine reads `meilisearch_engines.api_key` directly and cannot use
+   ciphertext. With the encryption secrets still set, run
+   `cd saas && bin/rails db:migrate:down VERSION=20260930000001` (it decrypts
+   the keys), then deploy the previous Rails release right away. Rolling Rails
+   back is not optional: the phase 1 release still declares
+   `encrypts :api_key`, so any engine created or edited on it after the
+   `db:migrate:down` is stored encrypted again. It also restores `analytics`
+   in the Rails MCP server's route list (`SAAS_PREFIXES` in
+   `saas/app/services/mcp_toolset.rb`), so MCP analytics calls go to Rails
+   again, matching the console proxy (next step). Check that no key is left
+   encrypted (Active Record ciphertext is a JSON object starting with `{"p":`):
+
+   ```sql
+   -- on the Lab (Rails) database: must return no rows
+   SELECT id FROM meilisearch_engines WHERE api_key LIKE '{"p":%';
+   ```
+
+   If it returns rows (an engine was saved between the two), decrypt them
+   from the phase 1 release's checkout, with the secrets still set:
+   `cd saas && bin/rails runner 'MeilisearchEngine.find_each(&:decrypt)'`
+   (what the migration's `down` does; the migration itself has already run).
+4. **Start the old binary**, restore the `analytics` route in Caddy and
+   `SAAS_PREFIXES` in the console proxy, and put the public API route back.
+
+Jobs created on the new engine will not appear in the old engine's history. The
+Lab's copy of `lab_events` still holds rows the move script copied as
+undelivered; the old engine may deliver them again, which is harmless because
+the Lab processes each event id once.
 
 ## 0. Drain or cancel running jobs first
 
@@ -176,17 +413,10 @@ mid-rollout.
 
 ## 1. Rails migration and pre-merge checks
 
-The engine degrades to in-memory-only accounting (see `CLAUDE.md` → "Degraded
-mode") if the `jobs.accounting` column is missing, so the Rails migration
-**must** run before the API is deployed:
-
-```bash
-cd saas
-bin/rails db:migrate
-```
-
-This applies `20260926000001_add_accounting_to_jobs` (and any later
-migrations on the branch).
+Since the Lab split the engine migrates its own database (including the
+`jobs.accounting` column), so only the Rails release needs its migrations
+(`cd saas && bin/rails db:migrate`); the order relative to the engine is in
+"Lab split phase 1" above.
 
 Before merging to `main`, also run — neither of these ran during
 development because Postgres was down locally:
@@ -209,7 +439,7 @@ rpk topic list | grep -E 'scrapix\.(jobs\.status|dlq\.urls)'
 `scrapix.fetch.feedback` carries the crawler's per-URL fetch outcome back to
 the frontier (releases the domain politeness slot, feeds robots
 `Crawl-delay`/`Retry-After` into the domain's delay) — it must exist before
-crawlers that publish to it are rolled out (see step 4). Confirm
+crawlers that publish to it are rolled out (see "4. Deploy order"). Confirm
 `scrapix.jobs.status` and `scrapix.dlq.urls` already exist; create them with
 `rpk topic create` if not.
 
