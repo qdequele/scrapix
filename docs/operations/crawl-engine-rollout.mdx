@@ -39,7 +39,7 @@ Rails app and on the engine (`scrapix-api`): `LAB_EVENTS_SECRET` signs the
 engine → Rails event deliveries, `LAB_SERVICE_TOKEN` authenticates Rails →
 engine calls. The engine also needs `LAB_EVENTS_URL`, the Rails
 `POST /internal/events` endpoint (e.g. `https://scrapix.meilisearch.com/internal/events`,
-or `http://localhost:8081/internal/events` when both run on the box). The
+or `http://127.0.0.1:8091/internal/events` when both run on the box). The
 hosted engine **refuses to start** without all three (secrets ≥ 32
 characters); standalone ignores them.
 
@@ -72,17 +72,28 @@ before migrating. An index of that name that already exists is left alone.
 1. Set `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` on the Rails app. Leave
    `LAB_CRON_ENABLED` **unset** (off): the old engine still runs its own
    cron scheduler, and enabling both would fire every scheduled crawl twice.
-2. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. This
+   Production must **not** inherit `.env.example`'s `LAB_CRON_ENABLED=true`
+   (a dev convenience): if the production env was seeded from it, remove
+   the line before this deploy and set it only at step E.
+2. Check that Rails' `SCRAPIX_ENGINE_URL` points at the engine's API. Cron
+   now runs in Rails and sends `LAB_SERVICE_TOKEN` there, so a wrong URL both
+   breaks scheduled crawls and hands the token to whatever listens on it.
+   The Rails default is `http://localhost:8080`; on qdq-server that port
+   belongs to LUMEN and the engine is at `http://127.0.0.1:8090`. (Rails logs
+   a warning at boot when `LAB_CRON_ENABLED=true` and `LAB_SERVICE_TOKEN` or
+   `SCRAPIX_ENGINE_URL` is unset.)
+3. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. This
    creates `lab_events` (the engine's outbox), `lab_events_received`,
    `accounts.last_auto_topup_attempt_at` and `crawl_configs.last_error`.
    Rails **must** be migrated before the new engine starts: the engine writes
-   `lab_events`, and while the table is missing each request's usage event
-   fails to record (logged as `Failed to record lab events`) and is lost.
-3. Check that SolidQueue is running the recurring jobs
+   `lab_events` and never migrates the Rails database, so the hosted engine
+   refuses to start while the table is missing (`lab_events table missing
+   … bin/rails db:migrate`).
+4. Check that SolidQueue is running the recurring jobs
    (`process_lab_events` every 10 s, `run_due_crawl_configs` every 30 s,
    `cleanup_oauth_tokens` hourly). `run_due_crawl_configs` exits immediately
    while `LAB_CRON_ENABLED` is off.
-4. Verify the endpoint answers: an unsigned request gets `401`, not `503`
+5. Verify the endpoint answers: an unsigned request gets `401`, not `503`
    (`503` means `LAB_EVENTS_SECRET` is not set on Rails).
 
    ```bash
@@ -117,7 +128,11 @@ After the API starts:
 ### E. Enable cron
 
 Only once the engine is upgraded (it no longer runs a cron scheduler), set
-`LAB_CRON_ENABLED=true` on Rails and restart. Confirm a saved config with a
+`LAB_CRON_ENABLED=true` on Rails and restart. Re-check first that Rails'
+`SCRAPIX_ENGINE_URL` points at the upgraded engine (`http://127.0.0.1:8090`
+on qdq-server, not the `http://localhost:8080` default) and that
+`LAB_SERVICE_TOKEN` matches the engine's; a boot warning in the Rails log
+means one of them is missing. Confirm a saved config with a
 cron schedule fires (`last_run_at` / `last_job_id` set on the config; a
 failure shows in `last_error`). Between D and E, scheduled crawls do not
 fire — keep that window short.
@@ -127,7 +142,15 @@ fire — keep that window short.
 - Rolling the **engine** back to the previous version is safe: it resumes its
   own direct ledger writes, but any events still pending in `lab_events` are
   no longer delivered — drain the outbox (`scrapix_lab_events_pending` at 0)
-  before rolling back or those charges are never applied. Turn
+  before rolling back or those charges are never applied. After stopping the
+  new engine (and before starting the old one), confirm nothing was left
+  behind:
+
+  ```sql
+  SELECT count(*) FROM lab_events WHERE delivered_at IS NULL;  -- must be 0
+  ```
+
+  If it isn't 0, restart the new engine until it delivers them. Turn
   `LAB_CRON_ENABLED` off first, or scheduled crawls fire twice.
 - **Crash after a cancel.** Cancelling a job persists its terminal state a
   few seconds after the request (once the charge and the job event are
