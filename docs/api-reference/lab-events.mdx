@@ -154,10 +154,11 @@ printf 'sha256=%s\n' "$(openssl dgst -sha256 -hmac "$LAB_EVENTS_SECRET" -hex < b
 
 ## Service calls (Lab → engine)
 
-The Lab calls the engine on behalf of an account (saved-config cron, the MCP
-server) with `Authorization: Bearer <LAB_SERVICE_TOKEN>` and
+The Lab's saved-config cron calls the engine on behalf of the config's
+account with `Authorization: Bearer <LAB_SERVICE_TOKEN>` and
 `X-Scrapix-Account-Id: <account uuid>`. The engine accepts this only in
-hosted mode.
+hosted mode. It is the only service call today: requests made through the
+MCP server forward the caller's own credentials instead.
 
 ## Metrics
 

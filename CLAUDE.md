@@ -617,7 +617,7 @@ GROUP BY date ORDER BY date;
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
 | `LAB_EVENTS_URL` | API, hosted only, required: the Rails `POST /internal/events` URL (`http://`/`https://`) the engine delivers lab events to. Ignored in standalone |
 | `LAB_EVENTS_SECRET` | API + Rails, hosted only, required (≥32 chars, same value on both): HMAC-SHA256 key signing lab-event deliveries (`X-Scrapix-Signature`). Generate with `openssl rand -hex 32` |
-| `LAB_SERVICE_TOKEN` | API + Rails, hosted only, required (≥32 chars, same value on both): Bearer token Rails presents (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron, MCP) |
+| `LAB_SERVICE_TOKEN` | API + Rails, hosted only, required (≥32 chars, same value on both): Bearer token Rails presents (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron only) |
 | `LAB_CRON_ENABLED` | Rails: `true` runs the saved-config cron (default off, so a new Rails deploy can't double-fire crawls while the old engine still runs its own scheduler) |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
