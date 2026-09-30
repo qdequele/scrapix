@@ -11,8 +11,10 @@
     "ai_summary": null,
     "block_split": null,
     "custom_selectors": null,
+    "documents": null,
     "markdown": null,
     "metadata": null,
+    "ocr": null,
     "pdf": null,
     "schema": null
   },
@@ -38,9 +40,10 @@
     "respect_robots_txt": true
   },
   "sitemap": {
-    "enabled": false,
+    "enabled": true,
     "urls": []
   },
+  "source": null,
   "start_urls": [],
   "url_patterns": {
     "allowed_domains": [],
