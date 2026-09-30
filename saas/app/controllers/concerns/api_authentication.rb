@@ -38,10 +38,8 @@ module ApiAuthentication
   end
 
   def authenticate_bearer!(token)
-    holder = OauthToken.account_for(token)
-    unless holder
-      raise AuthenticationError.new("Invalid or expired Bearer token", "invalid_bearer_token")
-    end
+    holder = CredentialResolver.oauth(token)
+    raise AuthenticationError.new("Invalid or expired Bearer token", "invalid_bearer_token") unless holder
 
     @authenticated_account_id = holder[:account_id]
     @authenticated_tier = holder[:tier]
@@ -52,40 +50,24 @@ module ApiAuthentication
       raise AuthenticationError.new("Invalid API key format", "invalid_api_key")
     end
 
-    key_hash = Digest::SHA256.hexdigest(api_key)
-    # Same Postgres function the Rust middleware calls (also bumps last_used_at).
-    row = ActiveRecord::Base.connection.select_one(
-      ActiveRecord::Base.sanitize_sql_array(
-        [ "SELECT account_id, tier, active, api_key_id FROM validate_api_key(?)", key_hash ]
-      )
-    )
+    row = CredentialResolver.api_key(api_key)
     raise AuthenticationError.new("Invalid or inactive API key", "invalid_api_key") if row.nil?
-    raise AuthenticationError.new("Account is inactive", "account_inactive") unless row["active"]
+    raise AuthenticationError.new("Account is inactive", "account_inactive") unless row[:active]
 
-    @authenticated_account_id = row["account_id"]
-    @authenticated_tier = row["tier"]
-    @authenticated_api_key_id = row["api_key_id"]
+    @authenticated_account_id = row[:account_id]
+    @authenticated_tier = row[:tier]
+    @authenticated_api_key_id = row[:api_key_id]
   end
 
   def authenticate_session!
     token = cookies["scrapix_session"]
-    if token.blank?
-      raise AuthenticationError.new("Missing API key or session", "not_authenticated")
-    end
+    raise AuthenticationError.new("Missing API key or session", "not_authenticated") if token.blank?
 
-    begin
-      claims, = JWT.decode(token, jwt_secret, true, algorithm: "HS256")
-    rescue JWT::DecodeError
-      raise AuthenticationError.new("Invalid or expired session", "invalid_session")
-    end
+    user = CredentialResolver.session_user(token)
+    raise AuthenticationError.new("Invalid or expired session", "invalid_session") unless user
 
-    user_id = claims["sub"]
-    unless user_id.to_s.match?(/\A[0-9a-f-]{36}\z/i)
-      raise AuthenticationError.new("Invalid session", "invalid_session")
-    end
-
-    @authenticated_user_id = user_id
-    @authenticated_email = claims["email"]
+    @authenticated_user_id = user[:user_id]
+    @authenticated_email = user[:email]
     selected = request.headers["X-Account-Id"]
     @selected_account_id = selected if selected.to_s.match?(/\A[0-9a-f-]{36}\z/i)
   end
@@ -110,9 +92,5 @@ module ApiAuthentication
 
   def raise_account_not_found
     raise ApiErrorRendering::ApiError.new("Account not found", "not_found")
-  end
-
-  def jwt_secret
-    ENV.fetch("JWT_SECRET")
   end
 end

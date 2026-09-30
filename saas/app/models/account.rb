@@ -44,6 +44,14 @@ class Account < ApplicationRecord
     nil
   end
 
+  # Balance the engine may spend: the stored balance minus usage the Lab has
+  # received but not yet debited (ProcessLabEventsJob runs asynchronously).
+  def effective_credits_balance
+    pending = LabEventReceived.where(account_id: id, type: "usage.recorded", processed_at: nil)
+                              .sum(Arel.sql("COALESCE((payload->'data'->>'credits')::bigint, 0)"))
+    credits_balance - pending.to_i
+  end
+
   def owner_email
     account_members.find_by(role: "owner")&.user&.email
   end

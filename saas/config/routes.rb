@@ -60,6 +60,9 @@ Rails.application.routes.draw do
   # Product engines report usage/job events here (HMAC-signed, no user auth).
   namespace :internal do
     post "events", to: "events#create"
+    get "ping", to: "ping#show"
+    post "auth/introspect", to: "introspections#create"
+    get "accounts/:id", to: "accounts#show"
   end
 
   # Phase 8: OAuth 2.1 provider (RFC 8414/7591/7636/7009) + MCP.
