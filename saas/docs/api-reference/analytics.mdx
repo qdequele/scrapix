@@ -11,6 +11,15 @@ The analytics API provides long-term crawl metrics persisted to ClickHouse. Unli
   Requires `CLICKHOUSE_URL` to be set. These endpoints return 404 when ClickHouse is not configured.
 </Note>
 
+## Authentication
+
+Every pipe requires authentication, like the rest of the API: an API key (`X-API-Key`), an OAuth access token (`Authorization: Bearer`), or a console session (with `X-Account-Id` to pick an account). Results only ever cover **your own account**: every pipe, including the domain, error and job pipes, is filtered on it. An `account_id` parameter is optional; if you pass one that isn't your account, the request fails with `404`. Unauthenticated requests get `401`.
+
+```bash
+curl "https://api.scrapix.meilisearch.com/analytics/v0/pipes/kpis.json?hours=24" \
+  -H "X-API-Key: $SCRAPIX_API_KEY"
+```
+
 ## How It Works
 
 1. The API server batches crawl events (100 events or every 5 seconds)
@@ -165,7 +174,7 @@ AI enrichment usage statistics (when AI features are enabled).
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `hours` | integer | `24` | Time window |
-| `account_id` | string | all | Filter by account |
+| `account_id` | string | your account | Optional; must be your own account |
 
 ```bash
 curl "http://localhost:8080/analytics/v0/pipes/ai_usage.json?hours=24"
@@ -221,7 +230,7 @@ Usage metrics for a specific account (for billing purposes).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `account_id` | string | Yes | Account ID |
+| `account_id` | string | No | Optional; must be your own account |
 | `hours` | integer | No (720) | Time window |
 
 ```bash
@@ -236,7 +245,7 @@ Daily usage breakdown for an account.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `account_id` | string | Yes | Account ID |
+| `account_id` | string | No | Optional; must be your own account |
 | `hours` | integer | No (720) | Time window |
 
 ```bash
