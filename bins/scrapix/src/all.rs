@@ -51,11 +51,13 @@ pub struct AllArgs {
     pub kafka_brokers: Option<String>,
 
     // === Database (optional) ===
-    /// PostgreSQL database URL (for auth/cron features)
+    /// PostgreSQL database URL: the engine's own job-history store (never the
+    /// Lab's database). Unset uses a local SQLite file.
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: Option<String>,
 
-    /// JWT secret for auth (required when DATABASE_URL is set)
+    /// Ignored: the engine no longer verifies sessions (the Lab does, behind
+    /// `LAB_URL`). Kept so an old environment still parses.
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
 

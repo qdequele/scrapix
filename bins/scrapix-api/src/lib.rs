@@ -1433,7 +1433,8 @@ impl AppState {
     ///   owed terminal write failed (kept held, write retried next flush).
     /// - Transient accounting failure: keep everything held, the jobs dirty
     ///   and the terminal writes owed, for the next attempt.
-    /// - Missing `accounting` column (the Rails migration has not run):
+    /// - Missing `accounting` column or `jobs` table (the engine's own
+    ///   migrations did not apply, or the database was altered by hand):
     ///   non-retryable. Accounting persistence and ack deferral are turned
     ///   off for this process and every held ack is released, degrading to
     ///   in-memory accounting instead of blocking consumption forever.
@@ -1458,9 +1459,9 @@ impl AppState {
                 // In this degraded mode nothing is persisted, so jobs still
                 // running at a restart end as FailStalled after the stall timeout.
                 error!(
-                    "jobs.accounting column is missing (Rails migration \
-                     20260926000001_add_accounting_to_jobs not applied): job accounting is \
-                     kept in memory only and events are acked immediately for this process"
+                    "jobs.accounting column is missing (the engine's own migrations did not \
+                     apply): job accounting is kept in memory only and events are acked \
+                     immediately for this process"
                 );
                 self.accounting_persisted
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2109,7 +2110,7 @@ enum AccountingFlush {
     /// Transient failure: retry next flush, keep acks held.
     Retry,
     /// The `jobs.accounting` column / `jobs` table does not exist: the
-    /// Rails migration has not run. Not retryable.
+    /// engine's own migrations did not apply. Not retryable.
     SchemaMissing,
 }
 
@@ -7032,7 +7033,7 @@ pub async fn run_with_bus(
                     }
                     // A terminal write gated on Lab events became owed:
                     // record its events and persist it now (the quota and
-                    // the Rails app read the job's row).
+                    // the job history read the job's row).
                     _ = flush_state.crawl.terminal_flush_wake.notified() => {
                         if let Some(ref store) = flush_state.job_store {
                             flush_state.flush_to_db(store.as_ref()).await;

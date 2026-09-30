@@ -290,8 +290,8 @@ impl JobStore for PgJobStore {
     ///
     /// Deliberately a separate statement from
     /// [`flush_job_counters`](JobStore::flush_job_counters): if the engine
-    /// runs against a database where the Rails migration adding the column
-    /// has not been applied yet, only this statement fails (logged) and the
+    /// runs against a database where the migration adding the column
+    /// is missing, only this statement fails (logged) and the
     /// counter flush keeps working.
     ///
     /// Returns `Err` (after logging) when the statement fails, so the caller can

@@ -203,7 +203,7 @@ impl EngineSettings {
                     (None, false) => {
                         let hint = match database_url.as_deref() {
                             Some(u) if is_postgres(u) => {
-                                " If this is a hosted (Rails) deployment, set SCRAPIX_MODE=hosted."
+                                " If this is a hosted deployment, set SCRAPIX_MODE=hosted (with LAB_URL and the engine's own DATABASE_URL)."
                             }
                             _ => "",
                         };

@@ -18,8 +18,8 @@ pub use sqlite::SqliteJobStore;
 
 #[derive(Debug)]
 pub enum StoreError {
-    /// The table/column the write needs does not exist (e.g. the Rails
-    /// migration has not run). Not retryable.
+    /// The table/column the write needs does not exist (e.g. the engine's
+    /// own migrations did not apply). Not retryable.
     SchemaMissing(String),
     Other(String),
 }
