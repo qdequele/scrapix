@@ -70,8 +70,11 @@ class StripeWebhooksController < ApplicationController
       return
     end
 
-    StripeBilling.add_credits_for_payment(account_id, credits, pi_id, "Credit purchase (Invoice)")
-    queue_receipt(account_id, credits, invoice.amount_paid || 0)
+    # Receipt only when this delivery granted the credit: the purchase flow
+    # and AutoTopup send their own, and Stripe redelivers webhooks.
+    if StripeBilling.add_credits_for_payment(account_id, credits, pi_id, "Credit purchase (Invoice)")
+      queue_receipt(account_id, credits, invoice.amount_paid || 0)
+    end
   rescue ActiveRecord::ActiveRecordError => e
     Rails.logger.error("Failed to add credits from invoice webhook: #{e.message}")
   end
@@ -95,8 +98,9 @@ class StripeWebhooksController < ApplicationController
     end
     return unless valid_uuid?(account_id)
 
-    StripeBilling.add_credits_for_payment(account_id, credits, pi.id, "Credit purchase (Stripe)")
-    queue_receipt(account_id, credits, pi.amount)
+    if StripeBilling.add_credits_for_payment(account_id, credits, pi.id, "Credit purchase (Stripe)")
+      queue_receipt(account_id, credits, pi.amount)
+    end
   rescue ActiveRecord::ActiveRecordError => e
     Rails.logger.error("Failed to add credits from webhook: #{e.message}")
   end

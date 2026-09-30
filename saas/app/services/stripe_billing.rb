@@ -81,6 +81,7 @@ module StripeBilling
     description = "Scrapix: #{credits} credits"
     invoice = client.v1.invoices.create(
       customer: customer_id,
+      currency: "usd",
       collection_method: "charge_automatically",
       auto_advance: false,
       default_payment_method: payment_method_id,
@@ -149,13 +150,14 @@ module StripeBilling
                         .exists?
     if exists
       Rails.logger.info("Payment #{payment_intent_id} already processed, skipping")
-      return
+      return false
     end
 
     Account.find(account_id).credit!(
       credits, type: "manual_topup", description: description,
       metadata: { stripe_payment_intent_id: payment_intent_id }
     )
+    true
   end
 
   # First member's email for the account (payment receipts) — mirrors

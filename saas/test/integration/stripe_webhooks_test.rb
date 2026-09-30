@@ -54,7 +54,7 @@ class StripeWebhooksTest < ActionDispatch::IntegrationTest
 
   test "invoice.paid without payment_intent retrieves the invoice and credits under the payment intent" do
     fake = FakeStripe.new(FakeStripe::Obj.new("pi_1"))
-    deliver(invoice_paid, fake)
+    assert_enqueued_emails(1) { deliver(invoice_paid, fake) }
     assert_response :ok
     assert_equal [ [ "in_1", { expand: [ "payment_intent" ] } ] ], fake.retrieved
     assert_equal 5100, @acme.reload.credits_balance
@@ -66,7 +66,8 @@ class StripeWebhooksTest < ActionDispatch::IntegrationTest
     StripeBilling.add_credits_for_payment(@acme.id, 5000, "pi_1", "Auto top-up (Stripe)")
     assert_equal 5100, @acme.reload.credits_balance
 
-    deliver(invoice_paid, FakeStripe.new("pi_1")) # an unexpanded id works too
+    # An unexpanded id works too; the auto top-up sent its own receipt.
+    assert_no_enqueued_emails { deliver(invoice_paid, FakeStripe.new("pi_1")) }
     assert_response :ok
     assert_equal 5100, @acme.reload.credits_balance
     assert_equal 1, pi_credits("pi_1").count
@@ -86,10 +87,12 @@ class StripeWebhooksTest < ActionDispatch::IntegrationTest
                         metadata: { scrapix_account_id: @acme.id, credits: "5000" } } }
     }.to_json
     fake = FakeStripe.new(FakeStripe::Obj.new("pi_1"))
-    deliver(pi_event, fake)
-    assert_response :ok
-    deliver(invoice_paid, fake)
-    assert_response :ok
+    assert_enqueued_emails(1) do
+      deliver(pi_event, fake)
+      assert_response :ok
+      deliver(invoice_paid, fake)
+      assert_response :ok
+    end
     assert_equal 5100, @acme.reload.credits_balance
     assert_equal 1, pi_credits("pi_1").count
   end

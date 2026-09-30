@@ -76,6 +76,7 @@ class StripeBillingTest < ActiveSupport::TestCase
     invoice_params = fake.calls[0][1]
     assert_equal "exclude", invoice_params[:pending_invoice_items_behavior]
     assert_equal "cus_1", invoice_params[:customer]
+    assert_equal "usd", invoice_params[:currency], "a new customer has no currency yet; never rely on the account default"
     assert_equal "pm_1", invoice_params[:default_payment_method]
     assert_equal({ scrapix_account_id: accounts(:acme).id, credits: "5000", type: "auto_topup" }, invoice_params[:metadata])
     item_params = fake.calls[1][1]
