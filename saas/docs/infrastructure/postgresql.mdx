@@ -123,5 +123,7 @@ Production storage: 20Gi PVC.
 | [AWS RDS](https://aws.amazon.com/rds/postgresql/) | Managed Postgres on AWS. |
 | [Fly Postgres](https://fly.io/docs/postgres/) | Fly.io managed clusters. |
 
-Set `DATABASE_URL` to your managed PostgreSQL connection string, and make
-sure `SCRAPIX_MODE=hosted` is set on every engine instance pointed at it.
+Set `DATABASE_URL` on the Rails app to your managed PostgreSQL connection
+string. The crawl engine does **not** share it: give it a separate database
+(`scrapix_engine`) and set `SCRAPIX_MODE=hosted` and `LAB_URL` on every engine
+instance.

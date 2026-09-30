@@ -8,7 +8,7 @@ description: ClickHouse-powered analytics API with Tinybird-compatible response 
 The analytics API provides long-term crawl metrics persisted to ClickHouse. Unlike the diagnostics endpoints in the product docs' API reference (`/stats`, `/errors`, `/domains` — in-memory, since last restart), analytics data survives restarts and spans the full history.
 
 <Note>
-  Requires `CLICKHOUSE_URL` to be set. These endpoints return 404 when ClickHouse is not configured.
+  The pipes are served by the **crawl engine** (`bins/scrapix-api`), not by the Rails app, at the same URLs through the console proxy or the reverse proxy in front of the stack (same paths, same response format). They require the engine's `CLICKHOUSE_URL` and return 404 when ClickHouse is not configured.
 </Note>
 
 ## Authentication
@@ -22,7 +22,7 @@ curl "https://api.scrapix.meilisearch.com/analytics/v0/pipes/kpis.json?hours=24"
 
 ## How It Works
 
-1. The API server batches crawl events (100 events or every 5 seconds)
+1. The engine batches crawl events (100 events or every 5 seconds)
 2. Events are written to ClickHouse's `crawl_events` table
 3. Pre-defined "pipes" run SQL queries against this data
 4. Responses follow a [Tinybird](https://www.tinybird.co/)-compatible format

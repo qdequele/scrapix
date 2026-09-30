@@ -1,4 +1,4 @@
-api:      set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- api'
+api:      set -a && source .env && set +a && DATABASE_URL=$ENGINE_DATABASE_URL cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- api'
 frontier: set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- frontier'
 crawler:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- crawler'
 content:  set -a && source .env && set +a && cargo watch -w crates -w bins -x 'run -p scrapix --bin scrapix -- content'

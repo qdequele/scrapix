@@ -106,6 +106,8 @@ services:
       POSTGRES_PASSWORD: scrapix
     volumes:
       - pg_data:/var/lib/postgresql/data
+      # Creates the engine's own database (`scrapix_engine`) on first start.
+      - ./deploy/docker/postgres-init/10-scrapix-engine.sql:/docker-entrypoint-initdb.d/10-scrapix-engine.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U scrapix -d scrapix"]
       interval: 5s
@@ -202,11 +204,11 @@ services:
       CLICKHOUSE_DATABASE: scrapix
       CLICKHOUSE_USER: scrapix
       CLICKHOUSE_PASSWORD: scrapix
-      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
-      JWT_SECRET: dev-jwt-secret-change-in-production
-      # Engine -> Lab boundary (hosted mode requires all three; same values
-      # as the saas service below).
-      LAB_EVENTS_URL: http://saas:8081/internal/events
+      # The engine's own database; it never touches the Lab's `scrapix`.
+      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix_engine
+      # Engine -> Lab boundary (hosted mode requires all of these; the secrets
+      # are the same values as the saas service below).
+      LAB_URL: http://saas:8081
       LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
       LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
     volumes:

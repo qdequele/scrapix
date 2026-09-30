@@ -45,13 +45,12 @@ refuses to start if it finds one, to avoid two independently-migrated
 schemas colliding in the same database:
 
 ```
-DATABASE_URL points at a Rails (hosted) database; set SCRAPIX_MODE=hosted,
-or give standalone a dedicated database
+DATABASE_URL points at a Rails (Lab) database; the engine needs its own database
 ```
 
-If you're running the hosted platform instead of self-hosting, set
-`SCRAPIX_MODE=hosted` and point `DATABASE_URL` at the Rails-owned Postgres —
-see PostgreSQL in the Platform docs for that schema, and
+The same applies to the hosted platform: there the engine also uses its own
+database (`scrapix_engine`, next to the Rails app's `scrapix`), never the Rails
+one. The Rails app is reached over `LAB_URL` instead — see
 [Self-Hosting](/deployment/self-hosting) if you're not sure which mode you
 want.
 

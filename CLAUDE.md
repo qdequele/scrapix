@@ -104,10 +104,14 @@ just stop         # Stop everything (services + infra)
 - `just dev` is the hosted (Rails) stack: `.env` must set `SCRAPIX_MODE=hosted`
   (`.env.example` does). An older `.env` without it starts the API in
   standalone mode, which refuses to run without `SCRAPIX_ADMIN_KEY`.
-- The hosted engine also needs `LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and
+- The hosted engine also needs `LAB_URL`, `LAB_EVENTS_SECRET` and
   `LAB_SERVICE_TOKEN` (`.env.example` has dev values; Rails reads the same
-  secret and token). An older `.env` without them makes `just dev` fail at
-  engine startup.
+  secret and token) and its **own database**: `.env`'s `DATABASE_URL` is the
+  Rails one, so `Procfile.dev` and `just api` run the engine with
+  `DATABASE_URL=$ENGINE_DATABASE_URL` (`scrapix_engine` on the same Postgres,
+  created on first `just infra`; a dev volume from before the Lab split needs
+  `createdb -h localhost -p 5433 -U scrapix scrapix_engine` once). An older
+  `.env` without these makes `just dev` fail at engine startup.
 - **Rails tests:** `cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test`
   (needs Postgres on :5433, i.e. `just infra`). `just saas-test` runs the same
   thing but the justfile loads the repo `.env`, so it unsets `RESEND_API_KEY`
@@ -183,7 +187,7 @@ scrapix health
 
 When ClickHouse is configured (`CLICKHOUSE_URL` environment variable):
 1. The **Rust engine persists crawl events to ClickHouse** - PageCrawled and PageFailed events are batched (100 events) and flushed every 5 seconds
-2. The **Rails SaaS app serves the analytics API** at `/analytics/v0/pipes/` (port 8081, or via the console proxy)
+2. The **Rust engine serves the analytics API** at `/analytics/v0/pipes/` (port 8080), **scoped per account**: API-key, OAuth and session callers see only their own account (every query filters on `account_id`, and an `account_id` parameter naming another account is a 404). In standalone the admin key sees every account and `account_id` is an optional filter; the four account-level pipes (`account_usage`, `account_daily_usage`, `account_daily_usage_by_operation`, `api_key_usage`) then need `account_id`. The code is `bins/scrapix-api/src/analytics_pipes.rs`; the Rails copy (`saas/app/controllers/analytics_controller.rb`) stays until the cleanup release, and `contracts/analytics_parity.py` diffs the two.
 
 This provides long-term analytics storage beyond the in-memory diagnostics.
 
@@ -255,21 +259,37 @@ curl "http://localhost:8080/analytics/v0/pipes/kpis.json?hours=24"
 
 ## Architecture
 
-### Two Backends (SCR-85 split)
+### Two Backends (SCR-85 split, Lab split phase 1)
 
-The backend is deliberately split into two services sharing one Postgres:
+The backend is deliberately split into two services that **share no
+database**: the engine never touches the Lab's Postgres (enforced by
+`bins/scrapix-api/tests/lab_boundary.rs`, which fails the build on any SQL that
+names a Lab-owned table, reads included), and talks to the Rails app (the
+"Lab") only over HTTP:
 
 - **Rails SaaS control plane (`saas/`, port 8081)** — auth + sessions, social
   login, account/team/invites, API keys, billing + Stripe, saved crawl
-  configs + engines CRUD, analytics pipes, the OAuth 2.1 provider, and the
-  MCP server at `/mcp`. Contract-tested by `contracts/`.
+  configs + engines CRUD, the OAuth 2.1 provider, and the MCP server at
+  `/mcp`. It also serves the engine's `/internal/*` API (contract:
+  `contracts/lab-internal.openapi.json`). `meilisearch_engines.api_key` is
+  encrypted at rest (Active Record encryption, `ACTIVE_RECORD_ENCRYPTION_*`).
+  Contract-tested by `contracts/`.
 - **Rust crawl engine (`bins/scrapix-api`, port 8080)** — /scrape, /map,
-  /search, /crawl*, jobs, WebSockets, diagnostics. It validates credentials
-  (API keys, Bearer tokens, session JWTs) but issues none, and it never
-  writes Rails-owned tables (accounts, transactions, crawl_configs,
-  scheduled_emails, OAuth tables, API keys — enforced by
-  `bins/scrapix-api/tests/lab_boundary.rs`). Instead it **reports lab
-  events**: usage (`usage.recorded`) and job lifecycle (`job.completed` /
+  /search, /crawl*, jobs, WebSockets, diagnostics, and the analytics pipes
+  (`/analytics/v0/pipes/*`, scoped per account). It keeps its own store
+  (`DATABASE_URL`: jobs, job results, the lab-events outbox; SQLite by default
+  or its own Postgres, migrated by the engine itself in **both** modes) and
+  resolves everything it needs from the Lab through `LabClient`
+  (`{LAB_URL}/internal/*`, Bearer `LAB_SERVICE_TOKEN`): credentials are sent to
+  `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
+  30 s, stale up to 5 min if the Lab is down; an unknown credential while the
+  Lab is down is a 503 with `Retry-After: 5`), the Meilisearch target comes
+  from `GET /internal/accounts/{id}/meilisearch`, and credits from
+  `GET /internal/accounts/{id}`. It issues no credentials and reads no Lab
+  table. At startup it pings `{LAB_URL}/internal/ping` and refuses to start on
+  a wrong token or a 4xx (wrong `LAB_URL`); the metric
+  `scrapix_lab_requests_total{endpoint,outcome}` counts these calls. It also
+  **reports lab events**: usage (`usage.recorded`) and job lifecycle (`job.completed` /
   `job.failed`) go to an engine-owned `lab_events` outbox and are delivered,
   HMAC-signed, to Rails' `POST /internal/events` (contract:
   `contracts/lab-events.schema.json`, docs `docs/api-reference/lab-events.mdx`).
@@ -277,10 +297,10 @@ The backend is deliberately split into two services sharing one Postgres:
   auto top-up (Stripe, saved card only), low-balance and job emails, the
   saved-config cron (`RunDueCrawlConfigsJob`, gated by `LAB_CRON_ENABLED`,
   which calls the engine with `LAB_SERVICE_TOKEN`), and OAuth token cleanup.
-  The hosted engine refuses to start without `LAB_EVENTS_URL`,
-  `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`, or before the Rails migration
-  that creates `lab_events` has run; the engine never reads
-  `STRIPE_SECRET_KEY`.
+  The hosted engine refuses to start without `LAB_URL`,
+  `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`, and uses its own
+  `DATABASE_URL` (SQLite if unset; use its own Postgres in production); the
+  engine never reads `STRIPE_SECRET_KEY` or `JWT_SECRET`.
 
 The console proxy (`console/src/app/api/scrapix/[...path]/route.ts`) routes
 by path prefix via `SAAS_API_URL` + `SAAS_PREFIXES`; the frozen full-platform
@@ -289,15 +309,15 @@ spec is `contracts/openapi.json`, the engine-only spec is
 
 #### Standalone vs hosted
 
-The "sharing one Postgres" description above is the **hosted** picture.
-`bins/scrapix-api` also runs **standalone** (`SCRAPIX_MODE=standalone`, the
-default) with no Rails control plane at all: one operator key
-(`SCRAPIX_ADMIN_KEY`) instead of accounts/sessions/API keys, and its own
-small job-history store (SQLite by default, or a dedicated Postgres it
-migrates itself — never the Rails-owned database; it refuses to start
-against one). `SCRAPIX_MODE=hosted` requires the Rails Postgres
-(`DATABASE_URL`) and `JWT_SECRET`, and fails closed if either is missing or
-the DB is unreachable. Docs for self-hosters live in `docs/` (this is the
+The engine has the same store in both modes: a job-history store it migrates
+itself (SQLite by default, or a dedicated Postgres), and it refuses to start
+against a database that holds the Rails schema. `bins/scrapix-api` runs
+**standalone** (`SCRAPIX_MODE=standalone`, the default) with no Rails control
+plane at all: one operator key (`SCRAPIX_ADMIN_KEY`) instead of
+accounts/sessions/API keys. `SCRAPIX_MODE=hosted` adds the Lab: it requires
+`LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` (plus the engine's own
+`DATABASE_URL` in production), fails closed if one of the three is missing, and ignores `JWT_SECRET`
+(the Lab verifies sessions). Docs for self-hosters live in `docs/` (this is the
 product repo's docs site); platform-only docs (accounts, billing, API key
 CRUD, OAuth) live in `saas/docs/` and will eventually merge into the
 Meilisearch Lab docs. See `docs/deployment/self-hosting.mdx`.
@@ -381,15 +401,11 @@ never deletes a document whose page returned `304` in this job.
   but could not fully honor (see "Per-job config fields" below) plus
   worker-raised warnings during the run.
 
-### Degraded mode (accounting column missing)
+### Job accounting schema
 
-If the Rails `accounting` migration
-(`20260926000001_add_accounting_to_jobs`) hasn't run against Postgres, the API
-logs an error, turns off durable accounting for that process, and keeps job
-accounting in memory only (events are acked immediately instead of held for a
-durable flush). In this mode, jobs still running across an API restart end up
-`FailStalled` once the stall timeout elapses, since no state survives the
-restart to resume them from.
+The engine migrates its own schema in both modes (`bins/scrapix-api/migrations`),
+so the `jobs.accounting` column is always present and there is no degraded,
+in-memory-only accounting mode.
 
 ### Durability, controls and rollout caveats
 
@@ -455,7 +471,9 @@ rename without updating the scrape config there. Current metrics:
 `scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
 `scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
 `scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
-`scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`).
+`scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`),
+`scrapix_lab_requests_total{endpoint,outcome}` (the engine's calls to the Lab's
+`/internal/*` API).
 
 ### Webhooks (SCR-72)
 
@@ -599,8 +617,9 @@ GROUP BY date ORDER BY date;
 | `SCRAPIX_MODE` | API: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start |
 | `SCRAPIX_ADMIN_KEY` | API, standalone only: the operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; `?token=` on WebSocket routes). Required unless `SCRAPIX_AUTH=disabled`; must be ≥16 chars after trimming |
 | `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode and together with `SCRAPIX_ADMIN_KEY`) |
-| `DATABASE_URL` | API: per-mode meaning. **Standalone** — the engine's own job-history store; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema). **Hosted** — required, must be `postgres://`, the Rails-owned Postgres; the engine never migrates it |
-| `JWT_SECRET` | API, hosted only, required (no default): the same secret the Rails app signs session JWTs with; startup fails without it. Ignored (with a log line) if set in standalone |
+| `DATABASE_URL` | API: the engine's **own** job-history store in both modes; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema, so it can never be the Lab's). Hosted production should point it at a dedicated Postgres database (e.g. `scrapix_engine`). (Rails has its own `DATABASE_URL`, the Lab database.) |
+| `JWT_SECRET` | Rails only: signs session JWTs. The engine ignores it (logs a line if set) — the Lab verifies sessions |
+| `ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY` / `ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY` / `ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT` | Rails only, required: encrypt `meilisearch_engines.api_key` at rest. Generate with `cd saas && bin/rails db:encryption:init`; `.env.example` has dev placeholders |
 | `KAFKA_BROKERS` | Kafka/Redpanda broker addresses |
 | `MEILISEARCH_URL` | Meilisearch server URL |
 | `MEILISEARCH_API_KEY` | Meilisearch API key |
@@ -616,10 +635,11 @@ GROUP BY date ORDER BY date;
 | `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
 | `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
-| `LAB_EVENTS_URL` | API, hosted only, required: the Rails `POST /internal/events` URL (`http://`/`https://`) the engine delivers lab events to. Ignored in standalone |
+| `LAB_URL` | API, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone |
+| `LAB_EVENTS_URL` | **Deprecated** fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Do not set it |
 | `LAB_EVENTS_SECRET` | API + Rails, hosted only, required (≥32 chars, same value on both): HMAC-SHA256 key signing lab-event deliveries (`X-Scrapix-Signature`). Generate with `openssl rand -hex 32` |
-| `LAB_SERVICE_TOKEN` | API + Rails, hosted only, required (≥32 chars, same value on both): Bearer token Rails presents (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron only) |
-| `LAB_CRON_ENABLED` | Rails: `true` runs the saved-config cron (default off, so a new Rails deploy can't double-fire crawls while the old engine still runs its own scheduler) |
+| `LAB_SERVICE_TOKEN` | API + Rails, hosted only, required (≥32 chars, same value on both): Bearer token in both directions: Rails presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron), and the engine presents it on `{LAB_URL}/internal/*` |
+| `LAB_CRON_ENABLED` | Rails: `true` runs the saved-config cron (default off, so a Rails deploy can't double-fire crawls; the engine runs no scheduler of its own) |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |

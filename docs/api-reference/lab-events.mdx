@@ -5,10 +5,11 @@ description: The signed events the hosted engine reports to the Lab for usage bi
 
 # Lab Events
 
-In **hosted** mode the engine never writes to the Lab's tables (accounts,
+In **hosted** mode the engine never touches the Lab's database (accounts,
 credit ledger, saved configs, emails, OAuth). Instead it reports what
 happened as **lab events** to the Lab (the Rails control plane), which owns
-billing and email. This page is the wire contract between the two; the
+billing and email, and it asks the Lab's [internal API](#lab-internal-api)
+for everything else it needs. This page is the wire contract between the two; the
 machine-readable schema is
 [`contracts/lab-events.schema.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-events.schema.json)
 (JSON Schema 2020-12), and both the engine and the Rails receiver are tested
@@ -16,7 +17,7 @@ against it.
 
 <Note>
 Hosted mode only. A **standalone** engine emits no lab events and ignores
-`LAB_EVENTS_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`.
+`LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`.
 </Note>
 
 ## Event envelope
@@ -98,12 +99,12 @@ failed, so it can only ever send one email.
 
 ## Delivery
 
-Events are written to the engine-owned `lab_events` outbox table in the same
-Postgres (an insert per event, so nothing is lost if the Lab is down) and
-delivered by a background task once per second.
+Events are written to the engine-owned `lab_events` outbox table in the
+engine's own database (an insert per event, so nothing is lost if the Lab is
+down) and delivered by a background task once per second.
 
 ```http
-POST {LAB_EVENTS_URL}
+POST {LAB_URL}/internal/events
 Content-Type: application/json
 X-Scrapix-Signature: sha256=<hex hmac-sha256(raw body, LAB_EVENTS_SECRET)>
 
@@ -152,6 +153,24 @@ printf 'sha256=%s\n' "$(openssl dgst -sha256 -hmac "$LAB_EVENTS_SECRET" -hex < b
 
 </CodeGroup>
 
+## Lab internal API
+
+The other direction of the boundary: the engine calls the Lab at
+`{LAB_URL}/internal/*` with `Authorization: Bearer <LAB_SERVICE_TOKEN>` (the
+same token that authenticates Lab → engine calls). The events endpoint above is
+the one exception: it is authenticated by the HMAC signature instead. A missing
+or wrong token gets `401`. The machine-readable contract is
+[`contracts/lab-internal.openapi.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-internal.openapi.json).
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /internal/ping` | Liveness and token check. The engine calls it at startup and refuses to start on a wrong token or a `4xx` (a wrong `LAB_URL`). |
+| `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role and effective credit balance, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
+| `GET /internal/accounts/{id}` | Tier and spendable balance of an account (credit pre-check). |
+| `GET /internal/accounts/{account_id}/meilisearch` | The account's Meilisearch target with the decrypted key. The engine caches it for 60 s. |
+
+Calls are counted by `scrapix_lab_requests_total{endpoint,outcome}`.
+
 ## Service calls (Lab → engine)
 
 The Lab's saved-config cron calls the engine on behalf of the config's
@@ -168,16 +187,18 @@ The engine exposes the outbox state at `GET /metrics`:
 |--------|-------------|
 | `scrapix_lab_events_pending` | Undelivered events in the outbox. Should hover near zero; a growing value means the Lab is unreachable or rejecting events. |
 | `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them) or `failed` (unreachable or unreadable response). |
+| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint and outcome. |
 
 ## Configuration
 
 | Variable | Where | Description |
 |----------|-------|-------------|
-| `LAB_EVENTS_URL` | engine | The Lab's `POST /internal/events` URL (`http://` or `https://`). |
+| `LAB_URL` | engine | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
+| `LAB_EVENTS_URL` | engine | Deprecated fallback for `LAB_URL` (the old `…/internal/events` URL). |
 | `LAB_EVENTS_SECRET` | engine, Rails | Signing secret, at least 32 characters. Same value on both sides. |
-| `LAB_SERVICE_TOKEN` | engine, Rails | Bearer token for Lab → engine calls, at least 32 characters. Same value on both sides. |
+| `LAB_SERVICE_TOKEN` | engine, Rails | Bearer token for Lab → engine calls and for the engine's `/internal/*` calls, at least 32 characters. Same value on both sides. |
 | `LAB_CRON_ENABLED` | Rails | `true` runs the saved-config cron. Off by default. |
 
-The hosted engine refuses to start without the first three. See
+The hosted engine refuses to start without `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`. See
 [Environment Variables](/configuration/environment-variables) and the
 [rollout checklist](/operations/crawl-engine-rollout).

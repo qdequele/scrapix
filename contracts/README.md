@@ -55,7 +55,7 @@ pipeline (Kafka + frontier) up to accept a crawl.
 
 `tests/usage.contract.test.ts` exercises the engine → lab events → Rails
 ledger path end to end, so it needs the hosted engine and Rails running with
-matching `LAB_EVENTS_URL` / `LAB_EVENTS_SECRET` / `LAB_SERVICE_TOKEN` (see
+matching `LAB_URL` / `LAB_EVENTS_SECRET` / `LAB_SERVICE_TOKEN` (see
 `.env.example`), plus outbound access to example.com.
 
 Each test file signs up fresh throwaway users (`contract-*@example.com`), so

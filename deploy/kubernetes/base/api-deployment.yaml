@@ -55,7 +55,7 @@ spec:
                   name: scrapix-secrets
                   key: POSTGRES_PASSWORD
             - name: DATABASE_URL
-              value: "postgres://scrapix:$(POSTGRES_PASSWORD)@postgres:5432/scrapix"
+              value: "postgres://scrapix:$(POSTGRES_PASSWORD)@postgres:5432/scrapix_engine"
           resources:
             requests:
               cpu: "100m"

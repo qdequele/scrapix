@@ -118,8 +118,8 @@ No manual configuration required.
 
 The HTTP MCP endpoint only runs in hosted mode (`SCRAPIX_MODE=hosted`),
 which already requires:
-- `DATABASE_URL` — the Rails Postgres, used here for OAuth token storage
-- `JWT_SECRET` — for session token signing
+- `DATABASE_URL` — on the Rails app (the Lab): its Postgres, used here for OAuth token storage
+- `JWT_SECRET` — on the Rails app: session token signing (the engine ignores it)
 
 ## Available Tools
 

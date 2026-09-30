@@ -20,9 +20,9 @@ data:
   CLICKHOUSE_DATABASE: "scrapix"
   CLICKHOUSE_USER: "scrapix"
 
-  # Lab (Rails control plane) endpoint the API reports usage events to
-  # (hosted mode; required). Point it at the Rails app's /internal/events.
-  LAB_EVENTS_URL: "http://saas:8081/internal/events"
+  # Lab (Rails control plane) base URL (hosted mode; required). The API
+  # reports events to {LAB_URL}/internal/events and calls {LAB_URL}/internal/*.
+  LAB_URL: "http://saas:8081"
 
   # Logging
   RUST_LOG: "info,scrapix=debug"

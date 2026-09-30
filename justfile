@@ -63,9 +63,9 @@ stop-services:
 # Individual services (for when you only need one)
 # ---------------------------------------------------------------------------
 
-# Run API server with cargo-watch
+# Run API server with cargo-watch (on its own database: .env's DATABASE_URL is the Rails one)
 api:
-    cargo watch -w crates -w bins -x 'run --bin scrapix -- api'
+    DATABASE_URL="$ENGINE_DATABASE_URL" cargo watch -w crates -w bins -x 'run --bin scrapix -- api'
 
 # Run frontier service with cargo-watch
 frontier:
@@ -83,7 +83,7 @@ content:
 console:
     cd console && npm run dev
 
-# Run Rails SaaS control plane (migrates the shared DB first — Rails owns the schema)
+# Run Rails SaaS control plane (migrates the Lab database first; the engine migrates its own)
 saas:
     cd saas && bin/rails db:prepare && SOLID_QUEUE_IN_PUMA=1 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES bin/rails server
 

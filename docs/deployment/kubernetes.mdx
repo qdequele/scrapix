@@ -161,12 +161,11 @@ kubectl -n scrapix create secret generic scrapix-secrets \
   --from-literal=MEILISEARCH_API_KEY=your-key \
   --from-literal=POSTGRES_PASSWORD=your-password \
   --from-literal=CLICKHOUSE_PASSWORD=your-password \
-  --from-literal=JWT_SECRET=your-jwt-secret \
   --from-literal=LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
   --from-literal=LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
 ```
 
-The hosted API also needs `LAB_EVENTS_URL` (set in the `scrapix-config` ConfigMap) and refuses to start without all three `LAB_*` values; the Rails app must use the same secret and token. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
+The hosted API also needs `LAB_URL` (the Lab's base URL, set in the `scrapix-config` ConfigMap) and refuses to start without `LAB_URL` and both `LAB_*` secrets; the Rails app must use the same secret and token. It uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
 
 ## Monitoring
 

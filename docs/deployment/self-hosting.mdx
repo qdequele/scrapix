@@ -95,7 +95,7 @@ curl -s localhost:8080/search \
 | `SCRAPIX_MODE` | `standalone` | Set explicitly (`standalone` or `hosted`). Standalone is the self-hosting mode this guide covers. |
 | `SCRAPIX_ADMIN_KEY` | — | The operator key. Required in standalone unless `SCRAPIX_AUTH=disabled`. Must be at least 16 characters (leading/trailing whitespace is trimmed). |
 | `SCRAPIX_AUTH` | — | Set to `disabled` to turn off authentication entirely — **local development only**; the engine logs a loud warning at startup, refuses it in hosted mode, and refuses it together with `SCRAPIX_ADMIN_KEY` (conflicting config: unset one of the two). |
-| `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's own job-history store. SQLite by default (the Docker images default to the absolute path `sqlite:///data/scrapix.db` under the `/data` volume); or a `postgres://`/`postgresql://` URL for a **dedicated** Postgres database. The engine applies its own migrations and refuses to start against a database that already has the Rails platform's schema. See [PostgreSQL](/infrastructure/postgresql). |
+| `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's own job-history store. SQLite by default (the Docker images default to the absolute path `sqlite:///data/scrapix.db` under the `/data` volume); or a `postgres://`/`postgresql://` URL for a **dedicated** Postgres database. The engine applies its own migrations and refuses to start against a database that already has the Rails platform's schema. See [PostgreSQL](/infrastructure/postgresql). (The hosted platform uses the same store, on its own `scrapix_engine` database next to the Rails one.) |
 | `MEILISEARCH_URL` / `MEILISEARCH_API_KEY` | — | The default Meilisearch instance used for crawls that don't specify their own `meilisearch` block, and for `/search`. A crawl's own `meilisearch` block always wins over this default. |
 | `REDIS_URL` | — | Optional. When set (e.g. via `--profile durable`), the frontier's URL queue and dedup/politeness state survive an engine restart (in-flight work still doesn't — see **Durability** below). An empty value counts as unset. |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow the engine to fetch or deliver webhooks to private/loopback/link-local addresses. Tests and self-hosted private-network crawls only — never enable this in production. |
@@ -206,7 +206,7 @@ engine can run as separate services behind Redpanda (Kafka) — `scrapix api`,
 
 The repository's `docker-compose.yml` and the [Kubernetes](/deployment/kubernetes)
 manifests are **not** a ready-made standalone split: they are the hosted
-platform's stack (`SCRAPIX_MODE=hosted`, with the Rails app's Postgres for
-auth). Use them as a reference for the service layout, Redpanda topics and
+platform's stack (`SCRAPIX_MODE=hosted`: the engine on its own database plus
+`LAB_URL` pointing at the Rails app, which owns auth). Use them as a reference for the service layout, Redpanda topics and
 environment, but set the API to `SCRAPIX_MODE=standalone` as above and drop
 the Rails/Postgres auth pieces.
