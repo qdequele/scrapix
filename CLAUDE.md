@@ -297,9 +297,9 @@ that names a Lab-owned table, reads included).
 
 The engine owns `contracts/openapi.json` (the frozen full-platform spec the
 Lab implements), `contracts/openapi.engine.json` (the engine-only spec) and
-`contracts/lab-events.schema.json`; the Lab vendors byte copies of all three
-and drift-checks them, so change them only intentionally (see
-`contracts/README.md`).
+`contracts/lab-events.schema.json`; the Lab vendors byte copies of
+`openapi.json` and `lab-events.schema.json` and drift-checks them, so change
+them only intentionally (see `contracts/README.md`).
 
 #### Standalone vs hosted
 

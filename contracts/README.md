@@ -3,13 +3,14 @@
 The contracts the Scrapix engine owns, plus the one it vendors from the
 Meilisearch Lab. The Lab (Rails control plane + console) lives in
 [`meilisearch/lab`](https://github.com/meilisearch/lab), which vendors byte
-copies of the engine-owned files below and drift-checks them; the Lab's
-contract test suite lives there too.
+copies of `openapi.json` and `lab-events.schema.json` and drift-checks them
+(`openapi.engine.json` is not vendored); the Lab's contract test suite lives
+there too.
 
 ## Engine-owned files
 
-Change these only on an intentional, reviewed contract change — the Lab's
-drift check fails until it re-vendors them.
+Change these only on an intentional, reviewed contract change — for the two
+vendored files, the Lab's drift check fails until it re-vendors them.
 
 - `openapi.json` — the **frozen full-platform public spec** (engine + Lab
   routes). It is the contract the Lab implements and the source its MCP

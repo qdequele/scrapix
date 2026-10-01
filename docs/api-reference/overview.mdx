@@ -113,12 +113,13 @@ account key or session in hosted).
 |--------|------|-------------|
 | `POST` | `/mcp` | [MCP Streamable HTTP](/guides/mcp#http-mcp-endpoint) |
 
-### Analytics (Hosted Only)
+### Analytics
 
-The Tinybird-style `/analytics/v0/pipes/*` API is served by the Rails app
-against ClickHouse — see **Analytics** in the Platform docs. Self-hosted
-engines have `/stats`, `/errors` and `/domains` for in-memory diagnostics
-instead (see [Diagnostics](/api-reference/diagnostics)).
+The Tinybird-style `/analytics/v0/pipes/*` API is served by the engine itself
+against its ClickHouse, in both standalone and hosted mode (hosted callers
+only see their own account). Without ClickHouse configured the routes return
+`404`. Engines also have `/stats`, `/errors` and `/domains` for in-memory
+diagnostics (see [Diagnostics](/api-reference/diagnostics)).
 
 ## Rate Limiting
 

@@ -189,7 +189,9 @@ services:
       CLICKHOUSE_PASSWORD: scrapix
       # Hosted mode against a local Lab (meilisearch/lab, `docker compose watch`
       # there: Rails on :8081, Postgres on :5433 with a `scrapix_engine`
-      # database). Replace the three standalone lines above with:
+      # database). On plain Linux (not OrbStack / Docker Desktop) also add
+      # `extra_hosts: ["host.docker.internal:host-gateway"]` to this service.
+      # Replace the three standalone lines above with:
       # SCRAPIX_MODE: hosted
       # DATABASE_URL: postgres://scrapix:scrapix@host.docker.internal:5433/scrapix_engine
       # LAB_URL: http://host.docker.internal:8081
