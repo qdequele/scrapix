@@ -1,7 +1,9 @@
 # =============================================================================
 # Scrapix Docker Compose
 # =============================================================================
-# Full development stack with all services
+# Engine development stack: infrastructure + the Scrapix engine and workers
+# (standalone mode). The hosted platform (Rails control plane + console)
+# lives in meilisearch/lab.
 #
 # Usage:
 #   docker compose watch                    # Start with file watching (recommended)
@@ -94,26 +96,6 @@ services:
       timeout: 3s
       retries: 5
 
-  # PostgreSQL - Auth, accounts, API keys
-  postgres:
-    image: postgres:17-alpine
-    container_name: scrapix-postgres
-    ports:
-      - "5433:5432"
-    environment:
-      POSTGRES_DB: scrapix
-      POSTGRES_USER: scrapix
-      POSTGRES_PASSWORD: scrapix
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-      # Creates the engine's own database (`scrapix_engine`) on first start.
-      - ./deploy/docker/postgres-init/10-scrapix-engine.sql:/docker-entrypoint-initdb.d/10-scrapix-engine.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U scrapix -d scrapix"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # ClickHouse - Analytics database for crawl metrics
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -185,15 +167,16 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
       init-topics:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
       RUST_LOG: info,scrapix=debug
-      SCRAPIX_MODE: hosted
+      # Standalone: one operator key, the engine's own SQLite job store.
+      SCRAPIX_MODE: standalone
+      SCRAPIX_ADMIN_KEY: dev-admin-key-change-me
+      DATABASE_URL: sqlite:///data/scrapix.db
       HOST: 0.0.0.0
       PORT: 8080
       KAFKA_BROKERS: redpanda:9092
@@ -204,17 +187,19 @@ services:
       CLICKHOUSE_DATABASE: scrapix
       CLICKHOUSE_USER: scrapix
       CLICKHOUSE_PASSWORD: scrapix
-      # The engine's own database; it never touches the Lab's `scrapix`.
-      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix_engine
-      # Engine -> Lab boundary (hosted mode requires all of these; the secrets
-      # are the same values as the saas service below).
-      LAB_URL: http://saas:8081
-      LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
-      LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
+      # Hosted mode against a local Lab (meilisearch/lab, `docker compose watch`
+      # there: Rails on :8081, Postgres on :5433 with a `scrapix_engine`
+      # database). Replace the three standalone lines above with:
+      # SCRAPIX_MODE: hosted
+      # DATABASE_URL: postgres://scrapix:scrapix@host.docker.internal:5433/scrapix_engine
+      # LAB_URL: http://host.docker.internal:8081
+      # LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
+      # LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - target-api:/app/target
+      - scrapix-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
@@ -359,121 +344,11 @@ services:
         - action: rebuild
           path: ./Cargo.lock
 
-  # ---------------------------------------------------------------------------
-  # SaaS control plane (Rails) — SCR-85 backend split
-  # ---------------------------------------------------------------------------
-
-  saas:
-    build:
-      context: ./saas
-      dockerfile: Dockerfile.dev
-    container_name: scrapix-saas
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "8081:8081"
-    environment:
-      SAAS_PORT: 8081
-      DATABASE_URL: postgres://scrapix:scrapix@postgres:5432/scrapix
-      JWT_SECRET: dev-jwt-secret-change-in-production
-      SCRAPIX_ENGINE_URL: http://scrapix-api:8080
-      LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
-      LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
-      LAB_CRON_ENABLED: "true"
-      # dev only — generate real ones with `cd saas && bin/rails db:encryption:init` for production
-      ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY: dev-only-primary-key-000000000000
-      ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY: dev-only-deterministic-key-0000000
-      ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT: dev-only-key-derivation-salt-00000
-      REDIS_URL: redis://dragonfly:6379
-      CONSOLE_URL: http://localhost:3001
-      ENVIRONMENT: development
-      CLICKHOUSE_URL: http://clickhouse:8123
-      CLICKHOUSE_DATABASE: scrapix
-      CLICKHOUSE_USER: scrapix
-      CLICKHOUSE_PASSWORD: scrapix
-      # MCP tools are generated from the frozen OpenAPI snapshot, mounted below.
-      MCP_OPENAPI_SPEC_PATH: /contracts/openapi.json
-      MCP_SAAS_BASE_URL: http://127.0.0.1:8081
-    volumes:
-      - saas-bundle:/usr/local/bundle
-      - ./contracts/openapi.json:/contracts/openapi.json:ro
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    develop:
-      watch:
-        - action: sync
-          path: ./saas/app
-          target: /app/app
-        - action: sync
-          path: ./saas/lib
-          target: /app/lib
-        - action: sync+restart
-          path: ./saas/config
-          target: /app/config
-        - action: rebuild
-          path: ./saas/Gemfile
-        - action: rebuild
-          path: ./saas/Gemfile.lock
-
-  # ---------------------------------------------------------------------------
-  # Console (Next.js Frontend)
-  # ---------------------------------------------------------------------------
-
-  console:
-    build:
-      context: ./console
-      dockerfile: Dockerfile.dev
-    container_name: scrapix-console
-    depends_on:
-      scrapix-api:
-        condition: service_healthy
-    ports:
-      - "3001:3001"
-    environment:
-      WATCHPACK_POLLING: "true"
-      NEXT_PUBLIC_SCRAPIX_API_URL: http://localhost:8080
-      SCRAPIX_API_URL: http://scrapix-api:8080
-      SAAS_API_URL: http://saas:8081
-      SAAS_PREFIXES: configs,engines,auth,account,webhooks,oauth,.well-known,mcp
-    volumes:
-      - console-node-modules:/app/node_modules
-      - console-next:/app/.next
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3001"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    develop:
-      watch:
-        - action: sync
-          path: ./console/src
-          target: /app/src
-        - action: sync
-          path: ./console/public
-          target: /app/public
-        - action: rebuild
-          path: ./console/package.json
-        - action: rebuild
-          path: ./console/package-lock.json
-        - action: sync+restart
-          path: ./console/next.config.ts
-          target: /app/next.config.ts
-
 # -----------------------------------------------------------------------------
 # Volumes
 # -----------------------------------------------------------------------------
 volumes:
   # Infrastructure data
-  pg_data:
-    driver: local
   redpanda_data:
     driver: local
   dragonfly_data:
@@ -492,11 +367,8 @@ volumes:
   target-frontier:
   target-crawler:
   target-content:
-  # Console build caches
-  console-node-modules:
-  console-next:
-  # SaaS (Rails) gem cache
-  saas-bundle:
+  # Engine job-history store (standalone SQLite)
+  scrapix-data:
 
 # -----------------------------------------------------------------------------
 # Networks

@@ -2,6 +2,10 @@
 
 High-performance, distributed web crawler and search indexer built in Rust.
 
+This repo is the crawl engine. The hosted platform (accounts, billing, API
+keys, the console) is the Meilisearch Lab, in
+[`meilisearch/lab`](https://github.com/meilisearch/lab).
+
 ## Vision
 
 Scrapix aims to be an internet-scale web crawler capable of:
@@ -118,6 +122,9 @@ docker compose logs -f
 # Stop all services
 docker compose down
 ```
+
+The API runs standalone with the dev operator key `dev-admin-key-change-me`
+(send it as `Authorization: Bearer dev-admin-key-change-me`).
 
 Services will be available at:
 - API: http://localhost:8080

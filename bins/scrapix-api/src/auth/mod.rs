@@ -1,7 +1,7 @@
 //! Authentication middleware for the crawl engine.
 //!
 //! The SaaS control plane (signup/login/sessions, account/team, OAuth
-//! provider, social login) lives in the Lab (Rails app, `saas/`). The engine
+//! provider, social login) lives in the Lab (Rails app, meilisearch/lab). The engine
 //! only *validates* credentials issued there — API keys, OAuth Bearer tokens,
 //! session JWTs and the Lab's service token — and resolves every one of them
 //! through the Lab's internal API over HTTP (`LabClient`); it never reads the

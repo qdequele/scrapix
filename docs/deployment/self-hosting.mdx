@@ -23,9 +23,9 @@ Self-hosting gives you the full crawl **engine**:
 
 What you don't get is the **hosted platform** on top of it: no console UI,
 no multi-user accounts, no per-account billing/credits, no saved-config cron
-scheduling, no OAuth. Those live in the separate Meilisearch Lab platform —
-see the Platform docs if you want that instead of (or in addition to)
-self-hosting.
+scheduling, no OAuth. Those live in the separate Meilisearch Lab platform
+([`meilisearch/lab`](https://github.com/meilisearch/lab)) — see its docs if
+you want that instead of (or in addition to) self-hosting.
 
 ## 5-Minute Quickstart
 
@@ -204,9 +204,11 @@ engine can run as separate services behind Redpanda (Kafka) — `scrapix api`,
   than one frontier instance), and give each worker a stable
   `INSTANCE_ID`/`WORKER_ID`.
 
-The repository's `docker-compose.yml` and the [Kubernetes](/deployment/kubernetes)
-manifests are **not** a ready-made standalone split: they are the hosted
-platform's stack (`SCRAPIX_MODE=hosted`: the engine on its own database plus
-`LAB_URL` pointing at the Rails app, which owns auth). Use them as a reference for the service layout, Redpanda topics and
-environment, but set the API to `SCRAPIX_MODE=standalone` as above and drop
-the Rails/Postgres auth pieces.
+The repository's `docker-compose.yml` runs this split in standalone mode for
+development (dev operator key, SQLite job store, default passwords); use it
+as a reference for the service layout, Redpanda topics and environment, not
+as a hardened production setup. The [Kubernetes](/deployment/kubernetes)
+manifests are the hosted platform's stack (`SCRAPIX_MODE=hosted`: the engine
+on its own database plus `LAB_URL` pointing at the Lab, deployed from
+`meilisearch/lab`); to self-host with them, set the API to
+`SCRAPIX_MODE=standalone` as above and drop the `LAB_*` settings.

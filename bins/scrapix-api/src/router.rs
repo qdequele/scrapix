@@ -167,8 +167,8 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode, mode: Mode) ->
         .route("/job/{id}/resume", post(resume_job));
 
     // The SaaS surface (auth, account/team, configs/engines CRUD, billing,
-    // Stripe, OAuth provider, /mcp) is served by the Rails app (saas/,
-    // SCR-85); the engine keeps the crawl data plane and serves the analytics
+    // Stripe, OAuth provider, /mcp) is served by the Lab's Rails app
+    // (meilisearch/lab, SCR-85); the engine keeps the crawl data plane and serves the analytics
     // pipes over its own ClickHouse, scoped per account.
     let protected = guard(
         product

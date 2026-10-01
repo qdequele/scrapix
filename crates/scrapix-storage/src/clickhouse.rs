@@ -910,7 +910,8 @@ impl ClickHouseStorage {
     // Query Operations — request_events
     //
     // These back the analytics pipes (`bins/scrapix-api/src/analytics_pipes.rs`)
-    // and mirror the SQL of `saas/app/controllers/analytics_controller.rb`.
+    // and mirror the SQL of the Lab's Rails analytics controller
+    // (meilisearch/lab `saas/app/controllers/analytics_controller.rb`).
     // `account_id: Some(..)` scopes a query to one account; `None` (standalone
     // admin) reads every account.
     // ========================================================================

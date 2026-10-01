@@ -1,8 +1,10 @@
 # Fly.io Deployment Runbook
 
-Scrapix runs as six Fly apps. Redpanda is a durable singleton; every other app
+Scrapix runs as five Fly apps. Redpanda is a durable singleton; every other app
 scale-to-zeros when idle. CI (`.github/workflows/deploy-fly.yml`) builds images
 in GitHub Actions, pushes them to GHCR, and deploys via `flyctl deploy --image`.
+The console and the Rails control plane (the Lab) are deployed from
+`meilisearch/lab`, not from this repo.
 
 ## Apps
 
@@ -10,7 +12,6 @@ in GitHub Actions, pushes them to GHCR, and deploys via `flyctl deploy --image`.
 |---|---|---|---|
 | `scrapix-redpanda` | Kafka broker (port 9092, `*.internal` only) | singleton | no (data loss on suspend) |
 | `scrapix-api` | HTTP API | auto 1–N on HTTP requests | yes |
-| `scrapix-console` | Next.js | auto 1–N on HTTP requests | yes |
 | `scrapix-frontier` | Kafka consumer | singleton unless `REDIS_URL` is set (state is in-memory otherwise) | yes, via wake ping |
 | `scrapix-worker-crawler` | Kafka consumer | horizontal, `flyctl scale count N` | yes, via wake ping |
 | `scrapix-worker-content` | Kafka consumer | horizontal, `flyctl scale count N` | yes, via wake ping |
@@ -57,7 +58,7 @@ Create the seven Kafka topics with partition counts that match `docker-compose.y
 ### 2. Create remaining Fly apps
 
 ```bash
-for app in scrapix-api scrapix-console scrapix-frontier scrapix-worker-crawler scrapix-worker-content; do
+for app in scrapix-api scrapix-frontier scrapix-worker-crawler scrapix-worker-content; do
   flyctl apps create "$app" --org "$FLY_ORG"
 done
 ```
@@ -85,25 +86,18 @@ done
 flyctl secrets set \
   DATABASE_URL=... \
   OPENAI_API_KEY=... \
-  LAB_URL=https://<rails-host> \
+  LAB_URL=https://<lab-host> \
   LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
   LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
   --app scrapix-api
 
-# DATABASE_URL is the engine's OWN database (`scrapix_engine`), never the Rails
-# one; the engine does not read JWT_SECRET (the Lab verifies sessions).
+# DATABASE_URL is the engine's OWN database (`scrapix_engine`), never the
+# Lab's; the engine does not read JWT_SECRET (the Lab verifies sessions).
 # The hosted API refuses to start without LAB_URL, LAB_EVENTS_SECRET
-# and LAB_SERVICE_TOKEN (each secret >= 32 chars). The Rails app needs the
-# SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN (and, once the engine is
-# upgraded, LAB_CRON_ENABLED=true) — see docs/operations/crawl-engine-rollout.mdx.
-# Stripe is configured on the Rails app only; the engine never reads
-# STRIPE_SECRET_KEY.
-
-# Console-only:
-flyctl secrets set \
-  NEXT_PUBLIC_SCRAPIX_API_URL=https://api.scrapix.meilisearch.com \
-  NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=... \
-  --app scrapix-console
+# and LAB_SERVICE_TOKEN (each secret >= 32 chars). The Lab (deployed from
+# meilisearch/lab) needs the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN —
+# see docs/operations/crawl-engine-rollout.mdx. Stripe is configured on the
+# Lab only; the engine never reads STRIPE_SECRET_KEY.
 ```
 
 ### 4. First deploy
@@ -122,7 +116,6 @@ flyctl deploy --config deploy/fly/api/fly.toml \
 ```bash
 flyctl certs add api.scrapix.meilisearch.com --app scrapix-api
 flyctl certs add scrapix.meilisearch.dev --app scrapix-api
-flyctl certs add scrapix.meilisearch.com --app scrapix-console
 # flyctl prints the DNS records to add (AAAA + A + acme-challenge CNAME).
 ```
 

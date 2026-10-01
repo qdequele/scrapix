@@ -55,10 +55,15 @@ docker compose up -d
 
 ## Full Distributed Stack
 
-The repository's `docker-compose.yml` runs the full distributed system of the
-**hosted platform** (`SCRAPIX_MODE=hosted`, with the Rails app and its
-Postgres; the engine keeps its own `scrapix_engine` database on the same server) — it's the development stack for the platform, not a standalone
-self-hosting setup (see [Self-Hosting → Distributed Mode](/deployment/self-hosting#distributed-mode)):
+The repository's `docker-compose.yml` runs the engine as a full distributed
+system — the API, frontier, crawler and content workers over Redpanda — in
+**standalone** mode (`SCRAPIX_MODE=standalone`, the dev operator key
+`dev-admin-key-change-me`, job history in SQLite on the `scrapix-data`
+volume). It's the engine's development stack; for production self-hosting see
+[Self-Hosting → Distributed Mode](/deployment/self-hosting#distributed-mode).
+The hosted platform (Rails control plane + console) is not part of this repo:
+it lives in [`meilisearch/lab`](https://github.com/meilisearch/lab), whose
+compose file can also start the engine.
 
 ```bash
 # Clone the repo and start everything
@@ -75,12 +80,10 @@ This starts:
 | scrapix-frontier | — | URL frontier service |
 | scrapix-crawler (x3) | — | Crawler workers (3 replicas) |
 | scrapix-content (x2) | — | Content workers (2 replicas) |
-| console | 3001 | Web UI |
 | redpanda | 19092 | Kafka-compatible broker |
 | redpanda-console | 8090 | Redpanda web UI |
 | meilisearch | 7700 | Search engine |
 | dragonfly | 6380 | Redis-compatible cache |
-| postgres | 5433 | Rails database (`scrapix`) and the engine's own (`scrapix_engine`) |
 | clickhouse | 8123 | Analytics database |
 
 ### Infrastructure Only
@@ -92,6 +95,13 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
 The dev overlay disables all application services and reduces Redpanda memory to 512MB.
+
+To run the engine in **hosted** mode against a local Lab, start the Lab from a
+`meilisearch/lab` checkout (Rails on :8081, Postgres on :5433 with a
+`scrapix_engine` database) and switch the API to the commented hosted block
+in `docker-compose.yml` (or in `.env.example` for native `just dev`):
+`SCRAPIX_MODE=hosted`, `LAB_URL`, `LAB_EVENTS_SECRET`, `LAB_SERVICE_TOKEN`
+and a Postgres `DATABASE_URL` on `scrapix_engine`.
 
 Then start services natively:
 
@@ -135,7 +145,7 @@ init-topics:
 
 For running Docker Compose in production on a single server:
 
-1. **Change default passwords** — Update `MEILI_MASTER_KEY`, `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD`, `JWT_SECRET` (Rails only), `LAB_EVENTS_SECRET`, `LAB_SERVICE_TOKEN` (the hosted stack signs engine → Rails usage events with the first and authenticates Rails ↔ engine calls with the second; keep each identical on the `scrapix-api` and `saas` services). The engine uses its own `scrapix_engine` database, created by `deploy/docker/postgres-init/10-scrapix-engine.sql` on the first start of the Postgres volume (an older volume needs `createdb scrapix_engine` once)
+1. **Change default secrets** — Update `MEILI_MASTER_KEY`, `CLICKHOUSE_PASSWORD` and `SCRAPIX_ADMIN_KEY` (the dev value `dev-admin-key-change-me` is public). In hosted mode, also set `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` (the engine signs its usage events to the Lab with the first and the Lab and engine authenticate each other's calls with the second; keep each identical on the engine and the Lab)
 2. **Add a reverse proxy** — Use Caddy, Nginx, or Traefik in front of the API
 3. **Enable TLS** — Via the reverse proxy
 4. **Set resource limits** — Add `deploy.resources.limits` to each service
@@ -159,7 +169,7 @@ The compose file uses named volumes for all persistent data and build caches:
 | Volume | Purpose |
 |--------|---------|
 | `meili_data` | Meilisearch indexes |
-| `pg_data` | PostgreSQL data |
+| `scrapix-data` | Engine job-history store (SQLite) |
 | `redpanda_data` | Kafka topics and logs |
 | `dragonfly_data` | Redis cache |
 | `clickhouse_data` | Analytics data |
@@ -178,7 +188,6 @@ All services include health checks:
 
 - **API:** `GET /health`
 - **Meilisearch:** `GET /health`
-- **PostgreSQL:** `pg_isready`
 - **Redpanda:** `rpk cluster health`
 - **DragonflyDB:** `redis-cli ping`
 - **ClickHouse:** `wget --spider http://localhost:8123/ping`

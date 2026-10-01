@@ -18,7 +18,6 @@ spec:
   tls:
     - hosts:
         - api.scrapix.meilisearch.net
-        - console.scrapix.meilisearch.net
       secretName: scrapix-tls
   rules:
     - host: api.scrapix.meilisearch.net
@@ -31,13 +30,3 @@ spec:
                 name: scrapix-api
                 port:
                   number: 8080
-    - host: console.scrapix.meilisearch.net
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: console
-                port:
-                  number: 3000

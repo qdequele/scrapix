@@ -10,10 +10,17 @@ to the production box (`hackersearch`, deployed from the separate
 `qdq-server` repo, systemd-managed, env in `/etc/scrapix/scrapix.env`). It is
 a checklist, not automation — work through it in order.
 
+<Note>
+The Rails app (the Lab) and the console moved to their own repo,
+[`meilisearch/lab`](https://github.com/meilisearch/lab). Every Rails command
+below (`bin/rails …`, the Lab's migrations and tests, the analytics parity
+script) runs from a `meilisearch/lab` checkout, not from this repo.
+</Note>
+
 ## Pre-deploy checklist
 
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
-- [ ] **Local dev: add `SCRAPIX_MODE=hosted` to an existing `.env`.** `just dev` runs the engine against the Rails stack's Postgres; an `.env` copied from `.env.example` before standalone mode existed lacks the variable, so the API now starts in standalone mode and refuses to run without `SCRAPIX_ADMIN_KEY`. The current `.env.example` already sets it.
+- [ ] **Local dev: refresh an existing `.env`.** `just dev` in this repo now runs the engine **standalone** (`.env.example` sets `SCRAPIX_MODE=standalone` and a dev `SCRAPIX_ADMIN_KEY`); an `.env` copied from the old hosted dev setup still points `DATABASE_URL` at the Rails database and sets `SCRAPIX_MODE=hosted`. Re-copy `.env.example`, or use its commented "Hosted against a local Lab" block with the Lab running from a `meilisearch/lab` checkout.
 - [ ] **Set `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API and the matching secrets on Rails — the hosted engine refuses to start without them. If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
 
@@ -96,7 +103,7 @@ before migrating. An index of that name that already exists is left alone.
    belongs to LUMEN and the engine is at `http://127.0.0.1:8090`. (Rails logs
    a warning at boot when `LAB_CRON_ENABLED=true` and `LAB_SERVICE_TOKEN` or
    `SCRAPIX_ENGINE_URL` is unset.)
-3. Run the migrations (`cd saas && bin/rails db:migrate`) and deploy. **Not
+3. Run the Lab's migrations (in `meilisearch/lab`: `cd saas && bin/rails db:migrate`) and deploy. **Not
    while an engine from before the Lab split is running:** `db:migrate` now
    includes `20260930000001_encrypt_meilisearch_engine_api_keys`, which
    encrypts `meilisearch_engines.api_key`, the column such an engine reads
@@ -215,6 +222,7 @@ sections of this page.)
    - Generate the three Active Record encryption values:
 
      ```bash
+     # in a meilisearch/lab checkout
      cd saas && bin/rails db:encryption:init
      ```
 
@@ -325,6 +333,7 @@ sections of this page.)
    curl -s -H "X-API-Key: $KEY" \
      "http://127.0.0.1:8090/analytics/v0/pipes/kpis.json?hours=24"
 
+   # from a meilisearch/lab checkout (the parity script lives there)
    python3 contracts/analytics_parity.py \
      --rails http://127.0.0.1:8091 --engine http://127.0.0.1:8090 --api-key "$KEY"
    # expect: OK: N paths identical
@@ -332,8 +341,8 @@ sections of this page.)
 
    The parity script lists its accepted differences in its header.
 8. **Move analytics to the engine.** In Caddy, send the `analytics` path prefix
-   to 8090, and remove `analytics` from `SAAS_PREFIXES` (the console proxy).
-   Reload both.
+   to 8090, and drop `analytics` from the console proxy's list of Rails
+   prefixes (configured in `meilisearch/lab`). Reload both.
 9. **After a clean week,** the cleanup release drops `jobs`, `job_results` and
    `lab_events` from the Lab database and deletes Rails' analytics code. The
    engine's `LAB_EVENTS_URL` fallback stays one release longer.
@@ -372,14 +381,14 @@ its pending events before it is stopped: delivery only happens while it runs.
 3. **Decrypt the Meilisearch keys, then roll Rails back (required).** The old
    engine reads `meilisearch_engines.api_key` directly and cannot use
    ciphertext. With the encryption secrets still set, run
-   `cd saas && bin/rails db:migrate:down VERSION=20260930000001` (it decrypts
+   (in `meilisearch/lab`) `cd saas && bin/rails db:migrate:down VERSION=20260930000001` (it decrypts
    the keys), then deploy the previous Rails release right away. Rolling Rails
    back is not optional: the phase 1 release still declares
    `encrypts :api_key`, so any engine created or edited on it after the
    `db:migrate:down` is stored encrypted again. It also restores `analytics`
-   in the Rails MCP server's route list (`SAAS_PREFIXES` in
-   `saas/app/services/mcp_toolset.rb`), so MCP analytics calls go to Rails
-   again, matching the console proxy (next step). Check that no key is left
+   in the Rails MCP server's route list (the Lab's MCP toolset, in meilisearch/lab),
+   so MCP analytics calls go to Rails again, matching the console proxy (next
+   step). Check that no key is left
    encrypted (Active Record ciphertext is a JSON object starting with `{"p":`):
 
    ```sql
@@ -388,11 +397,12 @@ its pending events before it is stopped: delivery only happens while it runs.
    ```
 
    If it returns rows (an engine was saved between the two), decrypt them
-   from the phase 1 release's checkout, with the secrets still set:
-   `cd saas && bin/rails runner 'MeilisearchEngine.find_each(&:decrypt)'`
+   from the phase 1 release's checkout (now in meilisearch/lab), with the secrets still set:
+   (meilisearch/lab) `cd saas && bin/rails runner 'MeilisearchEngine.find_each(&:decrypt)'`
    (what the migration's `down` does; the migration itself has already run).
-4. **Start the old binary**, restore the `analytics` route in Caddy and
-   `SAAS_PREFIXES` in the console proxy, and put the public API route back.
+4. **Start the old binary**, restore the `analytics` route in Caddy and the
+   `analytics` prefix in the console proxy (meilisearch/lab), and put the
+   public API route back.
 
 Jobs created on the new engine will not appear in the old engine's history. The
 Lab's copy of `lab_events` still holds rows the move script copied as
@@ -415,17 +425,13 @@ mid-rollout.
 
 Since the Lab split the engine migrates its own database (including the
 `jobs.accounting` column), so only the Rails release needs its migrations
-(`cd saas && bin/rails db:migrate`); the order relative to the engine is in
+(run in `meilisearch/lab`); the order relative to the engine is in
 "Lab split phase 1" above.
 
 Before merging to `main`, also run — neither of these ran during
-development because Postgres was down locally:
-
-```bash
-cd saas && bin/rails db:prepare RAILS_ENV=test && bin/rails test
-```
-
-and one real accounting flush/restore round trip against a live Postgres
+development because Postgres was down locally — the Lab's Rails test suite
+(`just test` in a `meilisearch/lab` checkout) and one real accounting
+flush/restore round trip against a live Postgres
 (create a job, let it accumulate a few events, kill and restart the API,
 confirm the job's counters survive and it still reaches a terminal state).
 
@@ -478,7 +484,7 @@ warning at startup when the id is unset.
 
 **Distinct `WAKE_PORT` per service on one box.** Every worker binary serves
 `/metrics` and `/health` on `WAKE_PORT`, default `8081`, which is also the
-Rails SaaS port on `hackersearch`. A bind failure only logs a warning, so a
+Lab's Rails port on `hackersearch`. A bind failure only logs a warning, so a
 service that loses the race simply has no metrics. Set, per unit:
 
 | Service | `WAKE_PORT` | Prometheus target |

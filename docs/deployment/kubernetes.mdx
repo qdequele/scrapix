@@ -41,7 +41,6 @@ scrapix namespace
 │   ├── scrapix-frontier (1-5 replicas)
 │   ├── scrapix-worker-crawler (1-20 replicas)
 │   ├── scrapix-worker-content (1-10 replicas)
-│   ├── console (1 replica)
 │   └── dragonfly (1 replica)
 ├── StatefulSets
 │   ├── redpanda (1-3 replicas)
@@ -111,7 +110,7 @@ Optimized for Scaleway with KEDA autoscaling, Ingress, cert-manager, and node po
 |------|---------------|------|-----|---------|
 | Infra | PRO2-S | 4 | 16 GB | Redpanda, Meilisearch, Postgres, ClickHouse |
 | Workers | DEV1-M | 3 | 4 GB | Crawlers, content, frontier |
-| System | DEV1-S | 2 | 2 GB | API, console, ingress |
+| System | DEV1-S | 2 | 2 GB | API, ingress |
 
 **KEDA ScaledObjects** (scale-to-zero workers):
 
@@ -165,7 +164,7 @@ kubectl -n scrapix create secret generic scrapix-secrets \
   --from-literal=LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
 ```
 
-The hosted API also needs `LAB_URL` (the Lab's base URL, set in the `scrapix-config` ConfigMap) and refuses to start without `LAB_URL` and both `LAB_*` secrets; the Rails app must use the same secret and token. It uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
+The hosted API also needs `LAB_URL` (the Lab's base URL, set in the `scrapix-config` ConfigMap) and refuses to start without `LAB_URL` and both `LAB_*` secrets; the Lab (deployed from [`meilisearch/lab`](https://github.com/meilisearch/lab), not from these manifests; the ConfigMap points `LAB_URL` at its `lab-saas` service) must use the same secret and token. It uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
 
 ## Monitoring
 

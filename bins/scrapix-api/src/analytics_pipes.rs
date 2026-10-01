@@ -1,10 +1,11 @@
 //! Tinybird-style analytics pipes over the engine's ClickHouse
 //! (`/analytics/v0/pipes/*`).
 //!
-//! A port of `saas/app/controllers/analytics_controller.rb` (as hardened in
-//! PR #10), which stays authoritative until the Rails copy is deleted: same
-//! SQL (in `scrapix_storage::clickhouse`), parameters, field names and
-//! formats. `contracts/analytics_parity.py` diffs the two. Preserved quirks:
+//! A port of the Lab's Rails analytics controller, as hardened in PR #10
+//! (meilisearch/lab `saas/app/controllers/analytics_controller.rb`), which
+//! stays authoritative until the Rails copy is deleted: same SQL (in
+//! `scrapix_storage::clickhouse`), parameters, field names and formats. The
+//! Lab repo's `contracts/analytics_parity.py` diffs the two. Preserved quirks:
 //!
 //! - `job_timeline`'s `meta` declares 3 columns while rows carry 12 fields.
 //! - `domain_stats` and `account_usage` return one all-zeros row when there is

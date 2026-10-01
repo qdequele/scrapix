@@ -44,6 +44,3 @@ images:
   - name: scrapix-worker-content
     newName: rg.fr-par.scw.cloud/scrapix/scrapix-worker-content
     newTag: b13613e
-  - name: scrapix-console
-    newName: rg.fr-par.scw.cloud/scrapix/scrapix-console
-    newTag: b13613e

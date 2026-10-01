@@ -22,7 +22,9 @@ data:
 
   # Lab (Rails control plane) base URL (hosted mode; required). The API
   # reports events to {LAB_URL}/internal/events and calls {LAB_URL}/internal/*.
-  LAB_URL: "http://saas:8081"
+  # The Lab is deployed from meilisearch/lab (its `lab-saas` service), not
+  # from these manifests.
+  LAB_URL: "http://lab-saas:8081"
 
   # Logging
   RUST_LOG: "info,scrapix=debug"
