@@ -1,69 +1,50 @@
 # Scrapix API Contracts
 
-Backend-agnostic contract tests for the SaaS API surface, plus the frozen
-OpenAPI specs. This was the safety net for the Rails migration
-([SCR-85](https://linear.app/meilisearch/issue/SCR-85)) and remains the
-regression suite for the Rails SaaS app.
+The contracts the Scrapix engine owns, plus the one it vendors from the
+Meilisearch Lab. The Lab (Rails control plane + console) lives in
+[`meilisearch/lab`](https://github.com/meilisearch/lab), which vendors byte
+copies of `openapi.json` and `lab-events.schema.json` and drift-checks them
+(`openapi.engine.json` is not vendored); the Lab's contract test suite lives
+there too.
 
-Since phase 9 the split is permanent: the Rails app (`saas/`, port 8081)
-serves the whole SaaS surface (auth, account/team, API keys, billing/Stripe,
-configs, engines, analytics pipes, OAuth provider, `/mcp`), and the Rust API
-(port 8080) is a pure crawl engine (scrape/map/search/crawl, jobs, WebSockets,
-diagnostics). The engine no longer serves any SaaS route.
+## Engine-owned files
 
-## Files
+Change these only on an intentional, reviewed contract change — for the two
+vendored files, the Lab's drift check fails until it re-vendors them.
 
-- `openapi.json` — the **frozen full-platform public spec** (engine + SaaS
-  routes). It is the contract the Rails app implements and the source the
-  Rails MCP server generates its tools from. Hand-frozen — no generator
-  regenerates it anymore; edit only on an intentional, reviewed contract
-  change. The Python and TypeScript SDKs (`sdks/`) are generated from it:
-  after editing it, run `just sdk-generate` and commit the result (CI's
+- `openapi.json` — the **frozen full-platform public spec** (engine + Lab
+  routes). It is the contract the Lab implements and the source its MCP
+  server generates tools from. Hand-frozen — no generator regenerates it.
+  The Python and TypeScript SDKs (`sdks/`) are generated from it: after
+  editing it, run `just sdk-generate` and commit the result (CI's
   `just sdk-check` fails on stale SDK code).
 - `openapi.engine.json` — the engine-only spec served by the Rust API at
   `/openapi.json`, pinned by `cargo test -p scrapix-api --test
   openapi_snapshot`. Regenerate after an intentional engine API change with
   `UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p scrapix-api --test
   openapi_snapshot`, and review the diff.
-- `tests/*.contract.test.ts` — live-backend contract tests (vitest).
-- `src/shapes.ts` — the frozen response shapes (snake_case, exact keys —
-  extra keys are failures).
 - `lab-events.schema.json` — JSON Schema for the events the engine reports to
-  Rails (`POST /internal/events`). The engine's `lab_events.rs` tests and
-  `saas/test/integration/lab_events_contract_test.rb` both validate against
-  it; change it only together with both sides.
-- `analytics_parity.py` — live diff of the analytics pipes between two
-  backends (was used to prove byte parity during the migration).
+  the Lab (`POST {LAB_URL}/internal/events`). The engine's `lab_events.rs`
+  tests and the Lab's receiver tests both validate against it; change it only
+  together with both sides.
 
-## Running
+## Vendored from the Lab
 
-The suite targets the Rails app, with the Rust engine up for the routes that
-proxy into it (config trigger, MCP product tools). Start `just infra`, the
-engine, and the Rails server (with `AUTH_RATE_LIMIT=1000` — Rack::Attack's
-5/min signup throttle trips the suite otherwise):
+- `vendor/lab/lab-internal.openapi.json` — the Lab's internal API
+  (`/internal/*`: credential introspection, accounts, Meilisearch targets)
+  that the hosted engine calls with `LAB_SERVICE_TOKEN`. Owned by
+  `meilisearch/lab` (`contracts/lab-internal.openapi.json`); never edit the
+  vendored copy by hand.
+
+`check-drift.sh` compares the vendored copy with the Lab's `main`:
 
 ```bash
-cd contracts
-npm install
-npm test   # defaults to the Rails app on :8081
+contracts/check-drift.sh          # or: just check-contracts
+contracts/check-drift.sh --fix    # re-vendor; or: just sync-contracts
 ```
 
-The job routes (`/crawl`, `/jobs`, `/job/*`, used by
-`tests/jobs.contract.test.ts`) go straight to the engine at
-`CONTRACT_ENGINE_BASE_URL` (default `http://localhost:8080`), which needs its
-pipeline (Kafka + frontier) up to accept a crawl.
-
-`tests/usage.contract.test.ts` exercises the engine → lab events → Rails
-ledger path end to end, so it needs the hosted engine and Rails running with
-matching `LAB_URL` / `LAB_EVENTS_SECRET` / `LAB_SERVICE_TOKEN` (see
-`.env.example`), plus outbound access to example.com.
-
-Each test file signs up fresh throwaway users (`contract-*@example.com`), so
-runs are self-contained; no seeding or cleanup required. Analytics tests
-self-skip when ClickHouse isn't configured.
-
-## Rules
-
-- Shapes in `src/shapes.ts` mirror the original Rust handlers and
-  `console/src/lib/api-types.ts`. Change them only when the API contract
-  changes intentionally — never to make a backend pass.
+The owner copy comes from `$LAB_SRC/contracts/` when `LAB_SRC` points at a
+local Lab checkout, else from GitHub through `gh api` (the Lab repo is
+private, so it needs `GH_TOKEN` or `LAB_REPO_TOKEN`). With neither, the check
+prints a notice and exits 0. CI's `contracts` job runs it with the
+`LAB_REPO_TOKEN` secret.

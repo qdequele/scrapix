@@ -1,9 +1,10 @@
-# Scrapix Development Justfile
-# Usage: just dev       — start everything (infra + services + console)
+# Scrapix Development Justfile (engine only — the hosted platform, Rails +
+# console, lives in meilisearch/lab)
+# Usage: just dev       — start everything (infra + engine + workers, standalone mode)
 #        just infra     — start infrastructure only
-#        just services  — start Rust services + console (assumes infra is up)
+#        just services  — start the engine + workers (assumes infra is up)
 #        just stop      — stop everything
-#        just logs NAME — attach to a specific overmind process (api, frontier, crawler, content, console)
+#        just logs NAME — attach to a specific overmind process (api, frontier, crawler, content)
 
 set dotenv-load
 
@@ -15,7 +16,7 @@ default:
 # Full stack
 # ---------------------------------------------------------------------------
 
-# Start infrastructure, wait for health, then run all services
+# Start infrastructure, wait for health, then run the engine + workers (standalone by default, see .env.example)
 dev: infra _wait-healthy
     overmind start -f Procfile.dev -N
 
@@ -23,7 +24,7 @@ dev: infra _wait-healthy
 # Infrastructure
 # ---------------------------------------------------------------------------
 
-# Start infrastructure services (Redpanda, Meilisearch, DragonflyDB, PostgreSQL, ClickHouse)
+# Start infrastructure services (Redpanda, Meilisearch, DragonflyDB, ClickHouse)
 infra:
     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
@@ -43,7 +44,7 @@ infra-logs *ARGS:
 # Services (assumes infra is running)
 # ---------------------------------------------------------------------------
 
-# Start all Rust services + console via overmind
+# Start the engine + workers via overmind
 services:
     overmind start -f Procfile.dev -N
 
@@ -63,9 +64,9 @@ stop-services:
 # Individual services (for when you only need one)
 # ---------------------------------------------------------------------------
 
-# Run API server with cargo-watch (on its own database: .env's DATABASE_URL is the Rails one)
+# Run API server with cargo-watch
 api:
-    DATABASE_URL="$ENGINE_DATABASE_URL" cargo watch -w crates -w bins -x 'run --bin scrapix -- api'
+    cargo watch -w crates -w bins -x 'run --bin scrapix -- api'
 
 # Run frontier service with cargo-watch
 frontier:
@@ -78,21 +79,6 @@ crawler:
 # Run content worker with cargo-watch
 content:
     cargo watch -w crates -w bins -x 'run --bin scrapix -- content'
-
-# Run Next.js console
-console:
-    cd console && npm run dev
-
-# Run Rails SaaS control plane (migrates the Lab database first; the engine migrates its own)
-saas:
-    cd saas && bin/rails db:prepare && SOLID_QUEUE_IN_PUMA=1 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES bin/rails server
-
-# Rails-native test suite (isolated scrapix_test DB; fast, no live services).
-# `set dotenv-load` puts the repo .env in the environment; unset the vars that
-# would make tests reach outside (a real RESEND_API_KEY makes the mailer
-# initializer use SMTP) or change behavior (LAB_CRON_ENABLED).
-saas-test:
-    cd saas && env -u RESEND_API_KEY -u LAB_CRON_ENABLED bin/rails db:prepare RAILS_ENV=test && env -u RESEND_API_KEY -u LAB_CRON_ENABLED bin/rails test
 
 # ---------------------------------------------------------------------------
 # Build & Test
@@ -149,6 +135,18 @@ sdk-build:
     cd sdks/python && uv build
 
 # ---------------------------------------------------------------------------
+# Contracts vendored from meilisearch/lab (contracts/vendor/lab/)
+# ---------------------------------------------------------------------------
+
+# Re-copy the Lab's contracts (from $LAB_SRC if set, else GitHub via gh + GH_TOKEN/LAB_REPO_TOKEN)
+sync-contracts:
+    contracts/check-drift.sh --fix
+
+# Fail if a vendored Lab contract differs from the Lab's main (skips without LAB_SRC or a token)
+check-contracts:
+    contracts/check-drift.sh
+
+# ---------------------------------------------------------------------------
 # Stop everything
 # ---------------------------------------------------------------------------
 
@@ -165,7 +163,7 @@ _wait-healthy:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Waiting for infrastructure..."
-    services=("scrapix-redpanda" "scrapix-dragonfly" "scrapix-meilisearch" "scrapix-postgres" "scrapix-clickhouse")
+    services=("scrapix-redpanda" "scrapix-dragonfly" "scrapix-meilisearch" "scrapix-clickhouse")
     for svc in "${services[@]}"; do
         printf "  %-25s " "$svc"
         timeout=60

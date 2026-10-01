@@ -2,9 +2,11 @@
 # =============================================================================
 # Scrapix Heroku Setup Script
 # =============================================================================
-# Provisions two Heroku apps:
-#   1. scrapix-api    — Rust API (scrapix all mode) + Postgres addon
-#   2. scrapix-console — Next.js frontend
+# Provisions one Heroku app:
+#   scrapix-api — Rust API (scrapix all mode, hosted) + Postgres addon (the
+#                 engine's own job store)
+# The console and the Rails control plane (the Lab) are deployed from
+# meilisearch/lab.
 #
 # Prerequisites:
 #   - Heroku CLI installed and logged in (`heroku login`)
@@ -23,7 +25,6 @@ set -euo pipefail
 # Configuration — edit these before running
 # ---------------------------------------------------------------------------
 API_APP_NAME="scrapix-api"
-CONSOLE_APP_NAME="scrapix-console"
 HEROKU_TEAM="meili"
 
 # Meilisearch Cloud
@@ -40,14 +41,14 @@ CLICKHOUSE_PASSWORD=""
 # calls its /internal/* API, and refuses to start without LAB_URL. Rails needs
 # the SAME LAB_EVENTS_SECRET / LAB_SERVICE_TOKEN (printed at the end of this
 # script).
-LAB_URL=""                # e.g. https://saas.example.com (the base URL, no path)
+LAB_URL=""                # e.g. https://lab.example.com (the base URL, no path)
 
 # AI enrichment (optional)
 AI_PROVIDER="anthropic"
 ANTHROPIC_API_KEY=""
 
-# CORS — the console URL will be added automatically
-# Add extra origins here (comma-separated), *.meilisearch.com is always allowed
+# CORS — add the console's origin (and any other) here, comma-separated;
+# *.meilisearch.com is always allowed
 CORS_ORIGINS=""
 
 # ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ CORS_ORIGINS=""
 case "${LAB_URL}" in
     http://*|https://*) ;;
     *)
-        echo "LAB_URL must be set to the Rails app's http(s) base URL" >&2
+        echo "LAB_URL must be set to the Lab's http(s) base URL" >&2
         echo "(the hosted engine refuses to start without it). Edit the config block above." >&2
         exit 1
         ;;
@@ -94,30 +95,11 @@ CONFIG_VARS=(
 [ -n "${CLICKHOUSE_PASSWORD}" ] && CONFIG_VARS+=("CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}")
 [ -n "${AI_PROVIDER}" ]         && CONFIG_VARS+=("AI_PROVIDER=${AI_PROVIDER}")
 [ -n "${ANTHROPIC_API_KEY}" ]   && CONFIG_VARS+=("ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-
-# Add console URL to CORS origins
-CONSOLE_URL="https://${CONSOLE_APP_NAME}.herokuapp.com"
-if [ -n "${CORS_ORIGINS}" ]; then
-    CONFIG_VARS+=("CORS_ORIGINS=${CORS_ORIGINS},${CONSOLE_URL}")
-else
-    CONFIG_VARS+=("CORS_ORIGINS=${CONSOLE_URL}")
-fi
+[ -n "${CORS_ORIGINS}" ]        && CONFIG_VARS+=("CORS_ORIGINS=${CORS_ORIGINS}")
 
 heroku config:set -a "${API_APP_NAME}" "${CONFIG_VARS[@]}"
 
-# ---------------------------------------------------------------------------
-# Create Console app
-# ---------------------------------------------------------------------------
-echo ""
-echo "==> Creating Console app: ${CONSOLE_APP_NAME}"
-heroku create "${CONSOLE_APP_NAME}" --team "${HEROKU_TEAM}" --region eu --stack container
-
 API_URL="https://${API_APP_NAME}.herokuapp.com"
-
-echo "==> Setting Console config vars"
-heroku config:set -a "${CONSOLE_APP_NAME}" \
-    SCRAPIX_API_URL="${API_URL}" \
-    NEXT_PUBLIC_SCRAPIX_API_URL="${API_URL}"
 
 # ---------------------------------------------------------------------------
 # Deploy instructions
@@ -133,19 +115,12 @@ echo "  1. Deploy the API (from repo root):"
 echo "     git remote add heroku-api https://git.heroku.com/${API_APP_NAME}.git"
 echo "     git push heroku-api main"
 echo ""
-echo "  2. Deploy the Console (from console/ dir):"
-echo "     cd console"
-echo "     git remote add heroku-console https://git.heroku.com/${CONSOLE_APP_NAME}.git"
-echo "     git subtree push --prefix console heroku-console main"
-echo "     # Or use a separate repo for the console"
-echo ""
-echo "  3. Check logs:"
+echo "  2. Check logs:"
 echo "     heroku logs -a ${API_APP_NAME} --tail"
-echo "     heroku logs -a ${CONSOLE_APP_NAME} --tail"
 echo ""
-echo "  Set the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN on the Rails app:"
+echo "  Set the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN on the Lab"
+echo "  (deployed from meilisearch/lab):"
 echo "     heroku config -a ${API_APP_NAME} | grep LAB_"
 echo ""
-echo "  API URL:     ${API_URL}"
-echo "  Console URL: ${CONSOLE_URL}"
+echo "  API URL: ${API_URL}"
 echo ""

@@ -11,27 +11,25 @@ All Scrapix services are configured through environment variables. When running 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCRAPIX_MODE` | `standalone` | `standalone` (self-hosted, this repo's default) or `hosted` (the Rails control plane, the "Lab", reached over `LAB_URL`; the engine keeps its own database). Validated at startup — an unrecognized value refuses to start. See [Self-Hosting](/deployment/self-hosting). |
+| `SCRAPIX_MODE` | `standalone` | `standalone` (self-hosted, this repo's default) or `hosted` (behind the Meilisearch Lab control plane — [`meilisearch/lab`](https://github.com/meilisearch/lab) — reached over `LAB_URL`; the engine keeps its own database). Validated at startup — an unrecognized value refuses to start. See [Self-Hosting](/deployment/self-hosting). |
 | `SCRAPIX_ADMIN_KEY` | — | **Standalone only.** The single operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; WebSockets also accept `?token=`). Required unless `SCRAPIX_AUTH=disabled`; must be at least 16 characters (leading/trailing whitespace trimmed, blank-after-trim counts as unset). |
 | `SCRAPIX_AUTH` | — | Set to `disabled` to turn off all authentication — **standalone only, local development only**. Logs a loud warning at startup; refused in hosted mode and refused together with `SCRAPIX_ADMIN_KEY` (conflicting config). |
-| `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's **own** job-history store, in both modes — SQLite by default, or a `postgres://`/`postgresql://` URL for a dedicated Postgres database (e.g. `scrapix_engine`). The engine applies its own migrations and refuses a database that already has the Rails schema, so it can never be pointed at the Lab's database. In hosted production use a dedicated Postgres database. (The Rails app has its own, separate `DATABASE_URL`.) |
-| `JWT_SECRET` | — | **Rails only.** Signs session JWTs. The engine ignores it (with a log line if set): the Lab verifies sessions. |
-| `ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY`, `ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY`, `ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT` | — | **Rails only, required.** Encrypt `meilisearch_engines.api_key` at rest. Generate with `cd saas && bin/rails db:encryption:init`. |
+| `DATABASE_URL` | `sqlite://./data/scrapix.db` | The engine's **own** job-history store, in both modes — SQLite by default, or a `postgres://`/`postgresql://` URL for a dedicated Postgres database (e.g. `scrapix_engine`). The engine applies its own migrations and refuses a database that already has the Rails schema, so it can never be pointed at the Lab's database. In hosted production use a dedicated Postgres database. |
+| `JWT_SECRET` | — | Ignored by the engine (with a log line if set): the Lab verifies sessions. |
 
 ## Lab Boundary (hosted only)
 
-In hosted mode the engine reports usage and job lifecycle to the Lab (Rails) as signed events, calls the Lab's `/internal/*` API (credential introspection, credits, Meilisearch targets) and is called back with the same service token — see [Lab Events](/api-reference/lab-events). The hosted engine **refuses to start** without `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`, and at startup it pings `{LAB_URL}/internal/ping` and refuses to start on a wrong token or a wrong `LAB_URL`; standalone ignores them. Generate each secret with `openssl rand -hex 32`.
+In hosted mode the engine reports usage and job lifecycle to the Lab ([`meilisearch/lab`](https://github.com/meilisearch/lab)) as signed events, calls the Lab's `/internal/*` API (credential introspection, credits, Meilisearch targets) and is called back with the same service token — see [Lab Events](/api-reference/lab-events). The hosted engine **refuses to start** without `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`, and at startup it pings `{LAB_URL}/internal/ping` and refuses to start on a wrong token or a wrong `LAB_URL`; standalone ignores them. Generate each secret with `openssl rand -hex 32`.
 
 | Variable | Where | Default | Description |
 |----------|-------|---------|-------------|
 | `LAB_URL` | engine | — | **Required (hosted).** The Lab's base URL, e.g. `https://scrapix.example.com` (no path). Must start with `http://` or `https://`. Events go to `{LAB_URL}/internal/events`; the rest of the boundary to `{LAB_URL}/internal/*`. |
 | `LAB_EVENTS_URL` | engine | — | **Deprecated.** Fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Remove it once `LAB_URL` is set. |
-| `LAB_EVENTS_SECRET` | engine and Rails | — | **Required (hosted).** HMAC-SHA256 key that signs each delivery (`X-Scrapix-Signature`); at least 32 characters, identical on both sides. |
-| `LAB_SERVICE_TOKEN` | engine and Rails | — | **Required (hosted).** Bearer token for both directions: the Lab presents it to call the engine on behalf of an account, the engine presents it on `{LAB_URL}/internal/*`; at least 32 characters, identical on both sides. |
-| `LAB_CRON_ENABLED` | Rails | off | Set to `true` to fire saved-config cron schedules from Rails. Leave off until the engine is upgraded (see the [rollout](/operations/crawl-engine-rollout)). |
+| `LAB_EVENTS_SECRET` | engine and Lab | — | **Required (hosted).** HMAC-SHA256 key that signs each delivery (`X-Scrapix-Signature`); at least 32 characters, identical on both sides. |
+| `LAB_SERVICE_TOKEN` | engine and Lab | — | **Required (hosted).** Bearer token for both directions: the Lab presents it to call the engine on behalf of an account, the engine presents it on `{LAB_URL}/internal/*`; at least 32 characters, identical on both sides. |
 
 <Note>
-Stripe (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`) is configured on the Rails app only. The engine never talks to Stripe: it reports usage, and Rails debits the ledger and runs auto top-up.
+The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, session secrets) are documented in the `meilisearch/lab` repo. The engine never talks to Stripe: it reports usage, and the Lab debits the ledger and runs auto top-up.
 </Note>
 
 ## API Server
@@ -114,7 +112,7 @@ modes.
 | `JOB_RETENTION_HOURS` | `168` | How long a finished/cancelled job's counters and state stay queryable after its queue and seen set are released |
 | `INSTANCE_ID` | random per start | Instance identifier. **Set a stable value per frontier instance in production**: it names the instance's job-control consumer group, so a random id loses controls published while the instance was down and leaks one consumer group per restart (a warning is logged when unset) |
 | `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight send and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (Fly `kill_timeout` is 30 s) |
-| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health`. On a single box give each service its own port (8081 is also the Rails SaaS port; a failed bind only logs a warning) |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health`. On a single box give each service its own port (8081 is also the Lab's Rails port; a failed bind only logs a warning) |
 
 ### Link Graph (optional)
 

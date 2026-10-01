@@ -10,7 +10,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'sdks/**'
-      - 'contracts/openapi.json'
+      - 'contracts/**'
       - 'justfile'
       - '.github/workflows/ci.yml'
   workflow_call:
@@ -105,3 +105,16 @@ jobs:
       - if: matrix.python == '3.9'
         run: uv run --group dev --resolution lowest-direct pytest
       - run: uv build
+
+  # ---------------------------------------------------------------------------
+  # Contracts vendored from meilisearch/lab (skips without LAB_REPO_TOKEN)
+  # ---------------------------------------------------------------------------
+
+  contracts:
+    name: Lab contract drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: contracts/check-drift.sh
+        env:
+          GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}

@@ -1,6 +1,6 @@
 //! The 14 pipes: each runs its `scrapix_storage::clickhouse` query and maps
 //! the rows to the Rails field names and formats
-//! (`saas/app/controllers/analytics_controller.rb`).
+//! (meilisearch/lab `saas/app/controllers/analytics_controller.rb`).
 
 use scrapix_storage::clickhouse::{ClickHouseError, DomainStats};
 use serde_json::{json, Value};

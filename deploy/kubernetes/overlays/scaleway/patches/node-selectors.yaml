@@ -3,7 +3,7 @@
 # Node pool recommendations:
 #   infra pool  (PRO2-S: 4 vCPU, 16GB) x 3  — Redpanda, Meilisearch, PostgreSQL, ClickHouse
 #   workers pool (DEV1-M: 3 vCPU, 4GB) x auto — crawlers, content workers, frontier
-#   system pool  (DEV1-S: 2 vCPU, 2GB) x 2   — API, console, ingress
+#   system pool  (DEV1-S: 2 vCPU, 2GB) x 2   — API, ingress
 #
 # Label your Scaleway node pools with:
 #   k8s.scaleway.com/pool-name=infra | workers | system
@@ -13,18 +13,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: scrapix-api
-  namespace: scrapix
-spec:
-  template:
-    spec:
-      nodeSelector:
-        k8s.scaleway.com/pool-name: system
----
-# System pool: Console
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: console
   namespace: scrapix
 spec:
   template:

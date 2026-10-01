@@ -6,7 +6,8 @@ description: Connect AI assistants to Scrapix via the Model Context Protocol
 # MCP Server
 
 <Note>
-  The HTTP `/mcp` endpoint is hosted only — it runs in the platform (Rails).
+  The HTTP `/mcp` endpoint is hosted only — it runs in the platform (the Lab's
+  Rails app, [`meilisearch/lab`](https://github.com/meilisearch/lab)).
   The stdio `scrapix-mcp` binary works against any engine, including a
   self-hosted standalone one: point `--api-url` at it and pass your
   `SCRAPIX_ADMIN_KEY` as `--api-key` (sent as `X-API-Key`).

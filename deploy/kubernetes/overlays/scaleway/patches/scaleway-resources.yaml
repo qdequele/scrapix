@@ -106,25 +106,6 @@ spec:
                 topologyKey: kubernetes.io/hostname
 ---
 apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: console
-  namespace: scrapix
-spec:
-  replicas: 2
-  template:
-    spec:
-      containers:
-        - name: console
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
----
-apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: redpanda

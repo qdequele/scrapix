@@ -7,13 +7,15 @@ description: The signed events the hosted engine reports to the Lab for usage bi
 
 In **hosted** mode the engine never touches the Lab's database (accounts,
 credit ledger, saved configs, emails, OAuth). Instead it reports what
-happened as **lab events** to the Lab (the Rails control plane), which owns
+happened as **lab events** to the Lab (the Rails control plane, in
+[`meilisearch/lab`](https://github.com/meilisearch/lab)), which owns
 billing and email, and it asks the Lab's [internal API](#lab-internal-api)
 for everything else it needs. This page is the wire contract between the two; the
 machine-readable schema is
 [`contracts/lab-events.schema.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-events.schema.json)
-(JSON Schema 2020-12), and both the engine and the Rails receiver are tested
-against it.
+(JSON Schema 2020-12), owned by this repo; both the engine and the Lab's
+receiver are tested against it (the Lab vendors a byte copy and drift-checks
+it).
 
 <Note>
 Hosted mode only. A **standalone** engine emits no lab events and ignores
@@ -159,8 +161,12 @@ The other direction of the boundary: the engine calls the Lab at
 `{LAB_URL}/internal/*` with `Authorization: Bearer <LAB_SERVICE_TOKEN>` (the
 same token that authenticates Lab → engine calls). The events endpoint above is
 the one exception: it is authenticated by the HMAC signature instead. A missing
-or wrong token gets `401`. The machine-readable contract is
-[`contracts/lab-internal.openapi.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-internal.openapi.json).
+or wrong token gets `401`. The machine-readable contract is owned by the Lab
+(`contracts/lab-internal.openapi.json` in `meilisearch/lab`); this repo
+vendors it at
+[`contracts/vendor/lab/lab-internal.openapi.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/vendor/lab/lab-internal.openapi.json)
+and `contracts/check-drift.sh` (`just check-contracts`) fails when the copy
+drifts from the Lab's `main`.
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -195,9 +201,9 @@ The engine exposes the outbox state at `GET /metrics`:
 |----------|-------|-------------|
 | `LAB_URL` | engine | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
 | `LAB_EVENTS_URL` | engine | Deprecated fallback for `LAB_URL` (the old `…/internal/events` URL). |
-| `LAB_EVENTS_SECRET` | engine, Rails | Signing secret, at least 32 characters. Same value on both sides. |
-| `LAB_SERVICE_TOKEN` | engine, Rails | Bearer token for Lab → engine calls and for the engine's `/internal/*` calls, at least 32 characters. Same value on both sides. |
-| `LAB_CRON_ENABLED` | Rails | `true` runs the saved-config cron. Off by default. |
+| `LAB_EVENTS_SECRET` | engine, Lab | Signing secret, at least 32 characters. Same value on both sides. |
+| `LAB_SERVICE_TOKEN` | engine, Lab | Bearer token for Lab → engine calls and for the engine's `/internal/*` calls, at least 32 characters. Same value on both sides. |
+| `LAB_CRON_ENABLED` | Lab | `true` runs the saved-config cron. Off by default. |
 
 The hosted engine refuses to start without `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`. See
 [Environment Variables](/configuration/environment-variables) and the

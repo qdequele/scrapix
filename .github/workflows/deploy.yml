@@ -9,62 +9,8 @@ on:
         description: "Force deploy API"
         type: boolean
         default: false
-      force_console:
-        description: "Force deploy Console"
-        type: boolean
-        default: false
 
 jobs:
-  # ── Console pipeline ─────────────────────────────────────────────────────────
-
-  detect-console-changes:
-    name: Detect Console Changes
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.filter.outputs.console }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          filters: |
-            console:
-              - 'console/**'
-
-  deploy-console:
-    name: Deploy Console
-    needs: [detect-console-changes]
-    if: needs.detect-console-changes.outputs.changed == 'true' || inputs.force_console == true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Heroku Container Registry
-        run: echo "${{ secrets.HEROKU_API_KEY }}" | docker login registry.heroku.com -u _ --password-stdin
-
-      - name: Build and push Console image
-        id: build-console
-        uses: docker/build-push-action@v7
-        with:
-          context: ./console
-          file: ./console/Dockerfile
-          push: true
-          provenance: false
-          tags: registry.heroku.com/scrapix-console/web
-          cache-from: type=gha,scope=heroku-console
-          cache-to: type=gha,mode=max,scope=heroku-console
-
-      - name: Release Console on Heroku
-        run: |
-          curl -sf -X PATCH "https://api.heroku.com/apps/scrapix-console/formation" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/vnd.heroku+json; version=3.docker-releases" \
-            -H "Authorization: Bearer ${{ secrets.HEROKU_API_KEY }}" \
-            -d '{"updates": [{"type": "web", "docker_image": "${{ steps.build-console.outputs.imageid }}"}]}'
-
   # ── API pipeline ──────────────────────────────────────────────────────────────
 
   detect-api-changes:

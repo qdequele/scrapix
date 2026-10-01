@@ -64,14 +64,3 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: postgres
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: console-pdb
-  namespace: scrapix
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: console

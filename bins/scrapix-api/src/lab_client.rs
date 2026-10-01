@@ -736,7 +736,8 @@ impl LabClient {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    //! In-process fake of the Lab's internal API (contracts/lab-internal.openapi.json).
+    //! In-process fake of the Lab's internal API
+    //! (contracts/vendor/lab/lab-internal.openapi.json).
     use axum::{
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},

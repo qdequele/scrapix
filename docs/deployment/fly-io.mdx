@@ -5,7 +5,7 @@ description: Deploy Scrapix on Fly.io with aggressive scale-to-zero and CI-drive
 
 # Fly.io
 
-Scrapix runs as **six Fly apps** with GitHub Actions building Docker images and deploying via `flyctl deploy --image`. All services except the Kafka broker scale to zero when idle, giving a baseline cost of ~$18/mo.
+Scrapix runs as **five Fly apps** with GitHub Actions building Docker images and deploying via `flyctl deploy --image`. All services except the Kafka broker scale to zero when idle, giving a baseline cost of ~$18/mo.
 
 ## Architecture
 
@@ -13,12 +13,11 @@ Scrapix runs as **six Fly apps** with GitHub Actions building Docker images and 
 |---|---|---|---|
 | `scrapix-redpanda` | Kafka broker (`*.internal` only) | shared-cpu-2x, 1 GB + 10 GB volume | No — broker must stay up |
 | `scrapix-api` | HTTP API | shared-cpu-1x, 512 MB | Yes — auto-starts on HTTP request |
-| `scrapix-console` | Next.js web UI | shared-cpu-1x, 256 MB | Yes — auto-starts on HTTP request |
 | `scrapix-frontier` | URL frontier singleton | shared-cpu-1x, 256 MB | Yes — woken by API on `POST /crawl` |
 | `scrapix-worker-crawler` | Fetcher worker (Chromium) | shared-cpu-2x, 1 GB | Yes — horizontally scalable |
 | `scrapix-worker-content` | Content parser worker | shared-cpu-1x, 512 MB | Yes — horizontally scalable |
 
-External dependencies (unchanged): hosted Meilisearch, ClickHouse Cloud, managed Postgres, managed Redis/Dragonfly.
+External dependencies (unchanged): hosted Meilisearch, ClickHouse Cloud, managed Postgres, managed Redis/Dragonfly. The console and the Rails control plane (the Lab) are deployed from [`meilisearch/lab`](https://github.com/meilisearch/lab), not from this repo.
 
 ## How scale-to-zero works for workers
 
@@ -46,7 +45,7 @@ Topic partition counts (created by `deploy/fly/create-topics.sh`) must match `do
 
 `.github/workflows/deploy-fly.yml` runs on every push to `main`:
 
-1. **Change detection** — `dorny/paths-filter` decides whether to rebuild Rust, Console, or both.
+1. **Change detection** — `dorny/paths-filter` decides whether the Rust services need a rebuild.
 2. **Cargo fmt + check** — fails fast on lint.
 3. **Build** — one matrix job per binary (`scrapix-api`, `scrapix-frontier-service`, `scrapix-worker-crawler`, `scrapix-worker-content`), all sharing the same `Dockerfile.fly` multi-target build and the same GHA cache scope (`scrapix-rust`). Images pushed to `ghcr.io/<owner>/<name>:<sha>` and `:main`.
 4. **Deploy** — one `flyctl deploy --image` job per Fly app, parallel, using the pre-built GHCR image (no Fly builder).
@@ -69,7 +68,7 @@ Kafka consumer groups rebalance automatically when machines join or leave. Offse
 
 See `deploy/fly/README.md` for the full runbook. At a high level:
 
-1. Create the six Fly apps (`flyctl apps create …`).
+1. Create the five Fly apps (`flyctl apps create …`).
 2. Create the 10 GB volume for Redpanda.
 3. Deploy Redpanda and run `./deploy/fly/create-topics.sh`.
 4. Set secrets per app (`flyctl secrets set …`).
