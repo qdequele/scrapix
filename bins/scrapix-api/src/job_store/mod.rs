@@ -88,8 +88,19 @@ pub trait JobStore: Send + Sync {
     async fn load_active_job_accounting(&self) -> Vec<(String, serde_json::Value)>;
     /// One job, scoped to `account_id` when given.
     async fn get_job(&self, job_id: &str, account_id: Option<&str>) -> Option<JobState>;
-    /// Jobs newest first, scoped to `account_id` when given.
-    async fn list_jobs(&self, account_id: Option<&str>, limit: i64, offset: i64) -> Vec<JobState>;
+    /// Jobs newest first, scoped to `account_id` and to `status` (a
+    /// `status_to_str` value) when given.
+    async fn list_jobs(
+        &self,
+        account_id: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<JobState>;
+    /// Delete a finished (completed, failed or cancelled) job and its
+    /// results, scoped to `account_id` when given. `Ok(false)`: no such
+    /// finished job.
+    async fn delete_job(&self, job_id: &str, account_id: Option<&str>) -> Result<bool, StoreError>;
     /// Ids of an account's pending/running jobs (concurrent-job quota;
     /// see `AppState::active_job_count`).
     async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError>;

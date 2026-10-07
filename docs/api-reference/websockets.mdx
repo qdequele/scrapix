@@ -18,6 +18,8 @@ For single-job monitoring, [SSE events](/api-reference/jobs#job-events-sse) are 
 ## GET /ws
 
 General-purpose WebSocket endpoint. Connect and subscribe to events from one or more jobs.
+An account can only `subscribe` to (or `get_status` of) its own jobs: any other
+job id answers an `error` with code `not_found`, as on `/ws/job/{id}`.
 
 ### Connection
 

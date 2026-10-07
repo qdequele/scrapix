@@ -417,6 +417,8 @@ fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
             "WEBHOOK_MAX_CONCURRENT_DELIVERIES",
             scrapix_api::webhooks::DEFAULT_MAX_CONCURRENT_DELIVERIES as u64,
         ) as usize,
+        // The crawler runs in this process: it renders pages iff BROWSER_RENDER.
+        crawl_browser_available: Some(args.browser_render),
         verbose: args.verbose,
     }
 }

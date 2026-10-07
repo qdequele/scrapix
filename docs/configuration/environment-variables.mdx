@@ -29,6 +29,10 @@ In hosted mode the engine reports usage and job lifecycle to the Lab ([`meilisea
 | `LAB_SERVICE_TOKEN` | engine and Lab | — | **Required (hosted).** Bearer token for both directions: the Lab presents it to call the engine on behalf of an account, the engine presents it on `{LAB_URL}/internal/*`; at least 32 characters, identical on both sides. |
 
 <Note>
+**Credential revocation is not instant.** The engine caches each credential's introspection answer for the `cache_ttl` the Lab returns (30 s by default, capped at 5 min), so a revoked or deleted API key keeps working on the engine for up to that long. While the Lab is unreachable, a credential that was valid is served stale for up to 5 more minutes. Lower the Lab's `cache_ttl` to shorten the window.
+</Note>
+
+<Note>
 The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, session secrets) are documented in the `meilisearch/lab` repo. The engine never talks to Stripe: it reports usage, and the Lab debits the ledger and runs auto top-up.
 </Note>
 
@@ -47,6 +51,7 @@ The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, s
 | `MAX_PENDING_ACKS` | `50000` | Maximum event acks held while waiting for the accounting flush; the event consumer blocks (backpressure) at this cap until a flush frees room |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow webhook deliveries to reach private/loopback/link-local addresses (SSRF opt-out; same policy as the crawler's own `ALLOW_PRIVATE_IPS` — off by default, tests only) |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Maximum webhook deliveries in flight at once, across all jobs and hooks |
+| `CRAWL_BROWSER_AVAILABLE` | unset | Whether the crawler workers can render pages in a browser. Unset: unknown, `crawler_type: "browser"` crawls are accepted. `false`: `POST /crawl` refuses them (`503 render_js_unavailable`). Reported as `crawl_browser_available` by `GET /health/services`. `scrapix all` sets it from `BROWSER_RENDER` |
 
 ## Message Queue
 

@@ -28,7 +28,6 @@ use tracing::{info, warn};
 
 use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::config::WebhookConfig;
-use scrapix_extractor::SelectorDefinition;
 
 use crate::auth::AuthenticatedAccount;
 use crate::engine_jobs::{self, Gate};
@@ -36,7 +35,8 @@ use crate::job_kind::JobKind;
 use crate::results::{JobResultError, JobResultItem};
 use crate::{
     billing, check_write_permission, extract_account_context, perform_scrape, AccountContext,
-    AiOptions, ApiError, AppState, ScrapeFormat, ScrapeRequest, ScreenshotRequestOptions,
+    AiOptions, ApiError, AppState, ScrapeFormat, ScrapeRequest, ScrapeSelector,
+    ScreenshotRequestOptions,
 };
 
 /// Maximum number of URLs in one batch.
@@ -79,8 +79,9 @@ pub(crate) struct BatchScrapeRequest {
     exclude_selectors: Option<Vec<String>>,
     /// CSS selectors to keep (only extract from these)
     include_selectors: Option<Vec<String>>,
-    /// Custom CSS selector extraction (field_name -> selector definition)
-    extract: Option<HashMap<String, SelectorDefinition>>,
+    /// Custom CSS selector extraction: field name -> a CSS selector, a list
+    /// of selectors or a selector definition (as on `/scrape`)
+    extract: Option<HashMap<String, ScrapeSelector>>,
     /// AI enrichment, per URL
     ai: Option<AiOptions>,
     /// Screenshot options, used when `formats` includes `"screenshot"`
@@ -159,6 +160,11 @@ pub(crate) fn parse_batch_body(body: Value) -> Result<ParsedBatch, ApiError> {
             ),
             "validation_error",
         ));
+    }
+    // Indexes count the non-blank URLs (the ones scraped).
+    for (i, url) in urls.iter().enumerate() {
+        crate::check_http_url(url)
+            .map_err(|msg| ApiError::new(format!("urls[{i}]: {msg}"), "validation_error"))?;
     }
     let concurrency = match options.remove("concurrency") {
         None | Some(Value::Null) => DEFAULT_BATCH_CONCURRENCY,
@@ -248,6 +254,7 @@ pub(crate) async fn start_batch(
     account_ctx: &Option<AccountContext>,
     batch: ParsedBatch,
 ) -> Result<BatchScrapeResponse, ApiError> {
+    crate::require_ai_provider(state, batch.sample.ai.as_ref())?;
     if batch.sample.render_js && state.browser_renderer.is_none() {
         return Err(ApiError::new(
             "JS rendering is not available (Chrome/Chromium not found on this server)",
@@ -583,6 +590,14 @@ mod tests {
         )
         .is_err());
 
+        for bad in ["nope", "ftp://a.test/x", "https://"] {
+            let err = parse_batch_body(serde_json::json!({ "urls": ["https://a.test", bad] }))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert_eq!(err.code, "validation_error");
+            assert!(err.error.starts_with("urls[1]: "), "{}", err.error);
+        }
+
         let parsed = parse_batch_body(serde_json::json!({
             "urls": [" https://a.test/1 ", "", "https://a.test/2"],
             "concurrency": 500,
@@ -600,6 +615,20 @@ mod tests {
         assert_eq!(redacted["headers"]["Authorization"], "***");
     }
 
+    #[tokio::test]
+    async fn ai_without_a_provider_refuses_the_batch() {
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state(&bus);
+        let batch = parse_batch_body(serde_json::json!({
+            "urls": ["https://a.test/1"],
+            "ai": { "summary": true }
+        }))
+        .unwrap();
+        let err = start_batch(&state, &None, batch).await.err().unwrap();
+        assert_eq!(err.code, "service_unavailable");
+        assert!(state.crawl.jobs.read().is_empty(), "no job created");
+    }
+
     /// SCR-74 acceptance: a 100-URL batch against a local server, with
     /// failing URLs (404s, an unreachable host, an invalid URL), captured as
     /// items without failing the batch; results page consistently.
@@ -610,7 +639,8 @@ mod tests {
         let mut urls: Vec<String> = (0..90).map(|i| format!("{base}/ok/{i}")).collect();
         urls.extend((0..8).map(|i| format!("{base}/missing/{i}")));
         urls.push("http://unreachable.invalid/".to_string());
-        urls.push("not a url".to_string());
+        // A well-formed URL `/scrape` refuses (raw IP): a per-item error.
+        urls.push("https://10.0.0.1/".to_string());
         assert_eq!(urls.len(), 100);
 
         let bus = scrapix_queue::ChannelBus::new();

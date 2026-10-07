@@ -54,6 +54,19 @@ Create an asynchronous crawl job. Returns immediately with a job ID that you can
 
 See [Crawl Configs](/configuration/crawl-configs) for the complete schema with all options.
 
+### Validation
+
+A request the engine cannot run is refused up front instead of creating a
+job that fails (or completes empty) later:
+
+| Case | Response |
+|------|----------|
+| A start URL that is not an absolute `http`/`https` URL with a host | `400 validation_error` (`start_urls[<i>]: ...`) |
+| An `index_uid` that is not 1 to 511 characters among `a-z`, `A-Z`, `0-9`, `-`, `_` | `400 validation_error` (`index_uid: ...`) |
+| `features.ai_summary` / `features.ai_extraction` enabled on a server without an AI provider | `503 service_unavailable` |
+| `"crawler_type": "browser"` when the crawlers have no browser (`crawl_browser_available: false` in [`GET /health/services`](/api-reference/diagnostics)) | `503 render_js_unavailable` |
+| Concurrent-job limit of the plan reached (hosted) | `429 quota_exceeded` |
+
 ### Response
 
 ```json
@@ -84,7 +97,7 @@ When authentication is enabled, the following limits are enforced:
 | Max concurrent jobs | 1 | 3 | 10 | 100 |
 | Browser rendering | No | No | Yes | Yes |
 
-Exceeding a limit returns HTTP 429 with code `tier_limit_exceeded`.
+Exceeding a limit returns HTTP 429 (`quota_exceeded` for the concurrent-job limit).
 
 ### Domain Whitelisting
 

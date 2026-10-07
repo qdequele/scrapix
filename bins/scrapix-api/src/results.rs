@@ -723,6 +723,20 @@ impl ResultsState {
     fn in_memory(&self, job_id: &str) -> bool {
         self.memory.read().pages.contains_key(job_id)
     }
+
+    /// Drop everything kept about `job_id` (the job was deleted).
+    pub(crate) fn forget(&self, job_id: &str) {
+        {
+            let mut m = self.memory.write();
+            m.pages.remove(job_id);
+            m.summaries.remove(job_id);
+            m.order.retain(|id| id != job_id);
+        }
+        let mut guard = self.crawl_targets.write();
+        let (map, order) = &mut *guard;
+        map.remove(job_id);
+        order.retain(|id| id != job_id);
+    }
 }
 
 /// Store result `seq` (1-based, in completion order) of an engine-run job.
@@ -875,7 +889,15 @@ pub(crate) mod test_support {
     pub(crate) fn test_state_with_lab(
         bus: &ChannelBus,
     ) -> (Arc<AppState>, Arc<crate::lab_events::MemoryOutbox>) {
-        let mut state = build_state(bus, None);
+        test_state_with_ai_and_lab(bus, None)
+    }
+
+    /// Both: an AI service (or none) and an in-memory Lab.
+    pub(crate) fn test_state_with_ai_and_lab(
+        bus: &ChannelBus,
+        ai_service: Option<Arc<scrapix_ai::AiService>>,
+    ) -> (Arc<AppState>, Arc<crate::lab_events::MemoryOutbox>) {
+        let mut state = build_state(bus, ai_service);
         let outbox = crate::with_memory_lab(&mut state);
         (Arc::new(state), outbox)
     }

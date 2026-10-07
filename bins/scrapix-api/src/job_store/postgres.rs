@@ -404,48 +404,61 @@ impl JobStore for PgJobStore {
     }
 
     /// Paginated list of jobs, newest first: all jobs, or those of one
-    /// account.
-    async fn list_jobs(&self, account_id: Option<&str>, limit: i64, offset: i64) -> Vec<JobState> {
-        match account_id {
-            None => {
-                let rows =
-                    sqlx::query("SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2")
-                        .bind(limit)
-                        .bind(offset)
-                        .fetch_all(&self.pool)
-                        .await;
-
-                match rows {
-                    Ok(rows) => rows.iter().map(row_to_job_state).collect(),
-                    Err(e) => {
-                        warn!(error = %e, "Failed to list jobs from Postgres");
-                        Vec::new()
-                    }
-                }
-            }
-            Some(account_id) => {
-                let account_uuid: uuid::Uuid = match account_id.parse() {
-                    Ok(u) => u,
-                    Err(_) => return Vec::new(),
-                };
-                let rows = sqlx::query(
-                    "SELECT * FROM jobs WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-                )
-                .bind(account_uuid)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await;
-
-                match rows {
-                    Ok(rows) => rows.iter().map(row_to_job_state).collect(),
-                    Err(e) => {
-                        warn!(error = %e, "Failed to list jobs for account from Postgres");
-                        Vec::new()
-                    }
-                }
+    /// account, optionally of one status.
+    async fn list_jobs(
+        &self,
+        account_id: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<JobState> {
+        let account_uuid: Option<uuid::Uuid> = match account_id {
+            None => None,
+            Some(a) => match a.parse() {
+                Ok(u) => Some(u),
+                Err(_) => return Vec::new(),
+            },
+        };
+        let rows = sqlx::query(
+            "SELECT * FROM jobs WHERE ($1::uuid IS NULL OR account_id = $1)
+             AND ($2::text IS NULL OR status = $2)
+             ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+        )
+        .bind(account_uuid)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => rows.iter().map(row_to_job_state).collect(),
+            Err(e) => {
+                warn!(error = %e, "Failed to list jobs from Postgres");
+                Vec::new()
             }
         }
+    }
+
+    /// Delete a finished job; its `job_results` rows go with it (ON DELETE
+    /// CASCADE).
+    async fn delete_job(&self, job_id: &str, account_id: Option<&str>) -> Result<bool, StoreError> {
+        let account_uuid: Option<uuid::Uuid> = match account_id {
+            None => None,
+            Some(a) => match a.parse() {
+                Ok(u) => Some(u),
+                Err(_) => return Ok(false),
+            },
+        };
+        sqlx::query(
+            "DELETE FROM jobs WHERE job_id = $1 AND ($2::uuid IS NULL OR account_id = $2)
+             AND status IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(job_id)
+        .bind(account_uuid)
+        .execute(&self.pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .map_err(store_err)
     }
 
     /// Pending/running jobs of an account (per-tier concurrent job limit).

@@ -43,14 +43,20 @@ All responses return JSON. Successful responses return the data directly. Errors
 
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
-| `not_found` | 404 | Resource does not exist |
+| `not_found` | 404 | Resource does not exist (or belongs to another account) |
 | `bad_request` | 400 | Malformed request |
-| `validation_error` | 400 | Invalid field values |
+| `validation_error` | 400 | Invalid field values (e.g. a start URL that is not an absolute http(s) URL, an invalid `index_uid`) |
 | `unauthorized` | 401 | Missing or invalid credentials |
-| `conflict` | 409 | Resource already exists |
-| `tier_limit_exceeded` | 429 | Billing tier limit reached |
-| `queue_error` | 500 | Failed to publish to message queue |
-| `timeout` | 500 | Operation timed out |
+| `insufficient_credits` | 402 | Not enough credits |
+| `forbidden` | 403 | The caller's role cannot do this (viewers) |
+| `spend_limit_exceeded` | 403 | The account's spend limit is reached |
+| `analytics_unavailable` | 404 | `/analytics/v0/*` on a server without ClickHouse |
+| `conflict` | 409 | The resource is in the wrong state (e.g. cancelling a finished job) |
+| `quota_exceeded` | 429 | Plan limit reached (e.g. concurrent jobs) |
+| `fetch_error` | 502 | The target page could not be fetched |
+| `service_unavailable` | 503 | A dependency is unavailable (e.g. AI features without an AI provider); may carry `Retry-After` |
+| `render_js_unavailable` | 503 | A browser feature on a server without a browser (see `GET /health/services`) |
+| `timeout` | 504 | Operation timed out |
 
 ## Endpoints Summary
 
@@ -64,7 +70,7 @@ All responses return JSON. Successful responses return the data directly. Errors
 | `GET` | `/openapi.json` | OpenAPI 3.1 specification |
 | `GET` | `/docs` | Interactive API docs (Scalar UI) |
 
-### Diagnostics (Auth Required in Standalone; Public in Hosted)
+### Diagnostics (Auth Required, Every Mode; Scoped to the Caller's Account)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -91,7 +97,7 @@ All responses return JSON. Successful responses return the data directly. Errors
 | `GET` | `/job/{id}/status` | [Get job status](/api-reference/jobs#get-job-status) |
 | `GET` | `/job/{id}/results` | [Paginated job results](/api-reference/jobs#get-job-id-results) |
 | `GET` | `/job/{id}/events` | [SSE event stream](/api-reference/jobs#job-events-sse) |
-| `DELETE` | `/job/{id}` | [Cancel a job](/api-reference/jobs#cancel-job) |
+| `DELETE` | `/job/{id}` | [Cancel a job](/api-reference/jobs#cancel-job), or delete a finished one with `?purge=true` |
 | `POST` | `/job/{id}/pause` | [Pause a job](/api-reference/jobs#post-job-id-pause) |
 | `POST` | `/job/{id}/resume` | [Resume a job](/api-reference/jobs#post-job-id-resume) |
 
@@ -118,7 +124,7 @@ account key or session in hosted).
 The Tinybird-style `/analytics/v0/pipes/*` API is served by the engine itself
 against its ClickHouse, in both standalone and hosted mode (hosted callers
 only see their own account). Without ClickHouse configured the routes return
-`404`. Engines also have `/stats`, `/errors` and `/domains` for in-memory
+`404` with `{"error": "Analytics unavailable", "code": "analytics_unavailable"}`. Engines also have `/stats`, `/errors` and `/domains` for in-memory
 diagnostics (see [Diagnostics](/api-reference/diagnostics)).
 
 ## Rate Limiting

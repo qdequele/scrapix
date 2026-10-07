@@ -110,7 +110,7 @@ pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {
         s.insert_job(&job(&format!("ls-{i}"))).await.unwrap();
     }
     let ids: Vec<String> = s
-        .list_jobs(None, 100, 0)
+        .list_jobs(None, None, 100, 0)
         .await
         .into_iter()
         .map(|j| j.job_id)
@@ -118,7 +118,7 @@ pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {
         .collect();
     assert_eq!(ids, vec!["ls-2", "ls-1", "ls-0"]);
     let page: Vec<String> = s
-        .list_jobs(None, 1, 0)
+        .list_jobs(None, None, 1, 0)
         .await
         .into_iter()
         .map(|j| j.job_id)
@@ -130,7 +130,7 @@ pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {
     owned.account_id = Some(account.into());
     s.insert_job(&owned).await.unwrap();
     let mine: Vec<String> = s
-        .list_jobs(Some(account), 100, 0)
+        .list_jobs(Some(account), None, 100, 0)
         .await
         .into_iter()
         .map(|j| j.job_id)
@@ -139,6 +139,54 @@ pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {
     assert!(s.get_job("ls-0", Some(account)).await.is_none());
     assert!(s.get_job("ls-owned", Some(account)).await.is_some());
     assert_eq!(s.active_job_ids(account).await.unwrap(), vec!["ls-owned"]);
+}
+
+pub(super) async fn list_filters_by_status(s: Arc<dyn JobStore>) {
+    let mut done = job("lf-done");
+    done.status = JobStatus::Completed;
+    s.insert_job(&done).await.unwrap();
+    let mut running = job("lf-run");
+    running.start();
+    s.insert_job(&running).await.unwrap();
+    let ids = |jobs: Vec<JobState>| jobs.into_iter().map(|j| j.job_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(s.list_jobs(None, Some("completed"), 100, 0).await),
+        vec!["lf-done"]
+    );
+    assert_eq!(
+        ids(s.list_jobs(None, Some("running"), 100, 0).await),
+        vec!["lf-run"]
+    );
+    assert!(s.list_jobs(None, Some("paused"), 100, 0).await.is_empty());
+}
+
+pub(super) async fn delete_only_finished_owned_jobs(s: Arc<dyn JobStore>) {
+    let account = "7f1c2a8e-0000-4000-8000-000000000001";
+    let mut done = job("dl-done");
+    done.status = JobStatus::Completed;
+    done.account_id = Some(account.into());
+    s.insert_job(&done).await.unwrap();
+    s.store_result_page("dl-done", 1, "https://e.com/1", true, &json!({"n": 1}))
+        .await
+        .unwrap();
+    let mut running = job("dl-run");
+    running.start();
+    s.insert_job(&running).await.unwrap();
+
+    // Not finished, another account's, unknown: nothing deleted.
+    assert!(!s.delete_job("dl-run", None).await.unwrap());
+    assert!(s.get_job("dl-run", None).await.is_some());
+    let other = "7f1c2a8e-0000-4000-8000-0000000000ff";
+    assert!(!s.delete_job("dl-done", Some(other)).await.unwrap());
+    assert!(!s.delete_job("nope", None).await.unwrap());
+
+    assert!(s.delete_job("dl-done", Some(account)).await.unwrap());
+    assert!(s.get_job("dl-done", None).await.is_none());
+    assert_eq!(s.result_pages("dl-done", 0, 10).await.unwrap(), (vec![], 0));
+    assert!(
+        !s.delete_job("dl-done", None).await.unwrap(),
+        "already gone"
+    );
 }
 
 pub(super) async fn job_results_pages_and_summary(s: Arc<dyn JobStore>) {
@@ -199,6 +247,8 @@ macro_rules! conformance_tests {
             case!(accounting_and_active_recovery);
             case!(list_newest_first_and_account_filter);
             case!(job_results_pages_and_summary);
+            case!(list_filters_by_status);
+            case!(delete_only_finished_owned_jobs);
         }
     };
 }
