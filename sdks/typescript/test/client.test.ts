@@ -106,7 +106,7 @@ describe("request bodies", () => {
       .add("GET", "/jobs", json(200, [jobStatus("a"), jobStatus("b")]))
       .add("POST", "/job/a/pause", json(200, jobStatus("a", "paused")))
       .add("POST", "/job/a/resume", json(200, jobStatus("a", "running")))
-      .add("DELETE", "/job/a", json(200, jobStatus("a", "cancelled")));
+      .add("DELETE", "/job/a", json(200, jobStatus("a", "cancelled")), new Response(null, { status: 204 }));
     const client = api.client();
     const jobs = await client.listJobs({ limit: 2 });
     expect(jobs.map((j) => j.job_id)).toEqual(["a", "b"]);
@@ -115,6 +115,10 @@ describe("request bodies", () => {
     expect((await client.pauseJob("a")).status).toBe("paused");
     expect((await client.resumeJob("a")).status).toBe("running");
     expect((await client.cancelJob("a")).status).toBe("cancelled");
+    expect(api.requests.at(-1)?.url.searchParams.has("purge")).toBe(false);
+    expect(await client.deleteJob("a")).toBeUndefined();
+    expect(api.requests.at(-1)?.url.searchParams.get("purge")).toBe("true");
+    await client.listJobs({ status: "completed" });
   });
 
   it("escapes job ids in paths", async () => {

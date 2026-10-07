@@ -217,40 +217,48 @@ have realistic values.
 
 ### Custom CSS Extraction
 
-The `extract` field maps field names to CSS selector definitions:
+The `extract` field maps field names to CSS selectors. Each value is one of:
+
+- a **CSS selector** (`"h1"`): the trimmed text of its first match, as in a
+  crawl's `features.custom_selectors`;
+- a **list of selectors** (`[".price", ".amount"]`): tried in order, the
+  trimmed text of the first that matches;
+- a **selector definition** object, for other extraction modes.
 
 ```json
 {
   "extract": {
-    "price": {
-      "selector": ".product-price",
-      "type": "text"
-    },
+    "title": "h1",
+    "price": [".sale-price", ".product-price"],
     "images": {
       "selector": "img.product-image",
-      "type": "list",
-      "attribute": "src"
+      "mode": "list"
     },
     "rating": {
       "selector": "[data-rating]",
-      "type": "text",
-      "attribute": "data-rating"
+      "mode": { "attribute": "data-rating" }
     }
   }
 }
 ```
 
-Each selector definition supports:
+A selector definition supports:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `selector` | string | **required** | CSS selector |
-| `type` | string | `"text"` | `"text"` for single value, `"list"` for multiple |
-| `attribute` | string | inner text | HTML attribute to extract |
+| `selector` / `selectors` | string / string[] | **required** (one of them) | CSS selector, or selectors tried in order |
+| `mode` | string or object | `"text"` | `"text"`, `"html"`, `"outer_html"`, `"list"`, `"first"`, `"count"`, `"list_of_objects"` or `{"attribute": "<name>"}` |
+| `default` | any | `null` | Value when nothing matches |
+| `transform` | array | `[]` | Transforms applied to the value (`"trim"`, `"lowercase"`, ...) |
 
 ### AI Enrichment
 
-Requires `OPENAI_API_KEY` environment variable.
+Requires an AI provider on the server (`AI_PROVIDER` and its API key, e.g.
+`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). Without one, a request asking for
+`ai.summary` or `ai.extract` is refused with `503 service_unavailable` before
+anything is fetched or billed. The AI surcharge is billed only for the AI work
+that produced a result: if the provider fails, the response carries a
+`warning` and only the scrape itself is billed.
 
 ```json
 {
@@ -370,7 +378,7 @@ the scrape. See [Documents & OCR](/guides/documents).
 }
 ```
 
-Fields are only present if the corresponding format was requested. A `warning` field appears when AI was requested but `OPENAI_API_KEY` is not set.
+Fields are only present if the corresponding format was requested. A `warning` field appears when requested AI work could not be generated (not billed).
 
 ### Examples
 

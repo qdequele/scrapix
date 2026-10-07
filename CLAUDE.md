@@ -176,6 +176,13 @@ scrapix health
 - All diagnostic data is from in-memory tracking (recent only, since API startup)
 - Error ring buffer holds last 1000 errors
 - Domain counters are aggregated from crawl events
+- `/stats`, `/errors`, `/domains` require auth in **both** modes and are scoped
+  per account (`bins/scrapix-api/src/diagnostics.rs`): an account sees its own
+  jobs, errors and domains; the standalone admin key sees everything. Only
+  `/health`, `/health/services` and `/metrics` are public. `/health/services`
+  also reports `browser_available` (the API's browser: `render_js`,
+  screenshots, actions) and `crawl_browser_available` (`CRAWL_BROWSER_AVAILABLE`;
+  `null` = unknown).
 
 ## Analytics API (Tinybird-style)
 
@@ -277,7 +284,9 @@ that names a Lab-owned table, reads included).
   (`{LAB_URL}/internal/*`, Bearer `LAB_SERVICE_TOKEN`): credentials are sent to
   `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
   30 s, stale up to 5 min if the Lab is down; an unknown credential while the
-  Lab is down is a 503 with `Retry-After: 5`), the Meilisearch target comes
+  Lab is down is a 503 with `Retry-After: 5`; so a revoked key keeps working
+  on the engine for up to `cache_ttl`, documented in
+  `docs/configuration/environment-variables.mdx`), the Meilisearch target comes
   from `GET /internal/accounts/{id}/meilisearch`, and credits from
   `GET /internal/accounts/{id}`. It issues no credentials and reads no Lab
   table. At startup it pings `{LAB_URL}/internal/ping` and refuses to start on
@@ -378,6 +387,22 @@ never deletes a document whose page returned `304` in this job.
   frontier and every worker for that job and bills the pages crawled so far.
   Only a non-terminal job can be cancelled — cancelling a `completed`,
   `failed` or `cancelled` job returns `409`.
+- `DELETE /job/{id}?purge=true` **deletes** a finished job the caller owns
+  (memory + job store, `job_results` cascade; documents stay in Meilisearch):
+  `204`; a non-terminal job is `409` (cancel first), and so is a job whose
+  terminal write / Lab events are still owed (`Retry-After: 5`).
+- `GET /jobs` takes `limit` (default 50, max 200), `offset` and `status`;
+  list items omit `config` (it is on `GET /job/{id}/status`).
+- Requests the engine cannot run are refused up front: invalid start URLs /
+  batch URLs / `index_uid` (`^[a-zA-Z0-9_-]{1,511}$`) → 400
+  `validation_error`; AI (`/scrape` `ai`, `/parse`, batch, crawl
+  `features.ai_*`) without an AI provider → 503 `service_unavailable`;
+  `crawler_type: browser` with `crawl_browser_available == false` → 503
+  `render_js_unavailable`. The AI surcharge is billed only for AI work that
+  produced a result.
+- Error code → status (`ApiError::into_response`): `quota_exceeded` 429,
+  `fetch_error` 502, `render_js_unavailable` 503, `forbidden` 403, `timeout`
+  504, `analytics_unavailable` 404 (`/analytics/v0/*` without ClickHouse).
 - `POST /job/{id}/pause` / `POST /job/{id}/resume` — the frontier stops
   dispatching a paused job's URLs (in-flight pages finish, and links they
   discover keep being **admitted** into the queue, just not dispatched); a
@@ -593,6 +618,7 @@ GROUP BY date ORDER BY date;
 | `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
 | `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
+| `CRAWL_BROWSER_AVAILABLE` | API: whether the crawlers can render pages; unset = unknown (browser crawls accepted), `false` = `POST /crawl` refuses `crawler_type: browser`. `scrapix all` sets it from `BROWSER_RENDER` |
 | `LAB_URL` | API, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone |
 | `LAB_EVENTS_URL` | **Deprecated** fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Do not set it |
 | `LAB_EVENTS_SECRET` | API, hosted only, required (≥32 chars, same value on the Lab): HMAC-SHA256 key signing lab-event deliveries (`X-Scrapix-Signature`). Generate with `openssl rand -hex 32` |

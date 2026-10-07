@@ -46,6 +46,7 @@ pub mod auth;
 pub(crate) mod batch;
 pub mod billing;
 pub mod completion;
+pub(crate) mod diagnostics;
 pub mod documents;
 pub(crate) mod engine_jobs;
 pub(crate) mod extract;
@@ -63,6 +64,8 @@ pub mod webhooks;
 
 #[cfg(test)]
 mod scrape_browser_tests;
+#[cfg(test)]
+mod scrape_tests;
 
 use axum::{
     extract::{
@@ -226,6 +229,14 @@ pub struct Args {
     )]
     pub webhook_max_concurrent_deliveries: usize,
 
+    /// Whether the crawler workers can render pages in a browser
+    /// (`crawler_type: "browser"` crawls). Unset: unknown, browser crawls
+    /// are accepted. `false`: they are refused at `POST /crawl` (503
+    /// `render_js_unavailable`). `scrapix all` sets it from its in-process
+    /// crawler's `BROWSER_RENDER`.
+    #[arg(long, env = "CRAWL_BROWSER_AVAILABLE")]
+    pub crawl_browser_available: Option<bool>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -284,9 +295,9 @@ struct CrawlState {
 /// Diagnostics: errors, domain stats, service health
 struct DiagnosticsState {
     /// Recent errors ring buffer (for diagnostics)
-    recent_errors: RwLock<VecDeque<ErrorRecord>>,
-    /// Per-domain counters (for diagnostics)
-    domain_counters: RwLock<HashMap<String, DomainCounter>>,
+    recent_errors: RwLock<VecDeque<diagnostics::ErrorRecord>>,
+    /// Per-(account, domain) counters (for diagnostics)
+    domain_counters: RwLock<HashMap<diagnostics::DomainKey, diagnostics::DomainCounter>>,
     /// Last time each service type was seen (for health monitoring)
     service_last_seen: RwLock<HashMap<String, std::time::Instant>>,
     /// Number of job completion/failure emails requested (one per terminal
@@ -372,6 +383,9 @@ struct AppState {
     pub(crate) auth_disabled: bool,
     /// Last time `/health` logged the auth-disabled warning.
     auth_disabled_warned_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Whether the crawler workers have a browser (`None`: unknown), see
+    /// [`Args::crawl_browser_available`].
+    pub(crate) crawl_browser: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +480,7 @@ impl AppState {
             meili: Arc::new(crate::meili::EnvResolver(None)),
             auth_disabled: false,
             auth_disabled_warned_at: parking_lot::Mutex::new(None),
+            crawl_browser: None,
             lab_api,
             job_store,
             analytics_store,
@@ -559,6 +574,22 @@ impl AppState {
             .is_none_or(|j| job_kind::JobKind::of(j).is_pipeline())
     }
 
+    /// The account a diagnostics record of `job_id` belongs to: the job's
+    /// own (engine-owned), else the one the event carries.
+    fn diagnostics_account(&self, job_id: &str, event: &CrawlEvent) -> Option<String> {
+        let job_account = self
+            .crawl
+            .jobs
+            .read()
+            .get(job_id)
+            .and_then(|j| j.account_id.clone());
+        job_account.or_else(|| match event {
+            CrawlEvent::PageCrawled { account_id, .. }
+            | CrawlEvent::PageFailed { account_id, .. } => account_id.clone(),
+            _ => None,
+        })
+    }
+
     /// Update a job
     fn update_job<F>(&self, job_id: &str, f: F) -> Option<JobState>
     where
@@ -573,7 +604,8 @@ impl AppState {
         }
     }
 
-    /// List all jobs
+    /// List all jobs (in-memory, unordered)
+    #[cfg(test)]
     fn list_jobs(&self, limit: usize, offset: usize) -> Vec<JobState> {
         let jobs = self.crawl.jobs.read();
         jobs.values().skip(offset).take(limit).cloned().collect()
@@ -1828,11 +1860,11 @@ impl AppState {
 
                 // Track domain stats
                 if let Some(domain) = extract_domain(url) {
-                    let mut counters = self.diagnostics.domain_counters.write();
-                    let counter = counters.entry(domain).or_default();
-                    counter.requests += 1;
-                    counter.successes += 1;
-                    counter.total_response_time_ms += *duration_ms;
+                    self.diagnostics.record_success(
+                        self.diagnostics_account(job_id, event),
+                        domain,
+                        *duration_ms,
+                    );
                 }
             }
             CrawlEvent::PageFailed {
@@ -1852,31 +1884,16 @@ impl AppState {
 
                 // Track error
                 let domain = extract_domain(url).unwrap_or_else(|| "unknown".to_string());
-                let error_record = ErrorRecord {
+                self.diagnostics.record_failure(diagnostics::ErrorRecord {
                     url: url.clone(),
-                    domain: domain.clone(),
+                    domain,
                     error: error.clone(),
                     status_code: status.or_else(|| extract_status_code(error)),
                     job_id: job_id.to_string(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     retry_count: *retry_count,
-                };
-
-                {
-                    let mut errors = self.diagnostics.recent_errors.write();
-                    errors.push_back(error_record);
-                    while errors.len() > 1000 {
-                        errors.pop_front();
-                    }
-                }
-
-                // Track domain stats
-                {
-                    let mut counters = self.diagnostics.domain_counters.write();
-                    let counter = counters.entry(domain).or_default();
-                    counter.requests += 1;
-                    counter.failures += 1;
-                }
+                    account_id: self.diagnostics_account(job_id, event),
+                });
             }
             CrawlEvent::DocumentIndexed { .. } if !frozen => {
                 self.update_job(job_id, |j| {
@@ -2569,7 +2586,12 @@ impl IntoResponse for ApiError {
             "insufficient_credits" => StatusCode::PAYMENT_REQUIRED,
             "action_error" => StatusCode::UNPROCESSABLE_ENTITY,
             "spend_limit_exceeded" => StatusCode::FORBIDDEN,
-            "service_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable" | "render_js_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+            "forbidden" => StatusCode::FORBIDDEN,
+            "quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+            "fetch_error" => StatusCode::BAD_GATEWAY,
+            "timeout" => StatusCode::GATEWAY_TIMEOUT,
+            "analytics_unavailable" => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let retry_after = self.retry_after;
@@ -2719,6 +2741,8 @@ impl From<JobState> for JobStatusResponse {
     fn from(job: JobState) -> Self {
         let duration_seconds = job.duration_seconds();
         let job_type = job_kind::JobKind::of(&job);
+        // A finished job has nothing left to estimate.
+        let eta_seconds = job.eta_seconds.filter(|_| !is_terminal(&job.status));
         Self {
             job_id: job.job_id,
             job_type,
@@ -2733,7 +2757,7 @@ impl From<JobState> for JobStatusResponse {
             duration_seconds,
             error_message: job.error_message,
             crawl_rate: job.crawl_rate,
-            eta_seconds: job.eta_seconds,
+            eta_seconds,
             start_urls: job.start_urls,
             max_pages: job.max_pages,
             config: job.config,
@@ -2745,14 +2769,31 @@ impl From<JobState> for JobStatusResponse {
 /// List jobs query parameters
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 struct ListJobsQuery {
+    /// Page size (default 50, at most 200)
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Jobs to skip (newest first)
     #[serde(default)]
     offset: usize,
+    /// Only jobs with this status: `pending`, `running`, `paused`,
+    /// `completed`, `failed` or `cancelled`
+    #[serde(default)]
+    status: Option<String>,
 }
 
 fn default_limit() -> usize {
     50
+}
+
+/// Largest `GET /jobs` page.
+const MAX_LIST_JOBS_LIMIT: usize = 200;
+
+/// `DELETE /job/{id}` query parameters
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct DeleteJobQuery {
+    /// `true`: delete a finished job instead of cancelling a running one
+    #[serde(default)]
+    purge: bool,
 }
 
 /// Health check response
@@ -2805,9 +2846,11 @@ struct ScrapeRequest {
     #[serde(default)]
     include_selectors: Vec<String>,
 
-    /// Custom CSS selector extraction (field_name -> selector definition)
+    /// Custom CSS selector extraction: field name -> a CSS selector, a list
+    /// of selectors (the first that matches wins) or a selector definition
+    /// (`{"selector": "...", "mode": "list", ...}`)
     #[serde(default)]
-    extract: HashMap<String, SelectorDefinition>,
+    extract: HashMap<String, ScrapeSelector>,
 
     /// AI enrichment options
     #[serde(default)]
@@ -2868,6 +2911,41 @@ impl Default for ScrapeRequest {
     }
 }
 
+/// One `/scrape` `extract` field, in any of the shapes crawl's
+/// `custom_selectors` accepts plus a full selector definition.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub(crate) enum ScrapeSelector {
+    /// A CSS selector: the trimmed text of its first match
+    Selector(String),
+    /// CSS selectors, tried in order: the trimmed text of the first match
+    Selectors(Vec<String>),
+    /// A selector definition (extraction mode, attribute, transforms, ...)
+    Definition(SelectorDefinition),
+}
+
+impl ScrapeSelector {
+    fn to_definition(&self) -> SelectorDefinition {
+        let text = |selector| SelectorDefinition {
+            selector,
+            mode: scrapix_extractor::ExtractionMode::Text,
+            attribute: None,
+            default: None,
+            transform: vec![scrapix_extractor::Transform::Trim],
+            fields: HashMap::new(),
+        };
+        match self {
+            Self::Selector(s) => text(scrapix_extractor::SelectorInput::Single {
+                selector: s.clone(),
+            }),
+            Self::Selectors(v) => text(scrapix_extractor::SelectorInput::Multiple {
+                selectors: v.clone(),
+            }),
+            Self::Definition(d) => d.clone(),
+        }
+    }
+}
+
 /// Screenshot options for /scrape
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 struct ScreenshotRequestOptions {
@@ -2887,6 +2965,38 @@ struct AiOptions {
     /// Extract structured data (prompt-based or schema-based)
     #[serde(default)]
     extract: Option<AiExtractOptions>,
+}
+
+impl AiOptions {
+    fn wants_summary(&self) -> bool {
+        self.summary
+    }
+
+    fn wants_extraction(&self) -> bool {
+        self.extract.is_some()
+    }
+}
+
+/// `ai` asks for AI work (a summary or an extraction) but no AI provider is
+/// configured: refuse up front, before anything is fetched or billed.
+fn require_ai_provider(state: &AppState, ai: Option<&AiOptions>) -> Result<(), ApiError> {
+    let wanted = ai.is_some_and(|ai| ai.wants_summary() || ai.wants_extraction());
+    if wanted && state.ai_service.is_none() {
+        return Err(no_ai_provider("AI features (ai.summary, ai.extract)"));
+    }
+    Ok(())
+}
+
+/// The 503 for `what` when the server has no AI provider (same as
+/// `POST /extract`).
+pub(crate) fn no_ai_provider(what: &str) -> ApiError {
+    ApiError::new(
+        format!(
+            "{what} require an AI provider: set AI_PROVIDER and the matching API key \
+             (e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY) on the server"
+        ),
+        "service_unavailable",
+    )
 }
 
 /// AI extraction options
@@ -3070,115 +3180,6 @@ impl From<ExtractedMetadata> for ScrapeMetadata {
 }
 
 // ============================================================================
-// Diagnostic Response Types
-// ============================================================================
-
-/// System stats response
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct SystemStatsResponse {
-    meilisearch: Option<MeilisearchStats>,
-    jobs: JobSummary,
-    diagnostics: DiagnosticsStats,
-    collected_at: String,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct MeilisearchStats {
-    available: bool,
-    url: String,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct JobSummary {
-    total: usize,
-    running: usize,
-    completed: usize,
-    failed: usize,
-    pending: usize,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct DiagnosticsStats {
-    recent_errors_count: usize,
-    tracked_domains: usize,
-    total_requests: u64,
-    total_successes: u64,
-    total_failures: u64,
-}
-
-/// Errors response
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct ErrorsResponse {
-    errors: Vec<ErrorRecord>,
-    total_count: usize,
-    by_status: HashMap<u16, u64>,
-    by_domain: Vec<(String, u64)>,
-    source: String,
-}
-
-/// Error record for tracking
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-struct ErrorRecord {
-    url: String,
-    domain: String,
-    error: String,
-    status_code: Option<u16>,
-    job_id: String,
-    timestamp: String,
-    retry_count: u32,
-}
-
-/// Errors query parameters
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-struct ErrorsQuery {
-    #[serde(default = "default_last")]
-    last: usize,
-    job_id: Option<String>,
-}
-
-fn default_last() -> usize {
-    20
-}
-
-/// Domains response
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct DomainsResponse {
-    domains: Vec<DomainInfo>,
-    total_domains: usize,
-    source: String,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct DomainInfo {
-    domain: String,
-    total_requests: u64,
-    successful_requests: u64,
-    failed_requests: u64,
-    avg_response_time_ms: Option<f64>,
-}
-
-/// Domains query parameters
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-struct DomainsQuery {
-    #[serde(default = "default_top")]
-    top: usize,
-    filter: Option<String>,
-}
-
-fn default_top() -> usize {
-    20
-}
-
-/// Per-domain counter for in-memory tracking
-#[derive(Debug, Clone, Default)]
-struct DomainCounter {
-    requests: u64,
-    successes: u64,
-    failures: u64,
-    total_response_time_ms: u64,
-}
-
-// ============================================================================
 // Route Handlers
 // ============================================================================
 
@@ -3257,6 +3258,14 @@ struct ServiceStatus {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ServiceHealthResponse {
     services: Vec<ServiceStatus>,
+    /// A browser is available to the API: `render_js`, `mobile`, `actions`
+    /// and the `screenshot` format on `/scrape`, `/batch/scrape`, `/map` and
+    /// `/extract` (they answer 503 `render_js_unavailable` otherwise).
+    browser_available: bool,
+    /// The crawlers can render pages (`crawler_type: "browser"` crawls);
+    /// `null` when the API does not know (separately deployed crawlers,
+    /// browser crawls accepted). When `false`, `POST /crawl` refuses them.
+    crawl_browser_available: Option<bool>,
 }
 
 /// Service health endpoint — reports liveness of each component
@@ -3307,7 +3316,11 @@ async fn health_services(State(state): State<Arc<AppState>>) -> Json<ServiceHeal
         worker_status("frontier"),
     ];
 
-    Json(ServiceHealthResponse { services })
+    Json(ServiceHealthResponse {
+        services,
+        browser_available: state.browser_renderer.is_some(),
+        crawl_browser_available: state.crawl_browser,
+    })
 }
 
 /// `/scrape` accepts PDFs and office documents (up to
@@ -3525,9 +3538,12 @@ pub(crate) async fn perform_scrape(
         debug!(account_id = %ctx.account_id, "Scrape request from account");
     }
 
-    // Compute credit cost based on requested features
-    let has_ai_summary_req = request.ai.as_ref().is_some_and(|ai| ai.summary);
-    let has_ai_extraction_req = request.ai.as_ref().is_some_and(|ai| ai.extract.is_some());
+    require_ai_provider(state, request.ai.as_ref())?;
+
+    // Credit estimate from the requested features (the charge is for what
+    // was delivered, see below)
+    let has_ai_summary_req = request.ai.as_ref().is_some_and(|ai| ai.wants_summary());
+    let has_ai_extraction_req = request.ai.as_ref().is_some_and(|ai| ai.wants_extraction());
     let scrape_cost =
         billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
 
@@ -3797,7 +3813,6 @@ pub(crate) async fn perform_scrape(
                 ai: request.ai.as_ref(),
                 status_code,
                 js_rendered,
-                base_cost: scrape_cost,
             },
             start_time,
         )
@@ -3845,7 +3860,13 @@ pub(crate) async fn perform_scrape(
             extractor = extractor.with_blocks();
         }
         if !request.extract.is_empty() {
-            let sel_extractor = SelectorExtractor::with_definitions(request.extract.clone());
+            let sel_extractor = SelectorExtractor::with_definitions(
+                request
+                    .extract
+                    .iter()
+                    .map(|(field, sel)| (field.clone(), sel.to_definition()))
+                    .collect(),
+            );
             extractor = extractor.with_selectors(sel_extractor);
         }
 
@@ -3935,9 +3956,12 @@ pub(crate) async fn perform_scrape(
 
     let scrape_duration_ms = start_time.elapsed().as_millis() as u64;
 
+    // Only the AI work that produced a result is reported and billed.
+    let has_ai_summary = ai_result.as_ref().is_some_and(|r| r.summary.is_some());
+    let has_ai_extraction = ai_result.as_ref().is_some_and(|r| r.extract.is_some());
+    let charged = billing::scrape_credits(&request.formats, has_ai_summary, has_ai_extraction);
+
     // Track successful scrape in ClickHouse request_events
-    let has_ai_summary = request.ai.as_ref().is_some_and(|ai| ai.summary);
-    let has_ai_extraction = request.ai.as_ref().is_some_and(|ai| ai.extract.is_some());
     if let Some(ref batcher) = state.analytics.request_batcher {
         let account_id = account_ctx
             .as_ref()
@@ -3971,9 +3995,9 @@ pub(crate) async fn perform_scrape(
             state,
             ctx,
             &request.formats,
-            has_ai_summary_req,
-            has_ai_extraction_req,
-            scrape_cost,
+            has_ai_summary,
+            has_ai_extraction,
+            charged,
             &final_url,
         )
         .await;
@@ -4096,8 +4120,21 @@ async fn run_ai_enrichment(state: &AppState, ai: Option<&AiOptions>, ai_text: &s
                     });
                 }
             }
-        } else {
-            warning = Some("AI features require a provider API key (set AI_PROVIDER and corresponding key env var)".to_string());
+        }
+        // Requested but not produced (provider error, nothing to work on,
+        // or no provider — which callers refuse up front): not billed.
+        let mut failed = Vec::new();
+        if ai_opts.wants_summary() && ai_result.as_ref().is_none_or(|r| r.summary.is_none()) {
+            failed.push("summary");
+        }
+        if ai_opts.wants_extraction() && ai_result.as_ref().is_none_or(|r| r.extract.is_none()) {
+            failed.push("extraction");
+        }
+        if !failed.is_empty() {
+            warning = Some(format!(
+                "AI {} could not be generated and was not billed",
+                failed.join(" and ")
+            ));
         }
     }
 
@@ -4238,6 +4275,12 @@ pub(crate) fn validate_crawl_config(config: &mut CrawlConfig) -> Result<(), ApiE
     config
         .validate()
         .map_err(|errors| ApiError::new(errors.to_string(), "validation_error"))?;
+    for (i, url) in config.start_urls.iter().enumerate() {
+        check_http_url(url)
+            .map_err(|msg| ApiError::new(format!("start_urls[{i}]: {msg}"), "validation_error"))?;
+    }
+    check_index_uid(&config.index_uid)
+        .map_err(|msg| ApiError::new(format!("index_uid: {msg}"), "validation_error"))?;
     if let Some(ref proxy) = config.proxy {
         validate_proxy_config(proxy)
             .map_err(|msg| ApiError::new(format!("proxy: {msg}"), "validation_error"))?;
@@ -4253,6 +4296,33 @@ pub(crate) fn validate_crawl_config(config: &mut CrawlConfig) -> Result<(), ApiE
             .map_err(|msg| ApiError::new(format!("webhooks: {msg}"), "validation_error"))?;
     }
     Ok(())
+}
+
+/// `url` is an absolute `http`/`https` URL with a host.
+pub(crate) fn check_http_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL `{url}` ({e})"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("`{url}` is not an http or https URL"));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!("`{url}` has no host"));
+    }
+    Ok(())
+}
+
+/// A Meilisearch index uid: 1 to 511 ASCII letters, digits, `-` or `_`.
+pub(crate) fn check_index_uid(uid: &str) -> Result<(), String> {
+    let valid = (1..=511).contains(&uid.len())
+        && uid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{uid}` is not a valid index uid (1 to 511 characters among a-z, A-Z, 0-9, - and _)"
+        ))
+    }
 }
 
 /// Redact secrets in a `CrawlConfig` before it's persisted (`jobs.config`)
@@ -4403,6 +4473,29 @@ pub(crate) fn crawl_config_warnings(config: &CrawlConfig) -> Vec<String> {
     warnings
 }
 
+/// Refuse a crawl asking for something this server cannot do, instead of
+/// accepting a job that fails (or bills for nothing) later.
+pub(crate) fn check_crawl_capabilities(
+    config: &CrawlConfig,
+    ai_available: bool,
+    browser_available: Option<bool>,
+) -> Result<(), ApiError> {
+    if config.crawler_type == CrawlerType::Browser && browser_available == Some(false) {
+        return Err(ApiError::new(
+            "crawler_type \"browser\" requires a browser, which is not available on this \
+             server's crawlers (Chrome/Chromium with BROWSER_RENDER)",
+            "render_js_unavailable",
+        ));
+    }
+    let features = &config.features;
+    if (features.ai_extraction_enabled() || features.ai_summary_enabled()) && !ai_available {
+        return Err(no_ai_provider(
+            "features.ai_extraction and features.ai_summary",
+        ));
+    }
+    Ok(())
+}
+
 /// Core crawl creation logic, reusable from the crawl handlers
 pub(crate) async fn do_create_crawl(
     state: &Arc<AppState>,
@@ -4453,6 +4546,9 @@ pub(crate) async fn do_create_crawl(
     // `validate_crawl_config` clamps out-of-range webhook `timeout_ms`
     // values in place (SCR-72 fix round 1); `config` is already `mut`.
     validate_crawl_config(&mut config)?;
+
+    // Features the server cannot run fail the request, not the job.
+    check_crawl_capabilities(&config, state.ai_service.is_some(), state.crawl_browser)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
@@ -4880,13 +4976,9 @@ fn extract_page_links(html: &str, base_url: &url::Url) -> Vec<(String, Option<St
     links
 }
 
-/// Fetch a single URL and extract title, description, and child links.
-async fn map_fetch_page(
-    fetcher: Arc<HttpFetcher>,
-    browser: Option<Arc<CdpRenderer>>,
-    url: String,
-    base_url: url::Url,
-) -> Option<MapFetchResult> {
+/// The `<title>` and meta description of a page, entity-decoded
+/// (`&amp;` -> `&`). Read from the head via regex (avoids a full DOM parse).
+fn head_title_and_description(html: &str) -> (Option<String>, Option<String>) {
     use regex::Regex;
     use std::sync::LazyLock;
 
@@ -4908,6 +5000,41 @@ async fn map_fetch_page(
         .unwrap()
     });
 
+    let head_end = html.find("</head>").unwrap_or_else(|| {
+        let mut end = 8192.min(html.len());
+        while !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    });
+    let head = &html[..head_end];
+    let clean = |raw: &str| {
+        let text: String = scraper::Html::parse_fragment(raw)
+            .root_element()
+            .text()
+            .collect();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!text.is_empty()).then_some(text)
+    };
+    let title = RE_TITLE
+        .captures(head)
+        .and_then(|c| c.get(1))
+        .and_then(|m| clean(m.as_str()));
+    let description = RE_DESC
+        .captures(head)
+        .or_else(|| RE_DESC_ALT.captures(head))
+        .and_then(|c| c.get(1))
+        .and_then(|m| clean(m.as_str()));
+    (title, description)
+}
+
+/// Fetch a single URL and extract title, description, and child links.
+async fn map_fetch_page(
+    fetcher: Arc<HttpFetcher>,
+    browser: Option<Arc<CdpRenderer>>,
+    url: String,
+    base_url: url::Url,
+) -> Option<MapFetchResult> {
     let crawl_url = CrawlUrl::seed(&url);
     let fetch_fut = if let Some(ref renderer) = browser {
         let renderer = renderer.clone();
@@ -4924,26 +5051,7 @@ async fn map_fetch_page(
         _ => return None,
     };
 
-    // Extract title and description from the head via regex (avoids a full DOM parse)
-    let head_end = page
-        .html
-        .find("</head>")
-        .unwrap_or(8192.min(page.html.len()));
-    let head = &page.html[..head_end];
-
-    let title = RE_TITLE
-        .captures(head)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|t| !t.is_empty());
-
-    let description = RE_DESC
-        .captures(head)
-        .or_else(|| RE_DESC_ALT.captures(head))
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .filter(|d| !d.is_empty());
-
+    let (title, description) = head_title_and_description(&page.html);
     let child_links = extract_page_links(&page.html, &base_url);
 
     Some(MapFetchResult {
@@ -5896,181 +6004,6 @@ async fn get_job_events_history(
 }
 
 // ============================================================================
-// Diagnostic Handlers
-// ============================================================================
-
-/// System stats endpoint
-#[utoipa::path(get, path = "/stats", tag = "health", responses((status = 200, body = SystemStatsResponse)))]
-async fn handle_stats(State(state): State<Arc<AppState>>) -> Json<SystemStatsResponse> {
-    // Compute job summary
-    let jobs = state.crawl.jobs.read();
-    let mut running = 0;
-    let mut completed = 0;
-    let mut failed = 0;
-    let mut pending = 0;
-
-    for job in jobs.values() {
-        match job.status {
-            JobStatus::Running => running += 1,
-            JobStatus::Completed => completed += 1,
-            JobStatus::Failed => failed += 1,
-            JobStatus::Pending => pending += 1,
-            JobStatus::Cancelled => failed += 1,
-            JobStatus::Paused => pending += 1,
-        }
-    }
-
-    let job_summary = JobSummary {
-        total: jobs.len(),
-        running,
-        completed,
-        failed,
-        pending,
-    };
-    drop(jobs);
-
-    // Compute diagnostics stats
-    let errors_count = state.diagnostics.recent_errors.read().len();
-    let counters = state.diagnostics.domain_counters.read();
-    let tracked_domains = counters.len();
-    let mut total_requests = 0u64;
-    let mut total_successes = 0u64;
-    let mut total_failures = 0u64;
-
-    for counter in counters.values() {
-        total_requests += counter.requests;
-        total_successes += counter.successes;
-        total_failures += counter.failures;
-    }
-    drop(counters);
-
-    let diagnostics = DiagnosticsStats {
-        recent_errors_count: errors_count,
-        tracked_domains,
-        total_requests,
-        total_successes,
-        total_failures,
-    };
-
-    // Meilisearch status (we don't have direct access, just indicate availability from env)
-    let meilisearch = std::env::var("MEILISEARCH_URL")
-        .ok()
-        .map(|url| MeilisearchStats {
-            available: true,
-            url,
-        });
-
-    Json(SystemStatsResponse {
-        meilisearch,
-        jobs: job_summary,
-        diagnostics,
-        collected_at: chrono::Utc::now().to_rfc3339(),
-    })
-}
-
-/// Errors endpoint
-#[utoipa::path(get, path = "/errors", tag = "health", params(ErrorsQuery), responses((status = 200, body = ErrorsResponse)))]
-async fn handle_errors(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ErrorsQuery>,
-) -> Json<ErrorsResponse> {
-    let errors = state.diagnostics.recent_errors.read();
-
-    // Filter by job_id if specified
-    let filtered: Vec<ErrorRecord> = if let Some(ref job_id) = params.job_id {
-        errors
-            .iter()
-            .filter(|e| &e.job_id == job_id)
-            .cloned()
-            .collect()
-    } else {
-        errors.iter().cloned().collect()
-    };
-
-    let total_count = filtered.len();
-
-    // Take last N errors (most recent)
-    let recent: Vec<ErrorRecord> = filtered.into_iter().rev().take(params.last).collect();
-
-    // Compute status code distribution
-    let mut by_status: HashMap<u16, u64> = HashMap::new();
-    for error in &recent {
-        if let Some(code) = error.status_code {
-            *by_status.entry(code).or_insert(0) += 1;
-        }
-    }
-
-    // Compute domain distribution
-    let mut domain_counts: HashMap<String, u64> = HashMap::new();
-    for error in &recent {
-        *domain_counts.entry(error.domain.clone()).or_insert(0) += 1;
-    }
-
-    let mut by_domain: Vec<(String, u64)> = domain_counts.into_iter().collect();
-    by_domain.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    by_domain.truncate(10);
-
-    Json(ErrorsResponse {
-        errors: recent,
-        total_count,
-        by_status,
-        by_domain,
-        source: "memory".to_string(),
-    })
-}
-
-/// Domains endpoint
-#[utoipa::path(get, path = "/domains", tag = "health", params(DomainsQuery), responses((status = 200, body = DomainsResponse)))]
-async fn handle_domains(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<DomainsQuery>,
-) -> Json<DomainsResponse> {
-    let counters = state.diagnostics.domain_counters.read();
-
-    // Filter by pattern if specified
-    let filtered: Vec<(&String, &DomainCounter)> = if let Some(ref filter) = params.filter {
-        counters
-            .iter()
-            .filter(|(domain, _)| domain.contains(filter))
-            .collect()
-    } else {
-        counters.iter().collect()
-    };
-
-    let total_domains = filtered.len();
-
-    // Sort by total requests and take top N
-    let mut sorted: Vec<_> = filtered;
-    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.requests));
-    sorted.truncate(params.top);
-
-    let domains: Vec<DomainInfo> = sorted
-        .into_iter()
-        .map(|(domain, counter)| {
-            let avg_time = if counter.successes > 0 {
-                Some(counter.total_response_time_ms as f64 / counter.successes as f64)
-            } else {
-                None
-            };
-
-            DomainInfo {
-                domain: domain.clone(),
-                total_requests: counter.requests,
-                successful_requests: counter.successes,
-                failed_requests: counter.failures,
-                avg_response_time_ms: avg_time,
-            }
-        })
-        .collect();
-
-    Json(DomainsResponse {
-        domains,
-        total_domains,
-        source: "memory".to_string(),
-    })
-}
-
-// ============================================================================
 // WebSocket Types
 // ============================================================================
 
@@ -6114,12 +6047,21 @@ enum WsServerMessage {
 // ============================================================================
 
 /// WebSocket upgrade handler for real-time events
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    account_ext: Option<Extension<AuthenticatedAccount>>,
+) -> impl IntoResponse {
+    let account_ctx = extract_account_context(&account_ext).await;
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, account_ctx))
 }
 
 /// Handle a WebSocket connection
-async fn handle_ws_connection(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_ws_connection(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    account_ctx: Option<AccountContext>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // Track subscribed job IDs
@@ -6162,7 +6104,8 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<AppState>) {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(client_msg) = serde_json::from_str::<WsClientMessage>(&text) {
-                    let response = handle_ws_message(client_msg, &state_clone, &subs).await;
+                    let response =
+                        handle_ws_message(client_msg, &state_clone, &subs, &account_ctx).await;
                     if let Ok(json) = serde_json::to_string(&response) {
                         // We can't send directly here since sender is moved
                         // The response will be handled via the broadcast channel
@@ -6194,15 +6137,22 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<AppState>) {
     debug!("WebSocket connection handler finished");
 }
 
-/// Handle a WebSocket client message
+/// Handle a WebSocket client message. A job the caller does not own is
+/// "not found", as on the per-job socket.
 async fn handle_ws_message(
     msg: WsClientMessage,
     state: &Arc<AppState>,
     subscriptions: &Arc<RwLock<std::collections::HashSet<String>>>,
+    account_ctx: &Option<AccountContext>,
 ) -> WsServerMessage {
+    let owned = |job_id: &str| {
+        state
+            .get_job(job_id)
+            .filter(|job| check_job_ownership(job, account_ctx).is_ok())
+    };
     match msg {
         WsClientMessage::Subscribe { job_id } => {
-            if state.get_job(&job_id).is_some() {
+            if owned(&job_id).is_some() {
                 subscriptions.write().insert(job_id.clone());
                 info!(job_id = %job_id, "WebSocket client subscribed to job");
                 WsServerMessage::Subscribed { job_id }
@@ -6219,7 +6169,7 @@ async fn handle_ws_message(
             WsServerMessage::Unsubscribed { job_id }
         }
         WsClientMessage::GetStatus { job_id } => {
-            if let Some(job) = state.get_job(&job_id) {
+            if let Some(job) = owned(&job_id) {
                 WsServerMessage::Status {
                     job_id,
                     status: Box::new(job.into()),
@@ -6340,20 +6290,82 @@ async fn handle_job_ws_connection(socket: WebSocket, state: Arc<AppState>, job_i
     send_task.abort();
 }
 
-/// Cancel a job
+/// Cancel or delete a job
 ///
-/// Stops the job everywhere (frontier and workers) and bills the pages
-/// crawled so far. Only a pending, running or paused job can be cancelled:
-/// a job that already completed, failed or was cancelled returns 409 and
-/// keeps its status.
-#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is already terminal", body = ApiError)), security(("api_key" = [])))]
+/// Without `purge`: cancels the job. It stops everywhere (frontier and
+/// workers) and the pages crawled so far are billed. Only a pending,
+/// running or paused job can be cancelled: a job that already completed,
+/// failed or was cancelled returns 409 and keeps its status.
+///
+/// With `purge=true`: deletes a finished (completed, failed or cancelled)
+/// job: it disappears from `GET /jobs`, and its status and stored results
+/// are gone (204). The documents a crawl indexed stay in Meilisearch. A job
+/// that is not finished returns 409: cancel it first.
+#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID"), DeleteJobQuery), responses((status = 200, description = "Cancelled", body = JobStatusResponse), (status = 204, description = "Deleted (`purge=true`)"), (status = 404, body = ApiError), (status = 409, description = "Cancel: the job is already finished. Purge: the job is not finished (or is still being finalized, retry shortly)", body = ApiError)), security(("api_key" = [])))]
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Path(job_id): Path<String>,
-) -> Result<Json<JobStatusResponse>, ApiError> {
+    Query(query): Query<DeleteJobQuery>,
+) -> Result<Response, ApiError> {
+    if query.purge {
+        let account_ctx = extract_account_context(&account_ext).await;
+        state.delete_finished_job(&job_id, &account_ctx).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     owned_job(&state, &account_ext, &job_id).await?;
-    Ok(Json(state.cancel(&job_id)?.into()))
+    Ok(Json(JobStatusResponse::from(state.cancel(&job_id)?)).into_response())
+}
+
+impl AppState {
+    /// Delete the finished job `job_id` the caller owns, from memory and
+    /// from the job store (with its results).
+    async fn delete_finished_job(
+        &self,
+        job_id: &str,
+        account_ctx: &Option<AccountContext>,
+    ) -> Result<(), ApiError> {
+        let scope = account_ctx.as_ref().map(|c| c.account_id.as_str());
+        let job = match self.get_job(job_id) {
+            Some(job) => Some(job),
+            None => match &self.job_store {
+                Some(store) => store.get_job(job_id, scope).await,
+                None => None,
+            },
+        }
+        .ok_or_else(|| ApiError::new("Job not found", "not_found"))?;
+        check_job_ownership(&job, account_ctx)?;
+        if !is_terminal(&job.status) {
+            return Err(ApiError::new(
+                format!(
+                    "Job is {}: cancel it before deleting it",
+                    job_store::status_to_str(&job.status)
+                ),
+                "conflict",
+            ));
+        }
+        // Its terminal state (and billing events) must be durable first, or
+        // the pending write would bring the row back.
+        if self.crawl.terminal_pending.read().contains_key(job_id)
+            || self.has_pending_lab_events(job_id)
+        {
+            return Err(
+                ApiError::new("Job is still being finalized, retry shortly", "conflict")
+                    .with_retry_after(5),
+            );
+        }
+        if let Some(store) = &self.job_store {
+            store.delete_job(job_id, scope).await.map_err(|e| {
+                warn!(job_id = %job_id, error = %e, "Failed to delete job");
+                ApiError::new("Failed to delete job", "internal_error")
+            })?;
+        }
+        self.crawl.jobs.write().remove(job_id);
+        self.forget_job_tracking(job_id);
+        self.results.forget(job_id);
+        info!(job_id = %job_id, "Job deleted");
+        Ok(())
+    }
 }
 
 /// Pause a running job
@@ -6397,22 +6409,41 @@ async fn owned_job(
     Ok(existing)
 }
 
-/// List all jobs
-#[utoipa::path(get, path = "/jobs", tag = "jobs", params(ListJobsQuery), responses((status = 200, description = "List of jobs")), security(("api_key" = [])))]
+/// List jobs
+///
+/// The caller's jobs, newest first, paginated with `limit` (default 50, at
+/// most 200) and `offset`, optionally of one `status`. List items omit the
+/// job `config` (see `GET /job/{id}/status`).
+#[utoipa::path(get, path = "/jobs", tag = "jobs", params(ListJobsQuery), responses((status = 200, description = "Jobs, newest first", body = Vec<JobStatusResponse>), (status = 400, description = "Unknown `status`", body = ApiError)), security(("api_key" = [])))]
 async fn list_jobs(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Query(params): Query<ListJobsQuery>,
-) -> Json<Vec<JobStatusResponse>> {
+) -> Result<Json<Vec<JobStatusResponse>>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
+    let account = account_ctx.as_ref().map(|c| c.account_id.as_str());
+    let limit = params.limit.clamp(1, MAX_LIST_JOBS_LIMIT);
+    let status = match params.status.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => Some(parse_job_status(s).ok_or_else(|| {
+            ApiError::new(
+                format!(
+                    "Unknown status `{s}` (pending, running, paused, completed, failed, cancelled)"
+                ),
+                "validation_error",
+            )
+        })?),
+    };
+    let wanted = |j: &JobState| status.as_ref().is_none_or(|s| &j.status == s);
 
     // With a job store, query it for full history (survives restarts)
     // and overlay in-memory data for running jobs (fresher counters).
     let jobs: Vec<JobState> = if let Some(ref store) = state.job_store {
         let mut db_jobs = store
             .list_jobs(
-                account_ctx.as_ref().map(|c| c.account_id.as_str()),
-                params.limit as i64,
+                account,
+                status.as_ref().map(job_store::status_to_str),
+                limit as i64,
                 params.offset as i64,
             )
             .await;
@@ -6429,21 +6460,46 @@ async fn list_jobs(
                 }
             }
         }
+        db_jobs.retain(|j| wanted(j));
         db_jobs
-    } else if let Some(ctx) = &account_ctx {
-        // No DB — filter in-memory by account
-        let all_jobs = state.crawl.jobs.read();
-        all_jobs
-            .values()
-            .filter(|j| j.account_id.as_deref() == Some(&ctx.account_id))
-            .skip(params.offset)
-            .take(params.limit)
-            .cloned()
-            .collect()
     } else {
-        state.list_jobs(params.limit, params.offset)
+        let mut jobs: Vec<JobState> = state
+            .crawl
+            .jobs
+            .read()
+            .values()
+            .filter(|j| account.is_none_or(|a| j.account_id.as_deref() == Some(a)))
+            .filter(|j| wanted(j))
+            .cloned()
+            .collect();
+        jobs.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| a.job_id.cmp(&b.job_id))
+        });
+        jobs.into_iter().skip(params.offset).take(limit).collect()
     };
-    Json(jobs.into_iter().map(|j| j.into()).collect())
+    Ok(Json(
+        jobs.into_iter()
+            .map(|j| JobStatusResponse {
+                config: None,
+                ..j.into()
+            })
+            .collect(),
+    ))
+}
+
+/// A `JobStatus` from its API name.
+fn parse_job_status(s: &str) -> Option<JobStatus> {
+    Some(match s {
+        "pending" => JobStatus::Pending,
+        "running" => JobStatus::Running,
+        "paused" => JobStatus::Paused,
+        "completed" => JobStatus::Completed,
+        "failed" => JobStatus::Failed,
+        "cancelled" => JobStatus::Cancelled,
+        _ => return None,
+    })
 }
 
 // ============================================================================
@@ -6903,6 +6959,7 @@ pub async fn run_with_bus(
         .clone()
         .map(|outbox| Arc::new(lab_events::Lab::new(outbox)));
     state.auth_disabled = matches!(auth_mode, auth::AuthMode::Disabled);
+    state.crawl_browser = args.crawl_browser_available;
     let state = Arc::new(state);
 
     // Recover active jobs from the job store on startup
@@ -7146,7 +7203,7 @@ pub async fn run_with_bus(
 
     // Routes, auth guards, request tracing, /openapi.json + /docs and the
     // body-size limits (CORS is added below).
-    let mut app = router::build_router(state.clone(), &auth_mode, settings.mode);
+    let mut app = router::build_router(state.clone(), &auth_mode);
 
     // CORS: credential-aware
     // When CORS_ORIGINS is set (comma-separated URLs), use those + *.meilisearch.com wildcard.
@@ -7379,6 +7436,13 @@ mod tests {
             ("conflict", StatusCode::CONFLICT),
             ("insufficient_credits", StatusCode::PAYMENT_REQUIRED),
             ("spend_limit_exceeded", StatusCode::FORBIDDEN),
+            ("forbidden", StatusCode::FORBIDDEN),
+            ("quota_exceeded", StatusCode::TOO_MANY_REQUESTS),
+            ("fetch_error", StatusCode::BAD_GATEWAY),
+            ("render_js_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+            ("service_unavailable", StatusCode::SERVICE_UNAVAILABLE),
+            ("timeout", StatusCode::GATEWAY_TIMEOUT),
+            ("analytics_unavailable", StatusCode::NOT_FOUND),
             ("internal_error", StatusCode::INTERNAL_SERVER_ERROR),
             ("unknown_code", StatusCode::INTERNAL_SERVER_ERROR),
         ];
@@ -7411,6 +7475,51 @@ mod tests {
             .with_details(serde_json::json!({"field": "url", "reason": "empty"}));
         let json = serde_json::to_value(&error).unwrap();
         assert_eq!(json["details"]["field"], "url");
+    }
+
+    #[test]
+    fn crawl_browser_availability_defaults_to_unknown() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["scrapix-api"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap().crawl_browser_available
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--crawl-browser-available", "false"]), Some(false));
+        assert_eq!(parse(&["--crawl-browser-available", "true"]), Some(true));
+    }
+
+    #[test]
+    fn map_head_metadata_is_entity_decoded() {
+        let html = r#"<html><head><title> Search &amp; AI
+            Retrieval &#8211; Docs </title>
+            <meta name="description" content="Fast &quot;search&quot; &lt;3"></head>
+            <body></body></html>"#;
+        let (title, description) = head_title_and_description(html);
+        assert_eq!(title.as_deref(), Some("Search & AI Retrieval – Docs"));
+        assert_eq!(description.as_deref(), Some("Fast \"search\" <3"));
+        let (title, description) =
+            head_title_and_description("<html><head><title>  </title></head></html>");
+        assert_eq!((title, description), (None, None));
+        // No </head>, multi-byte text across the 8 KiB cut: no panic.
+        let long = format!("<title>t</title>{}", "é".repeat(5000));
+        assert_eq!(head_title_and_description(&long).0.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn finished_jobs_report_no_eta() {
+        let mut job = JobState::new("j", "idx");
+        job.start();
+        job.eta_seconds = Some(110);
+        assert_eq!(JobStatusResponse::from(job.clone()).eta_seconds, Some(110));
+        for status in [
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ] {
+            job.status = status;
+            assert_eq!(JobStatusResponse::from(job.clone()).eta_seconds, None);
+        }
     }
 
     // ========================================================================
@@ -7801,6 +7910,91 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_crawl_config(&mut cfg).is_ok());
+    }
+
+    fn crawl_config(v: serde_json::Value) -> CrawlConfig {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn validate_rejects_invalid_start_urls() {
+        for bad in ["not a url", "ftp://a.test/", "https://", "/relative"] {
+            let mut cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test", bad], "index_uid": "a"
+            }));
+            let err = validate_crawl_config(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert_eq!(err.code, "validation_error");
+            assert!(err.error.starts_with("start_urls[1]: "), "{}", err.error);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_index_uids() {
+        let long = "a".repeat(512);
+        for bad in ["bad uid!", "a/b", "é", long.as_str()] {
+            let mut cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test"], "index_uid": bad
+            }));
+            let err = validate_crawl_config(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert!(err.error.starts_with("index_uid: "), "{}", err.error);
+        }
+        let max = "A-z_0".repeat(102); // 510 chars
+        for good in ["docs", "Docs_v2-en", max.as_str()] {
+            let mut cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test"], "index_uid": good
+            }));
+            assert!(validate_crawl_config(&mut cfg).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn ai_crawl_features_need_an_ai_provider() {
+        for features in [
+            serde_json::json!({"ai_summary": {"enabled": true}}),
+            serde_json::json!({"ai_extraction": {"enabled": true, "prompt": "p"}}),
+        ] {
+            let cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test"], "index_uid": "a", "features": features
+            }));
+            let err = check_crawl_capabilities(&cfg, false, None).err().unwrap();
+            assert_eq!(err.code, "service_unavailable");
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(check_crawl_capabilities(&cfg, true, None).is_ok());
+        }
+        let disabled = crawl_config(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a",
+            "features": {"ai_summary": {"enabled": false}}
+        }));
+        assert!(check_crawl_capabilities(&disabled, false, None).is_ok());
+    }
+
+    #[test]
+    fn browser_crawls_are_refused_only_without_a_browser() {
+        let browser = crawl_config(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a", "crawler_type": "browser"
+        }));
+        let err = check_crawl_capabilities(&browser, true, Some(false))
+            .err()
+            .unwrap();
+        assert_eq!(err.code, "render_js_unavailable");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Unknown (distributed workers): accepted, as before.
+        assert!(check_crawl_capabilities(&browser, true, None).is_ok());
+        assert!(check_crawl_capabilities(&browser, true, Some(true)).is_ok());
+        let http = crawl_config(serde_json::json!({
+            "start_urls": ["https://a.test"], "index_uid": "a"
+        }));
+        assert!(check_crawl_capabilities(&http, true, Some(false)).is_ok());
     }
 
     fn config_with_webhook(webhook: serde_json::Value) -> CrawlConfig {
@@ -8342,7 +8536,20 @@ mod lifecycle_tests {
         async fn get_job(&self, _: &str, _: Option<&str>) -> Option<JobState> {
             None
         }
-        async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
+        async fn delete_job(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bool, job_store::StoreError> {
+            Ok(false)
+        }
+        async fn list_jobs(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: i64,
+            _: i64,
+        ) -> Vec<JobState> {
             Vec::new()
         }
         async fn active_job_ids(&self, _: &str) -> Result<Vec<String>, job_store::StoreError> {
@@ -8411,6 +8618,253 @@ mod lifecycle_tests {
             vec![(created.job_id, JobStatus::Running, false)],
             "one insert, of the running job, before any seed was published"
         );
+    }
+
+    #[tokio::test]
+    async fn health_services_reports_browser_availability() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let Json(body) = health_services(State(Arc::new(test_state(&bus)))).await;
+        let body = serde_json::to_value(body).unwrap();
+        assert_eq!(body["browser_available"], false);
+        assert!(body["crawl_browser_available"].is_null(), "unknown");
+
+        state.crawl_browser = Some(false);
+        let Json(body) = health_services(State(Arc::new(state))).await;
+        let body = serde_json::to_value(body).unwrap();
+        assert_eq!(body["crawl_browser_available"], false);
+    }
+
+    #[tokio::test]
+    async fn global_ws_only_serves_the_callers_jobs() {
+        let bus = ChannelBus::new();
+        let state = Arc::new(test_state(&bus));
+        running_job(&state, "mine", 1);
+        with_account(&state, "mine");
+        running_job(&state, "theirs", 1);
+        state.update_job("theirs", |j| {
+            j.account_id = Some("7f1c2a8e-0000-4000-8000-0000000000ff".into())
+        });
+        let caller = Some(ctx());
+        let subs: Arc<RwLock<HashSet<String>>> = Arc::default();
+        let send = |job_id: &str, get: bool| {
+            let msg = if get {
+                WsClientMessage::GetStatus {
+                    job_id: job_id.into(),
+                }
+            } else {
+                WsClientMessage::Subscribe {
+                    job_id: job_id.into(),
+                }
+            };
+            handle_ws_message(msg, &state, &subs, &caller)
+        };
+        assert!(matches!(
+            send("mine", false).await,
+            WsServerMessage::Subscribed { .. }
+        ));
+        assert!(matches!(
+            send("mine", true).await,
+            WsServerMessage::Status { .. }
+        ));
+        for get in [false, true] {
+            match send("theirs", get).await {
+                WsServerMessage::Error { code, .. } => assert_eq!(code, "not_found"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(*subs.read(), HashSet::from(["mine".to_string()]));
+    }
+
+    /// A state over a fresh SQLite job store.
+    async fn sqlite_state(bus: &ChannelBus) -> (Arc<AppState>, Arc<dyn job_store::JobStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("j.db").display());
+        std::mem::forget(dir); // keep the file for the test's lifetime
+        let store: Arc<dyn job_store::JobStore> =
+            Arc::new(job_store::SqliteJobStore::open(&url).await.unwrap());
+        let mut state = test_state(bus);
+        state.job_store = Some(store.clone());
+        (Arc::new(state), store)
+    }
+
+    /// A job of `ACCT` with `status`, in memory and in the store.
+    async fn stored_job(
+        state: &AppState,
+        store: &dyn job_store::JobStore,
+        job_id: &str,
+        status: JobStatus,
+    ) {
+        let mut job = JobState::with_account(job_id, "idx", ACCT);
+        job.start();
+        job.status = status;
+        job.config = Some(serde_json::json!({"start_urls": ["https://a.test"]}));
+        store.insert_job(&job).await.unwrap();
+        store.update_job_full(&job).await.unwrap();
+        state.insert_job(job);
+    }
+
+    fn tenant() -> Option<Extension<AuthenticatedAccount>> {
+        Some(Extension(AuthenticatedAccount {
+            account_id: ACCT.into(),
+            tier: "free".into(),
+            api_key_id: None,
+            role: None,
+        }))
+    }
+
+    async fn purge(state: &Arc<AppState>, job_id: &str) -> Result<StatusCode, ApiError> {
+        cancel_job(
+            State(state.clone()),
+            tenant(),
+            Path(job_id.to_string()),
+            Query(DeleteJobQuery { purge: true }),
+        )
+        .await
+        .map(|r| r.status())
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_a_finished_job_everywhere() {
+        let bus = ChannelBus::new();
+        let (state, store) = sqlite_state(&bus).await;
+        stored_job(&state, store.as_ref(), "done", JobStatus::Completed).await;
+        store
+            .store_result_page("done", 1, "https://a.test", true, &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(purge(&state, "done").await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(state.get_job("done").is_none());
+        assert!(store.get_job("done", None).await.is_none());
+        assert_eq!(store.result_pages("done", 0, 10).await.unwrap().1, 0);
+        // Gone: a second delete (or status) is a 404.
+        assert_eq!(purge(&state, "done").await.unwrap_err().code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn purge_finds_jobs_only_in_the_store() {
+        let bus = ChannelBus::new();
+        let (state, store) = sqlite_state(&bus).await;
+        stored_job(&state, store.as_ref(), "old", JobStatus::Failed).await;
+        state.crawl.jobs.write().remove("old"); // e.g. after a restart
+        assert_eq!(purge(&state, "old").await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(store.get_job("old", None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_unfinished_unowned_and_unsettled_jobs() {
+        let bus = ChannelBus::new();
+        let (state, store) = sqlite_state(&bus).await;
+        stored_job(&state, store.as_ref(), "live", JobStatus::Running).await;
+        let err = purge(&state, "live").await.unwrap_err();
+        assert_eq!(err.code, "conflict");
+        assert!(err.error.contains("cancel it"), "{}", err.error);
+        assert!(state.get_job("live").is_some());
+
+        stored_job(&state, store.as_ref(), "theirs", JobStatus::Completed).await;
+        state.update_job("theirs", |j| {
+            j.account_id = Some("7f1c2a8e-0000-4000-8000-0000000000ff".into())
+        });
+        assert_eq!(purge(&state, "theirs").await.unwrap_err().code, "not_found");
+        assert!(state.get_job("theirs").is_some());
+
+        stored_job(&state, store.as_ref(), "settling", JobStatus::Completed).await;
+        let snapshot = state.get_job("settling").unwrap();
+        state
+            .crawl
+            .terminal_pending
+            .write()
+            .insert("settling".into(), snapshot);
+        let err = purge(&state, "settling").await.unwrap_err();
+        assert_eq!(err.code, "conflict");
+        assert_eq!(err.retry_after, Some(5));
+    }
+
+    #[tokio::test]
+    async fn cancel_without_purge_still_cancels() {
+        let bus = ChannelBus::new();
+        let state = Arc::new(test_state(&bus));
+        running_job(&state, "j", 1);
+        with_account(&state, "j");
+        let res = cancel_job(
+            State(state.clone()),
+            tenant(),
+            Path("j".into()),
+            Query(DeleteJobQuery { purge: false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(state.get_job("j").unwrap().status, JobStatus::Cancelled);
+    }
+
+    async fn list(
+        state: &Arc<AppState>,
+        query: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        let query: ListJobsQuery = serde_json::from_value(query).unwrap();
+        list_jobs(State(state.clone()), tenant(), Query(query))
+            .await
+            .map(|Json(jobs)| {
+                jobs.into_iter()
+                    .map(|j| serde_json::to_value(j).unwrap())
+                    .collect()
+            })
+    }
+
+    #[tokio::test]
+    async fn list_jobs_filters_by_status_and_omits_configs() {
+        let bus = ChannelBus::new();
+        let (state, store) = sqlite_state(&bus).await;
+        stored_job(&state, store.as_ref(), "a-done", JobStatus::Completed).await;
+        stored_job(&state, store.as_ref(), "a-live", JobStatus::Running).await;
+
+        let all = list(&state, serde_json::json!({})).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|j| j.get("config").is_none()), "{all:?}");
+
+        let done = list(&state, serde_json::json!({"status": "completed"}))
+            .await
+            .unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["job_id"], "a-done");
+
+        let page = list(&state, serde_json::json!({"limit": 1, "offset": 1}))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+
+        let err = list(&state, serde_json::json!({"status": "done"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "validation_error");
+
+        // The status endpoint still has the config.
+        let Json(status) = job_status(State(state.clone()), tenant(), Path("a-done".into()))
+            .await
+            .unwrap();
+        assert!(status.config.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_without_a_store_is_scoped_filtered_and_bounded() {
+        let bus = ChannelBus::new();
+        let state = Arc::new(test_state(&bus));
+        for i in 0..(MAX_LIST_JOBS_LIMIT + 5) {
+            running_job(&state, &format!("j{i}"), 1);
+            with_account(&state, &format!("j{i}"));
+        }
+        running_job(&state, "unowned", 1);
+        let page = list(&state, serde_json::json!({"limit": 10_000}))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), MAX_LIST_JOBS_LIMIT);
+        assert!(page.iter().all(|j| j["job_id"] != "unowned"));
+        let none = list(&state, serde_json::json!({"status": "paused"}))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     /// R10/SCR-22: `/metrics` reports `scrapix_api_jobs{status}` computed
@@ -8620,7 +9074,20 @@ mod lifecycle_tests {
         async fn get_job(&self, _: &str, _: Option<&str>) -> Option<JobState> {
             None
         }
-        async fn list_jobs(&self, _: Option<&str>, _: i64, _: i64) -> Vec<JobState> {
+        async fn delete_job(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bool, job_store::StoreError> {
+            Ok(false)
+        }
+        async fn list_jobs(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: i64,
+            _: i64,
+        ) -> Vec<JobState> {
             Vec::new()
         }
         async fn active_job_ids(&self, _: &str) -> Result<Vec<String>, job_store::StoreError> {

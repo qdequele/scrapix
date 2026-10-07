@@ -38,9 +38,9 @@ use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
-    billing, check_write_permission, extract_account_context, extract_domain, run_ai_enrichment,
-    AccountContext, AiOptions, AiRun, ApiError, AppState, ScrapeFormat, ScrapeMetadata,
-    ScrapeResponse,
+    billing, check_write_permission, extract_account_context, extract_domain, require_ai_provider,
+    run_ai_enrichment, AccountContext, AiOptions, AiRun, ApiError, AppState, ScrapeFormat,
+    ScrapeMetadata, ScrapeResponse,
 };
 
 /// Default size cap for documents fetched by `/scrape` and uploaded to
@@ -185,8 +185,14 @@ pub(crate) struct DocumentJob<'a> {
     pub ai: Option<&'a AiOptions>,
     pub status_code: u16,
     pub js_rendered: bool,
-    /// Credits for the document itself (before OCR).
-    pub base_cost: i64,
+}
+
+impl DocumentJob<'_> {
+    /// Credits for the document itself (before OCR), with the AI work
+    /// `ai_summary`/`ai_extraction` (requested, or delivered).
+    fn credits(&self, ai_summary: bool, ai_extraction: bool) -> i64 {
+        billing::scrape_credits(&self.formats, ai_summary, ai_extraction)
+    }
 }
 
 /// Usage events for one parsed document: the document itself, plus its OCR
@@ -271,8 +277,10 @@ pub(crate) async fn document_response(
                 // daily budget can only lower the final cost).
                 let planned = engine.plan(&parsed, ocr_mode, job.parsers.ocr_max_pages);
                 if let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) {
-                    let estimate =
-                        job.base_cost + scrapix_billing::ocr_credits(planned.len() as u64);
+                    let estimate = job.credits(
+                        job.ai.is_some_and(|a| a.wants_summary()),
+                        job.ai.is_some_and(|a| a.wants_extraction()),
+                    ) + scrapix_billing::ocr_credits(planned.len() as u64);
                     billing::check_credits(lab, &ctx.account_id, estimate).await?;
                 }
                 let request = OcrRequest {
@@ -388,6 +396,10 @@ pub(crate) async fn document_response(
         warnings.push(w);
     }
 
+    // Only the AI work that produced a result is reported and billed.
+    let ai_summary = ai_result.as_ref().is_some_and(|r| r.summary.is_some());
+    let ai_extraction = ai_result.as_ref().is_some_and(|r| r.extract.is_some());
+
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let ocr_billable = ocr_report.as_ref().map_or(0, |r| r.billable_pages());
 
@@ -413,8 +425,8 @@ pub(crate) async fn document_response(
             duration_ms: duration_ms as u32,
             content_length: bytes_len as u64,
             js_rendered: job.js_rendered,
-            ai_summary: job.ai.is_some_and(|a| a.summary),
-            ai_extraction: job.ai.is_some_and(|a| a.extract.is_some()),
+            ai_summary,
+            ai_extraction,
             ai_prompt_tokens: prompt_tokens,
             ai_completion_tokens: completion_tokens,
             ai_model: model,
@@ -436,7 +448,7 @@ pub(crate) async fn document_response(
             ctx,
             job.operation,
             &job.label,
-            job.base_cost,
+            job.credits(ai_summary, ai_extraction),
             ocr_billable,
         )
         .await;
@@ -608,8 +620,9 @@ pub(crate) async fn parse_upload(
     // detection falls back to the bytes. The filename is never trusted.
     let content_type = part_content_type.filter(|ct| !ct.trim().is_empty());
 
-    let has_ai_summary = options.ai.as_ref().is_some_and(|ai| ai.summary);
-    let has_ai_extraction = options.ai.as_ref().is_some_and(|ai| ai.extract.is_some());
+    require_ai_provider(&state, options.ai.as_ref())?;
+    let has_ai_summary = options.ai.as_ref().is_some_and(|ai| ai.wants_summary());
+    let has_ai_extraction = options.ai.as_ref().is_some_and(|ai| ai.wants_extraction());
     let base_cost = billing::scrape_credits(&options.formats, has_ai_summary, has_ai_extraction);
     if let (Some(lab), Some(ctx)) = (&state.lab_api, &account_ctx) {
         billing::check_credits(lab, &ctx.account_id, base_cost).await?;
@@ -638,7 +651,6 @@ pub(crate) async fn parse_upload(
             ai: options.ai.as_ref(),
             status_code: 200,
             js_rendered: false,
-            base_cost,
         },
         start_time,
     )
@@ -972,6 +984,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_with_ai_but_no_provider_is_503() {
+        let data = b"a,b\n1,2\n";
+        let (status, body) = post_parse(
+            state(None),
+            &[
+                ("options", None, None, br#"{"ai":{"summary":true}}"#),
+                ("file", Some("t.csv"), Some("text/csv"), data),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "service_unavailable");
+    }
+
+    #[tokio::test]
     async fn parse_rejects_bad_uploads() {
         let (status, body) = post_parse(state(None), &[("options", None, None, b"{}")]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1090,7 +1117,6 @@ mod tests {
             ai: None,
             status_code: 200,
             js_rendered: false,
-            base_cost: 1,
         };
         document_response(&state, &Some(usage_ctx()), job, Instant::now())
             .await

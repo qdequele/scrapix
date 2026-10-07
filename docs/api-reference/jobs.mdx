@@ -61,7 +61,7 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 | `duration_seconds` | integer | Total elapsed time in seconds |
 | `error_message` | string | Error details if status is `failed` |
 | `crawl_rate` | float | Current crawl speed in pages/second |
-| `eta_seconds` | integer | Estimated time remaining in seconds |
+| `eta_seconds` | integer | Estimated time remaining in seconds (omitted once the job is finished) |
 | `start_urls` | string[] | Original seed URLs |
 | `max_pages` | integer | Page limit from configuration |
 | `config` | object | Original crawl configuration |
@@ -247,14 +247,17 @@ curl -N http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000/events
 
 ## GET /jobs
 
-List all jobs with pagination. When PostgreSQL is configured, returns the full job history (survives API restarts). In-memory running jobs are overlaid with the freshest counter values.
+List jobs, newest first, with pagination. Returns the full job history from the engine's job store (survives API restarts); in-memory running jobs are overlaid with the freshest counter values. List items omit `config`: read it with [`GET /job/{id}/status`](#get-job-status).
 
 ### Query Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `limit` | integer | `50` | Maximum number of jobs to return |
+| `limit` | integer | `50` | Maximum number of jobs to return (at most `200`) |
 | `offset` | integer | `0` | Number of jobs to skip |
+| `status` | string | all | Only jobs with this status: `pending`, `running`, `paused`, `completed`, `failed` or `cancelled` (anything else is a `400`) |
+
+A page shorter than `limit` is the last one.
 
 ### Response
 
@@ -301,6 +304,9 @@ curl "http://localhost:8080/jobs?limit=10"
 
 # Paginate through results
 curl "http://localhost:8080/jobs?limit=20&offset=20"
+
+# Running jobs only
+curl "http://localhost:8080/jobs?status=running"
 ```
 
 ---
@@ -344,6 +350,25 @@ Returns the final job status after cancellation:
 
 ```bash
 curl -X DELETE http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000
+```
+
+### Delete a finished job (`?purge=true`)
+
+`DELETE /job/{id}?purge=true` deletes a `completed`, `failed` or `cancelled`
+job: it disappears from `GET /jobs`, and its status and stored results
+(batch scrape and extract pages) are gone. It answers `204 No Content`. The
+documents a crawl indexed stay in Meilisearch, and the job's analytics
+events stay in ClickHouse.
+
+| Case | Response |
+|------|----------|
+| Finished job you own | `204` |
+| Job still `pending`, `running` or `paused` | `409 conflict`: cancel it first |
+| Job just finished, final state not yet saved | `409 conflict` with `Retry-After: 5` |
+| Unknown job, or another account's | `404 not_found` |
+
+```bash
+curl -X DELETE "http://localhost:8080/job/550e8400-e29b-41d4-a716-446655440000?purge=true"
 ```
 
 ---

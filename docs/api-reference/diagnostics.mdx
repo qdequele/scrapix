@@ -8,10 +8,11 @@ description: Health checks, system stats, error tracking, and domain statistics
 These endpoints provide real-time visibility into system health and crawl performance, returning in-memory data collected since the API started.
 
 `GET /health`, `/health/services` and `/metrics` are always public. `/stats`,
-`/errors` and `/domains` require the admin key in **standalone** mode (same
+`/errors` and `/domains` require authentication in every mode (same
 `Authorization: Bearer` / `X-API-Key` as every other protected route — see
-[Authentication](/api-reference/authentication)); they stay public in
-**hosted** mode.
+[Authentication](/api-reference/authentication)) and are scoped to the
+caller: an account (API key, session, OAuth or a Lab service call) only sees
+its own jobs, errors and domains; the standalone admin key sees everything.
 
 ## GET /health
 
@@ -68,6 +69,13 @@ Per-service liveness status. Reports which distributed services (crawler, conten
 }
 ```
 
+The response also says which browser-based features this server can run:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `browser_available` | boolean | The API has a browser: `render_js`, `mobile`, `actions` and the `screenshot` format on `/scrape`, `/batch/scrape`, `/map` and `/extract`. Without one they answer `503 render_js_unavailable`. |
+| `crawl_browser_available` | boolean or `null` | The crawlers can render pages (`crawler_type: "browser"`). `null` means unknown (separately deployed crawlers: browser crawls are accepted). `false` means `POST /crawl` refuses browser crawls with `503 render_js_unavailable`. Set with `CRAWL_BROWSER_AVAILABLE`; `scrapix all` sets it from `BROWSER_RENDER`. |
+
 ### Status Values
 
 | Status | Meaning |
@@ -110,7 +118,7 @@ System-wide statistics aggregated from in-memory tracking.
 
 | Section | Description |
 |---------|-------------|
-| `meilisearch` | Meilisearch connectivity (if configured) |
+| `meilisearch` | The engine's own Meilisearch (if configured); `null` for an account caller |
 | `jobs` | Job count breakdown by status |
 | `diagnostics` | Aggregate counters from the error ring buffer and domain tracker |
 

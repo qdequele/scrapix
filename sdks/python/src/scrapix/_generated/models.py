@@ -2165,6 +2165,18 @@ class ServiceHealthResponse(BaseModel):
         extra="allow",
         populate_by_name=True,
     )
+    browser_available: bool
+    """
+    A browser is available to the API: `render_js`, `mobile`, `actions`
+    and the `screenshot` format on `/scrape`, `/batch/scrape`, `/map` and
+    `/extract` (they answer 503 `render_js_unavailable` otherwise).
+    """
+    crawl_browser_available: Optional[bool] = None
+    """
+    The crawlers can render pages (`crawler_type: "browser"` crawls);
+    `null` when the API does not know (separately deployed crawlers,
+    browser crawls accepted). When `false`, `POST /crawl` refuses them.
+    """
     services: list[ServiceStatus]
 
 
@@ -2242,6 +2254,14 @@ class OcrInfo(BaseModel):
     warning: Optional[str] = None
 
 
+class ScrapeSelector(RootModel[Union[str, list[str], SelectorDefinition]]):
+    root: Union[str, list[str], SelectorDefinition]
+    """
+    One `/scrape` `extract` field, in any of the shapes crawl's
+    `custom_selectors` accepts plus a full selector definition.
+    """
+
+
 class BatchScrapeRequest(BaseModel):
     """
     Request body for `POST /batch/scrape`. Every field besides `urls`,
@@ -2272,9 +2292,10 @@ class BatchScrapeRequest(BaseModel):
     """
     CSS selectors to remove before extraction
     """
-    extract: Optional[dict[str, SelectorDefinition]] = None
+    extract: Optional[dict[str, ScrapeSelector]] = None
     """
-    Custom CSS selector extraction (field_name -> selector definition)
+    Custom CSS selector extraction: field name -> a CSS selector, a list
+    of selectors or a selector definition (as on `/scrape`)
     """
     formats: Optional[list[ScrapeFormat]] = None
     """
@@ -2513,9 +2534,11 @@ class ScrapeRequest(BaseModel):
     """
     CSS selectors to remove before extraction
     """
-    extract: Optional[dict[str, SelectorDefinition]] = None
+    extract: Optional[dict[str, ScrapeSelector]] = None
     """
-    Custom CSS selector extraction (field_name -> selector definition)
+    Custom CSS selector extraction: field name -> a CSS selector, a list
+    of selectors (the first that matches wins) or a selector definition
+    (`{"selector": "...", "mode": "list", ...}`)
     """
     formats: Optional[list[ScrapeFormat]] = None
     """

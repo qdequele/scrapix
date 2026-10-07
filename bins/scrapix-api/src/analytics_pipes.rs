@@ -28,7 +28,6 @@ use std::time::Instant;
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -275,9 +274,16 @@ fn pipes_catalog() -> Vec<PipeInfo> {
 // Handlers
 // ============================================================================
 
-/// Rails' `head :not_found` (routes absent, ClickHouse not configured).
+/// An unknown pipe (Rails answers an empty `head :not_found`; the engine
+/// answers its JSON error shape).
 fn not_found() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+    ApiError::new("Pipe not found", "not_found").into_response()
+}
+
+/// ClickHouse is not configured: 404 `analytics_unavailable`, so clients
+/// can tell "no analytics on this server" from an unknown pipe or account.
+fn analytics_unavailable() -> Response {
+    ApiError::new("Analytics unavailable", "analytics_unavailable").into_response()
 }
 
 /// ClickHouse, then the account scope — the order of Rails' before_actions.
@@ -287,7 +293,7 @@ async fn prepare<'a>(
     params: &Params,
 ) -> Result<(&'a ClickHouseStorage, Option<String>), Box<Response>> {
     let Some(analytics) = state.analytics_store.as_ref() else {
-        return Err(Box::new(not_found()));
+        return Err(Box::new(analytics_unavailable()));
     };
     let ctx = extract_account_context(account_ext).await;
     let account = scope(&ctx, params.get("account_id").map(String::as_str))
@@ -302,7 +308,7 @@ async fn prepare<'a>(
     tag = "analytics",
     responses(
         (status = 200, body = Vec<PipeInfo>),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -414,6 +420,7 @@ fn missing(name: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     const ACCT: &str = "11111111-1111-1111-1111-111111111111";
 

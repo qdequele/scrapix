@@ -45,7 +45,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -99,7 +106,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -153,7 +167,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -207,7 +228,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -251,7 +279,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -305,7 +340,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -349,7 +391,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -412,7 +461,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -456,7 +512,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -500,7 +563,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -552,7 +622,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -604,7 +681,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -667,7 +751,14 @@
             }
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -711,7 +802,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -766,7 +864,14 @@
             "description": "Tinybird envelope: meta, data, rows, statistics"
           },
           "404": {
-            "description": "ClickHouse is not configured, or `account_id` names another account"
+            "description": "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1001,7 +1106,8 @@
         "tags": [
           "health"
         ],
-        "summary": "Domains endpoint",
+        "summary": "Domain stats",
+        "description": "Per-domain request counters of the caller's jobs (every account's with\nthe standalone admin key), busiest first.",
         "operationId": "handle_domains",
         "parameters": [
           {
@@ -1035,8 +1141,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
       }
     },
     "/errors": {
@@ -1044,7 +1165,8 @@
         "tags": [
           "health"
         ],
-        "summary": "Errors endpoint",
+        "summary": "Recent errors",
+        "description": "The last failed pages of the caller's jobs (every account's with the\nstandalone admin key), most recent first.",
         "operationId": "handle_errors",
         "parameters": [
           {
@@ -1078,8 +1200,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
       }
     },
     "/extract": {
@@ -1243,8 +1380,8 @@
         "tags": [
           "jobs"
         ],
-        "summary": "Cancel a job",
-        "description": "Stops the job everywhere (frontier and workers) and bills the pages\ncrawled so far. Only a pending, running or paused job can be cancelled:\na job that already completed, failed or was cancelled returns 409 and\nkeeps its status.",
+        "summary": "Cancel or delete a job",
+        "description": "Without `purge`: cancels the job. It stops everywhere (frontier and\nworkers) and the pages crawled so far are billed. Only a pending,\nrunning or paused job can be cancelled: a job that already completed,\nfailed or was cancelled returns 409 and keeps its status.\n\nWith `purge=true`: deletes a finished (completed, failed or cancelled)\njob: it disappears from `GET /jobs`, and its status and stored results\nare gone (204). The documents a crawl indexed stay in Meilisearch. A job\nthat is not finished returns 409: cancel it first.",
         "operationId": "cancel_job",
         "parameters": [
           {
@@ -1255,11 +1392,20 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "purge",
+            "in": "query",
+            "description": "`true`: delete a finished job instead of cancelling a running one",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "",
+            "description": "Cancelled",
             "content": {
               "application/json": {
                 "schema": {
@@ -1267,6 +1413,9 @@
                 }
               }
             }
+          },
+          "204": {
+            "description": "Deleted (`purge=true`)"
           },
           "404": {
             "description": "",
@@ -1279,7 +1428,7 @@
             }
           },
           "409": {
-            "description": "The job is already terminal",
+            "description": "Cancel: the job is already finished. Purge: the job is not finished (or is still being finalized, retry shortly)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1551,12 +1700,14 @@
         "tags": [
           "jobs"
         ],
-        "summary": "List all jobs",
+        "summary": "List jobs",
+        "description": "The caller's jobs, newest first, paginated with `limit` (default 50, at\nmost 200) and `offset`, optionally of one `status`. List items omit the\njob `config` (see `GET /job/{id}/status`).",
         "operationId": "list_jobs",
         "parameters": [
           {
             "name": "limit",
             "in": "query",
+            "description": "Page size (default 50, at most 200)",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1566,16 +1717,49 @@
           {
             "name": "offset",
             "in": "query",
+            "description": "Jobs to skip (newest first)",
             "required": false,
             "schema": {
               "type": "integer",
               "minimum": 0
             }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Only jobs with this status: `pending`, `running`, `paused`,\n`completed`, `failed` or `cancelled`",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "List of jobs"
+            "description": "Jobs, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobStatusResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown `status`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1782,7 +1966,8 @@
         "tags": [
           "health"
         ],
-        "summary": "System stats endpoint",
+        "summary": "System stats",
+        "description": "Jobs, recent errors and domain counters since API startup, for the\ncaller's account (every account with the standalone admin key).",
         "operationId": "handle_stats",
         "responses": {
           "200": {
@@ -1794,8 +1979,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
       }
     }
   },
@@ -2117,9 +2317,9 @@
               "object",
               "null"
             ],
-            "description": "Custom CSS selector extraction (field_name -> selector definition)",
+            "description": "Custom CSS selector extraction: field name -> a CSS selector, a list\nof selectors or a selector definition (as on `/scrape`)",
             "additionalProperties": {
-              "$ref": "#/components/schemas/SelectorDefinition"
+              "$ref": "#/components/schemas/ScrapeSelector"
             },
             "propertyNames": {
               "type": "string"
@@ -4633,9 +4833,9 @@
           },
           "extract": {
             "type": "object",
-            "description": "Custom CSS selector extraction (field_name -> selector definition)",
+            "description": "Custom CSS selector extraction: field name -> a CSS selector, a list\nof selectors (the first that matches wins) or a selector definition\n(`{\"selector\": \"...\", \"mode\": \"list\", ...}`)",
             "additionalProperties": {
-              "$ref": "#/components/schemas/SelectorDefinition"
+              "$ref": "#/components/schemas/ScrapeSelector"
             },
             "propertyNames": {
               "type": "string"
@@ -4886,6 +5086,26 @@
           }
         }
       },
+      "ScrapeSelector": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "A CSS selector: the trimmed text of its first match"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "CSS selectors, tried in order: the trimmed text of the first match"
+          },
+          {
+            "$ref": "#/components/schemas/SelectorDefinition",
+            "description": "A selector definition (extraction mode, attribute, transforms, ...)"
+          }
+        ],
+        "description": "One `/scrape` `extract` field, in any of the shapes crawl's\n`custom_selectors` accepts plus a full selector definition."
+      },
       "ScreenshotRequestOptions": {
         "type": "object",
         "description": "Screenshot options for /scrape",
@@ -5042,9 +5262,21 @@
       "ServiceHealthResponse": {
         "type": "object",
         "required": [
-          "services"
+          "services",
+          "browser_available"
         ],
         "properties": {
+          "browser_available": {
+            "type": "boolean",
+            "description": "A browser is available to the API: `render_js`, `mobile`, `actions`\nand the `screenshot` format on `/scrape`, `/batch/scrape`, `/map` and\n`/extract` (they answer 503 `render_js_unavailable` otherwise)."
+          },
+          "crawl_browser_available": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The crawlers can render pages (`crawler_type: \"browser\"` crawls);\n`null` when the API does not know (separately deployed crawlers,\nbrowser crawls accepted). When `false`, `POST /crawl` refuses them."
+          },
           "services": {
             "type": "array",
             "items": {
@@ -5119,7 +5351,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/MeilisearchStats"
+                "$ref": "#/components/schemas/MeilisearchStats",
+                "description": "The engine's own Meilisearch (standalone); omitted for an account,\nwhose Meilisearch is resolved per account."
               }
             ]
           }

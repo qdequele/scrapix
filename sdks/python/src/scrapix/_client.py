@@ -329,16 +329,29 @@ class Scrapix:
         return parse_model(JobStatusResponse, self._request("GET", job_path(job_id, "/status")))
 
     def list_jobs(
-        self, *, limit: Optional[int] = None, offset: Optional[int] = None
+        self,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        status: Optional[str] = None,
     ) -> list[JobStatusResponse]:
-        """``GET /jobs``: the account's jobs, newest first."""
-        data = self._request("GET", "/jobs", params={"limit": limit, "offset": offset})
+        """``GET /jobs``: the account's jobs, newest first (``limit`` at most
+        200), optionally of one ``status``. Items omit ``config`` (see
+        :meth:`get_job`)."""
+        params = {"limit": limit, "offset": offset, "status": status}
+        data = self._request("GET", "/jobs", params=params)
         return [parse_model(JobStatusResponse, item) for item in data or []]
 
     def cancel_job(self, job_id: str) -> JobStatusResponse:
         """``DELETE /job/{id}``: cancel a running or paused job."""
         data = self._request("DELETE", job_path(job_id), idempotent=False)
         return parse_model(JobStatusResponse, data)
+
+    def delete_job(self, job_id: str) -> None:
+        """``DELETE /job/{id}?purge=true``: delete a finished (completed,
+        failed or cancelled) job and its stored results. A job that is not
+        finished is a 409: cancel it first."""
+        self._request("DELETE", job_path(job_id), params={"purge": "true"}, idempotent=False)
 
     def pause_job(self, job_id: str) -> JobStatusResponse:
         """``POST /job/{id}/pause``."""

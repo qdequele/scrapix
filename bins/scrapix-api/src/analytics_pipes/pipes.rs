@@ -68,7 +68,7 @@ fn query_error(pipe: &'static str) -> impl FnOnce(ClickHouseError) -> ApiError {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -93,7 +93,7 @@ pub(crate) async fn top_domains(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "`domain` is missing", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -117,7 +117,7 @@ pub(crate) async fn domain_stats(p: Pipe<'_>) -> Result<Value, ApiError> {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -163,7 +163,7 @@ pub(crate) async fn hourly_stats(p: Pipe<'_>) -> Result<Value, ApiError> {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -209,7 +209,7 @@ pub(crate) async fn daily_stats(p: Pipe<'_>) -> Result<Value, ApiError> {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -249,7 +249,7 @@ pub(crate) async fn error_distribution(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "`job_id` is missing", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -304,7 +304,7 @@ pub(crate) async fn job_stats(p: Pipe<'_>) -> Result<Value, ApiError> {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -356,7 +356,7 @@ pub(crate) async fn kpis(p: Pipe<'_>) -> Result<Value, ApiError> {
     ),
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -403,7 +403,7 @@ pub(crate) async fn ai_usage(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "`job_id` is missing", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -452,7 +452,7 @@ pub(crate) async fn job_timeline(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "`job_id` is missing", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -494,7 +494,7 @@ pub(crate) async fn job_event_summary(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "No account: the admin key must pass `account_id`", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -538,7 +538,7 @@ pub(crate) async fn account_usage(p: Pipe<'_>) -> Result<Value, ApiError> {
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "No account: the admin key must pass `account_id`", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -578,7 +578,7 @@ pub(crate) async fn account_daily_usage(p: Pipe<'_>) -> Result<Value, ApiError> 
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "No account: the admin key must pass `account_id`", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -619,7 +619,7 @@ pub(crate) async fn account_daily_usage_by_operation(p: Pipe<'_>) -> Result<Valu
     responses(
         (status = 200, description = "Tinybird envelope: meta, data, rows, statistics"),
         (status = 400, description = "No account: the admin key must pass `account_id`", body = ApiError),
-        (status = 404, description = "ClickHouse is not configured, or `account_id` names another account")
+        (status = 404, description = "ClickHouse is not configured (code `analytics_unavailable`), or `account_id` names another account (code `not_found`)", body = crate::ApiError)
     ),
     security(("api_key" = []))
 )]

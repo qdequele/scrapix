@@ -11,7 +11,6 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::auth::{self, AuthMode};
-use crate::settings::Mode;
 use crate::*; // handlers: health, metrics, handle_stats, ..., batch, extract, results, documents
 
 /// Path plus query with any `token` value replaced, for logs.
@@ -116,22 +115,23 @@ fn docs_routes() -> Router {
 
 /// Every engine route with its auth guard, the request trace layer and the
 /// body-size limits. CORS is added by the caller.
-pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode, mode: Mode) -> Router {
+pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode) -> Router {
     // Public routes (no auth required)
     let public = Router::new()
         .route("/health", get(health))
         .route("/health/services", get(health_services))
         .route("/metrics", get(metrics));
 
-    let diagnostics = Router::new()
-        .route("/stats", get(handle_stats))
-        .route("/errors", get(handle_errors))
-        .route("/domains", get(handle_domains));
-    // Standalone: the operator's data. Hosted: unchanged (public) for now.
-    let diagnostics = match mode {
-        Mode::Standalone => guard(diagnostics, auth, false),
-        Mode::Hosted => diagnostics,
-    };
+    // Guarded in every mode; each caller sees its own account's data
+    // (the standalone admin key sees everything).
+    let diagnostics = guard(
+        Router::new()
+            .route("/stats", get(diagnostics::handle_stats))
+            .route("/errors", get(diagnostics::handle_errors))
+            .route("/domains", get(diagnostics::handle_domains)),
+        auth,
+        false,
+    );
 
     // Guarded in every mode; both modes also accept `?token=` (browsers
     // can't set headers on an upgrade).
@@ -213,16 +213,15 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode, mode: Mode) ->
 mod tests {
     use super::*;
     use crate::auth::{AdminKey, AuthMode};
-    use crate::settings::Mode;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     const KEY: &str = "0123456789abcdef";
 
-    fn app(auth: AuthMode, mode: Mode) -> Router {
+    fn app(auth: AuthMode) -> Router {
         let bus = scrapix_queue::ChannelBus::new();
-        build_router(crate::results::test_support::test_state(&bus), &auth, mode)
+        build_router(crate::results::test_support::test_state(&bus), &auth)
     }
 
     async fn status(app: Router, uri: &str, key: Option<&str>) -> u16 {
@@ -235,6 +234,17 @@ mod tests {
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    /// Status and JSON body of an authenticated GET.
+    async fn get_json(app: Router, uri: &str, key: &str) -> (u16, serde_json::Value) {
+        let req = Request::get(uri).header("X-API-Key", key);
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status().as_u16();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     /// POST `len` bytes to `uri` (with an explicit `Content-Length`, as a
@@ -270,18 +280,12 @@ mod tests {
     #[tokio::test]
     async fn body_limit_is_2mb_except_parse() {
         // The admin key is sent so only the body limit can reject.
-        let parse = post_status(
-            app(admin(), Mode::Standalone),
-            "/parse",
-            Some(KEY),
-            THREE_MB,
-        )
-        .await;
+        let parse = post_status(app(admin()), "/parse", Some(KEY), THREE_MB).await;
         assert_ne!(parse, 413, "/parse has its own, larger cap");
         assert_ne!(parse, 401);
         for uri in ["/scrape", "/openapi.json"] {
             assert_eq!(
-                post_status(app(admin(), Mode::Standalone), uri, Some(KEY), THREE_MB).await,
+                post_status(app(admin()), uri, Some(KEY), THREE_MB).await,
                 413,
                 "{uri}"
             );
@@ -291,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_docs_are_public() {
         for uri in ["/openapi.json", "/docs"] {
-            let s = status(app(admin(), Mode::Standalone), uri, None).await;
+            let s = status(app(admin()), uri, None).await;
             assert_ne!(s, 401, "{uri}");
             assert_ne!(s, 404, "{uri}");
         }
@@ -300,79 +304,44 @@ mod tests {
     #[tokio::test]
     async fn standalone_upload_and_scrape_require_key() {
         for uri in ["/parse", "/scrape"] {
-            assert_eq!(
-                post_status(app(admin(), Mode::Standalone), uri, None, 2).await,
-                401,
-                "{uri}"
-            );
+            assert_eq!(post_status(app(admin()), uri, None, 2).await, 401, "{uri}");
         }
     }
 
     #[tokio::test]
     async fn standalone_unknown_path_is_404() {
-        assert_eq!(
-            status(app(admin(), Mode::Standalone), "/nope", None).await,
-            404
-        );
+        assert_eq!(status(app(admin()), "/nope", None).await, 404);
     }
 
     #[tokio::test]
     async fn hosted_ws_job_requires_auth() {
-        assert_eq!(
-            status(app(saas(), Mode::Hosted), "/ws/job/x", None).await,
-            401
-        );
+        assert_eq!(status(app(saas()), "/ws/job/x", None).await, 401);
     }
 
     #[tokio::test]
     async fn standalone_public_routes_stay_open() {
-        assert_eq!(
-            status(app(admin(), Mode::Standalone), "/health", None).await,
-            200
-        );
-        assert_eq!(
-            status(app(admin(), Mode::Standalone), "/metrics", None).await,
-            200
-        );
+        assert_eq!(status(app(admin()), "/health", None).await, 200);
+        assert_eq!(status(app(admin()), "/metrics", None).await, 200);
     }
 
     #[tokio::test]
     async fn standalone_protects_product_diagnostics_and_ws() {
         for uri in ["/jobs", "/stats", "/errors", "/domains", "/ws", "/ws/job/x"] {
-            assert_eq!(
-                status(app(admin(), Mode::Standalone), uri, None).await,
-                401,
-                "{uri}"
-            );
+            assert_eq!(status(app(admin()), uri, None).await, 401, "{uri}");
         }
-        assert_eq!(
-            status(app(admin(), Mode::Standalone), "/jobs", Some(KEY)).await,
-            200
-        );
-        assert_eq!(
-            status(app(admin(), Mode::Standalone), "/stats", Some(KEY)).await,
-            200
-        );
+        assert_eq!(status(app(admin()), "/jobs", Some(KEY)).await, 200);
+        assert_eq!(status(app(admin()), "/stats", Some(KEY)).await, 200);
     }
 
     #[tokio::test]
     async fn analytics_pipes_are_protected_and_404_without_clickhouse() {
         for uri in ["/analytics/v0/pipes", "/analytics/v0/pipes/kpis.json"] {
-            assert_eq!(
-                status(app(admin(), Mode::Standalone), uri, None).await,
-                401,
-                "{uri}"
-            );
-            assert_eq!(
-                status(app(admin(), Mode::Standalone), uri, Some(KEY)).await,
-                404,
-                "{uri}"
-            );
-            assert_eq!(
-                status(app(saas(), Mode::Hosted), uri, None).await,
-                401,
-                "{uri}"
-            );
+            assert_eq!(status(app(admin()), uri, None).await, 401, "{uri}");
+            let (code, body) = get_json(app(admin()), uri, KEY).await;
+            assert_eq!(code, 404, "{uri}");
+            assert_eq!(body["code"], "analytics_unavailable", "{uri}");
+            assert_eq!(body["error"], "Analytics unavailable", "{uri}");
+            assert_eq!(status(app(saas()), uri, None).await, 401, "{uri}");
         }
     }
 
@@ -380,19 +349,18 @@ mod tests {
     async fn ws_accepts_query_token() {
         // Not a real upgrade request: auth passes, then the WS extractor rejects
         // the plain GET (4xx other than 401).
-        let s = status(
-            app(admin(), Mode::Standalone),
-            &format!("/ws?token={KEY}"),
-            None,
-        )
-        .await;
+        let s = status(app(admin()), &format!("/ws?token={KEY}"), None).await;
         assert_ne!(s, 401);
     }
 
     #[tokio::test]
-    async fn hosted_ws_requires_auth_but_diagnostics_stay_public() {
-        assert_eq!(status(app(saas(), Mode::Hosted), "/ws", None).await, 401);
-        assert_eq!(status(app(saas(), Mode::Hosted), "/stats", None).await, 200);
+    async fn hosted_ws_and_diagnostics_require_auth() {
+        for uri in ["/ws", "/stats", "/errors", "/domains"] {
+            assert_eq!(status(app(saas()), uri, None).await, 401, "{uri}");
+        }
+        for uri in ["/health", "/health/services", "/metrics"] {
+            assert_eq!(status(app(saas()), uri, None).await, 200, "{uri}");
+        }
     }
 
     /// Status and body `error` of a rejected request to `uri` with `headers`.
@@ -432,20 +400,20 @@ mod tests {
         // (without it the request is "Missing API key or session").
         for uri in ["/ws?token=not-a-key", "/ws/job/x?token=not-a-key"] {
             assert_eq!(
-                auth_error(app(saas(), Mode::Hosted), uri, &[]).await,
+                auth_error(app(saas()), uri, &[]).await,
                 "Invalid API key format",
                 "{uri}"
             );
         }
         assert_eq!(
-            auth_error(app(saas(), Mode::Hosted), "/ws", &[]).await,
+            auth_error(app(saas()), "/ws", &[]).await,
             "Missing API key or session"
         );
         // Percent-decoded, like standalone's `?token=`: `%73k_live_...` is
         // `sk_live_...`, which passes the format check and reaches the
         // (unreachable) Lab.
         assert_eq!(
-            rejection(app(saas(), Mode::Hosted), "/ws?token=%73k_live_x", &[]).await,
+            rejection(app(saas()), "/ws?token=%73k_live_x", &[]).await,
             lab_unavailable()
         );
     }
@@ -456,7 +424,7 @@ mod tests {
         // not the well-formed `?token=`.
         assert_eq!(
             auth_error(
-                app(saas(), Mode::Hosted),
+                app(saas()),
                 "/ws?token=sk_live_x",
                 &[("X-API-Key", "not-a-key")]
             )
@@ -467,7 +435,7 @@ mod tests {
         // (unreachable) Lab; `?token=` (malformed, a local 401) is ignored.
         assert_eq!(
             rejection(
-                app(saas(), Mode::Hosted),
+                app(saas()),
                 "/ws?token=not-a-key",
                 &[("Authorization", "Bearer abc")]
             )
@@ -479,17 +447,14 @@ mod tests {
     #[tokio::test]
     async fn hosted_query_token_is_ws_only() {
         assert_eq!(
-            auth_error(app(saas(), Mode::Hosted), "/jobs?token=not-a-key", &[]).await,
+            auth_error(app(saas()), "/jobs?token=not-a-key", &[]).await,
             "Missing API key or session"
         );
     }
 
     #[tokio::test]
     async fn disabled_auth_leaves_everything_open() {
-        assert_eq!(
-            status(app(AuthMode::Disabled, Mode::Standalone), "/jobs", None).await,
-            200
-        );
+        assert_eq!(status(app(AuthMode::Disabled), "/jobs", None).await, 200);
     }
 
     #[test]

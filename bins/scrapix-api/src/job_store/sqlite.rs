@@ -310,25 +310,42 @@ impl JobStore for SqliteJobStore {
             .map(|r| row_to_job(&r))
     }
 
-    async fn list_jobs(&self, account_id: Option<&str>, limit: i64, offset: i64) -> Vec<JobState> {
-        let q = match account_id {
-            None => sqlx::query("SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?")
-                .bind(limit)
-                .bind(offset),
-            Some(a) => sqlx::query(
-                "SELECT * FROM jobs WHERE account_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
-            )
-            .bind(a)
-            .bind(limit)
-            .bind(offset),
-        };
-        q.fetch_all(&self.pool)
+    async fn list_jobs(
+        &self,
+        account_id: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<JobState> {
+        sqlx::query(
+            "SELECT * FROM jobs WHERE (?1 IS NULL OR account_id = ?1) AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at DESC, rowid DESC LIMIT ?3 OFFSET ?4",
+        )
+        .bind(account_id)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
             .await
             .map(|rows| rows.iter().map(row_to_job).collect())
             .unwrap_or_else(|e| {
                 warn!(error = %e, "Failed to list jobs from SQLite");
                 Vec::new()
             })
+    }
+
+    async fn delete_job(&self, job_id: &str, account_id: Option<&str>) -> Result<bool, StoreError> {
+        // `job_results` rows go with it (ON DELETE CASCADE, foreign keys on).
+        sqlx::query(
+            "DELETE FROM jobs WHERE job_id = ?1 AND (?2 IS NULL OR account_id = ?2)
+             AND status IN ('completed','failed','cancelled')",
+        )
+        .bind(job_id)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .map_err(other)
     }
 
     async fn active_job_ids(&self, account_id: &str) -> Result<Vec<String>, StoreError> {

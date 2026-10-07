@@ -182,6 +182,18 @@ def test_list_jobs_and_job_control(api: MockAPI) -> None:
     assert client.pause_job("a").status == "paused"
     assert client.resume_job("a").status == "running"
     assert client.cancel_job("a").status == "cancelled"
+    assert "purge" not in api.requests[-1].url.params
+
+
+def test_delete_job_and_status_filter(api: MockAPI) -> None:
+    api.add("DELETE", "/job/a", httpx.Response(204))
+    api.add("GET", "/jobs", httpx.Response(200, json=[job_status("a", "completed")]))
+    client = api.sync_client()
+    assert client.delete_job("a") is None
+    assert api.requests[0].url.params["purge"] == "true"
+    jobs = client.list_jobs(status="completed")
+    assert [j.status for j in jobs] == ["completed"]
+    assert api.requests[1].url.params["status"] == "completed"
 
 
 def test_job_ids_are_path_escaped(api: MockAPI) -> None:
