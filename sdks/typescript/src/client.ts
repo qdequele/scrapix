@@ -21,6 +21,7 @@ import {
   type JobResult,
   type JobResultItem,
   type JobResultsResponse,
+  type JobStatus,
   type JobStatusResponse,
   type MapRequest,
   type MapResponse,
@@ -393,9 +394,12 @@ export class Scrapix {
     return this.request({ method: "GET", path: jobPath(jobId, "/status") }, options);
   }
 
-  /** `GET /jobs`: the account's jobs, newest first. */
+  /**
+   * `GET /jobs`: the account's jobs, newest first (`limit` at most 200),
+   * optionally of one `status`. Items omit `config` (see `getJob`).
+   */
   listJobs(
-    query: { limit?: number; offset?: number } = {},
+    query: { limit?: number; offset?: number; status?: JobStatus } = {},
     options?: RequestOptions,
   ): Promise<JobStatusResponse[]> {
     return this.request({ method: "GET", path: "/jobs", query }, options);
@@ -404,6 +408,18 @@ export class Scrapix {
   /** `DELETE /job/{id}`: cancel a running or paused job. */
   cancelJob(jobId: string, options?: RequestOptions): Promise<JobStatusResponse> {
     return this.request({ method: "DELETE", path: jobPath(jobId), idempotent: false }, options);
+  }
+
+  /**
+   * `DELETE /job/{id}?purge=true`: delete a finished (completed, failed or
+   * cancelled) job and its stored results. A job that is not finished is a
+   * 409: cancel it first.
+   */
+  deleteJob(jobId: string, options?: RequestOptions): Promise<void> {
+    return this.request(
+      { method: "DELETE", path: jobPath(jobId), query: { purge: true }, idempotent: false },
+      options,
+    );
   }
 
   /** `POST /job/{id}/pause`. */

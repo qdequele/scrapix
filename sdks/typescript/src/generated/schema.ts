@@ -319,7 +319,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Domains endpoint */
+        /**
+         * Domain stats
+         * @description Per-domain request counters of the caller's jobs (every account's with
+         *     the standalone admin key), busiest first.
+         */
         get: operations["handle_domains"];
         put?: never;
         post?: never;
@@ -417,7 +421,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Errors endpoint */
+        /**
+         * Recent errors
+         * @description The last failed pages of the caller's jobs (every account's with the
+         *     standalone admin key), most recent first.
+         */
         get: operations["handle_errors"];
         put?: never;
         post?: never;
@@ -472,11 +480,16 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Cancel a job
-         * @description Stops the job everywhere (frontier and workers) and bills the pages
-         *     crawled so far. Only a pending, running or paused job can be cancelled:
-         *     a job that already completed, failed or was cancelled returns 409 and
-         *     keeps its status.
+         * Cancel or delete a job
+         * @description Without `purge`: cancels the job. It stops everywhere (frontier and
+         *     workers) and the pages crawled so far are billed. Only a pending,
+         *     running or paused job can be cancelled: a job that already completed,
+         *     failed or was cancelled returns 409 and keeps its status.
+         *
+         *     With `purge=true`: deletes a finished (completed, failed or cancelled)
+         *     job: it disappears from `GET /jobs`, and its status and stored results
+         *     are gone (204). The documents a crawl indexed stay in Meilisearch. A job
+         *     that is not finished returns 409: cancel it first.
          */
         delete: operations["cancel_job"];
         options?: never;
@@ -549,7 +562,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List all jobs */
+        /**
+         * List jobs
+         * @description The caller's jobs, newest first, paginated with `limit` (default 50, at
+         *     most 200) and `offset`, optionally of one `status`. List items omit the
+         *     job `config` (see `GET /job/{id}/status`).
+         */
         get: operations["list_jobs"];
         put?: never;
         post?: never;
@@ -628,7 +646,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** System stats endpoint */
+        /**
+         * System stats
+         * @description Jobs, recent errors and domain counters since API startup, for the
+         *     caller's account (every account with the standalone admin key).
+         */
         get: operations["handle_stats"];
         put?: never;
         post?: never;
@@ -1607,9 +1629,12 @@ export interface components {
             cookies?: components["schemas"]["RequestCookie"][] | null;
             /** @description CSS selectors to remove before extraction */
             exclude_selectors?: string[] | null;
-            /** @description Custom CSS selector extraction (field_name -> selector definition) */
+            /**
+             * @description Custom CSS selector extraction: field name -> a CSS selector, a list
+             *     of selectors or a selector definition (as on `/scrape`)
+             */
             extract?: {
-                [key: string]: components["schemas"]["SelectorDefinition"];
+                [key: string]: components["schemas"]["ScrapeSelector"];
             } | null;
             /** @description Formats to return for each URL (default: markdown, content, metadata) */
             formats?: components["schemas"]["ScrapeFormat"][] | null;
@@ -2406,9 +2431,13 @@ export interface components {
             cookies?: components["schemas"]["RequestCookie"][];
             /** @description CSS selectors to remove before extraction */
             exclude_selectors?: string[];
-            /** @description Custom CSS selector extraction (field_name -> selector definition) */
+            /**
+             * @description Custom CSS selector extraction: field name -> a CSS selector, a list
+             *     of selectors (the first that matches wins) or a selector definition
+             *     (`{"selector": "...", "mode": "list", ...}`)
+             */
             extract?: {
-                [key: string]: components["schemas"]["SelectorDefinition"];
+                [key: string]: components["schemas"]["ScrapeSelector"];
             };
             /** @description Formats to return (default: all) */
             formats?: components["schemas"]["ScrapeFormat"][];
@@ -2536,6 +2565,18 @@ export interface components {
             selectors: string[];
         };
         ServiceHealthResponse: {
+            /**
+             * @description A browser is available to the API: `render_js`, `mobile`, `actions`
+             *     and the `screenshot` format on `/scrape`, `/batch/scrape`, `/map` and
+             *     `/extract` (they answer 503 `render_js_unavailable` otherwise).
+             */
+            browser_available: boolean;
+            /**
+             * @description The crawlers can render pages (`crawler_type: "browser"` crawls);
+             *     `null` when the API does not know (separately deployed crawlers,
+             *     browser crawls accepted). When `false`, `POST /crawl` refuses them.
+             */
+            crawl_browser_available?: boolean | null;
             services: components["schemas"]["ServiceStatus"][];
         };
         /** @description Service health status for each component */
@@ -2808,6 +2849,11 @@ export interface components {
              */
             ocr_max_pages?: number | null;
         };
+        /**
+         * @description One `/scrape` `extract` field, in any of the shapes crawl's
+         *     `custom_selectors` accepts plus a full selector definition.
+         */
+        ScrapeSelector: string | string[] | components["schemas"]["SelectorDefinition"];
     };
     responses: never;
     parameters: never;
@@ -3691,6 +3737,14 @@ export interface operations {
                     "application/json": components["schemas"]["DomainsResponse"];
                 };
             };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     list_engines: {
@@ -3950,6 +4004,14 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorsResponse"];
                 };
             };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     health: {
@@ -3992,7 +4054,10 @@ export interface operations {
     };
     cancel_job: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description `true`: delete a finished job instead of cancelling a running one */
+                purge?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Job ID */
@@ -4002,6 +4067,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Cancelled */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4009,6 +4075,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["JobStatusResponse"];
                 };
+            };
+            /** @description Deleted (`purge=true`) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             404: {
                 headers: {
@@ -4018,7 +4091,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
-            /** @description The job is already terminal */
+            /** @description Cancel: the job is already finished. Purge: the job is not finished (or is still being finalized, retry shortly) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4140,8 +4213,15 @@ export interface operations {
     list_jobs: {
         parameters: {
             query?: {
+                /** @description Page size (default 50, at most 200) */
                 limit?: number;
+                /** @description Jobs to skip (newest first) */
                 offset?: number;
+                /**
+                 * @description Only jobs with this status: `pending`, `running`, `paused`,
+                 *     `completed`, `failed` or `cancelled`
+                 */
+                status?: string | null;
             };
             header?: never;
             path?: never;
@@ -4149,12 +4229,23 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description List of jobs */
+            /** @description Jobs, newest first */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["JobStatusResponse"][];
+                };
+            };
+            /** @description Unknown `status` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
             };
         };
     };
@@ -4274,6 +4365,14 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SystemStatsResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
                 };
             };
         };
