@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn lab_resolver_default_url_and_fallback() {
         use crate::lab_client::{
-            testing::{FakeLab, TOKEN},
+            testing::{FakeLab, INSTANCE_ID, SECRET},
             LabClient,
         };
         let lab = FakeLab::start().await;
@@ -212,7 +212,7 @@ mod tests {
             api_key: Some("ops".into()),
         });
         let r = LabMeilisearchResolver {
-            lab: std::sync::Arc::new(LabClient::new(&lab.url, TOKEN)),
+            lab: std::sync::Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET)),
             server,
         };
         assert_eq!(

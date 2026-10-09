@@ -1,6 +1,7 @@
 //! Engine → Lab lookups (spec: Lab split §3.2): credential introspection,
 //! account tier/balance, and Meilisearch targets over the Lab's internal
-//! API, authenticated with LAB_SERVICE_TOKEN. Answers are cached (TTL from
+//! API, authenticated with the instance credentials (`X-Lab-Instance-Id` +
+//! Bearer `LAB_INSTANCE_SECRET`). Answers are cached (TTL from
 //! the Lab, clamped); while the Lab is unreachable a cached answer is served
 //! for `stale_grace` past its expiry, then everything fails closed.
 //!
@@ -48,7 +49,7 @@ pub(crate) struct Identity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LabError {
     Unavailable(String),
-    ServiceTokenRejected,
+    CredentialsRejected,
     /// Lab answered a 3xx (redirects are never followed) or a 4xx other than
     /// 401: reachable but refusing the request. Never served stale.
     BadResponse(u16),
@@ -58,10 +59,25 @@ impl std::fmt::Display for LabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(m) => write!(f, "Lab unavailable: {m}"),
-            Self::ServiceTokenRejected => f.write_str("Lab rejected LAB_SERVICE_TOKEN"),
+            Self::CredentialsRejected => {
+                f.write_str("Lab rejected LAB_INSTANCE_ID/LAB_INSTANCE_SECRET")
+            }
             Self::BadResponse(code) => write!(f, "Lab answered HTTP {code}"),
         }
     }
+}
+
+/// `GET /internal/instances/me` (spec §3.6): what the Lab knows about this
+/// deployment. Called once at boot to confirm the credentials and log the
+/// identity; `kind` is `"hosted"` (there is no other kind of engine).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct InstanceInfo {
+    pub instance_id: String,
+    pub kind: String,
+    pub product: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    pub lab_url: String,
 }
 
 /// An account's spendable credits as the engine sees them.
@@ -235,7 +251,8 @@ impl<T: Clone> Lookups<T> {
 
 pub(crate) struct LabClient {
     base: String,
-    token: String,
+    instance_id: String,
+    secret: String,
     http: reqwest::Client,
     timing: Timing,
     permits: tokio::sync::Semaphore,
@@ -244,15 +261,16 @@ pub(crate) struct LabClient {
     balances: Mutex<HashMap<String, Balance>>,
 }
 
-/// Log a failed Lab call. A rejected LAB_SERVICE_TOKEN at runtime is an
-/// operator error (spec §6: engine and Lab disagree on the token), so it is
-/// logged at `error`; everything else is transient and logged at `warn`.
+/// Log a failed Lab call. Rejected instance credentials at runtime are an
+/// operator error (revoked or mistyped LAB_INSTANCE_ID/LAB_INSTANCE_SECRET),
+/// so it is logged at `error`; everything else is transient and logged at
+/// `warn`.
 pub(crate) fn log_lab_error(e: &LabError, during: &str) {
     match e {
-        LabError::ServiceTokenRejected => tracing::error!(
+        LabError::CredentialsRejected => tracing::error!(
             error = %e,
             during,
-            "The Lab rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab"
+            "The Lab rejected this engine's LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: re-issue them on the Lab with bin/rails lab:hosted_engine:create"
         ),
         _ => tracing::warn!(error = %e, during, "Lab call failed"),
     }
@@ -276,22 +294,28 @@ fn hashed(parts: &[&str]) -> String {
 }
 
 impl LabClient {
-    pub(crate) fn new(base_url: &str, service_token: &str) -> Self {
-        Self::with_timing(base_url, service_token, Timing::default())
+    pub(crate) fn new(base_url: &str, instance_id: &str, instance_secret: &str) -> Self {
+        Self::with_timing(base_url, instance_id, instance_secret, Timing::default())
     }
 
-    pub(crate) fn with_timing(base_url: &str, service_token: &str, timing: Timing) -> Self {
+    pub(crate) fn with_timing(
+        base_url: &str,
+        instance_id: &str,
+        instance_secret: &str,
+        timing: Timing,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(timing.connect_timeout)
             .timeout(timing.request_timeout)
             // A redirect is a misconfigured LAB_URL, never followed (it
-            // would also carry the service token elsewhere).
+            // would also carry the instance secret elsewhere).
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
         Self {
             base: base_url.trim_end_matches('/').to_string(),
-            token: service_token.to_string(),
+            instance_id: instance_id.to_string(),
+            secret: instance_secret.to_string(),
             http,
             permits: tokio::sync::Semaphore::new(timing.max_in_flight.max(1)),
             identities: Mutex::new(Lookups::new(&timing)),
@@ -331,10 +355,15 @@ impl LabClient {
                     return Err(LabError::Unavailable("Lab client saturated".into()));
                 }
             };
-        let result = match req.bearer_auth(&self.token).send().await {
+        let result = match req
+            .header("X-Lab-Instance-Id", &self.instance_id)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+        {
             Err(e) => Err(LabError::Unavailable(e.to_string())),
             Ok(resp) => match resp.status().as_u16() {
-                401 => Err(LabError::ServiceTokenRejected),
+                401 => Err(LabError::CredentialsRejected),
                 // The Meilisearch lookup's 404 means "no engine", handled by the caller.
                 404 if endpoint == "meilisearch" => Ok(resp),
                 c @ 300..=499 => Err(LabError::BadResponse(c)),
@@ -344,7 +373,7 @@ impl LabClient {
         };
         match &result {
             Err(LabError::Unavailable(_)) => count(endpoint, "unavailable"),
-            Err(LabError::ServiceTokenRejected | LabError::BadResponse(_)) => {
+            Err(LabError::CredentialsRejected | LabError::BadResponse(_)) => {
                 count(endpoint, "rejected")
             }
             Ok(_) => {}
@@ -485,20 +514,26 @@ impl LabClient {
         )
     }
 
-    pub(crate) async fn ping(&self) -> Result<(), LabError> {
-        let (status, _) = self
+    /// `GET /internal/instances/me`: confirms the instance credentials and
+    /// tells which deployment they belong to (checked once at boot).
+    pub(crate) async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
+        let (status, body) = self
             .request(
-                "ping",
-                self.http.get(format!("{}/internal/ping", self.base)),
+                "instances_me",
+                self.http
+                    .get(format!("{}/internal/instances/me", self.base)),
             )
             .await?;
-        if (200..300).contains(&status) {
-            count("ping", "ok");
-            Ok(())
-        } else {
-            count("ping", "unavailable");
-            Err(LabError::Unavailable(format!("HTTP {status}")))
+        if !(200..300).contains(&status) {
+            count("instances_me", "unavailable");
+            return Err(LabError::Unavailable(format!("HTTP {status}")));
         }
+        let me: InstanceInfo = serde_json::from_slice(&body).map_err(|e| {
+            count("instances_me", "unavailable");
+            LabError::Unavailable(format!("malformed: {e}"))
+        })?;
+        count("instances_me", "ok");
+        Ok(me)
     }
 
     pub(crate) async fn introspect(
@@ -705,7 +740,9 @@ pub(crate) mod testing {
         },
     };
 
-    pub(crate) const TOKEN: &str = "fake-lab-service-token-0123456789abcdef";
+    pub(crate) const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    pub(crate) const SECRET: &str =
+        "abababababababababababababababababababababababababababababababab";
 
     #[derive(Default)]
     pub(crate) struct FakeLabState {
@@ -720,6 +757,8 @@ pub(crate) mod testing {
         /// Non-zero: every gated route answers this status (after the down check).
         pub status_override: AtomicUsize,
         pub calls: AtomicUsize,
+        /// `GET /internal/instances/me` answer (`FakeLab::hosted_me()` by default).
+        pub me: Mutex<Value>,
     }
 
     pub(crate) struct FakeLab {
@@ -729,7 +768,8 @@ pub(crate) mod testing {
 
     fn authorized(h: &HeaderMap) -> bool {
         h.get("authorization").and_then(|v| v.to_str().ok())
-            == Some(format!("Bearer {TOKEN}").as_str())
+            == Some(format!("Bearer {SECRET}").as_str())
+            && h.get("x-lab-instance-id").and_then(|v| v.to_str().ok()) == Some(INSTANCE_ID)
     }
 
     async fn gate(s: &FakeLabState, h: &HeaderMap) -> Result<(), StatusCode> {
@@ -753,14 +793,18 @@ pub(crate) mod testing {
 
     impl FakeLab {
         pub(crate) async fn start() -> FakeLab {
-            let state = Arc::new(FakeLabState::default());
+            let state = Arc::new(FakeLabState {
+                me: Mutex::new(FakeLab::hosted_me()),
+                ..Default::default()
+            });
             let app =
                 Router::new()
                     .route(
-                        "/internal/ping",
+                        "/internal/instances/me",
                         get(
                             |State(s): State<Arc<FakeLabState>>, h: HeaderMap| async move {
-                                gate(&s, &h).await.map(|_| Json(json!({"ok": true})))
+                                gate(&s, &h).await?;
+                                Ok::<_, StatusCode>(Json(s.me.lock().unwrap().clone()))
                             },
                         ),
                     )
@@ -837,6 +881,10 @@ pub(crate) mod testing {
             FakeLab { url, state }
         }
 
+        pub(crate) fn hosted_me() -> Value {
+            json!({"instance_id": INSTANCE_ID, "kind": "hosted", "product": "scrapix",
+                   "region": "eu-west-1", "lab_url": "http://lab"})
+        }
         pub(crate) fn identity(account: &str, tier: &str, balance: i64) -> Value {
             json!({"active": true, "account_id": account, "tier": tier, "role": null, "api_key_id": null,
                    "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance}})
@@ -866,7 +914,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{FakeLab, TOKEN};
+    use super::testing::{FakeLab, INSTANCE_ID, SECRET};
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
@@ -898,22 +946,55 @@ mod tests {
 
     async fn setup() -> (FakeLab, LabClient) {
         let lab = FakeLab::start().await;
-        let client = LabClient::with_timing(&lab.url, TOKEN, fast());
+        let client = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, fast());
         (lab, client)
     }
 
     #[tokio::test]
-    async fn ping_ok_and_wrong_token_is_rejected() {
+    async fn instances_me_describes_the_deployment_and_a_wrong_secret_is_rejected() {
         let lab = FakeLab::start().await;
-        LabClient::with_timing(&lab.url, TOKEN, fast())
-            .ping()
+        let me = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, fast())
+            .instances_me()
             .await
             .unwrap();
-        let err = LabClient::with_timing(&lab.url, "wrong", fast())
-            .ping()
+        assert_eq!(me.instance_id, INSTANCE_ID);
+        assert_eq!(me.kind, "hosted");
+        assert_eq!(me.product, "scrapix");
+        assert_eq!(me.region.as_deref(), Some("eu-west-1"));
+        let err = LabClient::with_timing(&lab.url, INSTANCE_ID, "wrong", fast())
+            .instances_me()
             .await
             .unwrap_err();
-        assert_eq!(err, LabError::ServiceTokenRejected);
+        assert_eq!(err, LabError::CredentialsRejected);
+        let err = LabClient::with_timing(
+            &lab.url,
+            "22222222-2222-4222-8222-222222222222",
+            SECRET,
+            fast(),
+        )
+        .instances_me()
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LabError::CredentialsRejected,
+            "the id is part of the credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_call_carries_the_instance_id_header() {
+        let (lab, c) = setup().await;
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(c.account(ACCT).await.is_ok());
+        // `authorized` in the fake requires X-Lab-Instance-Id on every gated
+        // route; a client without it would have been 401 (CredentialsRejected).
+        assert_eq!(lab.calls(), 2);
     }
 
     #[tokio::test]
@@ -1184,12 +1265,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_404_is_bad_response() {
+    async fn a_404_on_instances_me_is_bad_response() {
         let (lab, c) = setup().await;
         lab.state
             .status_override
             .store(404, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(c.ping().await, Err(LabError::BadResponse(404)));
+        assert_eq!(
+            c.instances_me().await.unwrap_err(),
+            LabError::BadResponse(404)
+        );
     }
 
     #[tokio::test]
@@ -1306,7 +1390,8 @@ mod tests {
         let lab = FakeLab::start().await;
         let c = Arc::new(LabClient::with_timing(
             &lab.url,
-            TOKEN,
+            INSTANCE_ID,
+            SECRET,
             Timing {
                 max_in_flight: 1,
                 request_timeout: Duration::from_secs(2),
@@ -1424,8 +1509,8 @@ mod tests {
         let redirector = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let c = LabClient::with_timing(&redirector, TOKEN, fast());
-        assert_eq!(c.ping().await, Err(LabError::BadResponse(307)));
+        let c = LabClient::with_timing(&redirector, INSTANCE_ID, SECRET, fast());
+        assert_eq!(c.instances_me().await, Err(LabError::BadResponse(307)));
         lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 1));
         assert_eq!(
             c.introspect(CredentialKind::ApiKey, "sk_live_a", None)

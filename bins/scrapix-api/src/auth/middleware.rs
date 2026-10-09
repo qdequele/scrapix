@@ -237,7 +237,7 @@ pub(crate) async fn validate_api_key_or_session(
 mod tests {
     use super::*;
     use crate::lab_client::{
-        testing::{FakeLab, TOKEN},
+        testing::{FakeLab, INSTANCE_ID, SECRET},
         LabClient,
     };
     use axum::{
@@ -268,7 +268,7 @@ mod tests {
 
     async fn state() -> (FakeLab, Arc<AuthState>) {
         let lab = FakeLab::start().await;
-        let client = Arc::new(LabClient::new(&lab.url, TOKEN));
+        let client = Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET));
         (lab, Arc::new(AuthState::new(client, Some(SERVICE.into()))))
     }
 

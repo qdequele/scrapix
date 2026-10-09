@@ -125,6 +125,9 @@ pub trait LabOutbox: Send + Sync {
     async fn mark_delivered(&self, ids: &[Uuid]) -> Result<(), StoreError>;
     /// Record a failed delivery: attempts + 1 and exponential backoff.
     async fn reschedule(&self, ids: &[Uuid]) -> Result<(), StoreError>;
+    /// Delete undelivered events the Lab never acknowledged in time (spec
+    /// §3.4: permanently rejected after 24 h). Returns how many were dropped.
+    async fn abandon(&self, ids: &[Uuid]) -> Result<u64, StoreError>;
     /// Undelivered count and the creation time of the oldest one.
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError>;
     async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError>;
@@ -209,6 +212,18 @@ impl LabOutbox for PgOutbox {
         .await
         .map(|_| ())
         .map_err(db)
+    }
+
+    async fn abandon(&self, ids: &[Uuid]) -> Result<u64, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query("DELETE FROM lab_events WHERE id = ANY($1) AND delivered_at IS NULL")
+            .bind(ids)
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(db)
     }
 
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError> {
@@ -339,6 +354,21 @@ impl LabOutbox for SqliteOutbox {
         tx.commit().await.map_err(db)
     }
 
+    async fn abandon(&self, ids: &[Uuid]) -> Result<u64, StoreError> {
+        let mut dropped = 0;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        for id in ids {
+            dropped += sqlx::query("DELETE FROM lab_events WHERE id = ? AND delivered_at IS NULL")
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(dropped)
+    }
+
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError> {
         let (count, oldest): (i64, Option<String>) = sqlx::query_as(
             "SELECT count(*), min(created_at) FROM lab_events WHERE delivered_at IS NULL",
@@ -465,6 +495,13 @@ impl LabOutbox for MemoryOutbox {
             }
         }
         Ok(())
+    }
+
+    async fn abandon(&self, ids: &[Uuid]) -> Result<u64, StoreError> {
+        let mut rows = self.rows.lock();
+        let before = rows.len();
+        rows.retain(|r| r.delivered || !ids.contains(&r.event.id));
+        Ok((before - rows.len()) as u64)
     }
 
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError> {
@@ -723,7 +760,7 @@ mod tests {
 
     /// Shared outbox semantics: idempotent enqueue, oldest-first `due`,
     /// reschedule hides an event, delivery clears it from the pending stats,
-    /// purge removes it.
+    /// abandon drops only undelivered events, purge removes delivered ones.
     async fn outbox_roundtrip(o: &dyn LabOutbox) {
         let acct = "7f1c2a8e-0000-4000-8000-000000000001";
         let e = LabEvent::crawl_final_usage("j", acct, json!({"pages_http":5}), "Job j".into());
@@ -739,6 +776,21 @@ mod tests {
         assert_eq!(o.due(10).await.unwrap(), vec![u.clone()]);
         o.mark_delivered(&[e.id, u.id]).await.unwrap();
         assert!(o.due(10).await.unwrap().is_empty());
+        assert_eq!(o.pending_stats().await.unwrap(), (0, None));
+        let gone = LabEvent::usage(
+            acct,
+            None,
+            "map",
+            json!({"requests": 1}),
+            "old".into(),
+            None,
+        );
+        o.enqueue(std::slice::from_ref(&gone)).await.unwrap();
+        assert_eq!(
+            o.abandon(&[gone.id, e.id]).await.unwrap(),
+            1,
+            "only undelivered rows are dropped"
+        );
         assert_eq!(o.pending_stats().await.unwrap(), (0, None));
         assert_eq!(o.purge_delivered(-1).await.unwrap(), 2);
     }

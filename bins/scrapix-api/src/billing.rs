@@ -266,7 +266,7 @@ mod tests {
 mod lab_balance_tests {
     use super::check_credits;
     use crate::lab_client::{
-        testing::{FakeLab, TOKEN},
+        testing::{FakeLab, INSTANCE_ID, SECRET},
         LabClient,
     };
     use serde_json::json;
@@ -276,7 +276,7 @@ mod lab_balance_tests {
     #[tokio::test]
     async fn service_call_balance_uses_account_lookup() {
         let lab = FakeLab::start().await;
-        let c = LabClient::new(&lab.url, TOKEN);
+        let c = LabClient::new(&lab.url, INSTANCE_ID, SECRET);
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": 0}}),
@@ -290,7 +290,7 @@ mod lab_balance_tests {
     #[tokio::test]
     async fn a_top_up_counts_before_a_402_with_one_refresh_per_check() {
         let lab = FakeLab::start().await;
-        let c = LabClient::new(&lab.url, TOKEN);
+        let c = LabClient::new(&lab.url, INSTANCE_ID, SECRET);
         let account = |balance: i64| json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": balance}});
         lab.set_account(ACCT, account(1));
         assert_eq!(check_credits(&c, ACCT, 1).await.unwrap(), 1);
@@ -315,7 +315,7 @@ mod lab_balance_tests {
     async fn billing_unavailable_is_503_with_retry_after() {
         use axum::response::IntoResponse;
         let lab = FakeLab::start().await;
-        let c = LabClient::new(&lab.url, TOKEN);
+        let c = LabClient::new(&lab.url, INSTANCE_ID, SECRET);
         lab.set_down(true);
         let resp = check_credits(&c, ACCT, 1)
             .await
@@ -328,7 +328,7 @@ mod lab_balance_tests {
     #[tokio::test]
     async fn unknown_account_is_not_found_and_lab_down_is_503() {
         let lab = FakeLab::start().await;
-        let c = LabClient::new(&lab.url, TOKEN);
+        let c = LabClient::new(&lab.url, INSTANCE_ID, SECRET);
         assert_eq!(
             check_credits(&c, ACCT, 1).await.unwrap_err().code,
             "not_found"

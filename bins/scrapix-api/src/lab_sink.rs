@@ -1,15 +1,21 @@
-//! Delivers the lab outbox to the Lab's `POST /internal/events` (hosted only).
+//! Delivers the lab outbox to the Lab's `POST /internal/events` (hosted only):
+//! batches of up to 500 events, signed `X-Lab-Signature: sha256=<hex
+//! HMAC-SHA256(LAB_INSTANCE_SECRET, "<X-Lab-Timestamp>.<raw body>")>` and
+//! identified by `X-Lab-Instance-Id`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::job_store::StoreError;
 use crate::lab_events::LabOutbox;
 
-pub const BATCH: i64 = 100;
+pub const BATCH: i64 = 500;
+/// Spec §3.4: an event the Lab never acknowledged for this long is
+/// permanently rejected; drop it (error log) instead of retrying forever.
+const MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 const TICK: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PURGE_EVERY: Duration = Duration::from_secs(3600);
@@ -21,6 +27,7 @@ pub struct LabSink {
     outbox: Arc<dyn LabOutbox>,
     client: reqwest::Client,
     url: String,
+    instance_id: String,
     secret: String,
 }
 
@@ -35,34 +42,67 @@ impl LabSink {
         outbox: Arc<dyn LabOutbox>,
         client: reqwest::Client,
         url: String,
+        instance_id: String,
         secret: String,
     ) -> Self {
         Self {
             outbox,
             client,
             url,
+            instance_id,
             secret,
         }
     }
 
     /// Send one batch of due events. Accepted events are marked delivered,
-    /// the rest are rescheduled with backoff. Returns how many were accepted.
+    /// the rest are rescheduled with backoff; events older than 24 h are
+    /// dropped instead of sent. Returns how many were accepted.
     pub async fn deliver_once(&self) -> Result<usize, StoreError> {
-        let events = self.outbox.due(BATCH).await?;
+        let now = chrono::Utc::now();
+        let (expired, events): (Vec<_>, Vec<_>) = self
+            .outbox
+            .due(BATCH)
+            .await?
+            .into_iter()
+            .partition(|e| now - e.occurred_at > MAX_AGE);
+        if !expired.is_empty() {
+            for e in &expired {
+                error!(
+                    event_id = %e.id,
+                    account_id = %e.account_id,
+                    event_type = %e.kind,
+                    operation = e.data.get("operation").and_then(|v| v.as_str()),
+                    occurred_at = %e.occurred_at,
+                    "Lab event never acknowledged for 24 h: dropped (spec 3.4)"
+                );
+            }
+            let ids: Vec<Uuid> = expired.iter().map(|e| e.id).collect();
+            let dropped = self.outbox.abandon(&ids).await?;
+            scrapix_core::metrics::lab_events_delivered_total()
+                .with_label_values(&["dropped"])
+                .inc_by(dropped as f64);
+        }
         if events.is_empty() {
             return Ok(0);
         }
         let ids: Vec<Uuid> = events.iter().map(|e| e.id).collect();
         let body = serde_json::to_vec(&serde_json::json!({ "events": events }))
             .map_err(|e| StoreError::Other(e.to_string()))?;
-        let signature = crate::webhooks::sign_sha256(self.secret.as_bytes(), &body);
+        // Signed with the time of sending (the Lab rejects a timestamp more
+        // than 300 s off), never a cached one.
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let mut signed = format!("{timestamp}.").into_bytes();
+        signed.extend_from_slice(&body);
+        let signature = crate::webhooks::sign_sha256(self.secret.as_bytes(), &signed);
         // Not-accepted events count as `rejected` when the Lab answered but
         // did not take them, `failed` when it could not be reached or read.
         let (accepted, outcome): (Vec<Uuid>, &str) = match self
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
-            .header("X-Scrapix-Signature", signature)
+            .header("X-Lab-Instance-Id", &self.instance_id)
+            .header("X-Lab-Timestamp", &timestamp)
+            .header("X-Lab-Signature", signature)
             .timeout(REQUEST_TIMEOUT)
             .body(body)
             .send()
@@ -168,10 +208,11 @@ mod tests {
     use super::*;
     use crate::lab_events::{LabEvent, MemoryOutbox};
     use serde_json::json;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    const SECRET: &str = "abababababababababababababababababababababababababababababababab";
 
     fn ev() -> LabEvent {
         LabEvent::usage(
@@ -199,15 +240,23 @@ mod tests {
     }
 
     fn sink(outbox: Arc<MemoryOutbox>, url: String) -> LabSink {
-        LabSink::new(outbox, reqwest::Client::new(), url, SECRET.into())
+        LabSink::new(
+            outbox,
+            reqwest::Client::new(),
+            url,
+            INSTANCE_ID.into(),
+            SECRET.into(),
+        )
     }
 
     #[tokio::test]
-    async fn signs_raw_body_and_marks_accepted_delivered() {
+    async fn signature_covers_timestamp_dot_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/internal/events"))
-            .and(header_exists("X-Scrapix-Signature"))
+            .and(header_exists("X-Lab-Signature"))
+            .and(header_exists("X-Lab-Timestamp"))
+            .and(header("X-Lab-Instance-Id", INSTANCE_ID))
             .respond_with(AcceptAll)
             .expect(1)
             .mount(&server)
@@ -215,19 +264,78 @@ mod tests {
         let outbox = Arc::new(MemoryOutbox::default());
         outbox.enqueue(&[ev(), ev()]).await.unwrap();
         let s = sink(outbox.clone(), format!("{}/internal/events", server.uri()));
+        let before = chrono::Utc::now().timestamp();
         assert_eq!(s.deliver_once().await.unwrap(), 2);
         assert!(outbox.due(10).await.unwrap().is_empty());
         let req = &server.received_requests().await.unwrap()[0];
-        let sig = req
+        let ts = req
             .headers
-            .get("X-Scrapix-Signature")
+            .get("X-Lab-Timestamp")
             .unwrap()
             .to_str()
             .unwrap();
+        let ts_num: i64 = ts.parse().unwrap();
+        assert!(
+            (before..=chrono::Utc::now().timestamp()).contains(&ts_num),
+            "signed with the current time"
+        );
+        let sig = req
+            .headers
+            .get("X-Lab-Signature")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let mut signed = format!("{ts}.").into_bytes();
+        signed.extend_from_slice(&req.body);
         assert_eq!(
             sig,
-            crate::webhooks::sign_sha256(SECRET.as_bytes(), &req.body)
+            crate::webhooks::sign_sha256(SECRET.as_bytes(), &signed)
         );
+        assert!(
+            req.headers.get("X-Scrapix-Signature").is_none(),
+            "v1 header gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn batches_hold_up_to_500_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(AcceptAll)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let outbox = Arc::new(MemoryOutbox::default());
+        let events: Vec<_> = (0..501).map(|_| ev()).collect();
+        outbox.enqueue(&events).await.unwrap();
+        let s = sink(outbox.clone(), server.uri());
+        assert_eq!(s.deliver_once().await.unwrap(), 500);
+        assert_eq!(s.deliver_once().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_older_than_24h_are_dropped_with_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let outbox = Arc::new(MemoryOutbox::default());
+        let mut stale = ev();
+        stale.occurred_at = chrono::Utc::now() - chrono::TimeDelta::hours(25);
+        outbox.enqueue(&[stale.clone()]).await.unwrap();
+        let s = sink(outbox.clone(), server.uri());
+        let dropped =
+            scrapix_core::metrics::lab_events_delivered_total().with_label_values(&["dropped"]);
+        let before = dropped.get();
+        assert_eq!(s.deliver_once().await.unwrap(), 0);
+        assert_eq!(
+            outbox.pending_stats().await.unwrap().0,
+            0,
+            "abandoned, not retried"
+        );
+        assert!(dropped.get() > before);
     }
 
     #[tokio::test]
@@ -289,7 +397,7 @@ mod tests {
             .mount(&server)
             .await;
         let outbox = Arc::new(MemoryOutbox::default());
-        let events: Vec<_> = (0..250).map(|_| ev()).collect();
+        let events: Vec<_> = (0..1100).map(|_| ev()).collect();
         outbox.enqueue(&events).await.unwrap();
         let s = Arc::new(sink(outbox.clone(), server.uri()));
         let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -300,7 +408,7 @@ mod tests {
             }
         })
         .await
-        .expect("a 250-event backlog drains without 1 s pauses between full batches");
+        .expect("a 1100-event backlog drains without 1 s pauses between full batches");
         h.abort();
         let sent: Vec<String> = server
             .received_requests()

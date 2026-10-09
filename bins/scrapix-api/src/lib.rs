@@ -6691,16 +6691,37 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
     match (&settings.mode, &settings.auth, &settings.store) {
         (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
-            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.instance_secret);
-            match lab_api.ping().await {
-                Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
-                Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
-                    "the Lab at {} rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab",
+            let lab_api = lab_client::LabClient::new(
+                &lab_cfg.url,
+                &lab_cfg.instance_id,
+                &lab_cfg.instance_secret,
+            );
+            match lab_api.instances_me().await {
+                Ok(me) if me.kind == "hosted" && me.product == "scrapix" => info!(
+                    url = %lab_cfg.url,
+                    instance_id = %me.instance_id,
+                    region = me.region.as_deref().unwrap_or("-"),
+                    lab_url = %me.lab_url,
+                    "Lab reachable; hosted Scrapix engine"
+                ),
+                Ok(me) => anyhow::bail!(
+                    "LAB_INSTANCE_ID {} is a {} {} deployment; this engine needs a hosted scrapix \
+                     credential (bin/rails lab:hosted_engine:create PRODUCT=scrapix on the Lab)",
+                    me.instance_id,
+                    me.kind,
+                    me.product
+                ),
+                Err(lab_client::LabError::CredentialsRejected) => anyhow::bail!(
+                    "the Lab at {} rejected LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: re-issue them from the Lab",
+                    lab_cfg.url
+                ),
+                Err(lab_client::LabError::BadResponse(404)) => anyhow::bail!(
+                    "the Lab at LAB_URL ({}) has no GET /internal/instances/me: either LAB_URL is wrong \
+                     or the Lab predates contract v2",
                     lab_cfg.url
                 ),
                 Err(lab_client::LabError::BadResponse(code)) => anyhow::bail!(
-                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL \
-                     (a wrong URL typically 404s)",
+                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL",
                     lab_cfg.url
                 ),
                 Err(e) => warn!(
@@ -7149,6 +7170,7 @@ pub async fn run_with_bus(
             outbox,
             reqwest::Client::new(),
             format!("{}/internal/events", cfg.url),
+            cfg.instance_id.clone(),
             cfg.instance_secret.clone(),
         );
         info!("Lab event delivery started");
@@ -8044,7 +8066,7 @@ mod tests {
             meilisearch: None,
             lab: Some(settings::LabSettings {
                 url: lab_url.into(),
-                instance_id: "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f".into(),
+                instance_id: crate::lab_client::testing::INSTANCE_ID.into(),
                 instance_secret: instance_secret.into(),
                 service_token: "s".repeat(32),
             }),
@@ -8058,7 +8080,7 @@ mod tests {
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let w = wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url),
         ))
         .await
@@ -8068,19 +8090,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_wiring_refuses_a_wrong_service_token() {
+    async fn hosted_wiring_refuses_wrong_instance_credentials() {
         let lab = crate::lab_client::testing::FakeLab::start().await;
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let err = wire_mode(&hosted_settings(
             &lab.url,
-            &"wrong".repeat(8),
+            &"cd".repeat(32),
             settings::StoreUrl::Sqlite(url),
         ))
         .await
         .err()
         .unwrap();
-        assert!(err.to_string().contains("LAB_SERVICE_TOKEN"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("rejected"), "{msg}");
+        assert!(msg.contains("LAB_INSTANCE_ID/LAB_INSTANCE_SECRET"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_404_on_instances_me_aborts_startup() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.state
+            .status_override
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings::EngineSettings {
+            mode: settings::Mode::Hosted,
+            auth: settings::AuthSetting::Lab,
+            store: settings::StoreUrl::Sqlite(format!(
+                "sqlite://{}/engine.db",
+                dir.path().display()
+            )),
+            meilisearch: None,
+            lab: Some(settings::LabSettings {
+                url: lab.url.clone(),
+                instance_id: crate::lab_client::testing::INSTANCE_ID.into(),
+                instance_secret: crate::lab_client::testing::SECRET.into(),
+                service_token: "0123456789abcdef0123456789abcdef".into(),
+            }),
+        };
+        let err = wire_mode(&settings).await.err().unwrap().to_string();
+        assert!(err.contains("/internal/instances/me"), "{err}");
+        assert!(err.contains("LAB_URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_non_scrapix_instance() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let mut me = crate::lab_client::testing::FakeLab::hosted_me();
+        me["product"] = serde_json::json!("meilisearch");
+        *lab.state.me.lock().unwrap() = me;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::SECRET,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("hosted meilisearch deployment"), "{msg}");
+        assert!(msg.contains("LAB_INSTANCE_ID"), "{msg}");
     }
 
     #[tokio::test]
@@ -8088,12 +8160,12 @@ mod tests {
         let lab = crate::lab_client::testing::FakeLab::start().await;
         lab.state
             .status_override
-            .store(404, std::sync::atomic::Ordering::SeqCst);
+            .store(403, std::sync::atomic::Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let err = wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url),
         ))
         .await
@@ -8101,7 +8173,7 @@ mod tests {
         .unwrap();
         let msg = err.to_string();
         assert!(msg.contains("LAB_URL"), "{msg}");
-        assert!(msg.contains("404"), "{msg}");
+        assert!(msg.contains("403"), "{msg}");
     }
 
     #[tokio::test]
@@ -8112,7 +8184,7 @@ mod tests {
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         assert!(wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url)
         ))
         .await
@@ -8151,7 +8223,7 @@ mod tests {
             async move {
                 wire_mode(&hosted_settings(
                     &lab_url,
-                    crate::lab_client::testing::TOKEN,
+                    crate::lab_client::testing::SECRET,
                     settings::StoreUrl::Postgres(store),
                 ))
                 .await
@@ -9093,6 +9165,9 @@ mod lifecycle_tests {
         }
         async fn reschedule(&self, ids: &[uuid::Uuid]) -> Result<(), job_store::StoreError> {
             self.inner.reschedule(ids).await
+        }
+        async fn abandon(&self, ids: &[uuid::Uuid]) -> Result<u64, job_store::StoreError> {
+            self.inner.abandon(ids).await
         }
         async fn pending_stats(
             &self,
