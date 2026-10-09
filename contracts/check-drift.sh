@@ -23,21 +23,31 @@ if [ -z "${LAB_SRC:-}" ]; then
     exit 0
   fi
 fi
+# The one owner file the Lab has not published yet: it alone may be absent
+# (a missing file or an HTTP 404), and only that is skipped. Any other
+# failure, for any file, is fatal.
+NOT_YET_PUBLISHED=lab-events.schema.json
 owner="$(mktemp)"
-trap 'rm -f "$owner"' EXIT
+err="$(mktemp)"
+trap 'rm -f "$owner" "$err"' EXIT
 status=0
 for f in "${FILES[@]}"; do
   vendored="vendor/lab/$f"
   if [ -n "${LAB_SRC:-}" ]; then
-    if [ ! -f "$LAB_SRC/contracts/$f" ]; then
+    if [ ! -f "$LAB_SRC/contracts/$f" ] && [ "$f" = "$NOT_YET_PUBLISHED" ] && [ -d "$LAB_SRC/contracts" ]; then
       echo "notice: $LAB_SRC/contracts/$f does not exist yet on the Lab; skipping $vendored"
       continue
     fi
     cp "$LAB_SRC/contracts/$f" "$owner"
   else
-    if ! gh api "repos/meilisearch/lab/contents/contracts/$f" -H 'Accept: application/vnd.github.raw' > "$owner" 2>/dev/null; then
-      echo "notice: meilisearch/lab main has no contracts/$f yet; skipping $vendored"
-      continue
+    if ! gh api "repos/meilisearch/lab/contents/contracts/$f" -H 'Accept: application/vnd.github.raw' > "$owner" 2> "$err"; then
+      if [ "$f" = "$NOT_YET_PUBLISHED" ] && grep -qE '404|Not Found' "$err"; then
+        echo "notice: meilisearch/lab main has no contracts/$f yet; skipping $vendored"
+        continue
+      fi
+      cat "$err" >&2
+      echo "error: cannot fetch meilisearch/lab main:contracts/$f" >&2
+      exit 1
     fi
   fi
   if ! cmp -s "$owner" "$vendored"; then

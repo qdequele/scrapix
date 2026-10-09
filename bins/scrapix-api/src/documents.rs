@@ -195,20 +195,45 @@ impl DocumentJob<'_> {
     }
 }
 
-/// Usage events for one parsed document: the document itself, plus its OCR
-/// pages (when any were billable) as a second event in the same write.
+/// Units of the document event. A document fetched by `/scrape` is a
+/// scraped page (the Lab prices `scrape` on `pages_http`/`pages_browser`),
+/// with the same keys as `record_scrape_usage` plus `documents`; an
+/// uploaded document (`parse`) is one document.
+fn document_units(
+    operation: &str,
+    js_rendered: bool,
+    ai_summary: bool,
+    ai_extraction: bool,
+) -> serde_json::Value {
+    if operation == "scrape" {
+        serde_json::json!({
+            "pages_http": u8::from(!js_rendered),
+            "pages_browser": u8::from(js_rendered),
+            "documents": 1,
+            "ai_summary": u8::from(ai_summary),
+            "ai_extraction": u8::from(ai_extraction),
+        })
+    } else {
+        serde_json::json!({ "documents": 1 })
+    }
+}
+
+/// Usage events for one parsed document: the document itself (`units`, see
+/// `document_units`), plus its OCR pages (when any were billable) as a
+/// second event in the same write.
 async fn record_document_usage(
     state: &AppState,
     ctx: &AccountContext,
     operation: &str,
     label: &str,
+    units: serde_json::Value,
     ocr_billable: u32,
 ) {
     let mut events = vec![LabEvent::usage(
         &ctx.account_id,
         ctx.api_key_id.as_deref(),
         operation,
-        serde_json::json!({ "documents": 1 }),
+        units,
         label.to_string(),
         None,
     )];
@@ -440,7 +465,8 @@ pub(crate) async fn document_response(
 
     // Usage: the document under its operation, OCR pages separately.
     if let Some(ctx) = account_ctx {
-        record_document_usage(state, ctx, job.operation, &job.label, ocr_billable).await;
+        let units = document_units(job.operation, job.js_rendered, ai_summary, ai_extraction);
+        record_document_usage(state, ctx, job.operation, &job.label, units, ocr_billable).await;
     }
 
     info!(
@@ -1051,7 +1077,15 @@ mod tests {
     async fn document_usage_is_one_event_without_ocr() {
         let bus = ChannelBus::new();
         let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
-        record_document_usage(&state, &usage_ctx(), "parse", "upload://a.pdf", 0).await;
+        record_document_usage(
+            &state,
+            &usage_ctx(),
+            "parse",
+            "upload://a.pdf",
+            document_units("parse", false, false, false),
+            0,
+        )
+        .await;
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "usage.recorded");
@@ -1071,11 +1105,19 @@ mod tests {
     async fn document_usage_adds_an_ocr_event_for_billable_pages() {
         let bus = ChannelBus::new();
         let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
-        record_document_usage(&state, &usage_ctx(), "scrape", "https://e.com/s.pdf", 2).await;
+        record_document_usage(
+            &state,
+            &usage_ctx(),
+            "scrape",
+            "https://e.com/s.pdf",
+            document_units("scrape", false, false, false),
+            2,
+        )
+        .await;
         let events = outbox.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data["operation"], "scrape");
-        assert_eq!(events[0].data["units"], serde_json::json!({"documents": 1}));
+        assert_eq!(events[0].data["units"]["pages_http"], 1);
         assert_eq!(
             events[1].data,
             serde_json::json!({
@@ -1113,5 +1155,53 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["operation"], "parse");
         assert_eq!(events[0].data["units"]["documents"], 1);
+    }
+
+    #[test]
+    fn document_units_price_a_scrape_as_a_page_and_a_parse_as_a_document() {
+        assert_eq!(
+            document_units("scrape", true, true, false),
+            serde_json::json!({"pages_http": 0, "pages_browser": 1, "documents": 1,
+                               "ai_summary": 1, "ai_extraction": 0})
+        );
+        assert_eq!(
+            document_units("parse", true, true, true),
+            serde_json::json!({"documents": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn document_scrape_reports_a_page_with_the_scrape_keys() {
+        let bus = ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        let job = DocumentJob {
+            operation: "scrape",
+            label: "https://e.com/t.csv".into(),
+            base_url: Some("https://e.com/t.csv".into()),
+            fallback_title: None,
+            bytes: b"a,b\n1,2\n".to_vec(),
+            content_type: Some("text/csv".into()),
+            formats: vec![],
+            include_links: false,
+            parsers: serde_json::from_str("{}").unwrap(),
+            ai: None,
+            status_code: 200,
+            js_rendered: false,
+        };
+        document_response(&state, &Some(usage_ctx()), job, Instant::now())
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data,
+            serde_json::json!({
+                "operation": "scrape",
+                "units": {"pages_http": 1, "pages_browser": 0, "documents": 1,
+                          "ai_summary": 0, "ai_extraction": 0},
+                "provider_cost_micro_usd": 0,
+                "description": "https://e.com/t.csv",
+            })
+        );
     }
 }
