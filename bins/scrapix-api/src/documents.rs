@@ -202,27 +202,24 @@ async fn record_document_usage(
     ctx: &AccountContext,
     operation: &str,
     label: &str,
-    base_cost: i64,
     ocr_billable: u32,
 ) {
     let mut events = vec![LabEvent::usage(
         &ctx.account_id,
         ctx.api_key_id.as_deref(),
         operation,
-        base_cost,
-        serde_json::json!({}),
-        format!("{label} ({base_cost} credits)"),
+        serde_json::json!({ "documents": 1 }),
+        label.to_string(),
         None,
     )];
     if ocr_billable > 0 {
-        let ocr_cost = scrapix_billing::ocr_credits(ocr_billable as u64);
+        // The Lab prices `ocr` by `documents`: one per recognized page.
         events.push(LabEvent::usage(
             &ctx.account_id,
             ctx.api_key_id.as_deref(),
             "ocr",
-            ocr_cost,
-            serde_json::json!({ "pages_ocr": ocr_billable }),
-            format!("{label} ({ocr_billable} OCR pages, {ocr_cost} credits)"),
+            serde_json::json!({ "documents": ocr_billable, "pages_ocr": ocr_billable }),
+            format!("{label} ({ocr_billable} OCR pages)"),
             None,
         ));
     }
@@ -443,15 +440,7 @@ pub(crate) async fn document_response(
 
     // Usage: the document under its operation, OCR pages separately.
     if let Some(ctx) = account_ctx {
-        record_document_usage(
-            state,
-            ctx,
-            job.operation,
-            &job.label,
-            job.credits(ai_summary, ai_extraction),
-            ocr_billable,
-        )
-        .await;
+        record_document_usage(state, ctx, job.operation, &job.label, ocr_billable).await;
     }
 
     info!(
@@ -1062,7 +1051,7 @@ mod tests {
     async fn document_usage_is_one_event_without_ocr() {
         let bus = ChannelBus::new();
         let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
-        record_document_usage(&state, &usage_ctx(), "parse", "upload://a.pdf", 4, 0).await;
+        record_document_usage(&state, &usage_ctx(), "parse", "upload://a.pdf", 0).await;
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "usage.recorded");
@@ -1071,9 +1060,9 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "parse",
-                "credits": 4,
-                "units": {},
-                "description": "upload://a.pdf (4 credits)",
+                "units": {"documents": 1},
+                "provider_cost_micro_usd": 0,
+                "description": "upload://a.pdf",
             })
         );
     }
@@ -1082,19 +1071,18 @@ mod tests {
     async fn document_usage_adds_an_ocr_event_for_billable_pages() {
         let bus = ChannelBus::new();
         let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
-        record_document_usage(&state, &usage_ctx(), "scrape", "https://e.com/s.pdf", 3, 2).await;
+        record_document_usage(&state, &usage_ctx(), "scrape", "https://e.com/s.pdf", 2).await;
         let events = outbox.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data["operation"], "scrape");
-        assert_eq!(events[0].data["credits"], 3);
-        let ocr_cost = scrapix_billing::ocr_credits(2);
+        assert_eq!(events[0].data["units"], serde_json::json!({"documents": 1}));
         assert_eq!(
             events[1].data,
             serde_json::json!({
                 "operation": "ocr",
-                "credits": ocr_cost,
-                "units": {"pages_ocr": 2},
-                "description": format!("https://e.com/s.pdf (2 OCR pages, {ocr_cost} credits)"),
+                "units": {"documents": 2, "pages_ocr": 2},
+                "provider_cost_micro_usd": 0,
+                "description": "https://e.com/s.pdf (2 OCR pages)",
             })
         );
         assert_ne!(events[0].id, events[1].id);
@@ -1124,6 +1112,6 @@ mod tests {
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["operation"], "parse");
-        assert_eq!(events[0].data["credits"], 1);
+        assert_eq!(events[0].data["units"]["documents"], 1);
     }
 }

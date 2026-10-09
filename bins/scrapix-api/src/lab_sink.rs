@@ -178,7 +178,6 @@ mod tests {
             "7f1c2a8e-0000-4000-8000-000000000001",
             None,
             "map",
-            2,
             json!({}),
             "m".into(),
             None,

@@ -288,36 +288,6 @@ mod lab_balance_tests {
     }
 
     #[tokio::test]
-    async fn enough_credits_then_local_usage_runs_out() {
-        use crate::lab_events::{LabEvent, LabOutbox, MemoryOutbox};
-        let lab = FakeLab::start().await;
-        let outbox = std::sync::Arc::new(MemoryOutbox::default());
-        let c = LabClient::new(&lab.url, TOKEN).with_undelivered_usage(outbox.clone());
-        lab.set_account(
-            ACCT,
-            json!({"active": true, "account_id": ACCT, "tier": "free", "credits": {"balance": 10}}),
-        );
-        assert_eq!(check_credits(&c, ACCT, 3).await.unwrap(), 10);
-        // Recorded (not yet delivered to the Lab), then noted.
-        outbox
-            .enqueue(&[LabEvent::usage(
-                ACCT,
-                None,
-                "scrape",
-                8,
-                json!({}),
-                "s".into(),
-                None,
-            )])
-            .await
-            .unwrap();
-        c.note_usage(ACCT, 8);
-        // The refresh before the 402 still counts the undelivered 8.
-        let err = check_credits(&c, ACCT, 3).await.unwrap_err();
-        assert_eq!(err.code, "insufficient_credits");
-    }
-
-    #[tokio::test]
     async fn a_top_up_counts_before_a_402_with_one_refresh_per_check() {
         let lab = FakeLab::start().await;
         let c = LabClient::new(&lab.url, TOKEN);
@@ -332,11 +302,10 @@ mod lab_balance_tests {
         assert_eq!(check_credits(&c, ACCT, 5).await.unwrap(), 10);
         assert_eq!(lab.calls(), calls + 1, "one refresh");
 
-        lab.set_account(ACCT, account(2));
-        c.note_usage(ACCT, 8); // snapshot: 10 - 8 = 2
+        lab.set_account(ACCT, account(2)); // spent elsewhere, snapshot says 10
         let calls = lab.calls();
         assert_eq!(
-            check_credits(&c, ACCT, 5).await.unwrap_err().code,
+            check_credits(&c, ACCT, 20).await.unwrap_err().code,
             "insufficient_credits"
         );
         assert_eq!(lab.calls(), calls + 1, "still short: exactly one refresh");

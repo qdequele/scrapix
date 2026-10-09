@@ -85,13 +85,13 @@ fn request(body: serde_json::Value) -> ScrapeRequest {
     serde_json::from_value(body).unwrap()
 }
 
-/// Credits of every `usage.recorded` event.
-fn charged(outbox: &lab_events::MemoryOutbox) -> Vec<i64> {
+/// Units of every `usage.recorded` event.
+fn charged(outbox: &lab_events::MemoryOutbox) -> Vec<serde_json::Value> {
     outbox
         .events()
         .iter()
         .filter(|e| e.kind == "usage.recorded")
-        .map(|e| e.data["credits"].as_i64().unwrap())
+        .map(|e| e.data["units"].clone())
         .collect()
 }
 
@@ -130,11 +130,9 @@ async fn ai_options_asking_for_nothing_are_not_ai() {
     assert!(res.success);
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            false,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0})
+        ]
     );
 }
 
@@ -154,11 +152,9 @@ async fn a_failed_ai_call_is_not_billed() {
     assert!(warning.contains("not billed"), "{warning}");
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            false,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0})
+        ]
     );
 }
 
@@ -179,11 +175,9 @@ async fn a_successful_ai_summary_is_billed() {
     assert!(res.warning.is_none());
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            true,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 1, "ai_extraction": 0})
+        ]
     );
 }
 

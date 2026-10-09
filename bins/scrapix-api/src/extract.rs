@@ -601,8 +601,8 @@ impl ExtractRunner {
             .map(|c| c.account_id.clone())
     }
 
-    /// Charge `credits` for `operation` (after the work, like /scrape).
-    async fn charge(&self, credits: i64, operation: &str, description: &str) {
+    /// Report `units` of `operation` (after the work, like /scrape).
+    async fn charge(&self, units: serde_json::Value, operation: &str, description: &str) {
         let Some(ctx) = self.account_ctx.as_ref().as_ref() else {
             return;
         };
@@ -610,8 +610,7 @@ impl ExtractRunner {
             .record_usage(
                 ctx,
                 operation,
-                credits,
-                serde_json::json!({}),
+                units,
                 description.to_string(),
                 Some(&self.job_id),
             )
@@ -656,7 +655,8 @@ impl ExtractRunner {
             let room = MAX_EXTRACT_URLS - summary.sources.len();
             match resolve_glob(&self.state, input, room + 1).await {
                 Ok(urls) => {
-                    self.charge(billing::MAP_CREDITS, "map", input).await;
+                    self.charge(serde_json::json!({"requests": 1}), "map", input)
+                        .await;
                     if urls.is_empty() {
                         summary
                             .warnings
@@ -841,7 +841,7 @@ impl ExtractRunner {
             .await
             .map_err(|e| format!("AI extraction failed ({what}): {e}"))?;
         self.charge(
-            billing::extract_ai_call_credits(),
+            serde_json::json!({"documents": 1}),
             "extract",
             &format!("Extract {} ({what})", self.job_id),
         )
@@ -1301,7 +1301,13 @@ mod tests {
             instruction: String::new(),
             ai: ai(&llm),
         };
-        runner.charge(3, "extract", "extract: 3 pages").await;
+        runner
+            .charge(
+                serde_json::json!({"documents": 3}),
+                "extract",
+                "extract: 3 pages",
+            )
+            .await;
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
@@ -1309,8 +1315,8 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "extract",
-                "credits": 3,
-                "units": {},
+                "units": {"documents": 3},
+                "provider_cost_micro_usd": 0,
                 "description": "extract: 3 pages",
                 "job_id": "job-1",
             })

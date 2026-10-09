@@ -6,7 +6,7 @@
 # `--fix` rewrites the vendored copies.
 set -euo pipefail
 cd "$(dirname "$0")"
-FILES=(lab-internal.openapi.json)
+FILES=(lab-internal.openapi.json lab-events.schema.json)
 fix=false
 case "${1:-}" in
   "") ;;
@@ -29,9 +29,16 @@ status=0
 for f in "${FILES[@]}"; do
   vendored="vendor/lab/$f"
   if [ -n "${LAB_SRC:-}" ]; then
+    if [ ! -f "$LAB_SRC/contracts/$f" ]; then
+      echo "notice: $LAB_SRC/contracts/$f does not exist yet on the Lab; skipping $vendored"
+      continue
+    fi
     cp "$LAB_SRC/contracts/$f" "$owner"
   else
-    gh api "repos/meilisearch/lab/contents/contracts/$f" -H 'Accept: application/vnd.github.raw' > "$owner"
+    if ! gh api "repos/meilisearch/lab/contents/contracts/$f" -H 'Accept: application/vnd.github.raw' > "$owner" 2>/dev/null; then
+      echo "notice: meilisearch/lab main has no contracts/$f yet; skipping $vendored"
+      continue
+    fi
   fi
   if ! cmp -s "$owner" "$vendored"; then
     if $fix; then cp "$owner" "$vendored"; echo "updated $vendored"

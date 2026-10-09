@@ -50,17 +50,16 @@ fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn usage_data(
-    operation: &str,
-    credits: i64,
-    units: Value,
-    description: String,
-    job_id: Option<&str>,
-) -> Value {
+/// Provider pass-through cost the engine paid for this usage, in micro-USD
+/// (spec §4.2). Scrapix does not price its AI/OCR providers yet, so it
+/// reports 0; the Lab prices units from its own table.
+const PROVIDER_COST_MICRO_USD: i64 = 0;
+
+fn usage_data(operation: &str, units: Value, description: String, job_id: Option<&str>) -> Value {
     let mut d = json!({
         "operation": operation,
-        "credits": credits,
         "units": units,
+        "provider_cost_micro_usd": PROVIDER_COST_MICRO_USD,
         "description": strip_control_chars(&description),
     });
     if let Some(j) = job_id {
@@ -74,7 +73,6 @@ impl LabEvent {
         account_id: &str,
         api_key_id: Option<&str>,
         operation: &str,
-        credits: i64,
         units: Value,
         description: String,
         job_id: Option<&str>,
@@ -84,22 +82,13 @@ impl LabEvent {
             "usage.recorded",
             account_id,
             api_key_id,
-            usage_data(operation, credits, units, description, job_id),
+            usage_data(operation, units, description, job_id),
         )
     }
 
-    /// Credits of a `usage.recorded` event (None for other types).
-    pub(crate) fn usage_credits(&self) -> Option<i64> {
-        (self.kind == "usage.recorded")
-            .then(|| self.data.get("credits").and_then(|c| c.as_i64()))
-            .flatten()
-    }
-
-    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn crawl_final_usage(
         job_id: &str,
         account_id: &str,
-        credits: i64,
         units: Value,
         description: String,
     ) -> Self {
@@ -109,29 +98,25 @@ impl LabEvent {
             "usage.recorded",
             account_id,
             None,
-            usage_data("crawl", credits, units, description, Some(job_id)),
+            usage_data("crawl", units, description, Some(job_id)),
         )
     }
 
-    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     fn lifecycle(kind: &str, job_id: &str, account_id: &str, data: Value) -> Self {
         let id = Uuid::new_v5(&LAB_NAMESPACE, format!("job:{job_id}:lifecycle").as_bytes());
         event(id, kind, account_id, None, data)
     }
 
-    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn job_completed(job_id: &str, account_id: &str, data: Value) -> Self {
         Self::lifecycle("job.completed", job_id, account_id, data)
     }
 
-    #[allow(dead_code)] // wired in Task 5 (engine-lab boundary)
     pub fn job_failed(job_id: &str, account_id: &str, data: Value) -> Self {
         Self::lifecycle("job.failed", job_id, account_id, data)
     }
 }
 
 #[async_trait::async_trait]
-#[allow(dead_code)] // used by lab_sink / charge sites (engine-lab boundary plan)
 pub trait LabOutbox: Send + Sync {
     /// Insert events; an already-present id is skipped (idempotent).
     async fn enqueue(&self, events: &[LabEvent]) -> Result<(), StoreError>;
@@ -143,9 +128,6 @@ pub trait LabOutbox: Send + Sync {
     /// Undelivered count and the creation time of the oldest one.
     async fn pending_stats(&self) -> Result<(i64, Option<DateTime<Utc>>), StoreError>;
     async fn purge_delivered(&self, older_than_secs: i64) -> Result<u64, StoreError>;
-    /// Credits of `account_id`'s `usage.recorded` events not yet accepted by
-    /// the Lab (so not yet in the balance it reports). 0 for a non-uuid id.
-    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError>;
 }
 
 pub struct PgOutbox {
@@ -247,21 +229,6 @@ impl LabOutbox for PgOutbox {
         .execute(&self.pool)
         .await
         .map(|r| r.rows_affected())
-        .map_err(db)
-    }
-
-    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
-        let Ok(account) = account_id.parse::<Uuid>() else {
-            return Ok(0);
-        };
-        sqlx::query_scalar(
-            "SELECT COALESCE(SUM((payload->'data'->>'credits')::bigint), 0)::bigint \
-             FROM lab_events \
-             WHERE account_id = $1 AND type = 'usage.recorded' AND delivered_at IS NULL",
-        )
-        .bind(account)
-        .fetch_one(&self.pool)
-        .await
         .map_err(db)
     }
 }
@@ -391,21 +358,6 @@ impl LabOutbox for SqliteOutbox {
             .map(|r| r.rows_affected())
             .map_err(db)
     }
-
-    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
-        let Ok(account) = account_id.parse::<Uuid>() else {
-            return Ok(0);
-        };
-        sqlx::query_scalar(
-            "SELECT COALESCE(SUM(CAST(json_extract(payload, '$.data.credits') AS INTEGER)), 0) \
-             FROM lab_events \
-             WHERE account_id = ? AND type = 'usage.recorded' AND delivered_at IS NULL",
-        )
-        .bind(account.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db)
-    }
 }
 
 /// Records events; the only entry point handlers use.
@@ -418,11 +370,6 @@ impl Lab {
         Self { outbox }
     }
 
-    #[allow(dead_code)] // not used yet (engine-lab boundary)
-    pub fn outbox(&self) -> &Arc<dyn LabOutbox> {
-        &self.outbox
-    }
-
     pub async fn record(&self, events: &[LabEvent]) -> Result<(), StoreError> {
         let r = self.outbox.enqueue(events).await;
         if let Err(ref e) = r {
@@ -430,13 +377,13 @@ impl Lab {
             // One line per event so a lost charge can be reconstructed from logs.
             for ev in events {
                 let operation = ev.data.get("operation").and_then(|v| v.as_str());
-                let credits = ev.data.get("credits").and_then(|v| v.as_i64());
+                let units = ev.data.get("units").map(|u| u.to_string());
                 tracing::warn!(
                     event_id = %ev.id,
                     account_id = %ev.account_id,
                     event_type = %ev.kind,
                     operation,
-                    credits,
+                    units,
                     "Lab event not recorded"
                 );
             }
@@ -533,16 +480,6 @@ impl LabOutbox for MemoryOutbox {
         rows.retain(|r| !r.delivered);
         Ok((before - rows.len()) as u64)
     }
-
-    async fn undelivered_usage_credits(&self, account_id: &str) -> Result<i64, StoreError> {
-        Ok(self
-            .rows
-            .lock()
-            .iter()
-            .filter(|r| !r.delivered && r.event.account_id == account_id)
-            .filter_map(|r| r.event.usage_credits())
-            .sum())
-    }
 }
 
 #[cfg(test)]
@@ -551,21 +488,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn usage_credits_only_for_usage_events() {
-        let u = LabEvent::usage("acc", None, "scrape", 7, json!({}), "d".into(), None);
-        assert_eq!(u.usage_credits(), Some(7));
-        let f = LabEvent::crawl_final_usage("job-1", "acc", 12, json!({}), "d".into());
-        assert_eq!(f.usage_credits(), Some(12));
-        assert_eq!(
-            LabEvent::job_completed("job-1", "acc", json!({"credits": 5})).usage_credits(),
-            None
-        );
-    }
-
-    #[test]
     fn crawl_final_and_lifecycle_ids_are_deterministic_and_distinct() {
-        let a = LabEvent::crawl_final_usage("job-1", "acc", 10, json!({}), "d".into());
-        let b = LabEvent::crawl_final_usage("job-1", "acc", 99, json!({}), "x".into());
+        let a = LabEvent::crawl_final_usage("job-1", "acc", json!({}), "d".into());
+        let b = LabEvent::crawl_final_usage("job-1", "acc", json!({}), "x".into());
         assert_eq!(a.id, b.id);
         let c = LabEvent::job_completed("job-1", "acc", json!({}));
         let d = LabEvent::job_failed("job-1", "acc", json!({}));
@@ -576,7 +501,7 @@ mod tests {
         assert_ne!(a.id, c.id);
         assert_ne!(
             a.id,
-            LabEvent::crawl_final_usage("job-2", "acc", 10, json!({}), "d".into()).id
+            LabEvent::crawl_final_usage("job-2", "acc", json!({}), "d".into()).id
         );
     }
 
@@ -586,9 +511,8 @@ mod tests {
             "acc",
             Some("key"),
             "scrape",
-            3,
-            json!({"formats":["markdown"]}),
-            "https://e.com (3 credits)".into(),
+            json!({"pages_http": 1}),
+            "https://e.com".into(),
             None,
         );
         let v = serde_json::to_value(&e).unwrap();
@@ -597,8 +521,8 @@ mod tests {
         assert_eq!(v["account_id"], "acc");
         assert_eq!(v["api_key_id"], "key");
         assert_eq!(v["data"]["operation"], "scrape");
-        assert_eq!(v["data"]["credits"], 3);
-        assert_eq!(v["data"]["description"], "https://e.com (3 credits)");
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 0);
+        assert_eq!(v["data"]["description"], "https://e.com");
         assert!(v["data"].get("job_id").is_none());
         assert_eq!(e.id.get_version_num(), 7);
     }
@@ -609,21 +533,20 @@ mod tests {
             "acc",
             None,
             "search",
-            1,
             json!({}),
             "Search 'a\0b\nc\u{7}d\u{9b}e' (1 credit)".into(),
             None,
         );
         assert_eq!(e.data["description"], "Search 'abcde' (1 credit)");
-        let f = LabEvent::crawl_final_usage("j", "acc", 1, json!({}), "Job\r\n j\0".into());
+        let f = LabEvent::crawl_final_usage("j", "acc", json!({}), "Job\r\n j\0".into());
         assert_eq!(f.data["description"], "Job j");
     }
 
-    /// The engine's serialized events must satisfy the shared contract
-    /// (`contracts/lab-events.schema.json`), which the Rails receiver is
-    /// also tested against.
+    /// The engine's serialized events must satisfy the Lab-owned contract
+    /// (`contracts/vendor/lab/lab-events.schema.json`), which the Lab's
+    /// receiver is also tested against.
     fn contract_validator() -> jsonschema::Validator {
-        let raw = include_str!("../../../contracts/lab-events.schema.json");
+        let raw = include_str!("../../../contracts/vendor/lab/lab-events.schema.json");
         let schema: Value = serde_json::from_str(raw).unwrap();
         jsonschema::validator_for(&schema).unwrap()
     }
@@ -647,9 +570,8 @@ mod tests {
                 acct,
                 Some("key_1"),
                 "scrape",
-                3,
-                json!({"formats":["markdown"],"ai_summary":false,"ai_extraction":false}),
-                "https://e.com (3 credits)".into(),
+                json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0}),
+                "https://e.com".into(),
                 None,
             ),
         );
@@ -659,8 +581,7 @@ mod tests {
                 acct,
                 None,
                 "extract",
-                2,
-                json!({}),
+                json!({"documents": 1}),
                 "extract".into(),
                 Some("job-1"),
             ),
@@ -670,7 +591,6 @@ mod tests {
             &LabEvent::crawl_final_usage(
                 "job-1",
                 acct,
-                12,
                 json!({"pages_http":10,"pages_browser":2,"pages_ai":0,"pages_ocr":0}),
                 "Job job-1 (10 http + 2 browser pages, 0 AI-enriched)".into(),
             ),
@@ -695,6 +615,25 @@ mod tests {
     }
 
     #[test]
+    fn usage_events_carry_units_and_provider_cost_and_never_credits() {
+        let e = LabEvent::usage(
+            "7f1c2a8e-0000-4000-8000-000000000001",
+            None,
+            "map",
+            json!({"requests": 1, "urls_found": 17}),
+            "https://e.com".into(),
+            None,
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["data"]["units"], json!({"requests": 1, "urls_found": 17}));
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 0);
+        assert!(
+            v["data"].get("credits").is_none(),
+            "credits are priced by the Lab"
+        );
+    }
+
+    #[test]
     fn the_contract_schema_rejects_malformed_events() {
         let v = contract_validator();
         let acct = "7f1c2a8e-0000-4000-8000-000000000001";
@@ -702,19 +641,24 @@ mod tests {
             acct,
             None,
             "map",
-            2,
-            json!({}),
+            json!({"requests": 1}),
             "m".into(),
             None,
         ))
         .unwrap();
         assert!(v.is_valid(&good));
         let mut bad = good.clone();
-        bad["data"]["credits"] = json!(-1);
-        assert!(!v.is_valid(&bad), "negative credits");
+        bad["data"]["units"]["requests"] = json!(-1);
+        assert!(!v.is_valid(&bad), "negative unit");
+        let mut bad = good.clone();
+        bad["data"]["units"]["formats"] = json!(["markdown"]);
+        assert!(!v.is_valid(&bad), "units are integers only");
+        let mut bad = good.clone();
+        bad["data"]["provider_cost_micro_usd"] = json!(-5);
+        assert!(!v.is_valid(&bad), "negative provider cost");
         let mut bad = good.clone();
         bad["data"]["operation"] = json!("teleport");
-        assert!(!v.is_valid(&bad), "unknown operation");
+        assert!(!v.is_valid(&bad), "unknown scrapix operation");
         let mut bad = good.clone();
         bad["account_id"] = json!("acc");
         assert!(!v.is_valid(&bad), "non-uuid account");
@@ -726,8 +670,8 @@ mod tests {
     #[tokio::test]
     async fn memory_outbox_enqueue_is_idempotent_and_due_is_oldest_first() {
         let o = MemoryOutbox::default();
-        let e1 = LabEvent::usage("a", None, "map", 2, json!({}), "m".into(), None);
-        let e2 = LabEvent::usage("a", None, "map", 2, json!({}), "m".into(), None);
+        let e1 = LabEvent::usage("a", None, "map", json!({}), "m".into(), None);
+        let e2 = LabEvent::usage("a", None, "map", json!({}), "m".into(), None);
         o.enqueue(&[e1.clone(), e2.clone()]).await.unwrap();
         o.enqueue(std::slice::from_ref(&e1)).await.unwrap();
         let due = o.due(10).await.unwrap();
@@ -755,7 +699,6 @@ mod tests {
             "7f1c2a8e-0000-4000-8000-000000000001",
             None,
             "map",
-            1,
             json!({}),
             "m".into(),
             None,
@@ -783,8 +726,8 @@ mod tests {
     /// purge removes it.
     async fn outbox_roundtrip(o: &dyn LabOutbox) {
         let acct = "7f1c2a8e-0000-4000-8000-000000000001";
-        let e = LabEvent::crawl_final_usage("j", acct, 5, json!({"pages_http":5}), "Job j".into());
-        let u = LabEvent::usage(acct, Some("k"), "map", 2, json!({}), "m".into(), None);
+        let e = LabEvent::crawl_final_usage("j", acct, json!({"pages_http":5}), "Job j".into());
+        let u = LabEvent::usage(acct, Some("k"), "map", json!({}), "m".into(), None);
         o.enqueue(std::slice::from_ref(&e)).await.unwrap();
         o.enqueue(&[e.clone(), u.clone()]).await.unwrap();
         assert_eq!(o.due(10).await.unwrap(), vec![e.clone(), u.clone()]);
@@ -803,45 +746,6 @@ mod tests {
     #[tokio::test]
     async fn memory_outbox_roundtrip() {
         outbox_roundtrip(&MemoryOutbox::default()).await;
-    }
-
-    /// Only this account's undelivered `usage.recorded` credits count.
-    async fn undelivered_usage(o: &dyn LabOutbox) {
-        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
-        let other = "7f1c2a8e-0000-4000-8000-000000000002";
-        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 0);
-        let a = LabEvent::usage(acct, None, "scrape", 3, json!({}), "s".into(), None);
-        let b = LabEvent::crawl_final_usage("j", acct, 10, json!({}), "Job j".into());
-        let delivered = LabEvent::usage(acct, None, "map", 100, json!({}), "m".into(), None);
-        let mail = LabEvent::job_completed("j", acct, json!({"credits": 1000}));
-        let theirs = LabEvent::usage(other, None, "map", 7, json!({}), "m".into(), None);
-        o.enqueue(&[a, b, delivered.clone(), mail, theirs])
-            .await
-            .unwrap();
-        o.mark_delivered(&[delivered.id]).await.unwrap();
-        assert_eq!(o.undelivered_usage_credits(acct).await.unwrap(), 13);
-        assert_eq!(o.undelivered_usage_credits(other).await.unwrap(), 7);
-        assert_eq!(o.undelivered_usage_credits("not-a-uuid").await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn memory_outbox_undelivered_usage() {
-        undelivered_usage(&MemoryOutbox::default()).await;
-    }
-
-    #[tokio::test]
-    async fn sqlite_outbox_undelivered_usage() {
-        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
-        undelivered_usage(&SqliteOutbox::new(pool)).await;
-    }
-
-    #[tokio::test]
-    async fn pg_outbox_undelivered_usage() {
-        let Some(pool) = crate::job_store::postgres::test_pg_pool().await else {
-            eprintln!("skipped");
-            return;
-        };
-        undelivered_usage(&PgOutbox::new(pool)).await;
     }
 
     #[tokio::test]
@@ -863,7 +767,7 @@ mod tests {
     async fn sqlite_outbox_rejects_a_non_uuid_account_like_postgres() {
         let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
         let o = SqliteOutbox::new(pool);
-        let e = LabEvent::usage("acc", None, "map", 1, json!({}), "m".into(), None);
+        let e = LabEvent::usage("acc", None, "map", json!({}), "m".into(), None);
         assert!(o.enqueue(&[e]).await.is_err());
         assert_eq!(o.pending_stats().await.unwrap().0, 0);
     }
@@ -873,7 +777,7 @@ mod tests {
         let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
         let o = SqliteOutbox::new(pool.clone());
         let acct = "7f1c2a8e-0000-4000-8000-000000000001";
-        let e = LabEvent::usage(acct, None, "map", 1, json!({}), "m".into(), None);
+        let e = LabEvent::usage(acct, None, "map", json!({}), "m".into(), None);
         let next = |id: Uuid| {
             let pool = pool.clone();
             async move {
@@ -919,7 +823,7 @@ mod tests {
         let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
         let o = SqliteOutbox::new(pool);
         let acct = "7f1c2a8e-0000-4000-8000-000000000001";
-        let e = LabEvent::usage(acct, None, "map", 1, json!({}), "m".into(), None);
+        let e = LabEvent::usage(acct, None, "map", json!({}), "m".into(), None);
         o.enqueue(std::slice::from_ref(&e)).await.unwrap();
         assert_eq!(
             o.purge_delivered(-1).await.unwrap(),

@@ -11,14 +11,13 @@
 //! the positive ones.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::lab_events::LabOutbox;
 use crate::meili::MeiliTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,16 +163,9 @@ impl<T> Entry<T> {
 
 struct Balance {
     balance: i64,
-    used_since: i64,
     fetched: Instant,
     ttl: Duration,
     retry_at: Option<Instant>,
-}
-
-impl Balance {
-    fn available(&self) -> i64 {
-        self.balance - self.used_since
-    }
 }
 
 /// A size-bounded TTL map. On overflow, entries past `ttl + keep` (no longer
@@ -250,10 +242,6 @@ pub(crate) struct LabClient {
     identities: Mutex<Lookups<Identity>>,
     meili: Mutex<Lookups<MeiliTarget>>,
     balances: Mutex<HashMap<String, Balance>>,
-    /// The engine's outbox: usage recorded but not yet accepted by the Lab
-    /// is not in the balance the Lab reports, so a fresh snapshot starts
-    /// with it already spent. `None` (tests) starts every snapshot at 0.
-    undelivered: Option<Arc<dyn LabOutbox>>,
 }
 
 /// Log a failed Lab call. A rejected LAB_SERVICE_TOKEN at runtime is an
@@ -309,16 +297,8 @@ impl LabClient {
             identities: Mutex::new(Lookups::new(&timing)),
             meili: Mutex::new(Lookups::new(&timing)),
             balances: Mutex::new(HashMap::new()),
-            undelivered: None,
             timing,
         }
-    }
-
-    /// Count the engine's undelivered usage (from `outbox`) into every
-    /// balance snapshot taken from now on.
-    pub(crate) fn with_undelivered_usage(mut self, outbox: Arc<dyn LabOutbox>) -> Self {
-        self.undelivered = Some(outbox);
-        self
     }
 
     pub(crate) fn base_from_events_url(events_url: &str) -> String {
@@ -401,37 +381,15 @@ impl LabClient {
         Ok(a)
     }
 
-    /// Credits of `account_id` recorded in the engine's outbox and not yet
-    /// accepted by the Lab. On a read error the snapshot starts at 0, as
-    /// before this was counted.
-    async fn undelivered_usage(&self, account_id: &str) -> i64 {
-        let Some(outbox) = &self.undelivered else {
-            return 0;
-        };
-        match outbox.undelivered_usage_credits(account_id).await {
-            Ok(credits) => credits,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    account_id,
-                    "Cannot read undelivered usage; the balance snapshot ignores it"
-                );
-                0
-            }
-        }
-    }
-
-    /// Take a new balance snapshot. The Lab's balance does not include
-    /// usage still waiting in the outbox (read after the Lab answered, so
-    /// usage recorded meanwhile is counted too).
-    async fn remember_balance(&self, account_id: &str, credits: &Option<Credits>, ttl: Duration) {
+    /// Take a new balance snapshot. Usage this engine recorded since is in
+    /// the outbox and is debited by the Lab when delivered; the engine does
+    /// not price it (decision B), so the snapshot is the Lab's number.
+    fn remember_balance(&self, account_id: &str, credits: &Option<Credits>, ttl: Duration) {
         if let Some(c) = credits {
-            let used_since = self.undelivered_usage(account_id).await;
             self.balances.lock().unwrap().insert(
                 account_id.to_string(),
                 Balance {
                     balance: c.balance,
-                    used_since,
                     fetched: Instant::now(),
                     ttl,
                     retry_at: None,
@@ -515,7 +473,7 @@ impl LabClient {
         count(endpoint, "ok");
         let ttl = self.ttl_from(a.cache_ttl);
         let account_id = a.account_id.unwrap_or_default();
-        self.remember_balance(&account_id, &a.credits, ttl).await;
+        self.remember_balance(&account_id, &a.credits, ttl);
         (
             Some(Identity {
                 account_id,
@@ -581,14 +539,8 @@ impl LabClient {
         self.balances.lock().unwrap().remove(account_id);
     }
 
-    pub(crate) fn note_usage(&self, account_id: &str, credits: i64) {
-        if let Some(b) = self.balances.lock().unwrap().get_mut(account_id) {
-            b.used_since += credits;
-        }
-    }
-
-    /// Spendable credits: the Lab's balance minus usage this engine recorded
-    /// since (from a fresh snapshot, or a new one).
+    /// Spendable credits as the Lab last reported them (from a fresh
+    /// snapshot, or a new one).
     pub(crate) async fn available_credits(
         &self,
         account_id: &str,
@@ -596,7 +548,7 @@ impl LabClient {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.fetched.elapsed() < b.ttl {
                 return Ok(Some(Available {
-                    credits: b.available(),
+                    credits: b.balance,
                     cached: true,
                 }));
             }
@@ -622,7 +574,7 @@ impl LabClient {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.retry_at.is_some_and(|t| Instant::now() < t) && stale(b) {
                 count("account", "stale");
-                return served(b.available());
+                return served(b.balance);
             }
         }
         match self
@@ -640,7 +592,7 @@ impl LabClient {
                     return Ok(None);
                 }
                 match self.balances.lock().unwrap().get(account_id) {
-                    Some(b) => served(b.available()),
+                    Some(b) => served(b.balance),
                     None => Ok(None),
                 }
             }
@@ -650,7 +602,7 @@ impl LabClient {
                     Some(b) if stale(b) => {
                         count("account", "stale");
                         b.retry_at = Some(Instant::now() + self.timing.stale_retry);
-                        served(b.available())
+                        served(b.balance)
                     }
                     _ => Err(LabError::Unavailable(m)),
                 }
@@ -917,6 +869,7 @@ mod tests {
     use super::testing::{FakeLab, TOKEN};
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     const ACCT: &str = "11111111-1111-1111-1111-111111111111";
 
@@ -1155,25 +1108,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn balance_subtracts_local_usage_and_resets_on_refresh() {
+    async fn balance_is_the_labs_number_and_refreshes_after_ttl() {
         let (lab, c) = setup().await;
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}}),
         );
         assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
-        c.note_usage(ACCT, 30);
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70));
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 70}}),
         );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100), "cached");
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(
-            credits(&c, ACCT).await.unwrap(),
-            Some(70),
-            "fresh snapshot, local usage reset"
-        );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70), "fresh snapshot");
     }
 
     #[tokio::test]
@@ -1277,96 +1225,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    /// Important 1: usage recorded while the Lab was down is still spent
-    /// after the Lab comes back and the snapshot is refreshed, until the
-    /// outbox delivers it (then the Lab's own balance includes it).
-    #[tokio::test]
-    async fn refreshed_snapshot_still_counts_undelivered_usage() {
-        use crate::lab_events::{LabEvent, LabOutbox, MemoryOutbox};
-        let lab = FakeLab::start().await;
-        let outbox = Arc::new(MemoryOutbox::default());
-        let c =
-            LabClient::with_timing(&lab.url, TOKEN, fast()).with_undelivered_usage(outbox.clone());
-        let account = |balance: i64| json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": balance}});
-        lab.set_account(ACCT, account(100));
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
-
-        lab.set_down(true);
-        let spent = LabEvent::usage(ACCT, None, "scrape", 30, json!({}), "s".into(), None);
-        outbox.enqueue(std::slice::from_ref(&spent)).await.unwrap();
-        c.note_usage(ACCT, 30);
-        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl: stale
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70));
-
-        lab.set_down(false); // back, but has not received the 30 yet
-        tokio::time::sleep(Duration::from_millis(150)).await; // past the stale backoff
-        assert_eq!(
-            credits(&c, ACCT).await.unwrap(),
-            Some(70),
-            "a new snapshot must not hand the undelivered 30 back"
-        );
-
-        outbox.mark_delivered(&[spent.id]).await.unwrap();
-        lab.set_account(ACCT, account(70)); // the Lab debited it
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70), "counted once");
-    }
-
-    /// An outbox that cannot be read: snapshots start at 0 (as before).
-    struct BrokenOutbox;
-
-    #[async_trait::async_trait]
-    impl LabOutbox for BrokenOutbox {
-        async fn enqueue(
-            &self,
-            _: &[crate::lab_events::LabEvent],
-        ) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn due(
-            &self,
-            _: i64,
-        ) -> Result<Vec<crate::lab_events::LabEvent>, crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn mark_delivered(
-            &self,
-            _: &[uuid::Uuid],
-        ) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn reschedule(&self, _: &[uuid::Uuid]) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn pending_stats(
-            &self,
-        ) -> Result<(i64, Option<chrono::DateTime<chrono::Utc>>), crate::job_store::StoreError>
-        {
-            unreachable!()
-        }
-        async fn purge_delivered(&self, _: i64) -> Result<u64, crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn undelivered_usage_credits(
-            &self,
-            _: &str,
-        ) -> Result<i64, crate::job_store::StoreError> {
-            Err(crate::job_store::StoreError::Other("db down".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn unreadable_outbox_falls_back_to_the_labs_balance() {
-        let lab = FakeLab::start().await;
-        let c = LabClient::with_timing(&lab.url, TOKEN, fast())
-            .with_undelivered_usage(Arc::new(BrokenOutbox));
-        lab.set_account(
-            ACCT,
-            json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}}),
-        );
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
     }
 
     /// Important 3: "no engine" is a negative answer, re-asked after
