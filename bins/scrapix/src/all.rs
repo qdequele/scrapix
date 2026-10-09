@@ -403,6 +403,8 @@ fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
         lab_events_url: std::env::var("LAB_EVENTS_URL").ok(),
         lab_events_secret: std::env::var("LAB_EVENTS_SECRET").ok(),
         lab_service_token: std::env::var("LAB_SERVICE_TOKEN").ok(),
+        lab_instance_id: std::env::var("LAB_INSTANCE_ID").ok(),
+        lab_instance_secret: std::env::var("LAB_INSTANCE_SECRET").ok(),
         meilisearch_url: args.meilisearch_url.clone(),
         meilisearch_api_key: args.meilisearch_key.clone(),
         max_jobs: 1000,

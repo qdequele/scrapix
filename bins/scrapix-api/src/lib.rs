@@ -165,13 +165,22 @@ pub struct Args {
     #[arg(long, env = "LAB_EVENTS_URL")]
     pub lab_events_url: Option<String>,
 
-    /// HMAC key signing event batches sent to the Lab (hosted only, min 32 chars).
+    /// Deprecated and ignored: event batches are signed with LAB_INSTANCE_SECRET.
     #[arg(long, env = "LAB_EVENTS_SECRET", hide_env_values = true)]
     pub lab_events_secret: Option<String>,
 
-    /// Bearer token for the Lab's internal service API (hosted only, min 32 chars).
+    /// Hosted only (min 32 chars): the token the Lab presents when it calls this engine for an account (X-Scrapix-Account-Id).
     #[arg(long, env = "LAB_SERVICE_TOKEN", hide_env_values = true)]
     pub lab_service_token: Option<String>,
+
+    /// The instance id the Lab minted for this hosted engine deployment
+    /// (uuid). Required in hosted mode, refused in standalone mode.
+    #[arg(long, env = "LAB_INSTANCE_ID")]
+    pub lab_instance_id: Option<String>,
+
+    /// The secret the Lab minted with LAB_INSTANCE_ID (64 hex chars).
+    #[arg(long, env = "LAB_INSTANCE_SECRET", hide_env_values = true)]
+    pub lab_instance_secret: Option<String>,
 
     /// Default Meilisearch for crawls and /search in standalone.
     #[arg(long, env = "MEILISEARCH_URL")]
@@ -6682,7 +6691,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
     match (&settings.mode, &settings.auth, &settings.store) {
         (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
-            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.service_token);
+            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.instance_secret);
             match lab_api.ping().await {
                 Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
                 Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
@@ -7140,7 +7149,7 @@ pub async fn run_with_bus(
             outbox,
             reqwest::Client::new(),
             format!("{}/internal/events", cfg.url),
-            cfg.events_secret.clone(),
+            cfg.instance_secret.clone(),
         );
         info!("Lab event delivery started");
         Arc::new(sink).spawn(shutdown_rx.clone())
@@ -8025,7 +8034,7 @@ mod tests {
 
     fn hosted_settings(
         lab_url: &str,
-        token: &str,
+        instance_secret: &str,
         store: settings::StoreUrl,
     ) -> settings::EngineSettings {
         settings::EngineSettings {
@@ -8035,8 +8044,9 @@ mod tests {
             meilisearch: None,
             lab: Some(settings::LabSettings {
                 url: lab_url.into(),
-                events_secret: "s".repeat(32),
-                service_token: token.into(),
+                instance_id: "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f".into(),
+                instance_secret: instance_secret.into(),
+                service_token: "s".repeat(32),
             }),
         }
     }
