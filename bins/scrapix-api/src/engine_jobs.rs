@@ -108,6 +108,19 @@ pub(crate) fn enforce_limits(
     Ok(())
 }
 
+/// Give a crawl that names no `max_depth` the plan's limit. The frontier
+/// reads `None` as unbounded, so without this the default crawl body would
+/// escape every plan's depth limit. An explicit depth is left to
+/// `enforce_limits`; with no `limits` (contract v1 Lab, standalone) the
+/// depth stays `None`.
+pub(crate) fn cap_unspecified_depth(max_depth: &mut Option<u32>, ctx: Option<&AccountContext>) {
+    if max_depth.is_none() {
+        *max_depth = ctx
+            .and_then(|c| c.limits.as_ref())
+            .map(|limits| limits.max_depth);
+    }
+}
+
 /// Balance pre-check and plan limits, as for `/crawl` (hosted only).
 pub(crate) async fn preflight(
     state: &AppState,
@@ -369,6 +382,37 @@ mod limit_tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_crawl_with_no_max_depth_is_capped_at_the_plans_limit() {
+        let free_ctx = ctx(Some(free()));
+        let mut depth = None;
+        cap_unspecified_depth(&mut depth, Some(&free_ctx));
+        assert_eq!(depth, Some(3), "unbounded becomes the plan's max_depth");
+
+        let mut depth = Some(2);
+        cap_unspecified_depth(&mut depth, Some(&free_ctx));
+        assert_eq!(depth, Some(2), "an explicit depth is kept");
+
+        // An explicit depth over the limit is still refused.
+        let e = enforce_limits(
+            &free_ctx,
+            0,
+            PlanCheck {
+                max_depth: Some(4),
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+
+        // No limits (contract v1 Lab) or no account (standalone): unbounded.
+        let mut depth = None;
+        cap_unspecified_depth(&mut depth, Some(&ctx(None)));
+        assert_eq!(depth, None);
+        cap_unspecified_depth(&mut depth, None);
+        assert_eq!(depth, None);
     }
 
     #[test]

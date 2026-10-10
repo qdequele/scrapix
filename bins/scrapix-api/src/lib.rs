@@ -4527,6 +4527,9 @@ pub(crate) async fn do_create_crawl(
         },
     )
     .await?;
+    // No depth given: cap it at the plan's limit before the job is stored
+    // and published, since the frontier treats `None` as unbounded.
+    engine_jobs::cap_unspecified_depth(&mut config.max_depth, account_ctx);
 
     // Generate job ID
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -5034,9 +5037,18 @@ async fn map_url(
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
-    // Pre-flight balance check
+    // Pre-flight (hosted): a positive balance, and JS rendering only on a
+    // plan that includes it.
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
         billing::check_credits(lab, &ctx.account_id).await?;
+        engine_jobs::enforce_limits(
+            ctx,
+            0,
+            engine_jobs::PlanCheck {
+                max_depth: None,
+                js_rendering: request.render_js,
+            },
+        )?;
     }
 
     let start_time = std::time::Instant::now();
