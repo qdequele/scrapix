@@ -2591,6 +2591,8 @@ pub(crate) struct AccountContext {
     pub tier: String,
     /// User role in this account (None for API keys and service calls — they are account-scoped).
     pub user_role: Option<String>,
+    /// The plan's limits from the Lab (`None`: a Lab that sent none).
+    pub limits: Option<scrapix_auth::Limits>,
 }
 
 /// Account context for the request: API key, OAuth, session or service call — the auth
@@ -2603,6 +2605,7 @@ async fn extract_account_context(
         api_key_id: acct.api_key_id.clone(),
         tier: acct.tier.clone(),
         user_role: acct.role.clone(),
+        limits: acct.limits.clone(),
     })
 }
 
@@ -3480,8 +3483,8 @@ async fn record_search_usage(
         .await;
 }
 
-/// The full /scrape pipeline for one URL: credit pre-check, fetch (HTTP or
-/// browser), extraction, AI enrichment, analytics and credit deduction.
+/// The full /scrape pipeline for one URL: balance and plan pre-check, fetch
+/// (HTTP or browser), extraction, AI enrichment, analytics and usage report.
 ///
 /// Shared by `POST /scrape` and the endpoints that scrape many URLs on the
 /// caller's behalf (batch scrape, extract). Permission checks are the
@@ -3497,16 +3500,22 @@ pub(crate) async fn perform_scrape(
 
     require_ai_provider(state, request.ai.as_ref())?;
 
-    // Credit estimate from the requested features (the charge is for what
-    // was delivered, see below)
-    let has_ai_summary_req = request.ai.as_ref().is_some_and(|ai| ai.wants_summary());
-    let has_ai_extraction_req = request.ai.as_ref().is_some_and(|ai| ai.wants_extraction());
-    let scrape_cost =
-        billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
-
-    // Pre-flight credit check (soft UX check; real deduction is atomic below)
+    // Pre-flight (hosted): a positive balance, and JS rendering only on a
+    // plan that includes it.
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, scrape_cost).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
+        let wants_browser = request.render_js
+            || request.formats.contains(&ScrapeFormat::Screenshot)
+            || !request.actions.is_empty()
+            || request.mobile;
+        engine_jobs::enforce_limits(
+            ctx,
+            0,
+            engine_jobs::PlanCheck {
+                max_depth: None,
+                js_rendering: wants_browser,
+            },
+        )?;
     }
 
     let start_time = std::time::Instant::now();
@@ -4508,25 +4517,16 @@ pub(crate) async fn do_create_crawl(
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
 
-    // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref lab), Some(ctx)) = (&state.lab_api, account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, 1).await?;
-
-        // Enforce max concurrent jobs per billing tier
-        let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
-        let max_concurrent = tier.max_concurrent_jobs() as i64;
-        let active_count = state.active_job_count(&ctx.account_id).await;
-
-        if active_count >= max_concurrent {
-            return Err(ApiError::new(
-                format!(
-                    "Maximum concurrent jobs reached ({}/{}). Upgrade your plan for more.",
-                    active_count, max_concurrent
-                ),
-                "quota_exceeded",
-            ));
-        }
-    }
+    // Pre-flight (hosted): a positive balance and the plan's limits.
+    engine_jobs::preflight(
+        state,
+        account_ctx,
+        engine_jobs::PlanCheck {
+            max_depth: config.max_depth,
+            js_rendering: config.crawler_type == CrawlerType::Browser,
+        },
+    )
+    .await?;
 
     // Generate job ID
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -5034,9 +5034,9 @@ async fn map_url(
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
-    // Pre-flight credit check (map costs 2 credits)
+    // Pre-flight balance check
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, billing::MAP_CREDITS).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -5468,9 +5468,9 @@ async fn search_url(
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
-    // Pre-flight credit check
+    // Pre-flight balance check
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, billing::SEARCH_CREDITS).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -8360,6 +8360,7 @@ mod lifecycle_tests {
             api_key_id: Some("k".into()),
             tier: "free".into(),
             user_role: None,
+            limits: None,
         }
     }
 
@@ -8396,6 +8397,7 @@ mod lifecycle_tests {
             api_key_id: None,
             tier: "free".into(),
             user_role: None,
+            limits: None,
         };
         state
             .record_usage(&ctx, "map", serde_json::json!({}), "m".into(), None)
@@ -8721,6 +8723,7 @@ mod lifecycle_tests {
             tier: "free".into(),
             api_key_id: None,
             role: None,
+            limits: None,
         }))
     }
 

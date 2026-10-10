@@ -11,7 +11,7 @@ pub(crate) mod admin_key;
 pub(crate) mod middleware;
 
 // Re-export core auth primitives from the scrapix-auth crate.
-pub use scrapix_auth::{AuthenticatedAccount, Claims};
+pub use scrapix_auth::{AuthenticatedAccount, Claims, Limits};
 
 pub use admin_key::AdminKey;
 

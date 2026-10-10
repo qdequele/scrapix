@@ -13,11 +13,10 @@
 //! content worker uses — and the same OCR engine.
 //!
 //! OCR is opt-in per request (`parsers.ocr`: `off` | `auto` | `force`).
-//! Before recognizing anything, the credit pre-flight is re-run with the
-//! planned OCR pages at `OCR_PAGE_CREDITS` each; after, the document is
-//! billed under its operation (`scrape` / `parse`) and the freshly
-//! recognized pages as a separate `ocr` ledger entry, so OCR spend is
-//! attributable. Cache hits are not billed.
+//! Before recognizing anything, the balance pre-check is re-run; after,
+//! the document is reported under its operation (`scrape` / `parse`) and
+//! the freshly recognized pages as a separate `ocr` usage event, so OCR
+//! spend is attributable. Cache hits are not reported.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -187,14 +186,6 @@ pub(crate) struct DocumentJob<'a> {
     pub js_rendered: bool,
 }
 
-impl DocumentJob<'_> {
-    /// Credits for the document itself (before OCR), with the AI work
-    /// `ai_summary`/`ai_extraction` (requested, or delivered).
-    fn credits(&self, ai_summary: bool, ai_extraction: bool) -> i64 {
-        billing::scrape_credits(&self.formats, ai_summary, ai_extraction)
-    }
-}
-
 /// Units of the document event. A document fetched by `/scrape` is a
 /// scraped page (the Lab prices `scrape` on `pages_http`/`pages_browser`),
 /// with the same keys as `record_scrape_usage` plus `documents`; an
@@ -295,15 +286,9 @@ pub(crate) async fn document_response(
     if !ocr_mode.is_off() {
         match state.ocr.as_ref() {
             Some(engine) => {
-                // Pre-flight with the planned OCR pages (cache hits and the
-                // daily budget can only lower the final cost).
-                let planned = engine.plan(&parsed, ocr_mode, job.parsers.ocr_max_pages);
+                // Balance pre-check again before recognizing anything.
                 if let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) {
-                    let estimate = job.credits(
-                        job.ai.is_some_and(|a| a.wants_summary()),
-                        job.ai.is_some_and(|a| a.wants_extraction()),
-                    ) + scrapix_billing::ocr_credits(planned.len() as u64);
-                    billing::check_credits(lab, &ctx.account_id, estimate).await?;
+                    billing::check_credits(lab, &ctx.account_id).await?;
                 }
                 let request = OcrRequest {
                     mode: ocr_mode,
@@ -636,11 +621,8 @@ pub(crate) async fn parse_upload(
     let content_type = part_content_type.filter(|ct| !ct.trim().is_empty());
 
     require_ai_provider(&state, options.ai.as_ref())?;
-    let has_ai_summary = options.ai.as_ref().is_some_and(|ai| ai.wants_summary());
-    let has_ai_extraction = options.ai.as_ref().is_some_and(|ai| ai.wants_extraction());
-    let base_cost = billing::scrape_credits(&options.formats, has_ai_summary, has_ai_extraction);
     if let (Some(lab), Some(ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, base_cost).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
     }
 
     let label = format!("upload://{}", filename.as_deref().unwrap_or("document"));
@@ -1070,6 +1052,7 @@ mod tests {
             api_key_id: Some("k".into()),
             tier: "free".into(),
             user_role: None,
+            limits: None,
         }
     }
 

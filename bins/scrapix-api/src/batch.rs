@@ -2,10 +2,11 @@
 //!
 //! The API runs the `/scrape` pipeline (`perform_scrape`) for each URL with
 //! bounded concurrency. A URL that fails becomes a result item with
-//! `success: false` and an `error` instead of failing the batch. Credits are
-//! pre-checked for the whole batch and deducted per URL by
-//! `perform_scrape`, as for `/scrape`. Results are served by
-//! `GET /job/{id}/results` (append-only, in the order URLs finish).
+//! `success: false` and an `error` instead of failing the batch. The
+//! balance and the plan's limits are pre-checked for the batch, and usage
+//! is reported per URL by `perform_scrape`, as for `/scrape`. Results are
+//! served by `GET /job/{id}/results` (append-only, in the order URLs
+//! finish).
 //!
 //! The body is `{ urls, concurrency?, webhooks?, ...options }` where every
 //! other field is a `POST /scrape` option applied to every URL: each URL's
@@ -34,9 +35,8 @@ use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
 use crate::results::{JobResultError, JobResultItem};
 use crate::{
-    billing, check_write_permission, extract_account_context, perform_scrape, AccountContext,
-    AiOptions, ApiError, AppState, ScrapeFormat, ScrapeRequest, ScrapeSelector,
-    ScreenshotRequestOptions,
+    check_write_permission, extract_account_context, perform_scrape, AccountContext, AiOptions,
+    ApiError, AppState, ScrapeFormat, ScrapeRequest, ScrapeSelector, ScreenshotRequestOptions,
 };
 
 /// Maximum number of URLs in one batch.
@@ -114,7 +114,7 @@ pub(crate) struct ParsedBatch {
     pub webhooks: Vec<WebhookConfig>,
     /// `/scrape` options shared by every URL (no `url` key)
     pub options: Map<String, Value>,
-    /// The options parsed for the first URL (validation, credit estimate)
+    /// The options parsed for the first URL (validation, plan check)
     pub sample: ScrapeRequest,
 }
 
@@ -210,13 +210,6 @@ fn redacted_options(options: &Map<String, Value>) -> Value {
     v
 }
 
-/// Credits one URL of this batch costs (same as `/scrape`).
-fn credits_per_url(request: &ScrapeRequest) -> i64 {
-    let summary = request.ai.as_ref().is_some_and(|ai| ai.summary);
-    let extraction = request.ai.as_ref().is_some_and(|ai| ai.extract.is_some());
-    billing::scrape_credits(&request.formats, summary, extraction)
-}
-
 /// Scrape many URLs as one job
 ///
 /// Starts a job that runs the `/scrape` pipeline for every URL (bounded
@@ -261,8 +254,15 @@ pub(crate) async fn start_batch(
             "render_js_unavailable",
         ));
     }
-    let total_credits = credits_per_url(&batch.sample) * batch.urls.len() as i64;
-    engine_jobs::preflight(state, account_ctx, total_credits).await?;
+    engine_jobs::preflight(
+        state,
+        account_ctx.as_ref(),
+        engine_jobs::PlanCheck {
+            max_depth: None,
+            js_rendering: batch.sample.render_js,
+        },
+    )
+    .await?;
 
     let mut config = serde_json::json!({
         "urls_count": batch.urls.len(),
@@ -610,7 +610,6 @@ mod tests {
         assert_eq!(parsed.concurrency, MAX_BATCH_CONCURRENCY);
         assert!(!parsed.options.contains_key("url"));
         assert_eq!(parsed.sample.url, "https://a.test/1");
-        assert_eq!(credits_per_url(&parsed.sample), 2);
         let redacted = redacted_options(&parsed.options);
         assert_eq!(redacted["headers"]["Authorization"], "***");
     }

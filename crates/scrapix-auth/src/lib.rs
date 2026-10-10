@@ -11,4 +11,4 @@ pub mod types;
 pub use jwt::{decode_jwt, encode_jwt, Claims};
 pub use password::{hash_password, verify_password};
 pub use rate_limit::InMemoryAuthRateLimiter;
-pub use types::{AuthenticatedAccount, AuthenticatedUser};
+pub use types::{AuthenticatedAccount, AuthenticatedUser, Limits};

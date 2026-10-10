@@ -4,7 +4,7 @@
 //! If content_length is wrong, customers are over/under-charged.
 //! If account_id is lost, usage can't be attributed.
 
-use scrapix_core::{Account, BillingTier, CrawlUrl, UsageMetrics};
+use scrapix_core::CrawlUrl;
 use scrapix_queue::{CrawlEvent, RawPageMessage, UrlMessage};
 
 // ============================================================================
@@ -161,113 +161,4 @@ fn test_account_id_none_in_events_without_account() {
         }
         _ => panic!("Wrong variant"),
     }
-}
-
-// ============================================================================
-// Billing tier limits and usage tracking
-// ============================================================================
-
-#[test]
-fn test_billing_tier_rate_limits_ordered() {
-    // Higher tiers should have higher limits
-    assert!(BillingTier::Starter.rate_limit() > BillingTier::Free.rate_limit());
-    assert!(BillingTier::Pro.rate_limit() > BillingTier::Starter.rate_limit());
-    assert!(BillingTier::Enterprise.rate_limit() > BillingTier::Pro.rate_limit());
-}
-
-#[test]
-fn test_billing_tier_quotas_ordered() {
-    assert!(BillingTier::Starter.monthly_quota() > BillingTier::Free.monthly_quota());
-    assert!(BillingTier::Pro.monthly_quota() > BillingTier::Starter.monthly_quota());
-    assert!(BillingTier::Enterprise.monthly_quota() > BillingTier::Pro.monthly_quota());
-}
-
-#[test]
-fn test_billing_tier_bandwidth_quotas_ordered() {
-    assert!(BillingTier::Starter.bandwidth_quota() > BillingTier::Free.bandwidth_quota());
-    assert!(BillingTier::Pro.bandwidth_quota() > BillingTier::Starter.bandwidth_quota());
-    assert!(BillingTier::Enterprise.bandwidth_quota() > BillingTier::Pro.bandwidth_quota());
-}
-
-#[test]
-fn test_billing_tier_prices_decreasing() {
-    // Higher tiers should have lower per-unit pricing
-    assert!(BillingTier::Pro.price_per_1k_pages() < BillingTier::Starter.price_per_1k_pages());
-    assert!(BillingTier::Enterprise.price_per_1k_pages() < BillingTier::Pro.price_per_1k_pages());
-    assert_eq!(BillingTier::Free.price_per_1k_pages(), 0);
-}
-
-#[test]
-fn test_usage_exceeds_quota_by_pages() {
-    let account = Account::new("acct_1", "Test", BillingTier::Free);
-    let mut usage = UsageMetrics::new("acct_1", "2024-01-01", "2024-02-01");
-
-    usage.pages_crawled = 999;
-    assert!(!usage.exceeds_quota(&account));
-
-    usage.pages_crawled = 1000; // == quota
-    assert!(usage.exceeds_quota(&account));
-}
-
-#[test]
-fn test_usage_exceeds_quota_by_bandwidth() {
-    let account = Account::new("acct_1", "Test", BillingTier::Free);
-    let mut usage = UsageMetrics::new("acct_1", "2024-01-01", "2024-02-01");
-
-    // Free tier has 100MB bandwidth quota
-    usage.bytes_downloaded = 99 * 1024 * 1024;
-    assert!(!usage.exceeds_quota(&account));
-
-    usage.bytes_downloaded = 100 * 1024 * 1024; // == quota
-    assert!(usage.exceeds_quota(&account));
-}
-
-#[test]
-fn test_usage_cost_calculation() {
-    let mut usage = UsageMetrics::new("acct_1", "2024-01-01", "2024-02-01");
-    usage.pages_crawled = 10_000;
-
-    // Starter: $1.00 per 1000 pages = 100 cents per 1000
-    let cost = usage.estimated_cost(BillingTier::Starter);
-    assert_eq!(cost, 1000); // 10 * 100 cents = $10.00
-
-    // Pro: $0.50 per 1000 = 50 cents per 1000
-    let cost = usage.estimated_cost(BillingTier::Pro);
-    assert_eq!(cost, 500); // 10 * 50 = $5.00
-
-    // Free: $0
-    let cost = usage.estimated_cost(BillingTier::Free);
-    assert_eq!(cost, 0);
-}
-
-#[test]
-fn test_account_override_takes_precedence() {
-    let mut account = Account::new("acct_1", "VIP", BillingTier::Free);
-    account.rate_limit_override = Some(500);
-    account.quota_override = Some(1_000_000);
-
-    // Overrides should take precedence over tier defaults
-    assert_eq!(account.rate_limit(), 500); // not Free's 10
-    assert_eq!(account.monthly_quota(), 1_000_000); // not Free's 1000
-}
-
-#[test]
-fn test_js_rendering_tier_gating() {
-    assert!(!BillingTier::Free.js_rendering_enabled());
-    assert!(!BillingTier::Starter.js_rendering_enabled());
-    assert!(BillingTier::Pro.js_rendering_enabled());
-    assert!(BillingTier::Enterprise.js_rendering_enabled());
-}
-
-#[test]
-fn test_quota_percentage_calculation() {
-    let account = Account::new("acct_1", "Test", BillingTier::Free);
-    let mut usage = UsageMetrics::new("acct_1", "2024-01-01", "2024-02-01");
-
-    // Free tier: 1000 pages, 100MB bandwidth
-    usage.pages_crawled = 500;
-    usage.bytes_downloaded = 50 * 1024 * 1024;
-
-    let pct = usage.quota_percentage(&account);
-    assert_eq!(pct, 50.0); // Both at 50%, returns max
 }

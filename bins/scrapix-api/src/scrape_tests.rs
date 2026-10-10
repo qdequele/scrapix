@@ -15,6 +15,7 @@ fn ctx() -> Option<AccountContext> {
         api_key_id: None,
         tier: "free".into(),
         user_role: None,
+        limits: None,
     })
 }
 

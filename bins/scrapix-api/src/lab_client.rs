@@ -44,6 +44,8 @@ pub(crate) struct Identity {
     pub tier: String,
     pub role: Option<String>,
     pub api_key_id: Option<String>,
+    /// The plan's limits; `None` from a Lab that predates them (contract v1).
+    pub limits: Option<scrapix_auth::Limits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +150,8 @@ struct Answer {
     api_key_id: Option<String>,
     #[serde(default)]
     credits: Option<Credits>,
+    #[serde(default)]
+    limits: Option<scrapix_auth::Limits>,
     #[serde(default)]
     cache_ttl: Option<i64>,
 }
@@ -509,6 +513,7 @@ impl LabClient {
                 tier: a.tier.unwrap_or_default(),
                 role: a.role,
                 api_key_id: a.api_key_id,
+                limits: a.limits,
             }),
             ttl,
         )
@@ -886,8 +891,17 @@ pub(crate) mod testing {
                    "region": "eu-west-1", "lab_url": "http://lab"})
         }
         pub(crate) fn identity(account: &str, tier: &str, balance: i64) -> Value {
+            let limits = match tier {
+                "pro" => {
+                    json!({"concurrent_jobs": 10, "rate_limit_rpm": 1200, "max_depth": 10, "js_rendering": true})
+                }
+                _ => {
+                    json!({"concurrent_jobs": 1, "rate_limit_rpm": 60, "max_depth": 3, "js_rendering": false})
+                }
+            };
             json!({"active": true, "account_id": account, "tier": tier, "role": null, "api_key_id": null,
-                   "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance}})
+                   "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance},
+                   "limits": limits})
         }
         pub(crate) fn set_credential(&self, kind: &str, credential: &str, v: Value) {
             self.state
@@ -1007,6 +1021,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((id.account_id.as_str(), id.tier.as_str()), (ACCT, "pro"));
+        assert_eq!(
+            id.limits,
+            Some(scrapix_auth::Limits {
+                concurrent_jobs: 10,
+                rate_limit_rpm: 1200,
+                max_depth: 10,
+                js_rendering: true
+            })
+        );
         c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
             .await
             .unwrap();

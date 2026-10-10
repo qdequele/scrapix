@@ -7,10 +7,8 @@
 //! - Document types
 //! - Error types
 //! - Core traits
-//! - Billing types (accounts, API keys, usage tracking)
 
 pub mod ack;
-pub mod billing;
 pub mod browser;
 pub mod config;
 pub mod content_types;
@@ -24,7 +22,6 @@ pub mod traits;
 pub mod url_glob;
 
 pub use ack::Ack;
-pub use billing::*;
 pub use config::*;
 pub use document::*;
 pub use error::*;

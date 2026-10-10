@@ -484,11 +484,15 @@ pub(crate) async fn start_extract(
             serde_json::to_value(&headers).unwrap_or_default(),
         );
     }
-    // Minimum spend: every explicit URL, one map per glob, one AI call.
-    let globs = inputs.len() - explicit;
-    let minimum =
-        explicit as i64 + globs as i64 * billing::MAP_CREDITS + billing::extract_ai_call_credits();
-    engine_jobs::preflight(state, account_ctx, minimum).await?;
+    engine_jobs::preflight(
+        state,
+        account_ctx.as_ref(),
+        engine_jobs::PlanCheck {
+            max_depth: None,
+            js_rendering: render_js,
+        },
+    )
+    .await?;
 
     let mut config = serde_json::json!({
         "urls": inputs,
@@ -617,12 +621,12 @@ impl ExtractRunner {
             .await;
     }
 
-    /// Enough credits for one more AI call?
+    /// Any balance left for one more AI call?
     async fn can_afford_ai(&self) -> Result<(), String> {
         let (Some(lab), Some(ctx)) = (&self.state.lab_api, self.account_ctx.as_ref()) else {
             return Ok(());
         };
-        billing::check_credits(lab, &ctx.account_id, billing::extract_ai_call_credits())
+        billing::check_credits(lab, &ctx.account_id)
             .await
             .map(|_| ())
             .map_err(|e| e.error)
@@ -1295,6 +1299,7 @@ mod tests {
                 api_key_id: Some("k".into()),
                 tier: "free".into(),
                 user_role: None,
+                limits: None,
             })),
             job_id: "job-1".into(),
             options: Arc::new(Map::new()),

@@ -5635,7 +5635,6 @@ dependencies = [
  "scraper",
  "scrapix-ai",
  "scrapix-auth",
- "scrapix-billing",
  "scrapix-core",
  "scrapix-crawler",
  "scrapix-extractor",
@@ -5686,14 +5685,6 @@ dependencies = [
  "scrapix-core",
  "scrapix-frontier",
  "scrapix-parser",
-]
-
-[[package]]
-name = "scrapix-billing"
-version = "0.1.0"
-dependencies = [
- "scrapix-core",
- "thiserror 1.0.69",
 ]
 
 [[package]]
