@@ -61,6 +61,7 @@ pub mod openapi;
 pub(crate) mod results;
 pub(crate) mod router;
 pub mod settings;
+pub(crate) mod usage_units;
 pub mod webhooks;
 
 #[cfg(test)]
@@ -1296,8 +1297,7 @@ impl AppState {
                 })
                 .unwrap_or_default()
         };
-        let feature_pages =
-            total_pages.saturating_mul(legacy_credits::non_ai_feature_credits(&features) as u64);
+        let feature_pages = total_pages.saturating_mul(usage_units::page_feature_count(&features));
         let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features)
             + legacy_credits::ocr_credits(pages_ocr);
         let units = serde_json::json!({
@@ -3471,7 +3471,7 @@ async fn record_scrape_usage(
                 "pages_browser": u8::from(js_rendered),
                 "ai_summary": u8::from(ai_summary),
                 "ai_extraction": u8::from(ai_extraction),
-                "feature_pages": legacy_credits::feature_format_count(formats),
+                "feature_pages": usage_units::feature_format_count(formats),
             }),
             final_url.to_string(),
             None,

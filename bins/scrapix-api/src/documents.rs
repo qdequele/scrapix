@@ -38,8 +38,8 @@ use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
     billing, check_write_permission, extract_account_context, extract_domain, legacy_credits,
-    require_ai_provider, run_ai_enrichment, AccountContext, AiOptions, AiRun, ApiError, AppState,
-    ScrapeFormat, ScrapeMetadata, ScrapeResponse,
+    require_ai_provider, run_ai_enrichment, usage_units, AccountContext, AiOptions, AiRun,
+    ApiError, AppState, ScrapeFormat, ScrapeMetadata, ScrapeResponse,
 };
 
 /// Default size cap for documents fetched by `/scrape` and uploaded to
@@ -207,7 +207,7 @@ fn document_units(
     ai_summary: bool,
     ai_extraction: bool,
 ) -> serde_json::Value {
-    let feature_pages = legacy_credits::feature_format_count(formats);
+    let feature_pages = usage_units::feature_format_count(formats);
     if operation == "scrape" {
         serde_json::json!({
             "pages_http": u8::from(!js_rendered),

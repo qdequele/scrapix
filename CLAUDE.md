@@ -288,7 +288,7 @@ that names a Lab-owned table, reads included).
   `LAB_INSTANCE_SECRET`): credentials are sent to
   `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
   30 s, stale up to 5 min if the Lab is down, except answers with
-  `cache_ttl` 0 (revoked/expired), which are never served stale; an unknown credential while the
+  `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the
   Lab is down is a 503 with `Retry-After: 5`; so a revoked key keeps working
   on the engine for up to `cache_ttl`, documented in
   `docs/configuration/environment-variables.mdx`), the Meilisearch target comes
@@ -600,13 +600,15 @@ The system tracks usage data for pricing/billing purposes.
 
 The engine has no tiers or plan constants (the old `scrapix-billing` crate
 and `scrapix-core::billing` are gone): it reports raw units in
-`usage.recorded` events (incl. `feature_pages`) and enforces the plan
-`limits` the Lab returns. `bins/scrapix-api/src/billing.rs` is only the
-balance pre-check. **Transition release:** every `usage.recorded` also
-carries `credits`, the pre-v2 price from `bins/scrapix-api/src/legacy_credits.rs`
-(the only price formula left, used for nothing else), which the Lab debits
-as authoritative for product scrapix; delete the module and the field next
-release. `provider_cost_micro_usd` is 0: the engine knows token counts, not
+`usage.recorded` events (incl. `feature_pages`, counted by the permanent
+`bins/scrapix-api/src/usage_units.rs`) and enforces the plan `limits` the
+Lab returns. `bins/scrapix-api/src/billing.rs` is only the balance
+pre-check. **Transition release:** every `usage.recorded` also carries
+`credits`, the pre-v2 price from `bins/scrapix-api/src/legacy_credits.rs`
+(the only price formula left, used only for that field; it reuses the
+`usage_units` counters), which the Lab debits as authoritative for product
+scrapix; delete the module and the field next release (units, including
+`feature_pages`, are unaffected). `provider_cost_micro_usd` is 0: the engine knows token counts, not
 provider prices.
 
 ### ClickHouse Analytics Queries

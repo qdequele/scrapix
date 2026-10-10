@@ -138,13 +138,17 @@ sdk-build:
 # Contracts vendored from meilisearch/lab (contracts/vendor/lab/)
 # ---------------------------------------------------------------------------
 
-# Re-copy the Lab's contracts (from $LAB_SRC if set, else GitHub via gh + GH_TOKEN/LAB_REPO_TOKEN)
-sync-contracts:
-    contracts/check-drift.sh --fix
+# Lab ref the vendored contracts are compared with (same pin as CI's contracts job).
+# TODO: drop LAB_REF once meilisearch/lab#17 merges (then compare against main).
+LAB_REF := env_var_or_default("LAB_REF", "42c282ce6005b14b1705711680fa70c0858e78ac")
 
-# Fail if a vendored Lab contract differs from the Lab's main (skips without LAB_SRC or a token)
+# Re-copy the Lab's contracts (from $LAB_SRC if set, else GitHub at LAB_REF via gh + GH_TOKEN/LAB_REPO_TOKEN)
+sync-contracts:
+    LAB_REF={{LAB_REF}} contracts/check-drift.sh --fix
+
+# Fail if a vendored Lab contract differs from the Lab's LAB_REF (skips without LAB_SRC or a token)
 check-contracts:
-    contracts/check-drift.sh
+    LAB_REF={{LAB_REF}} contracts/check-drift.sh
 
 # ---------------------------------------------------------------------------
 # Stop everything

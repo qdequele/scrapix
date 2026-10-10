@@ -216,7 +216,7 @@ drifts from the Lab's `main`.
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /internal/instances/me` | Called once at boot to confirm the credentials and log the deployment's product and region. A 401 or 404 aborts startup (a 404 means a wrong `LAB_URL` or a Lab that predates contract v2), and so does an instance that is not a hosted `scrapix` engine. |
-| `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role, effective credit balance and plan `limits`, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down, except answers with `cache_ttl` 0 (revoked/expired), which are never served stale; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
+| `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role, effective credit balance and plan `limits`, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down, except answers with `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
 | `GET /internal/accounts/{id}` | Tier, spendable balance and plan `limits` of an account (balance pre-check). |
 | `GET /internal/accounts/{account_id}/meilisearch` | The account's Meilisearch target with the decrypted key. The engine caches it for 60 s. A hosted tenant without a target cannot crawl: the engine never falls back to the operator's `MEILISEARCH_URL`. |
 

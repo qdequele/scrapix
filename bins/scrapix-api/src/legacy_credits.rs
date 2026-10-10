@@ -6,41 +6,23 @@
 //! commit f2ab8d2). The Lab debits `credits` as-is for product `scrapix`
 //! (lab-events schema `usageData.credits`) and stores the `units` next to
 //! it. Never used for a pre-check: pre-checks stay "balance > 0" plus the
-//! plan limits.
+//! plan limits. The feature counters it prices are the permanent
+//! `usage_units` ones (also reported as `feature_pages`), so deleting this
+//! module touches nothing else.
 
+use crate::usage_units::{feature_format_count, page_feature_count};
 use crate::ScrapeFormat;
 use scrapix_core::FeaturesConfig;
-
-/// Feature formats of a `/scrape` (or document scrape/parse) request: the
-/// count the pre-v2 scrape formula charged for. Base formats (`html`,
-/// `rawhtml`, `content`) are free and not counted. Also reported as the
-/// `feature_pages` unit of that one page.
-pub(crate) fn feature_format_count(formats: &[ScrapeFormat]) -> i64 {
-    formats
-        .iter()
-        .filter(|f| {
-            matches!(
-                f,
-                ScrapeFormat::Markdown
-                    | ScrapeFormat::Links
-                    | ScrapeFormat::Metadata
-                    | ScrapeFormat::Screenshot
-                    | ScrapeFormat::Schema
-                    | ScrapeFormat::Blocks
-            )
-        })
-        .count() as i64
-}
 
 /// Credits for one scraped page: +1 per feature format, +5 for a delivered
 /// AI summary, +5 for a delivered AI extraction, at least 1.
 fn scrape_credits_for_count(
-    feature_format_count: i64,
+    feature_formats: i64,
     has_ai_summary: bool,
     has_ai_extraction: bool,
 ) -> i64 {
     let ai_cost = if has_ai_summary { 5 } else { 0 } + if has_ai_extraction { 5 } else { 0 };
-    (feature_format_count + ai_cost).max(1)
+    (feature_formats + ai_cost).max(1)
 }
 
 /// Credits for a `/scrape` (and a document scrape or `/parse` upload).
@@ -50,7 +32,7 @@ pub(crate) fn scrape_credits(
     has_ai_extraction: bool,
 ) -> i64 {
     scrape_credits_for_count(
-        feature_format_count(formats),
+        feature_format_count(formats) as i64,
         has_ai_summary,
         has_ai_extraction,
     )
@@ -64,28 +46,8 @@ pub(crate) fn extract_ai_call_credits() -> i64 {
 
 /// Non-AI per-page feature surcharge of a crawl: +1 per enabled feature
 /// (metadata, markdown, block_split, schema, custom_selectors).
-pub(crate) fn non_ai_feature_credits(features: &FeaturesConfig) -> i64 {
-    let mut feature_count: i64 = 0;
-    if features.metadata.as_ref().is_some_and(|f| f.enabled) {
-        feature_count += 1;
-    }
-    if features.markdown.as_ref().is_some_and(|f| f.enabled) {
-        feature_count += 1;
-    }
-    if features.block_split.as_ref().is_some_and(|f| f.enabled) {
-        feature_count += 1;
-    }
-    if features.schema.as_ref().is_some_and(|s| s.enabled) {
-        feature_count += 1;
-    }
-    if features
-        .custom_selectors
-        .as_ref()
-        .is_some_and(|s| s.enabled)
-    {
-        feature_count += 1;
-    }
-    feature_count
+fn non_ai_feature_credits(features: &FeaturesConfig) -> i64 {
+    page_feature_count(features) as i64
 }
 
 /// AI per-page surcharge: +5 for AI extraction, +5 for AI summary, applied

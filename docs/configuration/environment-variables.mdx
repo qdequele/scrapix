@@ -33,7 +33,7 @@ The hosted engine **refuses to start** without `LAB_URL`, `LAB_INSTANCE_ID`, `LA
 | `LAB_EVENTS_SECRET` | engine | none | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |
 
 <Note>
-**Credential revocation is not instant.** The engine caches each credential's introspection answer for the `cache_ttl` the Lab returns (30 s by default, capped at 5 min), so a revoked or deleted API key keeps working on the engine for up to that long. While the Lab is unreachable, a credential that was valid is served stale for up to 5 more minutes, except answers with `cache_ttl` 0 (revoked/expired), which are never served stale. Lower the Lab's `cache_ttl` to shorten the window.
+**Credential revocation is not instant.** The engine caches each credential's introspection answer for the `cache_ttl` the Lab returns (30 s by default, capped at 5 min), so a revoked or deleted API key keeps working on the engine for up to that long. While the Lab is unreachable, a credential that was valid is served stale for up to 5 more minutes, except answers with `cache_ttl` 0 (expired or expiring), which are never served stale. Lower the Lab's `cache_ttl` to shorten the window.
 </Note>
 
 <Note>
