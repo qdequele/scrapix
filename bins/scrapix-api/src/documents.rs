@@ -189,7 +189,8 @@ pub(crate) struct DocumentJob<'a> {
 /// Units of the document event. A document fetched by `/scrape` is a
 /// scraped page (the Lab prices `scrape` on `pages_http`/`pages_browser`),
 /// with the same keys as `record_scrape_usage` plus `documents`; an
-/// uploaded document (`parse`) is one document.
+/// uploaded document (`parse`) is one document, with the same delivered-AI
+/// flags.
 fn document_units(
     operation: &str,
     js_rendered: bool,
@@ -205,7 +206,11 @@ fn document_units(
             "ai_extraction": u8::from(ai_extraction),
         })
     } else {
-        serde_json::json!({ "documents": 1 })
+        serde_json::json!({
+            "documents": 1,
+            "ai_summary": u8::from(ai_summary),
+            "ai_extraction": u8::from(ai_extraction),
+        })
     }
 }
 
@@ -1077,7 +1082,7 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "parse",
-                "units": {"documents": 1},
+                "units": {"documents": 1, "ai_summary": 0, "ai_extraction": 0},
                 "provider_cost_micro_usd": 0,
                 "description": "upload://a.pdf",
             })
@@ -1137,7 +1142,10 @@ mod tests {
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["operation"], "parse");
-        assert_eq!(events[0].data["units"]["documents"], 1);
+        assert_eq!(
+            events[0].data["units"],
+            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 0})
+        );
     }
 
     #[test]
@@ -1149,7 +1157,11 @@ mod tests {
         );
         assert_eq!(
             document_units("parse", true, true, true),
-            serde_json::json!({"documents": 1})
+            serde_json::json!({"documents": 1, "ai_summary": 1, "ai_extraction": 1})
+        );
+        assert_eq!(
+            document_units("parse", false, false, true),
+            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 1})
         );
     }
 

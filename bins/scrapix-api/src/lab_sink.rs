@@ -37,6 +37,17 @@ struct Ack {
     accepted: Vec<Uuid>,
 }
 
+/// The client the sink should be built with: like `LabClient`'s, it never
+/// follows a redirect (a 3xx is a misconfigured `LAB_URL`, and following it
+/// would send the signed batch elsewhere), so a 3xx counts as an
+/// undelivered batch and is retried with backoff.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client")
+}
+
 impl LabSink {
     pub fn new(
         outbox: Arc<dyn LabOutbox>,
@@ -242,7 +253,7 @@ mod tests {
     fn sink(outbox: Arc<MemoryOutbox>, url: String) -> LabSink {
         LabSink::new(
             outbox,
-            reqwest::Client::new(),
+            http_client(),
             url,
             INSTANCE_ID.into(),
             SECRET.into(),
@@ -386,6 +397,35 @@ mod tests {
             0
         );
         assert_eq!(outbox2.pending_stats().await.unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/events"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/elsewhere", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/elsewhere"))
+            .respond_with(AcceptAll)
+            .expect(0)
+            .mount(&server)
+            .await;
+        let outbox = Arc::new(MemoryOutbox::default());
+        outbox.enqueue(&[ev()]).await.unwrap();
+        let s = sink(outbox.clone(), format!("{}/internal/events", server.uri()));
+        assert_eq!(s.deliver_once().await.unwrap(), 0);
+        assert_eq!(
+            outbox.pending_stats().await.unwrap().0,
+            1,
+            "undelivered, retried later"
+        );
     }
 
     #[tokio::test]

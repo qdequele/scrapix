@@ -64,7 +64,7 @@ debits the account's balance; the engine never computes credits.
 | `description` | string | Text shown on the ledger row. |
 | `job_id` | string, optional | Present for job-scoped usage (a `crawl`, or an `extract` job). |
 
-Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr}` once per terminal job. The Lab converts units to credits with its `pricing.yml`; the engine holds no price table.
+Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr}` once per terminal job. The Lab converts units to credits with its `pricing.yml`; the engine holds no price table.
 
 A crawl is reported **once**, when the job reaches a terminal state, from what
 was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,

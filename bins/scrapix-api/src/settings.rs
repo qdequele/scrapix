@@ -110,7 +110,12 @@ fn instance_credentials(args: &Args) -> Result<(String, String), ConfigError> {
         (_, None) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_SECRET (minted with LAB_INSTANCE_ID by the Lab)"),
         (Some(id), Some(secret)) => {
             if uuid::Uuid::parse_str(&id).is_err() {
-                return err(format!("LAB_INSTANCE_ID must be a uuid, got `{id}`"));
+                // Never echo the value: a swapped id/secret would print the
+                // secret in the startup logs.
+                return err(format!(
+                    "LAB_INSTANCE_ID must be a uuid (got a {}-character value)",
+                    id.chars().count()
+                ));
             }
             if secret.len() != INSTANCE_SECRET_LEN || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return err("LAB_INSTANCE_SECRET must be the 64 hex characters the Lab minted");
@@ -458,6 +463,13 @@ mod tests {
             .unwrap_err()
             .0
             .contains("uuid"));
+        // A swapped id/secret never puts the secret in the error (startup logs).
+        const SECRET: &str = "abababababababababababababababababababababababababababababababab";
+        let mut swapped = hosted(&[]);
+        swapped[2] = ("LAB_INSTANCE_ID", SECRET);
+        let e = EngineSettings::resolve(&args(&swapped)).unwrap_err().0;
+        assert!(e.contains("uuid") && e.contains("64-character"), "{e}");
+        assert!(!e.contains(SECRET), "{e}");
         let mut short = hosted(&[]);
         short[3] = ("LAB_INSTANCE_SECRET", "abcdef");
         assert!(EngineSettings::resolve(&args(&short))

@@ -7176,11 +7176,12 @@ pub async fn run_with_bus(
     );
 
     // Lab event delivery: hosted only (drains the lab outbox to the Lab).
-    // The Lab is loopback/private, so a plain client, not the SSRF-safe one.
+    // The Lab is loopback/private, so not the SSRF-safe client; it never
+    // follows a redirect (like `LabClient`).
     let lab_handle = settings.lab.as_ref().zip(lab_outbox).map(|(cfg, outbox)| {
         let sink = lab_sink::LabSink::new(
             outbox,
-            reqwest::Client::new(),
+            lab_sink::http_client(),
             format!("{}/internal/events", cfg.url),
             cfg.instance_id.clone(),
             cfg.instance_secret.clone(),
