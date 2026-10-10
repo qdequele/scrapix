@@ -46,6 +46,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all -- -D warnings
 
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [clippy]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Postgres-backed outbox tests skip themselves without a database
+      # (`test_pg_pool()` returns None); everything else runs here.
+      - run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
   # SDKs (sdks/typescript, sdks/python)

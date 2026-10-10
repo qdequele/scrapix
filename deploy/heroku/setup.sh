@@ -38,10 +38,13 @@ CLICKHOUSE_USER="default"
 CLICKHOUSE_PASSWORD=""
 
 # Lab (Rails control plane): the hosted engine reports usage events there,
-# calls its /internal/* API, and refuses to start without LAB_URL. Rails needs
-# the SAME LAB_EVENTS_SECRET / LAB_SERVICE_TOKEN (printed at the end of this
-# script).
+# calls its /internal/* API, and refuses to start without LAB_URL,
+# LAB_INSTANCE_ID and LAB_INSTANCE_SECRET. Mint the last two on the Lab first:
+#   bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=eu URL=https://<API_APP_NAME>.herokuapp.com
+# The Lab needs the SAME LAB_SERVICE_TOKEN (printed at the end of this script).
 LAB_URL=""                # e.g. https://lab.example.com (the base URL, no path)
+LAB_INSTANCE_ID=""        # uuid printed by lab:hosted_engine:create
+LAB_INSTANCE_SECRET=""    # 64 hex printed by lab:hosted_engine:create
 
 # AI enrichment (optional)
 AI_PROVIDER="anthropic"
@@ -64,7 +67,12 @@ case "${LAB_URL}" in
         ;;
 esac
 
-LAB_EVENTS_SECRET=$(openssl rand -hex 32)
+if [ -z "${LAB_INSTANCE_ID}" ] || [ -z "${LAB_INSTANCE_SECRET}" ]; then
+    echo "LAB_INSTANCE_ID and LAB_INSTANCE_SECRET must be set (minted by the Lab:" >&2
+    echo "bin/rails lab:hosted_engine:create). Edit the config block above." >&2
+    exit 1
+fi
+
 LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
 
 # ---------------------------------------------------------------------------
@@ -82,7 +90,8 @@ echo "==> Setting API config vars"
 CONFIG_VARS=(
     "SCRAPIX_MODE=hosted"
     "LAB_URL=${LAB_URL}"
-    "LAB_EVENTS_SECRET=${LAB_EVENTS_SECRET}"
+    "LAB_INSTANCE_ID=${LAB_INSTANCE_ID}"
+    "LAB_INSTANCE_SECRET=${LAB_INSTANCE_SECRET}"
     "LAB_SERVICE_TOKEN=${LAB_SERVICE_TOKEN}"
     "RUST_LOG=info"
 )
@@ -118,9 +127,9 @@ echo ""
 echo "  2. Check logs:"
 echo "     heroku logs -a ${API_APP_NAME} --tail"
 echo ""
-echo "  Set the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN on the Lab"
-echo "  (deployed from meilisearch/lab):"
-echo "     heroku config -a ${API_APP_NAME} | grep LAB_"
+echo "  Set the SAME LAB_SERVICE_TOKEN on the Lab (deployed from"
+echo "  meilisearch/lab):"
+echo "     heroku config:get LAB_SERVICE_TOKEN -a ${API_APP_NAME}"
 echo ""
 echo "  API URL: ${API_URL}"
 echo ""

@@ -1,6 +1,6 @@
 # Scrapix API Contracts
 
-The contracts the Scrapix engine owns, plus the one it vendors from the
+The contracts the Scrapix engine owns, plus the two it vendors from the
 Meilisearch Lab. The Lab (Rails control plane + console) lives in
 [`meilisearch/lab`](https://github.com/meilisearch/lab), which vendors a byte
 copy of `openapi.json` and drift-checks it

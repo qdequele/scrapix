@@ -13,7 +13,7 @@
   "topbarLinks": [
     {
       "name": "GitHub",
-      "url": "https://github.com/quentindequelen/scrapix"
+      "url": "https://github.com/qdequele/scrapix"
     }
   ],
   "topbarCtaButton": {
@@ -24,7 +24,7 @@
     {
       "name": "GitHub",
       "icon": "github",
-      "url": "https://github.com/quentindequelen/scrapix"
+      "url": "https://github.com/qdequele/scrapix"
     }
   ],
   "navigation": [
@@ -120,6 +120,6 @@
     }
   ],
   "footerSocials": {
-    "github": "https://github.com/quentindequelen/scrapix"
+    "github": "https://github.com/qdequele/scrapix"
   }
 }

@@ -87,16 +87,19 @@ flyctl secrets set \
   DATABASE_URL=... \
   OPENAI_API_KEY=... \
   LAB_URL=https://<lab-host> \
-  LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
+  LAB_INSTANCE_ID=<instance_id from the Lab> \
+  LAB_INSTANCE_SECRET=<secret from the Lab> \
   LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
   --app scrapix-api
 
 # DATABASE_URL is the engine's OWN database (`scrapix_engine`), never the
 # Lab's; the engine does not read JWT_SECRET (the Lab verifies sessions).
-# The hosted API refuses to start without LAB_URL, LAB_EVENTS_SECRET
-# and LAB_SERVICE_TOKEN (each secret >= 32 chars). The Lab (deployed from
-# meilisearch/lab) needs the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN —
-# see docs/operations/crawl-engine-rollout.mdx. Stripe is configured on the
+# The hosted API refuses to start without LAB_URL, LAB_INSTANCE_ID,
+# LAB_INSTANCE_SECRET and LAB_SERVICE_TOKEN (>= 32 chars). Mint the instance
+# id and secret on the Lab (deployed from meilisearch/lab):
+#   bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=https://scrapix-api.fly.dev
+# The Lab needs the SAME LAB_SERVICE_TOKEN — see
+# deploy/kubernetes/README.md and docs/operations/crawl-engine-rollout.mdx. Stripe is configured on the
 # Lab only; the engine never reads STRIPE_SECRET_KEY.
 ```
 

@@ -1799,6 +1799,31 @@ class DocumentInfo(BaseModel):
     """
 
 
+class ParseUpload(BaseModel):
+    """
+    Multipart body of `POST /parse`.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    file: bytes
+    """
+    The document: PDF, DOC/DOCX, PPT/PPTX, XLS/XLSX/XLSB, ODT/ODS/ODP,
+    RTF, EPUB or CSV (or a PNG/JPEG/GIF/WebP/TIFF image with
+    `parsers.ocr`). Max 50 MB by default (`DOCUMENT_MAX_SIZE_MB`).
+    """
+    formats: Optional[str] = None
+    """
+    Shorthand for `options.formats`: a JSON array or comma-separated list.
+    """
+    options: Optional[str] = None
+    """
+    JSON options: `{"formats": ["markdown"], "parsers": {"ocr": "auto"}}`.
+    """
+
+
 class ParserOptions(BaseModel):
     """
     Document parsing options for `/scrape` and `/parse`.

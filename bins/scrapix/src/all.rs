@@ -179,8 +179,7 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
         brokers: String::new(),
         group_id: "scrapix-crawlers".to_string(),
         concurrency: args.crawler_concurrency,
-        user_agent: "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
-            .to_string(),
+        user_agent: "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)".to_string(),
         timeout: 30,
         max_retries: 3,
         follow_external: false,
@@ -600,8 +599,7 @@ async fn run_all_kafka(
         brokers: brokers.to_string(),
         group_id: "scrapix-all-crawlers".to_string(),
         concurrency: args.crawler_concurrency,
-        user_agent: "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
-            .to_string(),
+        user_agent: "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)".to_string(),
         timeout: 30,
         max_retries: 3,
         follow_external: false,

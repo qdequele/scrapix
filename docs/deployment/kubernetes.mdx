@@ -11,7 +11,7 @@ Scrapix ships with Kustomize manifests for Kubernetes deployment. Three overlays
 
 - Kubernetes cluster (minikube, kind, EKS, GKE, or any managed K8s)
 - `kubectl` configured for your cluster
-- Container images built or pulled from `ghcr.io/quentindequelen/scrapix-*`
+- Container images built or pulled from `ghcr.io/qdequele/scrapix-*`
 
 ## Quick Start (Local)
 
@@ -160,11 +160,16 @@ kubectl -n scrapix create secret generic scrapix-secrets \
   --from-literal=MEILISEARCH_API_KEY=your-key \
   --from-literal=POSTGRES_PASSWORD=your-password \
   --from-literal=CLICKHOUSE_PASSWORD=your-password \
-  --from-literal=LAB_EVENTS_SECRET=$(openssl rand -hex 32) \
+  --from-literal=LAB_INSTANCE_ID=<instance_id from the Lab> \
+  --from-literal=LAB_INSTANCE_SECRET=<secret from the Lab> \
   --from-literal=LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
 ```
 
-The hosted API also needs `LAB_URL` (the Lab's base URL, set in the `scrapix-config` ConfigMap) and refuses to start without `LAB_URL` and both `LAB_*` secrets; the Lab (deployed from [`meilisearch/lab`](https://github.com/meilisearch/lab), not from these manifests; the ConfigMap points `LAB_URL` at its `lab-saas` service) must use the same secret and token. It uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
+`LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` are minted by the Lab for this
+deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<this API's public URL>`
+on the Lab); `LAB_SERVICE_TOKEN` must be the same value on the Lab.
+
+The hosted API needs `LAB_URL` (the Lab's public base URL, in the `scrapix-config` ConfigMap) and refuses to start without `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`; see `deploy/kubernetes/README.md`. The Lab is deployed from [`meilisearch/lab`](https://github.com/meilisearch/lab), not from these manifests. The API uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
 
 ## Monitoring
 

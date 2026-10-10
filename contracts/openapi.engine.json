@@ -887,7 +887,7 @@
           "scrape"
         ],
         "summary": "Scrape many URLs as one job",
-        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Credits: same as `/scrape`, per URL scraped.",
+        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Usage is reported like `/scrape`, per URL\nscraped. Refused when the account's balance is gone; once a URL finds it\ngone, the remaining URLs are skipped with `insufficient_credits`.",
         "operationId": "batch_scrape",
         "requestBody": {
           "content": {
@@ -921,7 +921,7 @@
             }
           },
           "402": {
-            "description": "Not enough credits for the whole batch",
+            "description": "The account's credit balance is exhausted",
             "content": {
               "application/json": {
                 "schema": {

@@ -63,6 +63,9 @@ there.
 | `scrapix_content_flush_duration_seconds` | Histogram | — | content worker | Time to flush one storage backend |
 | `scrapix_api_jobs` | Gauge | `status` | engine | In-memory job count by status |
 | `scrapix_consumer_uncommitted` | Gauge | `topic` | every Kafka consumer | In-flight (unacked) message count per topic, sampled once per commit tick |
+| `scrapix_lab_events_pending` | Gauge | — | engine (hosted) | Undelivered events in the Lab outbox |
+| `scrapix_lab_events_delivered_total` | Counter | `outcome` (`accepted`/`rejected`/`failed`/`dropped`) | engine (hosted) | Lab event delivery outcomes; `dropped` = never acknowledged for 24 h, dropped with an error log |
+| `scrapix_lab_requests_total` | Counter | `endpoint` (`instances_me`/`introspect`/`account`/`meilisearch`), `outcome` (`ok`/`inactive`/`unavailable`/`rejected`/`stale`) | engine (hosted) | The engine's calls to the Lab's `/internal/*` API. The boot check is `endpoint="instances_me"` (it was `"ping"` before contract v2: update dashboards filtering on `endpoint="ping"`) |
 
 <Note>
   Metric names and labels below this table (fetch/processing/robots/DNS/AI/storage/browser

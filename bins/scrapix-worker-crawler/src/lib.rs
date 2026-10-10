@@ -79,7 +79,7 @@ pub struct Args {
     #[arg(
         long,
         env = "USER_AGENT",
-        default_value = "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
+        default_value = "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)"
     )]
     pub user_agent: String,
 

@@ -97,7 +97,7 @@ With `parsers.ocr` set, the response also carries an `ocr` object
 |--------|--------|------|
 | 400 | `validation_error` | Missing `file`, empty file, invalid `options` JSON |
 | 400 | `ocr_required` | An image was uploaded without `parsers.ocr` |
-| 402 | `insufficient_credits` | Not enough credits (including planned OCR pages) |
+| 402 | `insufficient_credits` | The account's credit balance is exhausted |
 | 413 | `file_too_large` | File larger than `DOCUMENT_MAX_SIZE_MB` |
 | 415 | `unsupported_document` | Unrecognized format |
 | 422 | `parse_error` | The file is corrupt, encrypted or otherwise unreadable |
@@ -105,7 +105,6 @@ With `parsers.ocr` set, the response also carries an `ocr` object
 
 ### Billing
 
-Billed **per document** like `/scrape` (1 credit minimum, +1 per feature
-format, +5 per AI option), plus **5 credits per page recognized by OCR**
-(recorded as a separate `ocr` ledger entry; cached pages are free). Credits
-are a hosted-billing concept — see **Billing & Usage** in the Platform docs.
+Reported **per document** (`parse` usage, `{documents: 1}`), plus the pages
+recognized by OCR as a separate `ocr` usage event (cached pages are free).
+Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs); the engine reports usage units and holds no price table.

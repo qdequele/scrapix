@@ -21,16 +21,16 @@ patches:
 # Override images with registry prefix
 images:
   - name: scrapix-api
-    newName: ghcr.io/quentindequelen/scrapix-api
+    newName: ghcr.io/qdequele/scrapix-api
     newTag: v0.1.0
   - name: scrapix-frontier-service
-    newName: ghcr.io/quentindequelen/scrapix-frontier-service
+    newName: ghcr.io/qdequele/scrapix-frontier-service
     newTag: v0.1.0
   - name: scrapix-worker-crawler
-    newName: ghcr.io/quentindequelen/scrapix-worker-crawler
+    newName: ghcr.io/qdequele/scrapix-worker-crawler
     newTag: v0.1.0
   - name: scrapix-worker-content
-    newName: ghcr.io/quentindequelen/scrapix-worker-content
+    newName: ghcr.io/qdequele/scrapix-worker-content
     newTag: v0.1.0
 
 # Secret generator for production secrets
@@ -39,4 +39,4 @@ images:
 #   - name: scrapix-secrets
 #     behavior: replace
 #     envs:
-#       - secrets.env   # must include LAB_EVENTS_SECRET, LAB_SERVICE_TOKEN
+#       - secrets.env   # must include LAB_INSTANCE_ID, LAB_INSTANCE_SECRET, LAB_SERVICE_TOKEN

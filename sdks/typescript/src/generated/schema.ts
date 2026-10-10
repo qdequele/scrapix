@@ -602,6 +602,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Parse an uploaded document
+         * @description Converts an uploaded file to Markdown with the same parsers the crawler
+         *     uses, and returns the `/scrape` response shape. Billed per document
+         *     (like `/scrape`), plus OCR pages when `parsers.ocr` recognizes scanned
+         *     pages.
+         */
+        post: operations["parse_upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/scrape": {
         parameters: {
             query?: never;
@@ -1458,7 +1481,9 @@ export interface paths {
          *     `GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages
          *     with `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that
          *     fails is reported as a result with `success: false` and an `error`; it
-         *     does not fail the batch. Credits: same as `/scrape`, per URL scraped.
+         *     does not fail the batch. Usage is reported like `/scrape`, per URL
+         *     scraped. Refused when the account's balance is gone; once a URL finds it
+         *     gone, the remaining URLs are skipped with `insufficient_credits`.
          */
         post: operations["batch_scrape"];
         delete?: never;
@@ -2826,6 +2851,20 @@ export interface components {
             parser: string;
             /** @description PDF classification: `text_based`, `scanned`, `image_based`, `mixed`. */
             pdf_type?: string | null;
+        };
+        /** @description Multipart body of `POST /parse`. */
+        ParseUpload: {
+            /**
+             * Format: binary
+             * @description The document: PDF, DOC/DOCX, PPT/PPTX, XLS/XLSX/XLSB, ODT/ODS/ODP,
+             *     RTF, EPUB or CSV (or a PNG/JPEG/GIF/WebP/TIFF image with
+             *     `parsers.ocr`). Max 50 MB by default (`DOCUMENT_MAX_SIZE_MB`).
+             */
+            file: string;
+            /** @description Shorthand for `options.formats`: a JSON array or comma-separated list. */
+            formats?: string | null;
+            /** @description JSON options: `{"formats": ["markdown"], "parsers": {"ocr": "auto"}}`. */
+            options?: string | null;
         };
         /** @description Document parsing options for `/scrape` and `/parse`. */
         ParserOptions: {
@@ -4280,6 +4319,44 @@ export interface operations {
             };
         };
     };
+    parse_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["ParseUpload"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScrapeResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description File larger than DOCUMENT_MAX_SIZE_MB */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     scrape_url: {
         parameters: {
             query?: never;
@@ -4459,7 +4536,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
-            /** @description Not enough credits for the whole batch */
+            /** @description The account's credit balance is exhausted */
             402: {
                 headers: {
                     [name: string]: unknown;

@@ -217,7 +217,9 @@ fn redacted_options(options: &Map<String, Value>) -> Value {
 /// `GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages
 /// with `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that
 /// fails is reported as a result with `success: false` and an `error`; it
-/// does not fail the batch. Credits: same as `/scrape`, per URL scraped.
+/// does not fail the batch. Usage is reported like `/scrape`, per URL
+/// scraped. Refused when the account's balance is gone; once a URL finds it
+/// gone, the remaining URLs are skipped with `insufficient_credits`.
 #[utoipa::path(
     post,
     path = "/batch/scrape",
@@ -226,7 +228,7 @@ fn redacted_options(options: &Map<String, Value>) -> Value {
     responses(
         (status = 200, body = BatchScrapeResponse),
         (status = 400, body = ApiError),
-        (status = 402, description = "Not enough credits for the whole batch", body = ApiError)
+        (status = 402, description = "The account's credit balance is exhausted", body = ApiError)
     ),
     security(("api_key" = []))
 )]

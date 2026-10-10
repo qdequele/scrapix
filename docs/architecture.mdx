@@ -34,9 +34,9 @@ graph LR
 |---------|--------|---------|-----------|
 | API Server | `scrapix api` | REST API, WebSocket, job management | No (job accounting persists to the engine's own database) |
 | Frontier | `scrapix frontier` | URL deduplication, priority scheduling, rate limiting, politeness | `FrontierStore`: Redis in production (`REDIS_URL`), in-memory for tests and `scrapix all` |
-| Crawler | `scrapix crawler` | HTTP fetching, link extraction, robots.txt | RocksDB (URL cache, DNS, robots) |
+| Crawler | `scrapix crawler` | HTTP fetching, link extraction, robots.txt | No (robots.txt and DNS caches are in-process; `REDIS_URL` shares incremental-crawl headers) |
 | Content | `scrapix content` | HTML parsing, extraction, Meilisearch indexing | No |
-| All-in-One | `scrapix all` | All services in a single process | RocksDB; in-process channel bus (no redelivery, so at-least-once delivery only holds over Kafka) |
+| All-in-One | `scrapix all` | All services in a single process | In-process channel bus (no redelivery, so at-least-once delivery only holds over Kafka) |
 
 With `REDIS_URL` set, the frontier's admission/dedup state and its
 per-domain politeness state are both shared in Redis, so more than one
@@ -134,8 +134,6 @@ The frontier uses dual locality-sensitive hashing to avoid crawling near-duplica
 | Backend | Purpose | Required? |
 |---------|---------|-----------|
 | **Meilisearch** | Document indexing, full-text search | Yes |
-| **RocksDB** | Per-worker URL cache, robots.txt, DNS cache | Auto-managed |
 | **Redis/DragonflyDB** | Frontier `FrontierStore` (dedup, queue, politeness), shared across frontier instances | Optional (required for durable/multi-instance frontier) |
 | **ClickHouse** | Analytics, time-series metrics | Optional |
-| **S3-compatible** | Raw HTML archival | Optional |
-| **PostgreSQL** | User accounts, API keys | Optional |
+| **PostgreSQL** | The engine's own job store (jobs, job results, lab-events outbox) | Optional (SQLite by default) |

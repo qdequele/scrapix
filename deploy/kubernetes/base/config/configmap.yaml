@@ -20,11 +20,11 @@ data:
   CLICKHOUSE_DATABASE: "scrapix"
   CLICKHOUSE_USER: "scrapix"
 
-  # Lab (Rails control plane) base URL (hosted mode; required). The API
-  # reports events to {LAB_URL}/internal/events and calls {LAB_URL}/internal/*.
-  # The Lab is deployed from meilisearch/lab (its `lab-saas` service), not
-  # from these manifests.
-  LAB_URL: "http://lab-saas:8081"
+  # Lab (control plane) base URL (hosted mode; required). The API calls
+  # {LAB_URL}/internal/* and reports events to {LAB_URL}/internal/events.
+  # The Lab is deployed from meilisearch/lab, not from these manifests:
+  # set this to its public URL.
+  LAB_URL: "https://lab.meilisearch.com"
 
   # Logging
   RUST_LOG: "info,scrapix=debug"
@@ -38,7 +38,7 @@ data:
   BLOOM_FP_RATE: "0.01"
 
   # Crawler configuration
-  USER_AGENT: "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
+  USER_AGENT: "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)"
   REQUEST_TIMEOUT: "30"
   MAX_RETRIES: "3"
   MAX_DEPTH: "100"

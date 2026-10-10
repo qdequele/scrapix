@@ -21,7 +21,7 @@ script) runs from a `meilisearch/lab` checkout, not from this repo.
 
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
 - [ ] **Local dev: refresh an existing `.env`.** `just dev` in this repo now runs the engine **standalone** (`.env.example` sets `SCRAPIX_MODE=standalone` and a dev `SCRAPIX_ADMIN_KEY`); an `.env` copied from the old hosted dev setup still points `DATABASE_URL` at the Rails database and sets `SCRAPIX_MODE=hosted`. Re-copy `.env.example`, or use its commented "Hosted against a local Lab" block with the Lab running from a `meilisearch/lab` checkout.
-- [ ] **Set `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API and the matching secrets on Rails — the hosted engine refuses to start without them. If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
+- [ ] **Set `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API (the instance id and secret are minted by the Lab with `bin/rails lab:hosted_engine:create`; `LAB_SERVICE_TOKEN` is the same value on the Lab) — the hosted engine refuses to start without them, and refuses a Lab that predates contract v2 (no `GET /internal/instances/me`), so deploy the Lab first. `LAB_EVENTS_SECRET` is ignored now (warned at boot): remove it. Dashboards filtering `scrapix_lab_requests_total` on `endpoint="ping"` must switch to `endpoint="instances_me"`, and `scrapix_lab_events_delivered_total` gains `outcome="dropped"` (events never acknowledged for 24 h). If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
 
 ## Engine ↔ Lab boundary rollout
@@ -45,24 +45,32 @@ window exists where a charge is lost or a crawl fires twice. (The Lab split
 changes the Rails-versus-engine order: see the warning above and "Lab split
 phase 1".)
 
-### A. Generate secrets
+### A. Credentials
 
 ```bash
-openssl rand -hex 32   # LAB_EVENTS_SECRET
+# on the Lab (meilisearch/lab checkout), once per engine deployment:
+bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<the engine's public URL>
+# prints instance_id, secret (64 hex, shown once) and lab_url
+
 openssl rand -hex 32   # LAB_SERVICE_TOKEN
 ```
 
-Use two different values. Both are needed, with **identical values**, on the
-Rails app and on the engine (`scrapix-api`): `LAB_EVENTS_SECRET` signs the
-engine → Rails event deliveries, `LAB_SERVICE_TOKEN` authenticates Rails →
-engine calls (and, since the Lab split, the engine's own `/internal/*` calls).
+`LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` come from the Lab, not from
+`openssl`: set the printed `instance_id` and `secret` on the engine
+(`scrapix-api`). The engine presents them on every `{LAB_URL}/internal/*` call
+(`X-Lab-Instance-Id` + `Authorization: Bearer <LAB_INSTANCE_SECRET>`) and signs
+its event batches with the secret. `LAB_SERVICE_TOKEN` is needed with an
+**identical value** on the Lab and on the engine: it authenticates Lab →
+engine calls only (the saved-config cron).
 The engine also needs `LAB_URL`, the Lab's base URL (e.g.
-`https://scrapix.meilisearch.com`, or `http://127.0.0.1:8091` when both run on
+`https://lab.meilisearch.com`, or `http://127.0.0.1:8091` when both run on
 the box); events go to `{LAB_URL}/internal/events`. The hosted engine
-**refuses to start** without `LAB_URL` and both secrets (secrets ≥ 32
-characters); standalone ignores them. (Before the Lab split this was
+**refuses to start** without `LAB_URL`, `LAB_INSTANCE_ID`,
+`LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`; a standalone engine refuses
+`LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET`. (Before the Lab split `LAB_URL` was
 `LAB_EVENTS_URL`, the full `…/internal/events` URL; it still works as a
-deprecated fallback.)
+deprecated fallback. Before contract v2 the engine signed with
+`LAB_EVENTS_SECRET`, which is now ignored.)
 
 ### B. Before the Rails migrations: check for duplicate payment intents
 
@@ -320,9 +328,11 @@ sections of this page.)
    use `JWT_SECRET`). If the other services also run the new build, follow the
    service order in "4. Deploy order" below. Put the public API route back in
    Caddy once the checks below pass. Then check:
-   - the log shows the Lab ping succeeded (a wrong token or `LAB_URL` stops the
+   - the log shows the Lab ping succeeded (from contract v2 on: the
+     `GET /internal/instances/me` boot check; a wrong token or `LAB_URL` stops the
      engine at startup instead);
    - `GET /metrics` shows `scrapix_lab_requests_total{endpoint="ping",outcome="ok"}`
+     (`endpoint="instances_me"` from contract v2 on)
      and `scrapix_lab_events_pending` draining to near 0.
 
    Then set `LAB_CRON_ENABLED=true` on Rails and restart it (section E).
@@ -598,9 +608,10 @@ After all services are deployed:
 
 1. Submit a small real crawl and watch it reach `Completed` (not stuck
    `Running`, not `FailStalled`) via `GET /job/{id}/status`.
-2. Check that its billing came out right (pages crawled × the credits
-   formula in `docs/guides/billing.mdx` — verify against
-   `crates/scrapix-billing/src/credits.rs` if anything looks off).
+2. Check that its usage came out right: one `usage.recorded` event with
+   `operation: "crawl"` whose `units` (`pages_http`, `pages_browser`) match
+   the pages crawled. The Lab prices it with its `pricing.yml`; the engine
+   holds no price table.
 3. Confirm the completion email was sent (exactly one) and the crawl's
    single `usage_deduction` row landed in the ledger (it is applied by Rails
    a few seconds after the job ends).

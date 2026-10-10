@@ -31,10 +31,10 @@ Scrapix aims to be an internet-scale web crawler capable of:
         │                     │                     │
         └─────────────────────┼─────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Layer                               │
-│  Redpanda │ RocksDB │ Meilisearch │ DragonflyDB │ S3            │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                              Data Layer                              │
+│  Redpanda │ Meilisearch │ DragonflyDB │ ClickHouse │ Postgres/SQLite │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Tech Stack
@@ -44,9 +44,8 @@ Scrapix aims to be an internet-scale web crawler capable of:
 | Language | Rust |
 | Message Queue | Redpanda (Kafka-compatible) |
 | Search | Meilisearch |
-| Local State | RocksDB |
 | Cache | DragonflyDB (Redis-compatible) |
-| Object Storage | S3/MinIO/RustFS |
+| Job store | SQLite (default) or Postgres, engine-owned |
 | Documents | pdf-inspector (PDF), anydoc (Word/Excel/PowerPoint/OpenDocument/RTF/EPUB/CSV) |
 | OCR | PDFium rasterization + vision LLM or Tesseract (opt-in) |
 
@@ -57,25 +56,33 @@ Scrapix aims to be an internet-scale web crawler capable of:
 - Rust 1.75+
 - Docker & Docker Compose
 
-### 1. Start Infrastructure
+### 1. Standalone in Docker (simplest)
 
 ```bash
-# Start all infrastructure (Redpanda, Meilisearch, DragonflyDB)
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+cp .env.standalone.example .env   # MEILI_MASTER_KEY, SCRAPIX_ADMIN_KEY=...
+docker compose -f compose.standalone.yaml up -d
+curl -H "Authorization: Bearer $SCRAPIX_ADMIN_KEY" localhost:8080/health
 ```
 
-### 2. Build the Project
+`compose.standalone.yaml` starts Meilisearch and the engine (`scrapix all`:
+the API, frontier, crawler and content workers in one process over an
+in-process bus) with one operator key. `SCRAPIX_MODE=standalone` is the
+default; `SCRAPIX_ADMIN_KEY` (16+ chars) is required unless
+`SCRAPIX_AUTH=disabled` (local dev only).
+
+### 2. Natively (iterating on the code)
 
 ```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   # infra only
 cargo build --release
 ```
-
-### 3. Run Services
 
 In separate terminals:
 
 ```bash
-# Terminal 1: API Server
+# Terminal 1: API Server (standalone, operator key)
+SCRAPIX_MODE=standalone \
+SCRAPIX_ADMIN_KEY=dev-admin-key-change-me \
 KAFKA_BROKERS=localhost:19092 \
 MEILISEARCH_URL=http://localhost:7700 \
 MEILISEARCH_API_KEY=masterKey \
@@ -96,7 +103,11 @@ MEILISEARCH_API_KEY=masterKey \
 cargo run --release --bin scrapix-worker-content
 ```
 
-### 4. Start a Crawl
+A standalone engine never talks to the Meilisearch Lab. Hosted deployments
+(`SCRAPIX_MODE=hosted`, operated by Meilisearch) are documented in
+`docs/deployment/kubernetes.mdx`.
+
+### 3. Start a Crawl
 
 ```bash
 # Using the CLI
@@ -104,6 +115,7 @@ cargo run --bin scrapix -- crawl -f examples/simple-crawl.json
 
 # Or using curl
 curl -X POST http://localhost:8080/crawl \
+  -H "Authorization: Bearer dev-admin-key-change-me" \
   -H "Content-Type: application/json" \
   -d @examples/simple-crawl.json
 ```
@@ -607,13 +619,13 @@ scrapix/
 │
 ├── tests/                     # Integration tests
 ├── examples/                  # Example configurations
-├── ARCHITECTURE.md            # Detailed architecture docs
+├── docs/                      # Mintlify docs site
 └── docker-compose.yml         # Docker Compose stack
 ```
 
 ## Documentation
 
-- [Architecture](ARCHITECTURE.md) - System design and tech decisions
+- [Architecture](docs/architecture.mdx) - System design and tech decisions
 
 ## Contributing
 
@@ -625,4 +637,4 @@ scrapix/
 
 ## License
 
-MIT
+MIT: see [LICENSE](LICENSE).
