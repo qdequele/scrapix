@@ -287,7 +287,8 @@ that names a Lab-owned table, reads included).
   (`{LAB_URL}/internal/*`, `X-Lab-Instance-Id: LAB_INSTANCE_ID` + Bearer
   `LAB_INSTANCE_SECRET`): credentials are sent to
   `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
-  30 s, stale up to 5 min if the Lab is down; an unknown credential while the
+  30 s, stale up to 5 min if the Lab is down, except answers with
+  `cache_ttl` 0 (revoked/expired), which are never served stale; an unknown credential while the
   Lab is down is a 503 with `Retry-After: 5`; so a revoked key keeps working
   on the engine for up to `cache_ttl`, documented in
   `docs/configuration/environment-variables.mdx`), the Meilisearch target comes

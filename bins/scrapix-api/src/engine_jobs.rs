@@ -79,10 +79,15 @@ pub(crate) fn enforce_limits(
         });
         return Ok(());
     };
+    // Each refusal names the plan (`ctx.tier`) and the limit, and says the
+    // limits come from the Lab: they are enforced since contract v2, so a
+    // request that used to pass can now be refused.
+    let plan = &ctx.tier;
     if active_jobs >= limits.concurrent_jobs {
         return Err(ApiError::new(
             format!(
-                "Maximum concurrent jobs reached ({}/{}). Upgrade your plan for more.",
+                "Maximum concurrent jobs reached for the {plan} plan ({}/{}). Plan limits come \
+                 from the Lab; wait for a running job to finish (or cancel one) or upgrade your plan.",
                 active_jobs, limits.concurrent_jobs
             ),
             "quota_exceeded",
@@ -92,7 +97,9 @@ pub(crate) fn enforce_limits(
         if depth > limits.max_depth {
             return Err(ApiError::new(
                 format!(
-                    "max_depth {depth} exceeds your plan's limit of {}",
+                    "max_depth {depth} exceeds the {plan} plan's max_depth limit of {}. Plan \
+                     limits come from the Lab; lower max_depth (or remove it to use the plan \
+                     limit) or upgrade your plan.",
                     limits.max_depth
                 ),
                 "quota_exceeded",
@@ -101,7 +108,10 @@ pub(crate) fn enforce_limits(
     }
     if check.js_rendering && !limits.js_rendering {
         return Err(ApiError::new(
-            "JS rendering (browser crawler, render_js, screenshots, actions) is not included in your plan",
+            format!(
+                "JS rendering (browser crawler, render_js, screenshots, actions) is not included \
+                 in the {plan} plan. Plan limits come from the Lab; disable it or upgrade your plan."
+            ),
             "quota_exceeded",
         ));
     }
@@ -344,7 +354,7 @@ mod limit_tests {
         assert!(enforce_limits(&ctx(Some(free())), 0, ok.clone()).is_ok());
         let e = enforce_limits(&ctx(Some(free())), 1, ok.clone()).unwrap_err();
         assert_eq!(e.code, "quota_exceeded");
-        assert!(e.error.contains("1/1"), "{}", e.error);
+        assert!(e.error.contains("for the free plan (1/1)"), "{}", e.error);
         let e = enforce_limits(
             &ctx(Some(free())),
             0,
@@ -355,7 +365,12 @@ mod limit_tests {
         )
         .unwrap_err();
         assert_eq!(e.code, "quota_exceeded");
-        assert!(e.error.contains("max_depth"), "{}", e.error);
+        assert!(
+            e.error
+                .contains("max_depth 4 exceeds the free plan's max_depth limit of 3"),
+            "{}",
+            e.error
+        );
         let e = enforce_limits(
             &ctx(Some(free())),
             0,
@@ -367,6 +382,11 @@ mod limit_tests {
         .unwrap_err();
         assert_eq!(e.code, "quota_exceeded");
         assert!(e.error.contains("JS rendering"), "{}", e.error);
+        assert!(
+            e.error.contains("not included in the free plan"),
+            "{}",
+            e.error
+        );
         let pro = Limits {
             concurrent_jobs: 10,
             rate_limit_rpm: 1200,
@@ -382,6 +402,82 @@ mod limit_tests {
             }
         )
         .is_ok());
+    }
+
+    fn ctx_on(tier: &str, limits: Limits) -> AccountContext {
+        AccountContext {
+            tier: tier.into(),
+            ..ctx(Some(limits))
+        }
+    }
+
+    /// Each refusal names the plan, the limit, and why it can fail now
+    /// (the limits come from the Lab).
+    #[test]
+    fn refusals_name_the_plan_and_the_limit() {
+        let pro = Limits {
+            concurrent_jobs: 10,
+            rate_limit_rpm: 1200,
+            max_depth: 10,
+            js_rendering: true,
+        };
+        let e = enforce_limits(
+            &ctx_on("pro", pro),
+            0,
+            PlanCheck {
+                max_depth: Some(15),
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(
+            e.error,
+            "max_depth 15 exceeds the pro plan's max_depth limit of 10. Plan limits come from \
+             the Lab; lower max_depth (or remove it to use the plan limit) or upgrade your plan."
+        );
+
+        let e = enforce_limits(
+            &ctx_on("free", free()),
+            0,
+            PlanCheck {
+                max_depth: None,
+                js_rendering: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(
+            e.error,
+            "JS rendering (browser crawler, render_js, screenshots, actions) is not included in \
+             the free plan. Plan limits come from the Lab; disable it or upgrade your plan."
+        );
+
+        let starter = Limits {
+            concurrent_jobs: 3,
+            rate_limit_rpm: 300,
+            max_depth: 5,
+            js_rendering: true,
+        };
+        let e = enforce_limits(
+            &ctx_on("starter", starter),
+            3,
+            PlanCheck {
+                max_depth: None,
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert!(
+            e.error
+                .starts_with("Maximum concurrent jobs reached for the starter plan (3/3). Plan limits come from the Lab;"),
+            "{}",
+            e.error
+        );
+        assert!(e.error.contains("upgrade your plan"), "{}", e.error);
+        use axum::response::IntoResponse;
+        assert_eq!(e.into_response().status(), 429);
     }
 
     #[test]

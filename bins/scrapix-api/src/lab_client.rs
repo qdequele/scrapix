@@ -179,6 +179,13 @@ impl<T> Entry<T> {
     fn fresh(&self) -> bool {
         self.fetched.elapsed() < self.ttl
     }
+    /// Servable while the Lab is unreachable: within `grace` past its ttl,
+    /// and only if it was cached with a positive ttl. A `cache_ttl: 0` (or
+    /// negative) answer — an expiring session or OAuth token, "do not
+    /// cache" — is never served stale.
+    fn servable_stale(&self, grace: Duration) -> bool {
+        !self.ttl.is_zero() && self.fetched.elapsed() < self.ttl + grace
+    }
     fn in_backoff(&self) -> bool {
         self.retry_at.is_some_and(|t| Instant::now() < t)
     }
@@ -189,6 +196,14 @@ struct Balance {
     fetched: Instant,
     ttl: Duration,
     retry_at: Option<Instant>,
+}
+
+impl Balance {
+    /// Same rule as `Entry::servable_stale`: a snapshot taken from a
+    /// `cache_ttl: 0` answer is never served while the Lab is unreachable.
+    fn servable_stale(&self, grace: Duration) -> bool {
+        !self.ttl.is_zero() && self.fetched.elapsed() < self.ttl + grace
+    }
 }
 
 /// A size-bounded TTL map. On overflow, entries past `ttl + keep` (no longer
@@ -216,7 +231,8 @@ impl<T: Clone> Cache<T> {
     fn put(&mut self, k: String, value: T, ttl: Duration) {
         if !self.map.contains_key(&k) && self.map.len() >= self.capacity {
             let keep = self.keep;
-            self.map.retain(|_, e| e.fetched.elapsed() < e.ttl + keep);
+            self.map
+                .retain(|_, e| !e.ttl.is_zero() && e.fetched.elapsed() < e.ttl + keep);
             if self.map.len() >= self.capacity {
                 if let Some(oldest) = self
                     .map
@@ -435,8 +451,9 @@ impl LabClient {
     }
 
     /// Cached lookup with the stale-on-error rule shared by every endpoint:
-    /// only a *positive* cached answer is ever served stale, and a key just
-    /// served stale is not retried for `stale_retry`.
+    /// only a *positive* cached answer with a positive ttl is ever served
+    /// stale (never a `cache_ttl: 0` one), and a key just served stale is
+    /// not retried for `stale_retry`.
     async fn cached<T, F, Fut>(
         &self,
         endpoint: &'static str,
@@ -450,7 +467,7 @@ impl LabClient {
         Fut: std::future::Future<Output = Result<(Option<T>, Duration), LabError>>,
     {
         let grace = self.timing.stale_grace;
-        let usable = |e: &Entry<T>| e.fetched.elapsed() < e.ttl + grace;
+        let usable = |e: &Entry<T>| e.servable_stale(grace);
         let hit = {
             let c = cache.lock().unwrap();
             if c.negative.get(&key).is_some_and(|e| e.fresh()) {
@@ -601,13 +618,14 @@ impl LabClient {
 
     /// Take a new balance snapshot now (directly, not through the identity
     /// cache: the balance must be current). While the Lab is unavailable the
-    /// last snapshot is served for `stale_grace` past its expiry, asking the
-    /// Lab again at most every `stale_retry`.
+    /// last snapshot is served for `stale_grace` past its expiry (unless it
+    /// came from a `cache_ttl: 0` answer), asking the Lab again at most
+    /// every `stale_retry`.
     pub(crate) async fn refresh_credits(
         &self,
         account_id: &str,
     ) -> Result<Option<Available>, LabError> {
-        let stale = |b: &Balance| b.fetched.elapsed() < b.ttl + self.timing.stale_grace;
+        let stale = |b: &Balance| b.servable_stale(self.timing.stale_grace);
         let served = |credits| {
             Ok(Some(Available {
                 credits,
@@ -1125,6 +1143,76 @@ mod tests {
         assert!(matches!(
             c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
                 .await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    /// An answer with `cache_ttl: 0` (a session or OAuth token about to
+    /// expire, "do not cache") is never served stale: with the Lab down the
+    /// next call is `Unavailable`, not the cached identity.
+    #[tokio::test]
+    async fn a_cache_ttl_0_answer_is_never_served_stale() {
+        let (lab, c) = setup().await; // grace 400 ms
+        let mut v = FakeLab::identity(ACCT, "pro", 50);
+        v["cache_ttl"] = json!(0);
+        lab.set_credential("session", "jwt_expiring", v);
+        assert!(c
+            .introspect(CredentialKind::Session, "jwt_expiring", None)
+            .await
+            .unwrap()
+            .is_some());
+        lab.set_down(true);
+        assert!(
+            matches!(
+                c.introspect(CredentialKind::Session, "jwt_expiring", None)
+                    .await,
+                Err(LabError::Unavailable(_))
+            ),
+            "well inside the stale grace, yet not served"
+        );
+
+        // A credential first cached with a positive ttl, then re-answered
+        // with cache_ttl 0: the zero-ttl answer replaces it and is not
+        // served stale either.
+        lab.set_down(false);
+        lab.set_credential("bearer", "tok", FakeLab::identity(ACCT, "pro", 50));
+        c.introspect(CredentialKind::Bearer, "tok", None)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await; // past the 200 ms ttl
+        let mut v = FakeLab::identity(ACCT, "pro", 50);
+        v["cache_ttl"] = json!(0);
+        lab.set_credential("bearer", "tok", v);
+        c.introspect(CredentialKind::Bearer, "tok", None)
+            .await
+            .unwrap()
+            .unwrap();
+        lab.set_down(true);
+        assert!(matches!(
+            c.introspect(CredentialKind::Bearer, "tok", None).await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    /// Same rule for the balance snapshot: one taken from a `cache_ttl: 0`
+    /// answer is not served while the Lab is down.
+    #[tokio::test]
+    async fn a_cache_ttl_0_balance_is_never_served_stale() {
+        let (lab, c) = setup().await;
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "pro",
+                   "credits": {"balance": 100}, "cache_ttl": 0}),
+        );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
+        lab.set_down(true);
+        assert!(matches!(
+            credits(&c, ACCT).await,
+            Err(LabError::Unavailable(_))
+        ));
+        assert!(matches!(
+            c.account(ACCT).await,
             Err(LabError::Unavailable(_))
         ));
     }
