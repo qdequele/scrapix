@@ -299,8 +299,13 @@ that names a Lab-owned table, reads included).
   `max_depth` (a hosted crawl without one gets the plan's) and JS rendering
   (crawl, scrape, batch, extract, `/map` with `render_js`), not
   `rate_limit_rpm`; it refuses billable work at a balance `<= 0` (402
-  `insufficient_credits`, 503 past the stale window). It holds **no price
-  table**: it reports raw units and the Lab prices them. It issues no
+  `insufficient_credits`, 503 past the stale window). It reports raw units
+  (incl. `feature_pages`, the per-feature surcharge) and, for the contract
+  v2 transition release only, the pre-v2 `credits`
+  (`bins/scrapix-api/src/legacy_credits.rs`), which the Lab debits as
+  authoritative for scrapix (removed next release; never used for a
+  pre-check); `provider_cost_micro_usd` is 0 (the engine knows token
+  counts, not provider prices). It issues no
   credentials and reads no Lab table. At startup it calls
   `GET {LAB_URL}/internal/instances/me` and refuses to start on a 401
   (re-issue the credentials), a 404 (wrong `LAB_URL` or a pre-v2 Lab) or an
@@ -592,10 +597,16 @@ The system tracks usage data for pricing/billing purposes.
 
 ### Billing is the Lab's
 
-The engine has no price table, tiers or plan constants (the old
-`scrapix-billing` crate and `scrapix-core::billing` are gone): it reports raw
-units in `usage.recorded` events and enforces the plan `limits` the Lab
-returns. `bins/scrapix-api/src/billing.rs` is only the balance pre-check.
+The engine has no tiers or plan constants (the old `scrapix-billing` crate
+and `scrapix-core::billing` are gone): it reports raw units in
+`usage.recorded` events (incl. `feature_pages`) and enforces the plan
+`limits` the Lab returns. `bins/scrapix-api/src/billing.rs` is only the
+balance pre-check. **Transition release:** every `usage.recorded` also
+carries `credits`, the pre-v2 price from `bins/scrapix-api/src/legacy_credits.rs`
+(the only price formula left, used for nothing else), which the Lab debits
+as authoritative for product scrapix; delete the module and the field next
+release. `provider_cost_micro_usd` is 0: the engine knows token counts, not
+provider prices.
 
 ### ClickHouse Analytics Queries
 

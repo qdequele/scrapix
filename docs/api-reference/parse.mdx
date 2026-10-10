@@ -105,7 +105,11 @@ With `parsers.ocr` set, the response also carries an `ocr` object
 
 ### Billing
 
-Reported **per document** (`parse` usage, `{documents: 1, ai_summary, ai_extraction}`,
-the AI flags 1 when that AI work produced a result), plus the pages
+Reported **per document** (`parse` usage, `{documents: 1, ai_summary, ai_extraction, feature_pages}`,
+the AI flags 1 when that AI work produced a result, `feature_pages` the
+number of feature formats requested, as on `/scrape`), plus the pages
 recognized by OCR as a separate `ocr` usage event (cached pages are free).
-Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs); the engine reports usage units and holds no price table.
+Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs). During the contract v2
+transition release each event also carries the pre-v2 `credits` the Lab
+debits (a document: `max(feature formats + 5 per delivered AI result, 1)`;
+OCR: 5 per recognized page); see [Lab Events](/api-reference/lab-events).

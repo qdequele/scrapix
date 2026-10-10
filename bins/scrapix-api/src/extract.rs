@@ -44,8 +44,8 @@ use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
 use crate::results::{self, find_owned_job, status_str};
 use crate::{
-    billing, check_write_permission, extract_account_context, map_fetch_page, AccountContext,
-    ApiError, AppState, ScrapeFormat,
+    billing, check_write_permission, extract_account_context, legacy_credits, map_fetch_page,
+    AccountContext, ApiError, AppState, ScrapeFormat,
 };
 
 /// Maximum number of URLs (explicit + resolved from globs) per extraction.
@@ -605,8 +605,15 @@ impl ExtractRunner {
             .map(|c| c.account_id.clone())
     }
 
-    /// Report `units` of `operation` (after the work, like /scrape).
-    async fn charge(&self, units: serde_json::Value, operation: &str, description: &str) {
+    /// Report `units` of `operation` (after the work, like /scrape), with
+    /// their pre-v2 `credits` (transition release).
+    async fn charge(
+        &self,
+        credits: i64,
+        units: serde_json::Value,
+        operation: &str,
+        description: &str,
+    ) {
         let Some(ctx) = self.account_ctx.as_ref().as_ref() else {
             return;
         };
@@ -614,6 +621,7 @@ impl ExtractRunner {
             .record_usage(
                 ctx,
                 operation,
+                credits,
                 units,
                 description.to_string(),
                 Some(&self.job_id),
@@ -659,8 +667,13 @@ impl ExtractRunner {
             let room = MAX_EXTRACT_URLS - summary.sources.len();
             match resolve_glob(&self.state, input, room + 1).await {
                 Ok(urls) => {
-                    self.charge(serde_json::json!({"requests": 1}), "map", input)
-                        .await;
+                    self.charge(
+                        legacy_credits::MAP_CREDITS,
+                        serde_json::json!({"requests": 1}),
+                        "map",
+                        input,
+                    )
+                    .await;
                     if urls.is_empty() {
                         summary
                             .warnings
@@ -845,6 +858,7 @@ impl ExtractRunner {
             .await
             .map_err(|e| format!("AI extraction failed ({what}): {e}"))?;
         self.charge(
+            legacy_credits::extract_ai_call_credits(),
             serde_json::json!({"documents": 1}),
             "extract",
             &format!("Extract {} ({what})", self.job_id),
@@ -1265,6 +1279,63 @@ mod tests {
             .all(|src| src.from_glob.as_deref() == Some(glob.as_str())));
     }
 
+    /// Transition release: every usage event of an extract job carries the
+    /// credits f2ab8d2 charged at its site: a glob resolution is a map
+    /// (`MAP_CREDITS` = 2), each fetched page a markdown `/scrape` (1, with
+    /// `feature_pages` 1), each AI call an AI extraction (5).
+    #[tokio::test]
+    async fn extract_usage_carries_pre_v2_credits_per_site() {
+        let site = site(false).await;
+        let llm = llm(r#"{"prices": []}"#).await;
+        let bus = scrapix_queue::ChannelBus::new();
+        let (state, outbox) =
+            crate::results::test_support::test_state_with_ai_and_lab(&bus, Some(ai(&llm)));
+        let ctx = Some(AccountContext {
+            account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
+            api_key_id: Some("k".into()),
+            tier: "free".into(),
+            user_role: None,
+            limits: None,
+        });
+        let glob = format!("{}/blog/*", base(&site));
+        let created = start_extract(&state, &ctx, request(vec![glob]))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        let usage: Vec<(String, i64, Value)> = outbox
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == "usage.recorded")
+            .map(|e| {
+                (
+                    e.data["operation"].as_str().unwrap().to_string(),
+                    e.data["credits"].as_i64().expect("usage carries credits"),
+                    e.data["units"].clone(),
+                )
+            })
+            .collect();
+        let of = |op: &str| -> Vec<(i64, Value)> {
+            usage
+                .iter()
+                .filter(|(o, _, _)| o == op)
+                .map(|(_, c, u)| (*c, u.clone()))
+                .collect()
+        };
+        assert_eq!(of("map"), vec![(2, serde_json::json!({"requests": 1}))]);
+        let scrapes = of("scrape");
+        assert_eq!(scrapes.len(), 2, "two pages fetched: {usage:?}");
+        for (credits, units) in scrapes {
+            assert_eq!(credits, 1);
+            assert_eq!(units["feature_pages"], 1);
+        }
+        assert_eq!(
+            of("extract"),
+            vec![(5, serde_json::json!({"documents": 1}))]
+        );
+        crate::lab_events::assert_contract_valid(&outbox.events());
+    }
+
     #[tokio::test]
     async fn fails_when_no_page_can_be_fetched() {
         let site = site(false).await;
@@ -1308,6 +1379,7 @@ mod tests {
         };
         runner
             .charge(
+                15,
                 serde_json::json!({"documents": 3}),
                 "extract",
                 "extract: 3 pages",
@@ -1320,6 +1392,7 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "extract",
+                "credits": 15,
                 "units": {"documents": 3},
                 "provider_cost_micro_usd": 0,
                 "description": "extract: 3 pages",

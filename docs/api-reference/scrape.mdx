@@ -88,7 +88,7 @@ base64-encoded PNG in the `screenshot` field:
 - If the server has no browser available, the request fails with
   `render_js_unavailable` instead of silently omitting the screenshot.
 
-A screenshot adds no usage unit of its own: on hosted the scrape is reported as one page (`pages_http` or `pages_browser`, whichever served it). Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs); the engine reports usage units and holds no price table.
+On hosted the scrape is reported as one page (`pages_http` or `pages_browser`, whichever served it); `screenshot`, like every feature format, counts toward the page's `feature_pages`. Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs); during the contract v2 transition release the event also carries the pre-v2 `credits` (see [Lab Events](/api-reference/lab-events)).
 
 ### Page actions
 

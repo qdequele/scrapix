@@ -54,18 +54,46 @@ Hosted mode only. A **standalone** engine emits no lab events and refuses
 
 ### `usage.recorded`
 
-One billable operation, reported as raw units. The Lab prices the units and
-debits the account's balance; the engine never computes credits.
+One billable operation, reported as raw units plus, for the contract v2
+transition release, its pre-v2 price in `credits`.
+
+<Warning>
+**Transition release.** The price card for units is not decided yet, so every
+Scrapix `usage.recorded` event also carries `credits`: what the engine charged
+before contract v2 for the same work (`bins/scrapix-api/src/legacy_credits.rs`).
+For product `scrapix` the Lab treats `credits` as authoritative: it debits it
+and stores the `units` without pricing them. `credits` (and
+`legacy_credits.rs`) is removed next release, together with the Lab, once
+`pricing.yml` prices the units.
+</Warning>
 
 | `data` field | Type | Description |
 |--------------|------|-------------|
 | `operation` | string | `scrape`, `map`, `search`, `parse`, `ocr`, `extract` or `crawl`. |
-| `units` | object of integer ≥ 0 | Raw units the Lab prices (`pages_http`, `pages_browser`, `requests`, `documents`) plus informational counters it stores and ignores (`ai_summary`, `ai_extraction`, `urls_found`, `results`, `pages_ai`, `pages_ocr`). |
-| `provider_cost_micro_usd` | integer ≥ 0 | Upstream provider money the engine paid, in micro-USD. Scrapix reports `0` today. |
+| `credits` | integer ≥ 0 | Deprecated, transition release only: the pre-v2 price of this usage, debited as-is by the Lab (see below). |
+| `units` | object of integer ≥ 0 | Raw units (`pages_http`, `pages_browser`, `requests`, `documents`, `feature_pages`) plus informational counters (`ai_summary`, `ai_extraction`, `urls_found`, `results`, `pages_ai`, `pages_ocr`). The Lab stores them all; a future `pricing.yml` prices them. |
+| `provider_cost_micro_usd` | integer ≥ 0 | Upstream provider money the engine paid, in micro-USD. Always `0` for Scrapix: the engine only knows the token counts its AI and OCR providers report, not what the provider charged. |
 | `description` | string | Text shown on the ledger row. |
 | `job_id` | string, optional | Present for job-scoped usage (a `crawl`, or an `extract` job). |
 
-Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr}` once per terminal job. The Lab converts units to credits with its `pricing.yml`; the engine holds no price table.
+Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction, feature_pages}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction, feature_pages}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`; fetched pages are `scrape` events); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr, feature_pages}` once per terminal job.
+
+`feature_pages` is the per-feature surcharge as a unit, so a future
+`pricing.yml` can price it: for `scrape` and `parse`, the number of feature
+formats requested for that one page (`markdown`, `links`, `metadata`,
+`screenshot`, `schema`, `blocks`; `html`, `rawhtml` and `content` are free);
+for `crawl`, `(pages_http + pages_browser) × <enabled non-AI features>`
+(`metadata`, `markdown`, `block_split`, `schema`, `custom_selectors`).
+
+`credits` during the transition (the pre-v2 formula):
+
+| Operation | `credits` |
+|-----------|-----------|
+| `scrape` (incl. a document URL), `parse` | `max(feature formats + 5 × AI summary delivered + 5 × AI extraction delivered, 1)` |
+| `ocr` | `5 ×` recognized pages |
+| `map`, `search` | `2` |
+| `extract` | `5` per AI call (glob maps and fetched pages are billed as `map` and `scrape`) |
+| `crawl` | `pages_http × (1 + F) + pages_browser × (2 + F) + pages_ai × A + 5 × pages_ocr`, with `F` the enabled non-AI features and `A` 5 per enabled AI feature (extraction, summary) |
 
 A crawl is reported **once**, when the job reaches a terminal state, from what
 was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,

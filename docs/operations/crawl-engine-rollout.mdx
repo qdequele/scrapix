@@ -630,8 +630,9 @@ After all services are deployed:
    `Running`, not `FailStalled`) via `GET /job/{id}/status`.
 2. Check that its usage came out right: one `usage.recorded` event with
    `operation: "crawl"` whose `units` (`pages_http`, `pages_browser`) match
-   the pages crawled. The Lab prices it with its `pricing.yml`; the engine
-   holds no price table.
+   the pages crawled, and whose `credits` (the pre-v2 price, debited as-is
+   by the Lab during the contract v2 transition release) match the pre-v2
+   formula in `docs/api-reference/lab-events.mdx`.
 3. Confirm the completion email was sent (exactly one) and the crawl's
    single `usage_deduction` row landed in the ledger (it is applied by Rails
    a few seconds after the job ends).

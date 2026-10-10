@@ -55,6 +55,7 @@ pub mod job_store;
 pub(crate) mod lab_client;
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
+pub(crate) mod legacy_credits;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
@@ -92,7 +93,8 @@ use tracing::{debug, error, info, warn};
 use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
 use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::{
-    ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, JobSpec, JobState, JobStatus,
+    ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
+    JobStatus,
 };
 use scrapix_crawler::{
     is_non_page_url, CdpRenderer, CdpRendererBuilder, HttpFetcher, HttpFetcherBuilder, PageOptions,
@@ -1238,8 +1240,10 @@ impl AppState {
 
     /// Report the crawled pages of a finished job: owes its crawl usage event
     /// (deterministic id, one per job) to the job's terminal write, so it
-    /// must be called before `write_terminal`. The event carries raw units;
-    /// the Lab prices them. The single billing path for terminal jobs.
+    /// must be called before `write_terminal`. The event carries raw units
+    /// plus, for the contract v2 transition release, the pre-v2 `credits`
+    /// (`legacy_credits::crawl_credits` + `ocr_credits`, from the job's
+    /// enabled features). The single billing path for terminal jobs.
     /// D4/R4: units count what was actually delivered, not the job's static
     /// config — `pages_http`/`pages_browser` split the crawled-ok page count
     /// by whether each page was actually rendered with a browser
@@ -1280,13 +1284,31 @@ impl AppState {
                 job_id, pages_http, pages_browser, pages_ai
             )
         };
+        // The job's enabled features (persisted config): they set the
+        // per-page feature surcharge, reported as `feature_pages`.
+        let features = {
+            let jobs = self.crawl.jobs.read();
+            jobs.get(job_id)
+                .and_then(|j| j.config.as_ref())
+                .and_then(|cfg| {
+                    cfg.get("features")
+                        .and_then(|v| serde_json::from_value::<FeaturesConfig>(v.clone()).ok())
+                })
+                .unwrap_or_default()
+        };
+        let feature_pages =
+            total_pages.saturating_mul(legacy_credits::non_ai_feature_credits(&features) as u64);
+        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features)
+            + legacy_credits::ocr_credits(pages_ocr);
         let units = serde_json::json!({
             "pages_http": pages_http,
             "pages_browser": pages_browser,
             "pages_ai": pages_ai,
             "pages_ocr": pages_ocr,
+            "feature_pages": feature_pages,
         });
-        let event = lab_events::LabEvent::crawl_final_usage(job_id, acct_id, units, description);
+        let event =
+            lab_events::LabEvent::crawl_final_usage(job_id, acct_id, credits, units, description);
         self.owe_lab_event(job_id, event);
     }
 
@@ -3385,10 +3407,13 @@ async fn scrape_url(
 
 impl AppState {
     /// Record one usage event for `ctx` (hosted only; no-op without a Lab).
+    /// `credits` is the pre-v2 price (`legacy_credits`) sent next to the
+    /// units during the contract v2 transition release.
     pub(crate) async fn record_usage(
         &self,
         ctx: &AccountContext,
         operation: &str,
+        credits: i64,
         units: serde_json::Value,
         description: String,
         job_id: Option<&str>,
@@ -3397,6 +3422,7 @@ impl AppState {
             &ctx.account_id,
             ctx.api_key_id.as_deref(),
             operation,
+            credits,
             units,
             description,
             job_id,
@@ -3422,10 +3448,14 @@ pub(crate) fn with_memory_lab(state: &mut AppState) -> Arc<lab_events::MemoryOut
 }
 
 /// Usage event for one successful scrape: one page, served by the browser
-/// or over HTTP, plus the AI work that produced a result.
+/// or over HTTP, plus the AI work that produced a result. `formats` are the
+/// requested formats: their feature-format count is the page's
+/// `feature_pages` and, with the delivered AI flags, sets the pre-v2
+/// `credits`.
 async fn record_scrape_usage(
     state: &AppState,
     ctx: &AccountContext,
+    formats: &[ScrapeFormat],
     js_rendered: bool,
     ai_summary: bool,
     ai_extraction: bool,
@@ -3435,11 +3465,13 @@ async fn record_scrape_usage(
         .record_usage(
             ctx,
             "scrape",
+            legacy_credits::scrape_credits(formats, ai_summary, ai_extraction),
             serde_json::json!({
                 "pages_http": u8::from(!js_rendered),
                 "pages_browser": u8::from(js_rendered),
                 "ai_summary": u8::from(ai_summary),
                 "ai_extraction": u8::from(ai_extraction),
+                "feature_pages": legacy_credits::feature_format_count(formats),
             }),
             final_url.to_string(),
             None,
@@ -3453,6 +3485,7 @@ async fn record_map_usage(state: &AppState, ctx: &AccountContext, url: &str, url
         .record_usage(
             ctx,
             "map",
+            legacy_credits::MAP_CREDITS,
             serde_json::json!({ "requests": 1, "urls_found": urls_found }),
             url.to_string(),
             None,
@@ -3476,6 +3509,7 @@ async fn record_search_usage(
         .record_usage(
             ctx,
             "search",
+            legacy_credits::SEARCH_CREDITS,
             serde_json::json!({ "requests": 1, "results": results }),
             format!("{url} q={q}"),
             None,
@@ -3959,6 +3993,7 @@ pub(crate) async fn perform_scrape(
         record_scrape_usage(
             state,
             ctx,
+            &request.formats,
             js_rendered,
             has_ai_summary,
             has_ai_extraction,
@@ -8386,6 +8421,7 @@ mod lifecycle_tests {
             .record_usage(
                 &ctx(),
                 "scrape",
+                1,
                 serde_json::json!({"pages_http": 1}),
                 "https://e.com".into(),
                 None,
@@ -8398,6 +8434,7 @@ mod lifecycle_tests {
         assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
         assert_eq!(events[0].data["operation"], "scrape");
         assert_eq!(events[0].data["units"]["pages_http"], 1);
+        assert_eq!(events[0].data["credits"], 1);
         assert!(events[0].data.get("job_id").is_none());
     }
 
@@ -8413,7 +8450,7 @@ mod lifecycle_tests {
             limits: None,
         };
         state
-            .record_usage(&ctx, "map", serde_json::json!({}), "m".into(), None)
+            .record_usage(&ctx, "map", 2, serde_json::json!({}), "m".into(), None)
             .await; // must not panic
     }
 
@@ -8422,7 +8459,17 @@ mod lifecycle_tests {
         let bus = ChannelBus::new();
         let mut state = test_state(&bus);
         let outbox = with_memory_lab(&mut state);
-        record_scrape_usage(&state, &ctx(), true, true, false, "https://e.com/x").await;
+        let formats = [ScrapeFormat::Markdown, ScrapeFormat::RawHtml];
+        record_scrape_usage(
+            &state,
+            &ctx(),
+            &formats,
+            true,
+            true,
+            false,
+            "https://e.com/x",
+        )
+        .await;
         let events = outbox.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "usage.recorded");
@@ -8431,7 +8478,10 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "scrape",
-                "units": {"pages_http": 0, "pages_browser": 1, "ai_summary": 1, "ai_extraction": 0},
+                // f2ab8d2: scrape_credits([markdown, rawhtml], true, false) = 1 + 5.
+                "credits": 6,
+                "units": {"pages_http": 0, "pages_browser": 1, "ai_summary": 1, "ai_extraction": 0,
+                          "feature_pages": 1},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com/x",
             })
@@ -8450,6 +8500,7 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "map",
+                "credits": 2,
                 "units": {"requests": 1, "urls_found": 17},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com",
@@ -8478,12 +8529,14 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "search",
+                "credits": 2,
                 "units": {"requests": 1, "results": 3},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com q=rust",
             })
         );
         assert_eq!(events[1].data["units"]["results"], 0);
+        lab_events::assert_contract_valid(&events);
     }
 
     #[tokio::test]
@@ -9372,6 +9425,7 @@ mod lifecycle_tests {
             lab_events::LabEvent::crawl_final_usage(
                 "j1",
                 ACCT,
+                0,
                 serde_json::json!({}),
                 String::new()
             )
@@ -10215,6 +10269,9 @@ mod lifecycle_tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].data["operation"], "crawl");
         assert_eq!(usage[0].data["units"]["pages_http"], 1);
+        assert_eq!(usage[0].data["units"]["feature_pages"], 0);
+        // f2ab8d2: crawl_credits(1, 0, 0, no features) = 1.
+        assert_eq!(usage[0].data["credits"], 1);
         assert_eq!(usage[0].data["job_id"], "j1");
         assert_eq!(events_of(&outbox, "job.failed").len(), 1);
         assert_eq!(
@@ -10356,8 +10413,13 @@ mod lifecycle_tests {
         assert_eq!(usage[0].data["operation"], "crawl");
         assert_eq!(
             usage[0].data["units"],
-            serde_json::json!({"pages_http": 1, "pages_browser": 2, "pages_ai": 1, "pages_ocr": 0})
+            serde_json::json!({"pages_http": 1, "pages_browser": 2, "pages_ai": 1, "pages_ocr": 0,
+                               "feature_pages": 0})
         );
+        // f2ab8d2: 1 http (1 credit) + 2 browser (2 credits each = 4) + 1
+        // AI-enriched page (10 credits surcharge) = 15. Not 3 * 12 = 36.
+        assert_eq!(usage[0].data["credits"], 15);
+        lab_events::assert_contract_valid(&usage);
         assert_eq!(
             usage[0].data["units"]["pages_http"].as_u64().unwrap()
                 + usage[0].data["units"]["pages_browser"].as_u64().unwrap(),
@@ -10374,11 +10436,80 @@ mod lifecycle_tests {
             lab_events::LabEvent::crawl_final_usage(
                 &job_id,
                 &acct,
+                0,
                 serde_json::json!({}),
                 String::new()
             )
             .id
         );
+    }
+
+    /// Transition release: a crawl with non-AI features and OCR'd pages
+    /// carries the pre-v2 `credits` and reports the per-feature surcharge
+    /// as `feature_pages` = pages x enabled non-AI features.
+    #[tokio::test]
+    async fn crawl_usage_carries_pre_v2_credits_and_feature_pages() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        running_job(&state, "feat", 3);
+        with_account(&state, "feat");
+        // metadata + markdown: 2 non-AI features.
+        let features = scrapix_core::FeaturesConfig::from_cli_args(
+            true, true, false, false, false, false, None,
+        );
+        state.update_job("feat", |j| {
+            j.config = Some(serde_json::json!({ "features": features }));
+        });
+        state.process_event("feat", &progress("feat", 3, 3, 0));
+        for (id, js) in [("m1", false), ("m2", false), ("m3", true)] {
+            state.process_event(
+                "feat",
+                &CrawlEvent::PageCrawled {
+                    job_id: "feat".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    status: 200,
+                    content_length: 0,
+                    duration_ms: 0,
+                    timestamp: 0,
+                    links_published: 0,
+                    url_message_id: id.into(),
+                    js_rendered: js,
+                    sitemap_pending: false,
+                },
+            );
+        }
+        for (id, ocr_pages) in [("m1", 0), ("m2", 2), ("m3", 0)] {
+            state.process_event(
+                "feat",
+                &CrawlEvent::DocumentIndexed {
+                    job_id: "feat".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    document_id: format!("d-{id}"),
+                    timestamp: 0,
+                    url_message_id: id.into(),
+                    ai_enriched: false,
+                    ocr_pages,
+                },
+            );
+        }
+        state
+            .finalize_job("feat", Finalize::Complete, Instant::now())
+            .await;
+        state.flush_to_db(&TerminalStore::default()).await;
+        let usage = events_of(&outbox, "usage.recorded");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(
+            usage[0].data["units"],
+            serde_json::json!({"pages_http": 2, "pages_browser": 1, "pages_ai": 0, "pages_ocr": 2,
+                               "feature_pages": 6})
+        );
+        // f2ab8d2: crawl_credits(2, 1, 0, 2 features) = 2 * (1 + 2) +
+        // 1 * (2 + 2) = 10, + ocr_credits(2) = 10: 20.
+        assert_eq!(usage[0].data["credits"], 20);
+        lab_events::assert_contract_valid(&outbox.events());
     }
 
     /// A decision computed up front is re-validated right before finalizing
@@ -10512,6 +10643,8 @@ mod lifecycle_tests {
         let usage = events_of(&outbox, "usage.recorded");
         assert_eq!(usage.len(), 1, "one charge");
         assert_eq!(usage[0].data["units"]["pages_http"], 3);
+        // f2ab8d2: crawl_credits(3, 0, 0, no features) = 3.
+        assert_eq!(usage[0].data["credits"], 3);
         assert_eq!(outbox.events().len(), 1, "no lifecycle email for a cancel");
         assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);
     }

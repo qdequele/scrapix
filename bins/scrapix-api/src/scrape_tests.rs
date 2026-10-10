@@ -96,6 +96,16 @@ fn charged(outbox: &lab_events::MemoryOutbox) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Pre-v2 `credits` of every `usage.recorded` event (transition release).
+fn credits(outbox: &lab_events::MemoryOutbox) -> Vec<i64> {
+    outbox
+        .events()
+        .iter()
+        .filter(|e| e.kind == "usage.recorded")
+        .map(|e| e.data["credits"].as_i64().expect("usage carries credits"))
+        .collect()
+}
+
 fn status_of(e: ApiError) -> StatusCode {
     e.into_response().status()
 }
@@ -132,9 +142,12 @@ async fn ai_options_asking_for_nothing_are_not_ai() {
     assert_eq!(
         charged(&outbox),
         vec![
-            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0})
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0,
+                               "feature_pages": 1})
         ]
     );
+    // f2ab8d2: scrape_credits([markdown], false, false) = 1.
+    assert_eq!(credits(&outbox), vec![1]);
 }
 
 #[tokio::test]
@@ -154,9 +167,12 @@ async fn a_failed_ai_call_is_not_billed() {
     assert_eq!(
         charged(&outbox),
         vec![
-            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0})
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0,
+                               "feature_pages": 1})
         ]
     );
+    // f2ab8d2: scrape_credits([markdown], false, false) = 1.
+    assert_eq!(credits(&outbox), vec![1]);
 }
 
 #[tokio::test]
@@ -177,9 +193,29 @@ async fn a_successful_ai_summary_is_billed() {
     assert_eq!(
         charged(&outbox),
         vec![
-            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 1, "ai_extraction": 0})
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 1, "ai_extraction": 0,
+                               "feature_pages": 1})
         ]
     );
+    // f2ab8d2: scrape_credits([markdown], true, false) = 1 + 5.
+    assert_eq!(credits(&outbox), vec![6]);
+}
+
+/// Transition release: the pre-v2 scrape formula counted feature formats
+/// (base formats are free); that count is the page's `feature_pages`.
+#[tokio::test]
+async fn feature_formats_are_reported_as_feature_pages_with_pre_v2_credits() {
+    let (_site, url) = site().await;
+    let bus = ChannelBus::new();
+    let (state, outbox) = test_state_with_lab(&bus);
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown", "links", "metadata", "html", "rawhtml", "content"]
+    }));
+    perform_scrape(&state, &ctx(), &req).await.unwrap();
+    assert_eq!(charged(&outbox)[0]["feature_pages"], 3);
+    // f2ab8d2: scrape_credits(3 feature formats, false, false) = 3.
+    assert_eq!(credits(&outbox), vec![3]);
+    lab_events::assert_contract_valid(&outbox.events());
 }
 
 #[tokio::test]

@@ -37,9 +37,9 @@ use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
-    billing, check_write_permission, extract_account_context, extract_domain, require_ai_provider,
-    run_ai_enrichment, AccountContext, AiOptions, AiRun, ApiError, AppState, ScrapeFormat,
-    ScrapeMetadata, ScrapeResponse,
+    billing, check_write_permission, extract_account_context, extract_domain, legacy_credits,
+    require_ai_provider, run_ai_enrichment, AccountContext, AiOptions, AiRun, ApiError, AppState,
+    ScrapeFormat, ScrapeMetadata, ScrapeResponse,
 };
 
 /// Default size cap for documents fetched by `/scrape` and uploaded to
@@ -186,17 +186,28 @@ pub(crate) struct DocumentJob<'a> {
     pub js_rendered: bool,
 }
 
+impl DocumentJob<'_> {
+    /// Pre-v2 credits of the document itself (before OCR), with the
+    /// delivered AI work: the `/scrape` formula over the requested formats.
+    fn credits(&self, ai_summary: bool, ai_extraction: bool) -> i64 {
+        legacy_credits::scrape_credits(&self.formats, ai_summary, ai_extraction)
+    }
+}
+
 /// Units of the document event. A document fetched by `/scrape` is a
 /// scraped page (the Lab prices `scrape` on `pages_http`/`pages_browser`),
 /// with the same keys as `record_scrape_usage` plus `documents`; an
 /// uploaded document (`parse`) is one document, with the same delivered-AI
-/// flags.
+/// flags. `feature_pages` is the requested feature-format count, as on
+/// `/scrape`.
 fn document_units(
     operation: &str,
+    formats: &[ScrapeFormat],
     js_rendered: bool,
     ai_summary: bool,
     ai_extraction: bool,
 ) -> serde_json::Value {
+    let feature_pages = legacy_credits::feature_format_count(formats);
     if operation == "scrape" {
         serde_json::json!({
             "pages_http": u8::from(!js_rendered),
@@ -204,24 +215,28 @@ fn document_units(
             "documents": 1,
             "ai_summary": u8::from(ai_summary),
             "ai_extraction": u8::from(ai_extraction),
+            "feature_pages": feature_pages,
         })
     } else {
         serde_json::json!({
             "documents": 1,
             "ai_summary": u8::from(ai_summary),
             "ai_extraction": u8::from(ai_extraction),
+            "feature_pages": feature_pages,
         })
     }
 }
 
 /// Usage events for one parsed document: the document itself (`units`, see
-/// `document_units`), plus its OCR pages (when any were billable) as a
-/// second event in the same write.
+/// `document_units`; `credits`, its pre-v2 price), plus its OCR pages (when
+/// any were billable) as a second event in the same write, at the pre-v2
+/// OCR page price.
 async fn record_document_usage(
     state: &AppState,
     ctx: &AccountContext,
     operation: &str,
     label: &str,
+    credits: i64,
     units: serde_json::Value,
     ocr_billable: u32,
 ) {
@@ -229,6 +244,7 @@ async fn record_document_usage(
         &ctx.account_id,
         ctx.api_key_id.as_deref(),
         operation,
+        credits,
         units,
         label.to_string(),
         None,
@@ -239,6 +255,7 @@ async fn record_document_usage(
             &ctx.account_id,
             ctx.api_key_id.as_deref(),
             "ocr",
+            legacy_credits::ocr_credits(u64::from(ocr_billable)),
             serde_json::json!({ "documents": ocr_billable, "pages_ocr": ocr_billable }),
             format!("{label} ({ocr_billable} OCR pages)"),
             None,
@@ -455,8 +472,23 @@ pub(crate) async fn document_response(
 
     // Usage: the document under its operation, OCR pages separately.
     if let Some(ctx) = account_ctx {
-        let units = document_units(job.operation, job.js_rendered, ai_summary, ai_extraction);
-        record_document_usage(state, ctx, job.operation, &job.label, units, ocr_billable).await;
+        let units = document_units(
+            job.operation,
+            &job.formats,
+            job.js_rendered,
+            ai_summary,
+            ai_extraction,
+        );
+        record_document_usage(
+            state,
+            ctx,
+            job.operation,
+            &job.label,
+            job.credits(ai_summary, ai_extraction),
+            units,
+            ocr_billable,
+        )
+        .await;
     }
 
     info!(
@@ -1070,7 +1102,8 @@ mod tests {
             &usage_ctx(),
             "parse",
             "upload://a.pdf",
-            document_units("parse", false, false, false),
+            4,
+            document_units("parse", &[], false, false, false),
             0,
         )
         .await;
@@ -1082,7 +1115,8 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "parse",
-                "units": {"documents": 1, "ai_summary": 0, "ai_extraction": 0},
+                "credits": 4,
+                "units": {"documents": 1, "ai_summary": 0, "ai_extraction": 0, "feature_pages": 0},
                 "provider_cost_micro_usd": 0,
                 "description": "upload://a.pdf",
             })
@@ -1098,24 +1132,28 @@ mod tests {
             &usage_ctx(),
             "scrape",
             "https://e.com/s.pdf",
-            document_units("scrape", false, false, false),
+            3,
+            document_units("scrape", &[], false, false, false),
             2,
         )
         .await;
         let events = outbox.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data["operation"], "scrape");
+        assert_eq!(events[0].data["credits"], 3);
         assert_eq!(events[0].data["units"]["pages_http"], 1);
         assert_eq!(
             events[1].data,
             serde_json::json!({
                 "operation": "ocr",
+                "credits": 10, // f2ab8d2: ocr_credits(2) = 2 * 5
                 "units": {"documents": 2, "pages_ocr": 2},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com/s.pdf (2 OCR pages)",
             })
         );
         assert_ne!(events[0].id, events[1].id);
+        crate::lab_events::assert_contract_valid(&events);
     }
 
     #[tokio::test]
@@ -1144,24 +1182,64 @@ mod tests {
         assert_eq!(events[0].data["operation"], "parse");
         assert_eq!(
             events[0].data["units"],
-            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 0})
+            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 0,
+                               "feature_pages": 0})
         );
+        // f2ab8d2: scrape_credits([], false, false) = 1.
+        assert_eq!(events[0].data["credits"], 1);
+    }
+
+    /// Transition release: a document's requested feature formats are its
+    /// `feature_pages`, and its `credits` are the pre-v2 scrape formula's.
+    #[tokio::test]
+    async fn document_feature_formats_are_feature_pages_with_pre_v2_credits() {
+        let bus = ChannelBus::new();
+        let (state, outbox) = crate::results::test_support::test_state_with_lab(&bus);
+        let job = DocumentJob {
+            operation: "parse",
+            label: "upload://t.csv".into(),
+            base_url: None,
+            fallback_title: None,
+            bytes: b"a,b\n1,2\n".to_vec(),
+            content_type: Some("text/csv".into()),
+            formats: vec![
+                ScrapeFormat::Markdown,
+                ScrapeFormat::Links,
+                ScrapeFormat::Content,
+            ],
+            include_links: false,
+            parsers: serde_json::from_str("{}").unwrap(),
+            ai: None,
+            status_code: 200,
+            js_rendered: false,
+        };
+        document_response(&state, &Some(usage_ctx()), job, Instant::now())
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["units"]["feature_pages"], 2);
+        // f2ab8d2: scrape_credits([markdown, links, content], false, false) = 2.
+        assert_eq!(events[0].data["credits"], 2);
+        crate::lab_events::assert_contract_valid(&events);
     }
 
     #[test]
     fn document_units_price_a_scrape_as_a_page_and_a_parse_as_a_document() {
         assert_eq!(
-            document_units("scrape", true, true, false),
+            document_units("scrape", &[], true, true, false),
             serde_json::json!({"pages_http": 0, "pages_browser": 1, "documents": 1,
-                               "ai_summary": 1, "ai_extraction": 0})
+                               "ai_summary": 1, "ai_extraction": 0, "feature_pages": 0})
         );
         assert_eq!(
-            document_units("parse", true, true, true),
-            serde_json::json!({"documents": 1, "ai_summary": 1, "ai_extraction": 1})
+            document_units("parse", &[ScrapeFormat::Markdown], true, true, true),
+            serde_json::json!({"documents": 1, "ai_summary": 1, "ai_extraction": 1,
+                               "feature_pages": 1})
         );
         assert_eq!(
-            document_units("parse", false, false, true),
-            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 1})
+            document_units("parse", &[], false, false, true),
+            serde_json::json!({"documents": 1, "ai_summary": 0, "ai_extraction": 1,
+                               "feature_pages": 0})
         );
     }
 
@@ -1192,8 +1270,9 @@ mod tests {
             events[0].data,
             serde_json::json!({
                 "operation": "scrape",
+                "credits": 1, // f2ab8d2: scrape_credits([], false, false)
                 "units": {"pages_http": 1, "pages_browser": 0, "documents": 1,
-                          "ai_summary": 0, "ai_extraction": 0},
+                          "ai_summary": 0, "ai_extraction": 0, "feature_pages": 0},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com/t.csv",
             })

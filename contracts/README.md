@@ -33,8 +33,13 @@ vendored `openapi.json`, the Lab's drift check fails until it re-vendors it.
   edit the vendored copy by hand.
 - `vendor/lab/lab-events.schema.json`: the events contract (spec: Lab
   platform contract v2 §4) every engine reports against at
-  `POST {LAB_URL}/internal/events`: `usage.recorded` carries raw `units` and
-  `provider_cost_micro_usd`, never credits; the Lab prices them. Owned by
+  `POST {LAB_URL}/internal/events`: `usage.recorded` carries raw `units`
+  (including `feature_pages`, the per-feature surcharge) and
+  `provider_cost_micro_usd` (always 0 from Scrapix: the engine knows token
+  counts, not provider prices). For the transition release Scrapix also
+  sends the deprecated `credits` (its pre-v2 price,
+  `bins/scrapix-api/src/legacy_credits.rs`), which the Lab debits as
+  authoritative for product `scrapix`; both go next release. Owned by
   `meilisearch/lab` (`contracts/lab-events.schema.json`).
 
 Both are byte copies of the Lab's contract v2 at commit
