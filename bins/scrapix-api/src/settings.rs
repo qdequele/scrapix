@@ -199,6 +199,9 @@ impl EngineSettings {
                     }
                     None => return err("SCRAPIX_MODE=hosted requires LAB_SERVICE_TOKEN (the Lab presents it when it calls this engine)"),
                 };
+                if meilisearch.is_some() {
+                    tracing::warn!("MEILISEARCH_URL is ignored in hosted mode: tenants use the Meilisearch targets registered in the Lab");
+                }
                 let lab = LabSettings {
                     url,
                     instance_id,
@@ -216,7 +219,7 @@ impl EngineSettings {
                     mode,
                     auth: AuthSetting::Lab,
                     store: store_from(database_url)?,
-                    meilisearch,
+                    meilisearch: None,
                     lab: Some(lab),
                 })
             }
@@ -544,6 +547,19 @@ mod tests {
     #[test]
     fn unknown_mode_refuses() {
         assert!(EngineSettings::resolve(&args(&[("SCRAPIX_MODE", "cloud")])).is_err());
+    }
+
+    #[test]
+    fn hosted_ignores_the_operator_meilisearch() {
+        let s = EngineSettings::resolve(&args(&hosted(&[
+            ("MEILISEARCH_URL", "http://ops:7700"),
+            ("MEILISEARCH_API_KEY", "ops"),
+        ])))
+        .unwrap();
+        assert!(
+            s.meilisearch.is_none(),
+            "a tenant must never land in the operator's Meilisearch"
+        );
     }
 
     #[test]

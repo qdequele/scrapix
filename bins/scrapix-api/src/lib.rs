@@ -6754,7 +6754,6 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 job_store: store,
                 meili: Arc::new(meili::LabMeilisearchResolver {
                     lab: lab_api.clone(),
-                    server: settings.meilisearch.clone(),
                 }),
                 lab_api: Some(lab_api),
             })

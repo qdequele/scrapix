@@ -56,13 +56,10 @@ impl MeilisearchResolver for EnvResolver {
 }
 
 /// Hosted: the account's engines as the Lab reports them
-/// (`GET /internal/accounts/{id}/meilisearch`), falling back to the
-/// operator's own server only when its URL matches the one being looked up
-/// (never as a tenant's default — a tenant's crawl must not land in the
-/// operator's Meilisearch).
+/// (`GET /internal/accounts/{id}/meilisearch`), and nothing else: a
+/// tenant's crawl never lands in the operator's Meilisearch.
 pub(crate) struct LabMeilisearchResolver {
     pub(crate) lab: std::sync::Arc<crate::lab_client::LabClient>,
-    pub(crate) server: Option<MeiliTarget>,
 }
 
 fn lab_err(e: crate::lab_client::LabError) -> ApiError {
@@ -72,13 +69,6 @@ fn lab_err(e: crate::lab_client::LabError) -> ApiError {
         "service_unavailable",
     )
     .with_retry_after(5)
-}
-
-/// Table-miss decision, factored out so it can be unit tested without a
-/// database: fall back to the operator's own server only when its URL is
-/// the one being looked up.
-fn server_fallback(server: &Option<MeiliTarget>, url: &str) -> Option<MeiliTarget> {
-    server.as_ref().filter(|t| same_url(&t.url, url)).cloned()
 }
 
 #[async_trait::async_trait]
@@ -98,14 +88,12 @@ impl MeilisearchResolver for LabMeilisearchResolver {
         url: &str,
     ) -> Result<Option<MeiliTarget>, ApiError> {
         let Some(account) = account_id else {
-            return Ok(server_fallback(&self.server, url));
+            return Ok(None);
         };
-        let found = self
-            .lab
+        self.lab
             .meilisearch(account, Some(url))
             .await
-            .map_err(lab_err)?;
-        Ok(found.or_else(|| server_fallback(&self.server, url)))
+            .map_err(lab_err)
     }
     fn missing_message(&self) -> &'static str {
         "No Meilisearch engine configured. Add one in Settings."
@@ -196,7 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lab_resolver_default_url_and_fallback() {
+    async fn hosted_resolver_never_falls_back_to_the_operator_server() {
         use crate::lab_client::{
             testing::{FakeLab, INSTANCE_ID, SECRET},
             LabClient,
@@ -207,13 +195,8 @@ mod tests {
             format!("{acct}|"),
             serde_json::json!({"id": "e", "url": "http://m:7700", "api_key": "k"}),
         );
-        let server = Some(MeiliTarget {
-            url: "http://ops:7700".into(),
-            api_key: Some("ops".into()),
-        });
         let r = LabMeilisearchResolver {
             lab: std::sync::Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET)),
-            server,
         };
         assert_eq!(
             r.default_target(Some(acct)).await.unwrap().unwrap().url,
@@ -223,23 +206,29 @@ mod tests {
         assert_eq!(
             r.target_for_url(Some(acct), "http://ops:7700/")
                 .await
-                .unwrap()
-                .unwrap()
-                .api_key
-                .as_deref(),
-            Some("ops")
+                .unwrap(),
+            None,
+            "a URL the Lab does not know is unknown"
         );
         assert_eq!(
-            r.target_for_url(None, "http://ops:7700")
-                .await
-                .unwrap()
-                .unwrap()
-                .url,
-            "http://ops:7700"
+            r.target_for_url(None, "http://ops:7700").await.unwrap(),
+            None
         );
-        lab.set_down(true);
         let other = "22222222-2222-2222-2222-222222222222";
-        let err = r.default_target(Some(other)).await.unwrap_err();
+        assert_eq!(
+            r.default_target(Some(other)).await.unwrap(),
+            None,
+            "no target, no fallback"
+        );
+        let err = resolve_crawl_meilisearch(&r, Some(other), Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "validation_error");
+        assert!(err.error.contains("Settings"), "{}", err.error);
+        lab.set_down(true);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let third = "33333333-3333-3333-3333-333333333333";
+        let err = r.default_target(Some(third)).await.unwrap_err();
         let resp = axum::response::IntoResponse::into_response(err);
         assert_eq!(resp.status(), 503);
         assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
@@ -249,16 +238,5 @@ mod tests {
     fn same_url_ignores_trailing_slash() {
         assert!(same_url("http://a:1/", "http://a:1"));
         assert!(!same_url("http://a:1", "http://b:1"));
-    }
-
-    #[test]
-    fn server_fallback_only_matches_same_url() {
-        let server = Some(t("http://server:7700", Some("serverkey")));
-        assert_eq!(
-            server_fallback(&server, "http://server:7700/"),
-            Some(t("http://server:7700", Some("serverkey")))
-        );
-        assert_eq!(server_fallback(&server, "http://tenant:7700"), None);
-        assert_eq!(server_fallback(&None, "http://server:7700"), None);
     }
 }
