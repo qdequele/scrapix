@@ -101,9 +101,10 @@ To run the engine in **hosted** mode against a local Lab, start the Lab from a
 `scrapix_engine` database) and switch the API to the commented hosted block
 in `docker-compose.yml` (or in `.env.example` for native `just dev`):
 `SCRAPIX_MODE=hosted`, `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`,
-`LAB_SERVICE_TOKEN` and a Postgres `DATABASE_URL` on `scrapix_engine`. Mint
-`LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET` on the Lab first
-(`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=dev URL=http://localhost:8080`).
+`LAB_SERVICE_TOKEN` and a Postgres `DATABASE_URL` on `scrapix_engine`. Pick
+the `LAB_SERVICE_TOKEN` first, then mint the engine's credentials on the Lab
+with it (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=dev URL=http://localhost:8080 CREDENTIAL=<LAB_SERVICE_TOKEN>`),
+which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once.
 
 Then start services natively:
 
@@ -147,7 +148,7 @@ init-topics:
 
 For running Docker Compose in production on a single server:
 
-1. **Change default secrets** — Update `MEILI_MASTER_KEY`, `CLICKHOUSE_PASSWORD` and `SCRAPIX_ADMIN_KEY` (the dev value `dev-admin-key-change-me` is public). In hosted mode, also set `LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET` (minted by the Lab) and `LAB_SERVICE_TOKEN` (the Lab's token for calling the engine)
+1. **Change default secrets** — Update `MEILI_MASTER_KEY`, `CLICKHOUSE_PASSWORD` and `SCRAPIX_ADMIN_KEY` (the dev value `dev-admin-key-change-me` is public). In hosted mode, also set `LAB_SERVICE_TOKEN` (the Lab's token for calling the engine, passed to the Lab at mint time as `CREDENTIAL=`) and the `LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET` that `bin/rails lab:hosted_engine:create ... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints
 2. **Add a reverse proxy** — Use Caddy, Nginx, or Traefik in front of the API
 3. **Enable TLS** — Via the reverse proxy
 4. **Set resource limits** — Add `deploy.resources.limits` to each service

@@ -25,10 +25,10 @@ The hosted engine **refuses to start** without `LAB_URL`, `LAB_INSTANCE_ID`, `LA
 
 | Variable | Where | Default | Description |
 |----------|-------|---------|-------------|
-| `LAB_URL` | engine | none | **Required (hosted).** The Lab's base URL, e.g. `https://lab.meilisearch.com` (no path). Events go to `{LAB_URL}/internal/events`; the rest of the boundary to `{LAB_URL}/internal/*`. |
-| `LAB_INSTANCE_ID` | engine | none | **Required (hosted).** The uuid the Lab's operator minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=...`). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
-| `LAB_INSTANCE_SECRET` | engine | none | **Required with `LAB_INSTANCE_ID`.** 64 hex characters minted with the id. Bearer token on `/internal/*` calls, HMAC key on event batches. Rotating it in the Lab keeps the old value valid for 10 minutes. |
-| `LAB_SERVICE_TOKEN` | engine and Lab | none | **Required (hosted).** The token the Lab presents (with `X-Scrapix-Account-Id`) when it calls this engine for an account; at least 32 characters, identical on both sides. Never sent to the Lab. |
+| `LAB_URL` | engine | none | **Required (hosted).** The Lab's base URL, e.g. `https://lab.meilisearch.com` (no path), as printed by the Lab's mint task. Events go to `{LAB_URL}/internal/events`; the rest of the boundary to `{LAB_URL}/internal/*`. |
+| `LAB_INSTANCE_ID` | engine | none | **Required (hosted).** The uuid the Lab's operator minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>`, which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
+| `LAB_INSTANCE_SECRET` | engine | none | **Required with `LAB_INSTANCE_ID`.** 64 hex characters minted with the id. Bearer token on `/internal/*` calls, HMAC key on event batches. Rotate it with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` on the Lab; the old value stays valid for 10 minutes. |
+| `LAB_SERVICE_TOKEN` | engine | none | **Required (hosted).** The token the Lab presents (with `X-Scrapix-Account-Id`) when it calls this engine for an account; at least 32 characters (`openssl rand -hex 32`). Generate it first: it is passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). The engine never sends it to the Lab. |
 | `LAB_EVENTS_URL` | engine | none | **Deprecated.** Fallback for `LAB_URL` (the old `…/internal/events` URL). |
 | `LAB_EVENTS_SECRET` | engine | none | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |
 

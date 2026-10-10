@@ -6718,7 +6718,8 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 ),
                 Ok(me) => anyhow::bail!(
                     "LAB_INSTANCE_ID {} is a {} {} deployment; this engine needs a hosted scrapix \
-                     credential (bin/rails lab:hosted_engine:create PRODUCT=scrapix on the Lab)",
+                     credential (bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... \
+                     URL=... CREDENTIAL=<LAB_SERVICE_TOKEN> on the Lab)",
                     me.instance_id,
                     me.kind,
                     me.product

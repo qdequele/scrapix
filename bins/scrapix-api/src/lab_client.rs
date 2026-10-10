@@ -274,7 +274,7 @@ pub(crate) fn log_lab_error(e: &LabError, during: &str) {
         LabError::CredentialsRejected => tracing::error!(
             error = %e,
             during,
-            "The Lab rejected this engine's LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: re-issue them on the Lab with bin/rails lab:hosted_engine:create"
+            "The Lab rejected this engine's LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: rotate the secret on the Lab (bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>) or mint new credentials (bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>)"
         ),
         _ => tracing::warn!(error = %e, during, "Lab call failed"),
     }

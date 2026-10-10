@@ -11,18 +11,21 @@ without the Lab, patch the API to `SCRAPIX_MODE=standalone` with
 
 | Key | Where it comes from |
 |-----|---------------------|
-| `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | Minted by the Lab for this engine deployment: on the Lab, run `bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<this API's public URL>`; it prints `instance_id`, `secret` (64 hex, shown once) and `lab_url`. Rotate with the same task; the old secret stays valid for 10 minutes. |
-| `LAB_SERVICE_TOKEN` | `openssl rand -hex 32`; the same value on the Lab (`LAB_SERVICE_TOKEN`). The Lab presents it when it calls this engine for an account (saved-config cron). |
+| `LAB_SERVICE_TOKEN` | Generate it first: `openssl rand -hex 32`. The Lab presents it when it calls this engine for an account (saved-config cron); it is passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). |
+| `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` | Minted by the Lab for this engine deployment: on the Lab, run `bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<this API's public URL> CREDENTIAL=<LAB_SERVICE_TOKEN>`; it prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` (64 hex) once. Rotate the secret with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>`; the old secret stays valid for 10 minutes. |
 | `MEILISEARCH_API_KEY`, `POSTGRES_PASSWORD`, `CLICKHOUSE_PASSWORD` | Your infrastructure. |
 
 `LAB_URL` lives in the ConfigMap (`base/config/configmap.yaml`): the Lab's
-public base URL, the `lab_url` the mint task printed.
+public base URL, the `LAB_URL` the mint task printed.
 
 ```bash
+LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+# on the Lab: bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> \
+#   URL=<this API's public URL> CREDENTIAL=$LAB_SERVICE_TOKEN
 kubectl -n scrapix create secret generic scrapix-secrets \
-  --from-literal=LAB_INSTANCE_ID=<instance_id> \
-  --from-literal=LAB_INSTANCE_SECRET=<secret> \
-  --from-literal=LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
+  --from-literal=LAB_INSTANCE_ID=<LAB_INSTANCE_ID printed by the Lab> \
+  --from-literal=LAB_INSTANCE_SECRET=<LAB_INSTANCE_SECRET printed by the Lab> \
+  --from-literal=LAB_SERVICE_TOKEN=$LAB_SERVICE_TOKEN \
   --from-literal=MEILISEARCH_API_KEY=... \
   --from-literal=POSTGRES_PASSWORD=... \
   --from-literal=CLICKHOUSE_PASSWORD=...

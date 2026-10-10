@@ -21,7 +21,7 @@ script) runs from a `meilisearch/lab` checkout, not from this repo.
 
 - [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
 - [ ] **Local dev: refresh an existing `.env`.** `just dev` in this repo now runs the engine **standalone** (`.env.example` sets `SCRAPIX_MODE=standalone` and a dev `SCRAPIX_ADMIN_KEY`); an `.env` copied from the old hosted dev setup still points `DATABASE_URL` at the Rails database and sets `SCRAPIX_MODE=hosted`. Re-copy `.env.example`, or use its commented "Hosted against a local Lab" block with the Lab running from a `meilisearch/lab` checkout.
-- [ ] **Set `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API (the instance id and secret are minted by the Lab with `bin/rails lab:hosted_engine:create`; `LAB_SERVICE_TOKEN` is the same value on the Lab) — the hosted engine refuses to start without them, and refuses a Lab that predates contract v2 (no `GET /internal/instances/me`), so deploy the Lab first. `LAB_EVENTS_SECRET` is ignored now (warned at boot): remove it. Dashboards filtering `scrapix_lab_requests_total` on `endpoint="ping"` must switch to `endpoint="instances_me"`, and `scrapix_lab_events_delivered_total` gains `outcome="dropped"` (events never acknowledged for 24 h). If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
+- [ ] **Set `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API (generate `LAB_SERVICE_TOKEN` first, then mint the instance id and secret on the Lab with `bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>`; see section A) — the hosted engine refuses to start without them, and refuses a Lab that predates contract v2 (no `GET /internal/instances/me`), so deploy the Lab first. `LAB_EVENTS_SECRET` is ignored now (warned at boot): remove it. Dashboards filtering `scrapix_lab_requests_total` on `endpoint="ping"` must switch to `endpoint="instances_me"`, and `scrapix_lab_events_delivered_total` gains `outcome="dropped"` (events never acknowledged for 24 h). If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
 - [ ] **`GET /ws/job/{id}` now requires auth.** The console's live job updates need the `scrapix_session` cookie to be readable on a parent domain shared with the API — set `SESSION_COOKIE_DOMAIN` (e.g. `scrapix.meilisearch.com`, which covers `api.scrapix.meilisearch.com`) before deploying, or the console's WebSocket connection will be rejected.
 
 ## Engine ↔ Lab boundary rollout
@@ -48,20 +48,23 @@ phase 1".)
 ### A. Credentials
 
 ```bash
-# on the Lab (meilisearch/lab checkout), once per engine deployment:
-bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<the engine's public URL>
-# prints instance_id, secret (64 hex, shown once) and lab_url
+openssl rand -hex 32   # LAB_SERVICE_TOKEN: generate it first
 
-openssl rand -hex 32   # LAB_SERVICE_TOKEN
+# on the Lab (meilisearch/lab checkout), once per engine deployment:
+bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> \
+  URL=<the engine's public URL> CREDENTIAL=<LAB_SERVICE_TOKEN>
+# prints LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET (64 hex) once
 ```
 
 `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` come from the Lab, not from
-`openssl`: set the printed `instance_id` and `secret` on the engine
-(`scrapix-api`). The engine presents them on every `{LAB_URL}/internal/*` call
-(`X-Lab-Instance-Id` + `Authorization: Bearer <LAB_INSTANCE_SECRET>`) and signs
-its event batches with the secret. `LAB_SERVICE_TOKEN` is needed with an
-**identical value** on the Lab and on the engine: it authenticates Lab →
-engine calls only (the saved-config cron).
+`openssl`: set the printed values on the engine (`scrapix-api`). The engine
+presents them on every `{LAB_URL}/internal/*` call (`X-Lab-Instance-Id` +
+`Authorization: Bearer <LAB_INSTANCE_SECRET>`) and signs its event batches
+with the secret. Rotate the secret with
+`bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays
+valid for 10 minutes). `LAB_SERVICE_TOKEN` is set on the engine and passed to
+the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine): it
+authenticates Lab → engine calls only (the saved-config cron).
 The engine also needs `LAB_URL`, the Lab's base URL (e.g.
 `https://lab.meilisearch.com`, or `http://127.0.0.1:8091` when both run on
 the box); events go to `{LAB_URL}/internal/events`. The hosted engine

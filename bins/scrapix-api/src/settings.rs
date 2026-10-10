@@ -106,7 +106,7 @@ fn instance_credentials(args: &Args) -> Result<(String, String), ConfigError> {
     let id = non_empty(&args.lab_instance_id);
     let secret = non_empty(&args.lab_instance_secret);
     match (id, secret) {
-        (None, _) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_ID (minted by the Lab: bin/rails lab:hosted_engine:create)"),
+        (None, _) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_ID (minted by the Lab: bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>)"),
         (_, None) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_SECRET (minted with LAB_INSTANCE_ID by the Lab)"),
         (Some(id), Some(secret)) => {
             if uuid::Uuid::parse_str(&id).is_err() {

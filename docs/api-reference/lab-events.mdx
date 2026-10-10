@@ -229,9 +229,9 @@ The engine exposes the outbox state at `GET /metrics`:
 | Variable | Where | Description |
 |----------|-------|-------------|
 | `LAB_URL` | engine | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
-| `LAB_INSTANCE_ID` | engine | The uuid the Lab minted for this deployment. Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
-| `LAB_INSTANCE_SECRET` | engine | The 64 hex characters minted with the id: Bearer token on `/internal/*`, HMAC key on event batches. Refused in standalone mode. |
-| `LAB_SERVICE_TOKEN` | engine, Lab | Inbound only: the Bearer token the Lab presents when it calls the engine (saved-config cron), at least 32 characters. Same value on both sides. |
+| `LAB_INSTANCE_ID` | engine | The uuid the Lab minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
+| `LAB_INSTANCE_SECRET` | engine | The 64 hex characters minted with the id: Bearer token on `/internal/*`, HMAC key on event batches. Rotate with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays valid for 10 minutes). Refused in standalone mode. |
+| `LAB_SERVICE_TOKEN` | engine | Inbound only: the Bearer token the Lab presents when it calls the engine (saved-config cron), at least 32 characters. Generated first and passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). |
 | `LAB_EVENTS_URL` | engine | Deprecated fallback for `LAB_URL` (the old `…/internal/events` URL). |
 | `LAB_EVENTS_SECRET` | engine | Deprecated, ignored (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |
 | `LAB_CRON_ENABLED` | Lab | `true` runs the saved-config cron. Off by default. |

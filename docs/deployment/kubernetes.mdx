@@ -156,18 +156,26 @@ images:
 Update secrets before deploying to production:
 
 ```bash
+LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+# Mint this engine's credentials on the Lab with that token, then use the
+# LAB_INSTANCE_ID / LAB_INSTANCE_SECRET it prints:
+#   bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> \
+#     URL=<this API's public URL> CREDENTIAL=$LAB_SERVICE_TOKEN
 kubectl -n scrapix create secret generic scrapix-secrets \
   --from-literal=MEILISEARCH_API_KEY=your-key \
   --from-literal=POSTGRES_PASSWORD=your-password \
   --from-literal=CLICKHOUSE_PASSWORD=your-password \
-  --from-literal=LAB_INSTANCE_ID=<instance_id from the Lab> \
-  --from-literal=LAB_INSTANCE_SECRET=<secret from the Lab> \
-  --from-literal=LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+  --from-literal=LAB_INSTANCE_ID=<LAB_INSTANCE_ID printed by the Lab> \
+  --from-literal=LAB_INSTANCE_SECRET=<LAB_INSTANCE_SECRET printed by the Lab> \
+  --from-literal=LAB_SERVICE_TOKEN=$LAB_SERVICE_TOKEN
 ```
 
-`LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` are minted by the Lab for this
-deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=<this API's public URL>`
-on the Lab); `LAB_SERVICE_TOKEN` must be the same value on the Lab.
+Generate `LAB_SERVICE_TOKEN` first: it is passed to the Lab at mint time as
+`CREDENTIAL=` (the Lab stores it per engine and presents it when it calls this
+engine). The mint task prints `LAB_URL`, `LAB_INSTANCE_ID` and
+`LAB_INSTANCE_SECRET` once; rotate the secret with
+`bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays
+valid for 10 minutes).
 
 The hosted API needs `LAB_URL` (the Lab's public base URL, in the `scrapix-config` ConfigMap) and refuses to start without `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`; see `deploy/kubernetes/README.md`. The Lab is deployed from [`meilisearch/lab`](https://github.com/meilisearch/lab), not from these manifests. The API uses its own `scrapix_engine` database (created by the Postgres init script), never the Lab's, and does not read `JWT_SECRET`. See [Environment Variables](/configuration/environment-variables#lab-boundary-hosted-only).
 

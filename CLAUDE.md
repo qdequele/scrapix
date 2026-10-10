@@ -111,8 +111,9 @@ just stop         # Stop everything (services + infra)
   `meilisearch/lab` checkout (Rails on :8081, Postgres on :5433 with a
   `scrapix_engine` database) and use the commented "Hosted against a local
   Lab" block in `.env.example` (`SCRAPIX_MODE=hosted`, `LAB_URL`,
-  `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` (minted on the Lab with
-  `bin/rails lab:hosted_engine:create`), `LAB_SERVICE_TOKEN`,
+  `LAB_SERVICE_TOKEN` (pick it first), `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`
+  (minted on the Lab with `bin/rails lab:hosted_engine:create PRODUCT=scrapix
+  REGION=dev URL=http://localhost:8080 CREDENTIAL=<LAB_SERVICE_TOKEN>`),
   `DATABASE_URL=…/scrapix_engine`).
 
 **Individual service commands** (when you only need one):
@@ -644,8 +645,8 @@ GROUP BY date ORDER BY date;
 | `CRAWL_BROWSER_AVAILABLE` | API: whether the crawlers can render pages; unset = unknown (browser crawls accepted), `false` = `POST /crawl` refuses `crawler_type: browser`. `scrapix all` sets it from `BROWSER_RENDER` |
 | `LAB_URL` | API, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone |
 | `LAB_EVENTS_URL` | **Deprecated** fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Do not set it |
-| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API, hosted only, required; refused in standalone. Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=...`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
-| `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars, same value on the Lab), inbound only: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron). Never sent to the Lab |
+| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API, hosted only, required; refused in standalone. Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` once; rotate with `lab:hosted_engine:rotate ID=`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
+| `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars; generated first and passed to the Lab at mint time as `CREDENTIAL=`, stored per engine), inbound only: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron). Never sent to the Lab |
 | `LAB_EVENTS_SECRET` | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET` |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |

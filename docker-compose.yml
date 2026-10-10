@@ -191,9 +191,10 @@ services:
       # there: Rails on :8081, Postgres on :5433 with a `scrapix_engine`
       # database). On plain Linux (not OrbStack / Docker Desktop) also add
       # `extra_hosts: ["host.docker.internal:host-gateway"]` to this service.
-      # Mint LAB_INSTANCE_ID / LAB_INSTANCE_SECRET on the Lab
-      # (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=dev
-      # URL=http://localhost:8080`). The API then ignores MEILISEARCH_URL:
+      # Mint LAB_INSTANCE_ID / LAB_INSTANCE_SECRET on the Lab with the
+      # LAB_SERVICE_TOKEN below (`bin/rails lab:hosted_engine:create
+      # PRODUCT=scrapix REGION=dev URL=http://localhost:8080
+      # CREDENTIAL=<LAB_SERVICE_TOKEN>`). The API then ignores MEILISEARCH_URL:
       # tenants use the Meilisearch targets registered in the Lab.
       # Replace the three standalone lines above with:
       # SCRAPIX_MODE: hosted

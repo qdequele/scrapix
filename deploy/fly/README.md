@@ -82,23 +82,27 @@ for app in scrapix-api scrapix-frontier scrapix-worker-crawler scrapix-worker-co
     --app "$app"
 done
 
-# API-only secrets:
+# API-only secrets. Generate LAB_SERVICE_TOKEN first and mint this engine's
+# credentials on the Lab (deployed from meilisearch/lab) with it:
+#   LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+#   bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> \
+#     URL=https://scrapix-api.fly.dev CREDENTIAL=$LAB_SERVICE_TOKEN
+# It prints LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET once.
 flyctl secrets set \
   DATABASE_URL=... \
   OPENAI_API_KEY=... \
-  LAB_URL=https://<lab-host> \
-  LAB_INSTANCE_ID=<instance_id from the Lab> \
-  LAB_INSTANCE_SECRET=<secret from the Lab> \
-  LAB_SERVICE_TOKEN=$(openssl rand -hex 32) \
+  LAB_URL=<LAB_URL printed by the Lab> \
+  LAB_INSTANCE_ID=<LAB_INSTANCE_ID printed by the Lab> \
+  LAB_INSTANCE_SECRET=<LAB_INSTANCE_SECRET printed by the Lab> \
+  LAB_SERVICE_TOKEN=$LAB_SERVICE_TOKEN \
   --app scrapix-api
 
 # DATABASE_URL is the engine's OWN database (`scrapix_engine`), never the
 # Lab's; the engine does not read JWT_SECRET (the Lab verifies sessions).
 # The hosted API refuses to start without LAB_URL, LAB_INSTANCE_ID,
-# LAB_INSTANCE_SECRET and LAB_SERVICE_TOKEN (>= 32 chars). Mint the instance
-# id and secret on the Lab (deployed from meilisearch/lab):
-#   bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=<region> URL=https://scrapix-api.fly.dev
-# The Lab needs the SAME LAB_SERVICE_TOKEN — see
+# LAB_INSTANCE_SECRET and LAB_SERVICE_TOKEN (>= 32 chars). The Lab keeps
+# LAB_SERVICE_TOKEN as the CREDENTIAL= it was minted with; rotate the secret
+# with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` — see
 # deploy/kubernetes/README.md and docs/operations/crawl-engine-rollout.mdx. Stripe is configured on the
 # Lab only; the engine never reads STRIPE_SECRET_KEY.
 ```
