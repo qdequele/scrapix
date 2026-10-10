@@ -72,9 +72,12 @@ impl std::fmt::Display for LabError {
 /// `GET /internal/instances/me` (spec §3.6): what the Lab knows about this
 /// deployment. Called once at boot to confirm the credentials and log the
 /// identity; `kind` is `"hosted"` (there is no other kind of engine).
+/// `instance_id` and `region` are null on the Lab's legacy service-token
+/// path (no deployment row).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct InstanceInfo {
-    pub instance_id: String,
+    #[serde(default)]
+    pub instance_id: Option<String>,
     pub kind: String,
     pub product: String,
     #[serde(default)]
@@ -971,7 +974,7 @@ mod tests {
             .instances_me()
             .await
             .unwrap();
-        assert_eq!(me.instance_id, INSTANCE_ID);
+        assert_eq!(me.instance_id.as_deref(), Some(INSTANCE_ID));
         assert_eq!(me.kind, "hosted");
         assert_eq!(me.product, "scrapix");
         assert_eq!(me.region.as_deref(), Some("eu-west-1"));
@@ -994,6 +997,21 @@ mod tests {
             LabError::CredentialsRejected,
             "the id is part of the credential"
         );
+    }
+
+    #[test]
+    fn instances_me_accepts_a_null_instance_id_and_region() {
+        // The Lab's legacy service-token path has no deployment row.
+        let me: InstanceInfo = serde_json::from_value(json!({
+            "instance_id": null, "kind": "hosted", "product": "scrapix",
+            "region": null, "lab_url": "https://lab.example"
+        }))
+        .unwrap();
+        assert_eq!(me.instance_id, None);
+        assert_eq!(me.region, None);
+        assert_eq!(me.kind, "hosted");
+        assert_eq!(me.product, "scrapix");
+        assert_eq!(me.lab_url, "https://lab.example");
     }
 
     #[tokio::test]

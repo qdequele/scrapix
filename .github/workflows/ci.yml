@@ -145,3 +145,5 @@ jobs:
       - run: contracts/check-drift.sh
         env:
           GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          # TODO: drop LAB_REF once meilisearch/lab#17 merges (then compare against main).
+          LAB_REF: 42c282ce6005b14b1705711680fa70c0858e78ac

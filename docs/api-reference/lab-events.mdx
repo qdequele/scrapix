@@ -17,8 +17,9 @@ machine-readable schema is owned by the Lab
 a byte copy at
 [`contracts/vendor/lab/lab-events.schema.json`](https://github.com/qdequele/scrapix/blob/main/contracts/vendor/lab/lab-events.schema.json),
 tests the engine's events against it, and `contracts/check-drift.sh`
-(`just check-contracts`) fails when the copy drifts from the Lab's `main`
-(until the Lab publishes the file, the check prints a notice instead).
+(`just check-contracts`) fails when the copy drifts from the Lab's `main`.
+Until meilisearch/lab#17 (contract v2) merges, CI pins the check to that PR's
+commit with `LAB_REF`.
 
 <Note>
 Hosted mode only. A **standalone** engine emits no lab events and refuses

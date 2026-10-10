@@ -6711,7 +6711,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             match lab_api.instances_me().await {
                 Ok(me) if me.kind == "hosted" && me.product == "scrapix" => info!(
                     url = %lab_cfg.url,
-                    instance_id = %me.instance_id,
+                    instance_id = me.instance_id.as_deref().unwrap_or("-"),
                     region = me.region.as_deref().unwrap_or("-"),
                     lab_url = %me.lab_url,
                     "Lab reachable; hosted Scrapix engine"
@@ -6720,7 +6720,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                     "LAB_INSTANCE_ID {} is a {} {} deployment; this engine needs a hosted scrapix \
                      credential (bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... \
                      URL=... CREDENTIAL=<LAB_SERVICE_TOKEN> on the Lab)",
-                    me.instance_id,
+                    me.instance_id.as_deref().unwrap_or(&lab_cfg.instance_id),
                     me.kind,
                     me.product
                 ),

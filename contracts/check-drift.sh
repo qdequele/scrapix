@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fails when a vendored contract differs from its owner's copy on main.
+# Fails when a vendored contract differs from its owner's copy on main (or on
+# $LAB_REF when set: a branch, tag or commit of meilisearch/lab).
 # Owner copies come from $LAB_SRC (a local checkout of meilisearch/lab) when
 # set, else from GitHub via `gh api` (meilisearch/lab is private, so this needs
 # GH_TOKEN or LAB_REPO_TOKEN). With neither, the check is skipped (exit 0).
@@ -23,6 +24,10 @@ if [ -z "${LAB_SRC:-}" ]; then
     exit 0
   fi
 fi
+lab="meilisearch/lab ${LAB_REF:-main}"
+ref_query=""
+if [ -n "${LAB_REF:-}" ]; then ref_query="?ref=$LAB_REF"; fi
+# TODO: remove NOT_YET_PUBLISHED and its skip once meilisearch/lab#17 merges (main then has lab-events.schema.json).
 # The one owner file the Lab has not published yet: it alone may be absent
 # (a missing file or an HTTP 404), and only that is skipped. Any other
 # failure, for any file, is fatal.
@@ -40,19 +45,19 @@ for f in "${FILES[@]}"; do
     fi
     cp "$LAB_SRC/contracts/$f" "$owner"
   else
-    if ! gh api "repos/meilisearch/lab/contents/contracts/$f" -H 'Accept: application/vnd.github.raw' > "$owner" 2> "$err"; then
+    if ! gh api "repos/meilisearch/lab/contents/contracts/$f$ref_query" -H 'Accept: application/vnd.github.raw' > "$owner" 2> "$err"; then
       if [ "$f" = "$NOT_YET_PUBLISHED" ] && grep -qE '404|Not Found' "$err"; then
-        echo "notice: meilisearch/lab main has no contracts/$f yet; skipping $vendored"
+        echo "notice: $lab has no contracts/$f yet; skipping $vendored"
         continue
       fi
       cat "$err" >&2
-      echo "error: cannot fetch meilisearch/lab main:contracts/$f" >&2
+      echo "error: cannot fetch $lab:contracts/$f" >&2
       exit 1
     fi
   fi
   if ! cmp -s "$owner" "$vendored"; then
     if $fix; then cp "$owner" "$vendored"; echo "updated $vendored"
-    else echo "DRIFT: $vendored differs from meilisearch/lab main:contracts/$f"; diff -u "$vendored" "$owner" | head -50 || true; status=1; fi
+    else echo "DRIFT: $vendored differs from $lab:contracts/$f"; diff -u "$vendored" "$owner" | head -50 || true; status=1; fi
   else
     echo "ok: $vendored"
   fi

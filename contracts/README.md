@@ -35,15 +35,20 @@ vendored `openapi.json`, the Lab's drift check fails until it re-vendors it.
   platform contract v2 §4) every engine reports against at
   `POST {LAB_URL}/internal/events`: `usage.recorded` carries raw `units` and
   `provider_cost_micro_usd`, never credits; the Lab prices them. Owned by
-  `meilisearch/lab` (`contracts/lab-events.schema.json`). Until the Lab
-  publishes it, the vendored copy is the text derived from the spec and the
-  drift check prints a notice instead of comparing.
+  `meilisearch/lab` (`contracts/lab-events.schema.json`).
 
-`check-drift.sh` compares the vendored copies with the Lab's `main`:
+Both are byte copies of the Lab's contract v2 at commit
+`42c282ce6005b14b1705711680fa70c0858e78ac` (meilisearch/lab#17). Until that
+PR merges, the Lab's `main` still has v1 (and no `lab-events.schema.json`), so
+CI pins the drift check to that commit with `LAB_REF`.
+
+`check-drift.sh` compares the vendored copies with the Lab's `main`, or with
+`$LAB_REF` (a branch, tag or commit) when set:
 
 ```bash
 contracts/check-drift.sh          # or: just check-contracts
 contracts/check-drift.sh --fix    # re-vendor; or: just sync-contracts
+LAB_REF=<sha> contracts/check-drift.sh   # compare with a Lab branch/commit
 ```
 
 The owner copy comes from `$LAB_SRC/contracts/` when `LAB_SRC` points at a
