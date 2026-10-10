@@ -15,6 +15,7 @@ fn ctx() -> Option<AccountContext> {
         api_key_id: None,
         tier: "free".into(),
         user_role: None,
+        limits: None,
     })
 }
 
@@ -85,13 +86,23 @@ fn request(body: serde_json::Value) -> ScrapeRequest {
     serde_json::from_value(body).unwrap()
 }
 
-/// Credits of every `usage.recorded` event.
-fn charged(outbox: &lab_events::MemoryOutbox) -> Vec<i64> {
+/// Units of every `usage.recorded` event.
+fn charged(outbox: &lab_events::MemoryOutbox) -> Vec<serde_json::Value> {
     outbox
         .events()
         .iter()
         .filter(|e| e.kind == "usage.recorded")
-        .map(|e| e.data["credits"].as_i64().unwrap())
+        .map(|e| e.data["units"].clone())
+        .collect()
+}
+
+/// Pre-v2 `credits` of every `usage.recorded` event (transition release).
+fn credits(outbox: &lab_events::MemoryOutbox) -> Vec<i64> {
+    outbox
+        .events()
+        .iter()
+        .filter(|e| e.kind == "usage.recorded")
+        .map(|e| e.data["credits"].as_i64().expect("usage carries credits"))
         .collect()
 }
 
@@ -130,12 +141,13 @@ async fn ai_options_asking_for_nothing_are_not_ai() {
     assert!(res.success);
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            false,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0,
+                               "feature_pages": 1})
+        ]
     );
+    // f2ab8d2: scrape_credits([markdown], false, false) = 1.
+    assert_eq!(credits(&outbox), vec![1]);
 }
 
 #[tokio::test]
@@ -154,12 +166,13 @@ async fn a_failed_ai_call_is_not_billed() {
     assert!(warning.contains("not billed"), "{warning}");
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            false,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 0, "ai_extraction": 0,
+                               "feature_pages": 1})
+        ]
     );
+    // f2ab8d2: scrape_credits([markdown], false, false) = 1.
+    assert_eq!(credits(&outbox), vec![1]);
 }
 
 #[tokio::test]
@@ -179,12 +192,30 @@ async fn a_successful_ai_summary_is_billed() {
     assert!(res.warning.is_none());
     assert_eq!(
         charged(&outbox),
-        vec![billing::scrape_credits(
-            &[ScrapeFormat::Markdown],
-            true,
-            false
-        )]
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 1, "ai_extraction": 0,
+                               "feature_pages": 1})
+        ]
     );
+    // f2ab8d2: scrape_credits([markdown], true, false) = 1 + 5.
+    assert_eq!(credits(&outbox), vec![6]);
+}
+
+/// Transition release: the pre-v2 scrape formula counted feature formats
+/// (base formats are free); that count is the page's `feature_pages`.
+#[tokio::test]
+async fn feature_formats_are_reported_as_feature_pages_with_pre_v2_credits() {
+    let (_site, url) = site().await;
+    let bus = ChannelBus::new();
+    let (state, outbox) = test_state_with_lab(&bus);
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown", "links", "metadata", "html", "rawhtml", "content"]
+    }));
+    perform_scrape(&state, &ctx(), &req).await.unwrap();
+    assert_eq!(charged(&outbox)[0]["feature_pages"], 3);
+    // f2ab8d2: scrape_credits(3 feature formats, false, false) = 3.
+    assert_eq!(credits(&outbox), vec![3]);
+    lab_events::assert_contract_valid(&outbox.events());
 }
 
 #[tokio::test]
@@ -243,4 +274,57 @@ async fn an_unreachable_page_is_a_502() {
     let err = perform_scrape(&state, &None, &req).await.err().unwrap();
     assert_eq!(err.code, "fetch_error");
     assert_eq!(status_of(err), StatusCode::BAD_GATEWAY);
+}
+
+/// `/map` with `render_js` uses the browser: a plan without JS rendering is
+/// refused before anything is fetched; one with it gets past the plan check.
+#[tokio::test]
+async fn map_with_render_js_follows_the_plans_js_rendering_limit() {
+    use crate::lab_client::{
+        testing::{FakeLab, INSTANCE_ID, SECRET},
+        LabClient,
+    };
+    const ACCT: &str = "7f1c2a8e-0000-4000-8000-000000000001";
+    let lab = FakeLab::start().await;
+    lab.set_account(ACCT, FakeLab::identity(ACCT, "free", 10));
+    let bus = ChannelBus::new();
+    let (mut state, _outbox) = test_state_with_lab(&bus);
+    Arc::get_mut(&mut state).unwrap().lab_api =
+        Some(Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET)));
+    let map = |limits: scrapix_auth::Limits| {
+        let state = state.clone();
+        async move {
+            let account = AuthenticatedAccount {
+                account_id: ACCT.into(),
+                tier: "free".into(),
+                api_key_id: None,
+                role: None,
+                limits: Some(limits),
+            };
+            let request: MapRequest = serde_json::from_value(
+                serde_json::json!({"url": "https://a.test", "render_js": true}),
+            )
+            .unwrap();
+            map_url(State(state), Some(Extension(account)), Json(request))
+                .await
+                .err()
+                .unwrap()
+        }
+    };
+    let no_js = scrapix_auth::Limits {
+        concurrent_jobs: 1,
+        rate_limit_rpm: 60,
+        max_depth: 3,
+        js_rendering: false,
+    };
+    let err = map(no_js.clone()).await;
+    assert_eq!(err.code, "quota_exceeded", "{}", err.error);
+    assert!(err.error.contains("JS rendering"), "{}", err.error);
+    // Past the plan check, the test server has no browser.
+    let err = map(scrapix_auth::Limits {
+        js_rendering: true,
+        ..no_js
+    })
+    .await;
+    assert_eq!(err.code, "render_js_unavailable", "{}", err.error);
 }

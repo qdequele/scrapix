@@ -9,17 +9,21 @@ In **hosted** mode the engine never touches the Lab's database (accounts,
 credit ledger, saved configs, emails, OAuth). Instead it reports what
 happened as **lab events** to the Lab (the Rails control plane, in
 [`meilisearch/lab`](https://github.com/meilisearch/lab)), which owns
-billing and email, and it asks the Lab's [internal API](#lab-internal-api)
+pricing, billing and email, and it asks the Lab's [internal API](#lab-internal-api)
 for everything else it needs. This page is the wire contract between the two; the
-machine-readable schema is
-[`contracts/lab-events.schema.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/lab-events.schema.json)
-(JSON Schema 2020-12), owned by this repo; both the engine and the Lab's
-receiver are tested against it (the Lab vendors a byte copy and drift-checks
-it).
+machine-readable schema is owned by the Lab
+(`contracts/lab-events.schema.json` in `meilisearch/lab`, JSON Schema
+2020-12, shared by every engine: Scrapix, Lumen, glutony). This repo vendors
+a byte copy at
+[`contracts/vendor/lab/lab-events.schema.json`](https://github.com/qdequele/scrapix/blob/main/contracts/vendor/lab/lab-events.schema.json),
+tests the engine's events against it, and `contracts/check-drift.sh`
+(`just check-contracts`) fails when the copy drifts from the Lab's `main`.
+Until meilisearch/lab#17 (contract v2) merges, CI pins the check to that PR's
+commit with `LAB_REF`.
 
 <Note>
-Hosted mode only. A **standalone** engine emits no lab events and ignores
-`LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`.
+Hosted mode only. A **standalone** engine emits no lab events and refuses
+`LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET`.
 </Note>
 
 ## Event envelope
@@ -43,26 +47,57 @@ Hosted mode only. A **standalone** engine emits no lab events and ignores
 | `occurred_at` | RFC 3339 timestamp | When the engine recorded the event. |
 | `account_id` | UUID | The account to bill or notify. |
 | `api_key_id` | string or `null` | The API key that made the request, when there was one. |
-| `product` | string | Always `"scrapix"`. |
+| `product` | string | `"scrapix"` for this engine (`lumen`, `glutony` for the other engines). |
 | `data` | object | Type-specific payload (below). |
 
 ## Event types
 
 ### `usage.recorded`
 
-One billable operation. The Lab debits `credits` from the account's balance.
+One billable operation, reported as raw units plus, for the contract v2
+transition release, its pre-v2 price in `credits`.
+
+<Warning>
+**Transition release.** The price card for units is not decided yet, so every
+Scrapix `usage.recorded` event also carries `credits`: what the engine charged
+before contract v2 for the same work (`bins/scrapix-api/src/legacy_credits.rs`).
+For product `scrapix` the Lab treats `credits` as authoritative: it debits it
+and stores the `units` without pricing them. `credits` (and
+`legacy_credits.rs`) is removed next release, together with the Lab, once
+`pricing.yml` prices the units.
+</Warning>
 
 | `data` field | Type | Description |
 |--------------|------|-------------|
 | `operation` | string | `scrape`, `map`, `search`, `parse`, `ocr`, `extract` or `crawl`. |
-| `credits` | integer ≥ 0 | Credits to debit. Prices are unchanged (`crates/scrapix-billing/src/credits.rs`). |
-| `units` | object | Operation-specific counters (for example `{"formats": ["markdown"]}` for a scrape, `{"pages_http": 10, "pages_browser": 2, "pages_ai": 0, "pages_ocr": 0}` for a crawl). |
-| `description` | string | Text shown on the ledger row. The Lab stores it as `"{operation}: {description}"`. |
+| `credits` | integer ≥ 0 | Deprecated, transition release only: the pre-v2 price of this usage, debited as-is by the Lab (see below). |
+| `units` | object of integer ≥ 0 | Raw units (`pages_http`, `pages_browser`, `requests`, `documents`, `feature_pages`) plus informational counters (`ai_summary`, `ai_extraction`, `urls_found`, `results`, `pages_ai`, `pages_ocr`). The Lab stores them all; a future `pricing.yml` prices them. |
+| `provider_cost_micro_usd` | integer ≥ 0 | Upstream provider money the engine paid, in micro-USD. Always `0` for Scrapix: the engine only knows the token counts its AI and OCR providers report, not what the provider charged. |
+| `description` | string | Text shown on the ledger row. |
 | `job_id` | string, optional | Present for job-scoped usage (a `crawl`, or an `extract` job). |
 
-A crawl is charged **once**, when the job reaches a terminal state, from what
+Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction, feature_pages}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction, feature_pages}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`; fetched pages are `scrape` events); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr, feature_pages}` once per terminal job.
+
+`feature_pages` is the per-feature surcharge as a unit, so a future
+`pricing.yml` can price it: for `scrape` and `parse`, the number of feature
+formats requested for that one page (`markdown`, `links`, `metadata`,
+`screenshot`, `schema`, `blocks`; `html`, `rawhtml` and `content` are free);
+for `crawl`, `(pages_http + pages_browser) × <enabled non-AI features>`
+(`metadata`, `markdown`, `block_split`, `schema`, `custom_selectors`).
+
+`credits` during the transition (the pre-v2 formula):
+
+| Operation | `credits` |
+|-----------|-----------|
+| `scrape` (incl. a document URL), `parse` | `max(feature formats + 5 × AI summary delivered + 5 × AI extraction delivered, 1)` |
+| `ocr` | `5 ×` recognized pages |
+| `map`, `search` | `2` |
+| `extract` | `5` per AI call (glob maps and fetched pages are billed as `map` and `scrape`) |
+| `crawl` | `pages_http × (1 + F) + pages_browser × (2 + F) + pages_ai × A + 5 × pages_ocr`, with `F` the enabled non-AI features and `A` 5 per enabled AI feature (extraction, summary) |
+
+A crawl is reported **once**, when the job reaches a terminal state, from what
 was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,
-`/map` and `/search` are charged as they complete.
+`/map` and `/search` are reported as they complete.
 
 ### `job.completed`
 
@@ -108,49 +143,59 @@ down) and delivered by a background task once per second.
 ```http
 POST {LAB_URL}/internal/events
 Content-Type: application/json
-X-Scrapix-Signature: sha256=<hex hmac-sha256(raw body, LAB_EVENTS_SECRET)>
+X-Lab-Instance-Id: <LAB_INSTANCE_ID>
+X-Lab-Timestamp: <unix seconds>
+X-Lab-Signature: sha256=<hex hmac-sha256("<X-Lab-Timestamp>.<raw body>", LAB_INSTANCE_SECRET)>
 
 {"events": [ { ...event... }, { ...event... } ]}
 ```
 
-- **Batch** — up to 100 events per request, oldest first.
-- **Signature** — `sha256=` followed by the lowercase hex HMAC-SHA256 of the
-  **raw request body** keyed with `LAB_EVENTS_SECRET`. There is no other
-  authentication on the endpoint.
-- **Acknowledgement** — `200` with `{"accepted": ["<id>", ...]}`. Only
+- **Batch**: up to 500 events per request, oldest first.
+- **Signature**: `sha256=` followed by the lowercase hex HMAC-SHA256 of
+  `"<timestamp>.<raw request body>"`, keyed with `LAB_INSTANCE_SECRET`. The
+  timestamp is the `X-Lab-Timestamp` header, taken when the batch is sent;
+  the Lab rejects a timestamp more than 300 s from its clock. The
+  `X-Lab-Instance-Id` header, not the body, names the reporting instance.
+- **Acknowledgement**: `200` with `{"accepted": ["<id>", ...]}`. Only
   acknowledged ids are marked delivered. An event that is not acknowledged
   (a malformed event is skipped and logged by the Lab; a `4xx`/`5xx`; a
   timeout) is retried.
-- **Backoff** — a failed event is retried at
-  `now() + min(2^attempts, 300)` seconds. Retries never stop; a backlog older
-  than 10 minutes logs a warning.
-- **Purge** — delivered rows are deleted after 7 days.
-- **Processing is asynchronous** — the Lab stores the event, acknowledges it,
-  and a recurring job (every 10 s) applies it. A scrape shows up on the
-  ledger within seconds.
+- **Backoff**: a failed event is retried at
+  `now() + min(2^(attempts + 1), 300)` seconds. A backlog older than 10
+  minutes logs a warning.
+- **Expiry**: an event never acknowledged for 24 h is dropped with an error
+  log and counted as `scrapix_lab_events_delivered_total{outcome="dropped"}`
+  (for example after the instance's secret was revoked: every batch then
+  gets `401`).
+- **Purge**: delivered rows are deleted after 7 days.
+- **Processing is asynchronous**: the Lab stores the event, acknowledges it,
+  and a recurring job applies it. A scrape shows up on the ledger within
+  seconds.
 
 | Status | Meaning |
 |--------|---------|
 | `200` | Body accepted; read `accepted` for the ids stored. |
 | `400` | Signed body is not a JSON object. |
-| `401` | Missing or wrong signature. |
-| `503` | The Lab has no `LAB_EVENTS_SECRET` configured. |
+| `401` | Missing or wrong instance id / signature, or a revoked instance. |
 
 ## Verifying a signature
 
-The signature covers the exact bytes received — verify before parsing.
+The signature covers the timestamp and the exact bytes received: verify
+before parsing.
 
 <CodeGroup>
 
 ```ruby Ruby
-expected = "sha256=#{OpenSSL::HMAC.hexdigest('SHA256', ENV.fetch('LAB_EVENTS_SECRET'), request.raw_post)}"
-given = request.headers["X-Scrapix-Signature"].to_s
-ok = ActiveSupport::SecurityUtils.secure_compare(expected, given)
+ts = request.headers["X-Lab-Timestamp"].to_s
+expected = "sha256=#{OpenSSL::HMAC.hexdigest('SHA256', instance_secret, "#{ts}.#{request.raw_post}")}"
+given = request.headers["X-Lab-Signature"].to_s
+ok = (Time.now.to_i - ts.to_i).abs <= 300 &&
+  ActiveSupport::SecurityUtils.secure_compare(expected, given)
 ```
 
 ```bash Shell
-# body.json is the raw request body, byte for byte
-printf 'sha256=%s\n' "$(openssl dgst -sha256 -hmac "$LAB_EVENTS_SECRET" -hex < body.json | sed 's/^.*= //')"
+# body.json is the raw request body, byte for byte; ts is X-Lab-Timestamp
+printf 'sha256=%s\n' "$(printf '%s.' "$ts" | cat - body.json | openssl dgst -sha256 -hmac "$LAB_INSTANCE_SECRET" -hex | sed 's/^.*= //')"
 ```
 
 </CodeGroup>
@@ -158,31 +203,46 @@ printf 'sha256=%s\n' "$(openssl dgst -sha256 -hmac "$LAB_EVENTS_SECRET" -hex < b
 ## Lab internal API
 
 The other direction of the boundary: the engine calls the Lab at
-`{LAB_URL}/internal/*` with `Authorization: Bearer <LAB_SERVICE_TOKEN>` (the
-same token that authenticates Lab → engine calls). The events endpoint above is
-the one exception: it is authenticated by the HMAC signature instead. A missing
-or wrong token gets `401`. The machine-readable contract is owned by the Lab
+`{LAB_URL}/internal/*` with `X-Lab-Instance-Id: <LAB_INSTANCE_ID>` and
+`Authorization: Bearer <LAB_INSTANCE_SECRET>`. The events endpoint above is
+the one exception: it is authenticated by the HMAC signature instead. Missing
+or wrong credentials get `401`. The machine-readable contract is owned by the Lab
 (`contracts/lab-internal.openapi.json` in `meilisearch/lab`); this repo
 vendors it at
-[`contracts/vendor/lab/lab-internal.openapi.json`](https://github.com/quentindequelen/scrapix/blob/main/contracts/vendor/lab/lab-internal.openapi.json)
+[`contracts/vendor/lab/lab-internal.openapi.json`](https://github.com/qdequele/scrapix/blob/main/contracts/vendor/lab/lab-internal.openapi.json)
 and `contracts/check-drift.sh` (`just check-contracts`) fails when the copy
 drifts from the Lab's `main`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /internal/ping` | Liveness and token check. The engine calls it at startup and refuses to start on a wrong token or a `4xx` (a wrong `LAB_URL`). |
-| `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role and effective credit balance, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
-| `GET /internal/accounts/{id}` | Tier and spendable balance of an account (credit pre-check). |
-| `GET /internal/accounts/{account_id}/meilisearch` | The account's Meilisearch target with the decrypted key. The engine caches it for 60 s. |
+| `GET /internal/instances/me` | Called once at boot to confirm the credentials and log the deployment's product and region. A 401 or 404 aborts startup (a 404 means a wrong `LAB_URL` or a Lab that predates contract v2), and so does an instance that is not a hosted `scrapix` engine. |
+| `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role, effective credit balance and plan `limits`, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down, except answers with `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
+| `GET /internal/accounts/{id}` | Tier, spendable balance and plan `limits` of an account (balance pre-check). |
+| `GET /internal/accounts/{account_id}/meilisearch` | The account's Meilisearch target with the decrypted key. The engine caches it for 60 s. A hosted tenant without a target cannot crawl: the engine never falls back to the operator's `MEILISEARCH_URL`. |
 
-Calls are counted by `scrapix_lab_requests_total{endpoint,outcome}`.
+Introspect and account answers carry `limits`
+(`concurrent_jobs`, `rate_limit_rpm`, `max_depth`, `js_rendering`), which the
+engine enforces: it refuses a job past `concurrent_jobs`, a `max_depth`
+above the plan's (a hosted crawl that sets none gets the plan's), and JS
+rendering when the plan has none (crawl, scrape, batch, extract, and `/map`
+with `render_js`), each as `429 quota_exceeded` naming the plan and the limit
+(for example `max_depth 15 exceeds the pro plan's max_depth limit of 10.
+Plan limits come from the Lab; ...`). `rate_limit_rpm` is not enforced by the engine today. An
+answer without `limits` (a pre-v2 Lab) logs one warning and enforces none of them.
+Before billable work the engine also checks the balance: a balance `<= 0`
+is refused with `402 insufficient_credits` (a stale low snapshot is
+refreshed once first, so a top-up counts), and past the 5-minute stale
+window with the Lab down the check answers `503` with `Retry-After: 5`.
+
+Calls are counted by `scrapix_lab_requests_total{endpoint,outcome}` (the boot check is `endpoint="instances_me"`).
 
 ## Service calls (Lab → engine)
 
 The Lab's saved-config cron calls the engine on behalf of the config's
 account with `Authorization: Bearer <LAB_SERVICE_TOKEN>` and
 `X-Scrapix-Account-Id: <account uuid>`. The engine accepts this only in
-hosted mode. It is the only service call today: requests made through the
+hosted mode. `LAB_SERVICE_TOKEN` is inbound only: the engine never presents
+it to the Lab. It is the only service call today: requests made through the
 MCP server forward the caller's own credentials instead.
 
 ## Metrics
@@ -192,19 +252,21 @@ The engine exposes the outbox state at `GET /metrics`:
 | Metric | Description |
 |--------|-------------|
 | `scrapix_lab_events_pending` | Undelivered events in the outbox. Should hover near zero; a growing value means the Lab is unreachable or rejecting events. |
-| `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them) or `failed` (unreachable or unreadable response). |
-| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint and outcome. |
+| `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them), `failed` (unreachable or unreadable response) or `dropped` (never acknowledged for 24 h). |
+| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint (`instances_me`, `introspect`, `account`, `meilisearch`) and outcome. `instances_me` replaced `ping`: dashboards filtering on `endpoint="ping"` go empty. |
 
 ## Configuration
 
 | Variable | Where | Description |
 |----------|-------|-------------|
 | `LAB_URL` | engine | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
+| `LAB_INSTANCE_ID` | engine | The uuid the Lab minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
+| `LAB_INSTANCE_SECRET` | engine | The 64 hex characters minted with the id: Bearer token on `/internal/*`, HMAC key on event batches. Rotate with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays valid for 10 minutes). Refused in standalone mode. |
+| `LAB_SERVICE_TOKEN` | engine | Inbound only: the Bearer token the Lab presents when it calls the engine (saved-config cron), at least 32 characters. Generated first and passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). |
 | `LAB_EVENTS_URL` | engine | Deprecated fallback for `LAB_URL` (the old `…/internal/events` URL). |
-| `LAB_EVENTS_SECRET` | engine, Lab | Signing secret, at least 32 characters. Same value on both sides. |
-| `LAB_SERVICE_TOKEN` | engine, Lab | Bearer token for Lab → engine calls and for the engine's `/internal/*` calls, at least 32 characters. Same value on both sides. |
+| `LAB_EVENTS_SECRET` | engine | Deprecated, ignored (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |
 | `LAB_CRON_ENABLED` | Lab | `true` runs the saved-config cron. Off by default. |
 
-The hosted engine refuses to start without `LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN`. See
+The hosted engine refuses to start without `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`. See
 [Environment Variables](/configuration/environment-variables) and the
 [rollout checklist](/operations/crawl-engine-rollout).

@@ -12,4 +12,3 @@ pub mod local;
 pub mod map;
 pub mod scrape;
 pub mod search;
-pub mod team;

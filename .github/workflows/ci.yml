@@ -46,6 +46,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all -- -D warnings
 
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [clippy]
+    # The Postgres-gated tests (job store conformance, the Postgres lab-events
+    # outbox, the Rails-schema guard) run against this throwaway database; each
+    # test works in its own fresh schema. Without JOBSTORE_TEST_DATABASE_URL
+    # they skip themselves.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: pg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JOBSTORE_TEST_DATABASE_URL: postgres://postgres:pg@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
   # SDKs (sdks/typescript, sdks/python)
@@ -118,3 +145,5 @@ jobs:
       - run: contracts/check-drift.sh
         env:
           GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          # TODO: drop LAB_REF once meilisearch/lab#17 merges (then compare against main).
+          LAB_REF: 42c282ce6005b14b1705711680fa70c0858e78ac

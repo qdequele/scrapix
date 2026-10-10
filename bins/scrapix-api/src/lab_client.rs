@@ -1,6 +1,7 @@
 //! Engine → Lab lookups (spec: Lab split §3.2): credential introspection,
 //! account tier/balance, and Meilisearch targets over the Lab's internal
-//! API, authenticated with LAB_SERVICE_TOKEN. Answers are cached (TTL from
+//! API, authenticated with the instance credentials (`X-Lab-Instance-Id` +
+//! Bearer `LAB_INSTANCE_SECRET`). Answers are cached (TTL from
 //! the Lab, clamped); while the Lab is unreachable a cached answer is served
 //! for `stale_grace` past its expiry, then everything fails closed.
 //!
@@ -11,14 +12,13 @@
 //! the positive ones.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::lab_events::LabOutbox;
 use crate::meili::MeiliTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,12 +44,14 @@ pub(crate) struct Identity {
     pub tier: String,
     pub role: Option<String>,
     pub api_key_id: Option<String>,
+    /// The plan's limits; `None` from a Lab that predates them (contract v1).
+    pub limits: Option<scrapix_auth::Limits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LabError {
     Unavailable(String),
-    ServiceTokenRejected,
+    CredentialsRejected,
     /// Lab answered a 3xx (redirects are never followed) or a 4xx other than
     /// 401: reachable but refusing the request. Never served stale.
     BadResponse(u16),
@@ -59,10 +61,28 @@ impl std::fmt::Display for LabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(m) => write!(f, "Lab unavailable: {m}"),
-            Self::ServiceTokenRejected => f.write_str("Lab rejected LAB_SERVICE_TOKEN"),
+            Self::CredentialsRejected => {
+                f.write_str("Lab rejected LAB_INSTANCE_ID/LAB_INSTANCE_SECRET")
+            }
             Self::BadResponse(code) => write!(f, "Lab answered HTTP {code}"),
         }
     }
+}
+
+/// `GET /internal/instances/me` (spec §3.6): what the Lab knows about this
+/// deployment. Called once at boot to confirm the credentials and log the
+/// identity; `kind` is `"hosted"` (there is no other kind of engine).
+/// `instance_id` and `region` are null on the Lab's legacy service-token
+/// path (no deployment row).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct InstanceInfo {
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    pub kind: String,
+    pub product: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    pub lab_url: String,
 }
 
 /// An account's spendable credits as the engine sees them.
@@ -134,6 +154,8 @@ struct Answer {
     #[serde(default)]
     credits: Option<Credits>,
     #[serde(default)]
+    limits: Option<scrapix_auth::Limits>,
+    #[serde(default)]
     cache_ttl: Option<i64>,
 }
 
@@ -157,6 +179,13 @@ impl<T> Entry<T> {
     fn fresh(&self) -> bool {
         self.fetched.elapsed() < self.ttl
     }
+    /// Servable while the Lab is unreachable: within `grace` past its ttl,
+    /// and only if it was cached with a positive ttl. A `cache_ttl: 0` (or
+    /// negative) answer — an expiring session or OAuth token, "do not
+    /// cache" — is never served stale.
+    fn servable_stale(&self, grace: Duration) -> bool {
+        !self.ttl.is_zero() && self.fetched.elapsed() < self.ttl + grace
+    }
     fn in_backoff(&self) -> bool {
         self.retry_at.is_some_and(|t| Instant::now() < t)
     }
@@ -164,15 +193,16 @@ impl<T> Entry<T> {
 
 struct Balance {
     balance: i64,
-    used_since: i64,
     fetched: Instant,
     ttl: Duration,
     retry_at: Option<Instant>,
 }
 
 impl Balance {
-    fn available(&self) -> i64 {
-        self.balance - self.used_since
+    /// Same rule as `Entry::servable_stale`: a snapshot taken from a
+    /// `cache_ttl: 0` answer is never served while the Lab is unreachable.
+    fn servable_stale(&self, grace: Duration) -> bool {
+        !self.ttl.is_zero() && self.fetched.elapsed() < self.ttl + grace
     }
 }
 
@@ -201,7 +231,8 @@ impl<T: Clone> Cache<T> {
     fn put(&mut self, k: String, value: T, ttl: Duration) {
         if !self.map.contains_key(&k) && self.map.len() >= self.capacity {
             let keep = self.keep;
-            self.map.retain(|_, e| e.fetched.elapsed() < e.ttl + keep);
+            self.map
+                .retain(|_, e| !e.ttl.is_zero() && e.fetched.elapsed() < e.ttl + keep);
             if self.map.len() >= self.capacity {
                 if let Some(oldest) = self
                     .map
@@ -243,28 +274,26 @@ impl<T: Clone> Lookups<T> {
 
 pub(crate) struct LabClient {
     base: String,
-    token: String,
+    instance_id: String,
+    secret: String,
     http: reqwest::Client,
     timing: Timing,
     permits: tokio::sync::Semaphore,
     identities: Mutex<Lookups<Identity>>,
     meili: Mutex<Lookups<MeiliTarget>>,
     balances: Mutex<HashMap<String, Balance>>,
-    /// The engine's outbox: usage recorded but not yet accepted by the Lab
-    /// is not in the balance the Lab reports, so a fresh snapshot starts
-    /// with it already spent. `None` (tests) starts every snapshot at 0.
-    undelivered: Option<Arc<dyn LabOutbox>>,
 }
 
-/// Log a failed Lab call. A rejected LAB_SERVICE_TOKEN at runtime is an
-/// operator error (spec §6: engine and Lab disagree on the token), so it is
-/// logged at `error`; everything else is transient and logged at `warn`.
+/// Log a failed Lab call. Rejected instance credentials at runtime are an
+/// operator error (revoked or mistyped LAB_INSTANCE_ID/LAB_INSTANCE_SECRET),
+/// so it is logged at `error`; everything else is transient and logged at
+/// `warn`.
 pub(crate) fn log_lab_error(e: &LabError, during: &str) {
     match e {
-        LabError::ServiceTokenRejected => tracing::error!(
+        LabError::CredentialsRejected => tracing::error!(
             error = %e,
             during,
-            "The Lab rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab"
+            "The Lab rejected this engine's LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: rotate the secret on the Lab (bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>) or mint new credentials (bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>)"
         ),
         _ => tracing::warn!(error = %e, during, "Lab call failed"),
     }
@@ -288,37 +317,35 @@ fn hashed(parts: &[&str]) -> String {
 }
 
 impl LabClient {
-    pub(crate) fn new(base_url: &str, service_token: &str) -> Self {
-        Self::with_timing(base_url, service_token, Timing::default())
+    pub(crate) fn new(base_url: &str, instance_id: &str, instance_secret: &str) -> Self {
+        Self::with_timing(base_url, instance_id, instance_secret, Timing::default())
     }
 
-    pub(crate) fn with_timing(base_url: &str, service_token: &str, timing: Timing) -> Self {
+    pub(crate) fn with_timing(
+        base_url: &str,
+        instance_id: &str,
+        instance_secret: &str,
+        timing: Timing,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(timing.connect_timeout)
             .timeout(timing.request_timeout)
             // A redirect is a misconfigured LAB_URL, never followed (it
-            // would also carry the service token elsewhere).
+            // would also carry the instance secret elsewhere).
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
         Self {
             base: base_url.trim_end_matches('/').to_string(),
-            token: service_token.to_string(),
+            instance_id: instance_id.to_string(),
+            secret: instance_secret.to_string(),
             http,
             permits: tokio::sync::Semaphore::new(timing.max_in_flight.max(1)),
             identities: Mutex::new(Lookups::new(&timing)),
             meili: Mutex::new(Lookups::new(&timing)),
             balances: Mutex::new(HashMap::new()),
-            undelivered: None,
             timing,
         }
-    }
-
-    /// Count the engine's undelivered usage (from `outbox`) into every
-    /// balance snapshot taken from now on.
-    pub(crate) fn with_undelivered_usage(mut self, outbox: Arc<dyn LabOutbox>) -> Self {
-        self.undelivered = Some(outbox);
-        self
     }
 
     pub(crate) fn base_from_events_url(events_url: &str) -> String {
@@ -351,10 +378,15 @@ impl LabClient {
                     return Err(LabError::Unavailable("Lab client saturated".into()));
                 }
             };
-        let result = match req.bearer_auth(&self.token).send().await {
+        let result = match req
+            .header("X-Lab-Instance-Id", &self.instance_id)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+        {
             Err(e) => Err(LabError::Unavailable(e.to_string())),
             Ok(resp) => match resp.status().as_u16() {
-                401 => Err(LabError::ServiceTokenRejected),
+                401 => Err(LabError::CredentialsRejected),
                 // The Meilisearch lookup's 404 means "no engine", handled by the caller.
                 404 if endpoint == "meilisearch" => Ok(resp),
                 c @ 300..=499 => Err(LabError::BadResponse(c)),
@@ -364,7 +396,7 @@ impl LabClient {
         };
         match &result {
             Err(LabError::Unavailable(_)) => count(endpoint, "unavailable"),
-            Err(LabError::ServiceTokenRejected | LabError::BadResponse(_)) => {
+            Err(LabError::CredentialsRejected | LabError::BadResponse(_)) => {
                 count(endpoint, "rejected")
             }
             Ok(_) => {}
@@ -401,37 +433,15 @@ impl LabClient {
         Ok(a)
     }
 
-    /// Credits of `account_id` recorded in the engine's outbox and not yet
-    /// accepted by the Lab. On a read error the snapshot starts at 0, as
-    /// before this was counted.
-    async fn undelivered_usage(&self, account_id: &str) -> i64 {
-        let Some(outbox) = &self.undelivered else {
-            return 0;
-        };
-        match outbox.undelivered_usage_credits(account_id).await {
-            Ok(credits) => credits,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    account_id,
-                    "Cannot read undelivered usage; the balance snapshot ignores it"
-                );
-                0
-            }
-        }
-    }
-
-    /// Take a new balance snapshot. The Lab's balance does not include
-    /// usage still waiting in the outbox (read after the Lab answered, so
-    /// usage recorded meanwhile is counted too).
-    async fn remember_balance(&self, account_id: &str, credits: &Option<Credits>, ttl: Duration) {
+    /// Take a new balance snapshot. Usage this engine recorded since is in
+    /// the outbox and is debited by the Lab when delivered; the engine does
+    /// not price it (decision B), so the snapshot is the Lab's number.
+    fn remember_balance(&self, account_id: &str, credits: &Option<Credits>, ttl: Duration) {
         if let Some(c) = credits {
-            let used_since = self.undelivered_usage(account_id).await;
             self.balances.lock().unwrap().insert(
                 account_id.to_string(),
                 Balance {
                     balance: c.balance,
-                    used_since,
                     fetched: Instant::now(),
                     ttl,
                     retry_at: None,
@@ -441,8 +451,9 @@ impl LabClient {
     }
 
     /// Cached lookup with the stale-on-error rule shared by every endpoint:
-    /// only a *positive* cached answer is ever served stale, and a key just
-    /// served stale is not retried for `stale_retry`.
+    /// only a *positive* cached answer with a positive ttl is ever served
+    /// stale (never a `cache_ttl: 0` one), and a key just served stale is
+    /// not retried for `stale_retry`.
     async fn cached<T, F, Fut>(
         &self,
         endpoint: &'static str,
@@ -456,7 +467,7 @@ impl LabClient {
         Fut: std::future::Future<Output = Result<(Option<T>, Duration), LabError>>,
     {
         let grace = self.timing.stale_grace;
-        let usable = |e: &Entry<T>| e.fetched.elapsed() < e.ttl + grace;
+        let usable = |e: &Entry<T>| e.servable_stale(grace);
         let hit = {
             let c = cache.lock().unwrap();
             if c.negative.get(&key).is_some_and(|e| e.fresh()) {
@@ -515,32 +526,39 @@ impl LabClient {
         count(endpoint, "ok");
         let ttl = self.ttl_from(a.cache_ttl);
         let account_id = a.account_id.unwrap_or_default();
-        self.remember_balance(&account_id, &a.credits, ttl).await;
+        self.remember_balance(&account_id, &a.credits, ttl);
         (
             Some(Identity {
                 account_id,
                 tier: a.tier.unwrap_or_default(),
                 role: a.role,
                 api_key_id: a.api_key_id,
+                limits: a.limits,
             }),
             ttl,
         )
     }
 
-    pub(crate) async fn ping(&self) -> Result<(), LabError> {
-        let (status, _) = self
+    /// `GET /internal/instances/me`: confirms the instance credentials and
+    /// tells which deployment they belong to (checked once at boot).
+    pub(crate) async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
+        let (status, body) = self
             .request(
-                "ping",
-                self.http.get(format!("{}/internal/ping", self.base)),
+                "instances_me",
+                self.http
+                    .get(format!("{}/internal/instances/me", self.base)),
             )
             .await?;
-        if (200..300).contains(&status) {
-            count("ping", "ok");
-            Ok(())
-        } else {
-            count("ping", "unavailable");
-            Err(LabError::Unavailable(format!("HTTP {status}")))
+        if !(200..300).contains(&status) {
+            count("instances_me", "unavailable");
+            return Err(LabError::Unavailable(format!("HTTP {status}")));
         }
+        let me: InstanceInfo = serde_json::from_slice(&body).map_err(|e| {
+            count("instances_me", "unavailable");
+            LabError::Unavailable(format!("malformed: {e}"))
+        })?;
+        count("instances_me", "ok");
+        Ok(me)
     }
 
     pub(crate) async fn introspect(
@@ -581,14 +599,8 @@ impl LabClient {
         self.balances.lock().unwrap().remove(account_id);
     }
 
-    pub(crate) fn note_usage(&self, account_id: &str, credits: i64) {
-        if let Some(b) = self.balances.lock().unwrap().get_mut(account_id) {
-            b.used_since += credits;
-        }
-    }
-
-    /// Spendable credits: the Lab's balance minus usage this engine recorded
-    /// since (from a fresh snapshot, or a new one).
+    /// Spendable credits as the Lab last reported them (from a fresh
+    /// snapshot, or a new one).
     pub(crate) async fn available_credits(
         &self,
         account_id: &str,
@@ -596,7 +608,7 @@ impl LabClient {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.fetched.elapsed() < b.ttl {
                 return Ok(Some(Available {
-                    credits: b.available(),
+                    credits: b.balance,
                     cached: true,
                 }));
             }
@@ -606,13 +618,14 @@ impl LabClient {
 
     /// Take a new balance snapshot now (directly, not through the identity
     /// cache: the balance must be current). While the Lab is unavailable the
-    /// last snapshot is served for `stale_grace` past its expiry, asking the
-    /// Lab again at most every `stale_retry`.
+    /// last snapshot is served for `stale_grace` past its expiry (unless it
+    /// came from a `cache_ttl: 0` answer), asking the Lab again at most
+    /// every `stale_retry`.
     pub(crate) async fn refresh_credits(
         &self,
         account_id: &str,
     ) -> Result<Option<Available>, LabError> {
-        let stale = |b: &Balance| b.fetched.elapsed() < b.ttl + self.timing.stale_grace;
+        let stale = |b: &Balance| b.servable_stale(self.timing.stale_grace);
         let served = |credits| {
             Ok(Some(Available {
                 credits,
@@ -622,7 +635,7 @@ impl LabClient {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.retry_at.is_some_and(|t| Instant::now() < t) && stale(b) {
                 count("account", "stale");
-                return served(b.available());
+                return served(b.balance);
             }
         }
         match self
@@ -640,7 +653,7 @@ impl LabClient {
                     return Ok(None);
                 }
                 match self.balances.lock().unwrap().get(account_id) {
-                    Some(b) => served(b.available()),
+                    Some(b) => served(b.balance),
                     None => Ok(None),
                 }
             }
@@ -650,7 +663,7 @@ impl LabClient {
                     Some(b) if stale(b) => {
                         count("account", "stale");
                         b.retry_at = Some(Instant::now() + self.timing.stale_retry);
-                        served(b.available())
+                        served(b.balance)
                     }
                     _ => Err(LabError::Unavailable(m)),
                 }
@@ -753,7 +766,9 @@ pub(crate) mod testing {
         },
     };
 
-    pub(crate) const TOKEN: &str = "fake-lab-service-token-0123456789abcdef";
+    pub(crate) const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    pub(crate) const SECRET: &str =
+        "abababababababababababababababababababababababababababababababab";
 
     #[derive(Default)]
     pub(crate) struct FakeLabState {
@@ -768,6 +783,8 @@ pub(crate) mod testing {
         /// Non-zero: every gated route answers this status (after the down check).
         pub status_override: AtomicUsize,
         pub calls: AtomicUsize,
+        /// `GET /internal/instances/me` answer (`FakeLab::hosted_me()` by default).
+        pub me: Mutex<Value>,
     }
 
     pub(crate) struct FakeLab {
@@ -777,7 +794,8 @@ pub(crate) mod testing {
 
     fn authorized(h: &HeaderMap) -> bool {
         h.get("authorization").and_then(|v| v.to_str().ok())
-            == Some(format!("Bearer {TOKEN}").as_str())
+            == Some(format!("Bearer {SECRET}").as_str())
+            && h.get("x-lab-instance-id").and_then(|v| v.to_str().ok()) == Some(INSTANCE_ID)
     }
 
     async fn gate(s: &FakeLabState, h: &HeaderMap) -> Result<(), StatusCode> {
@@ -801,14 +819,18 @@ pub(crate) mod testing {
 
     impl FakeLab {
         pub(crate) async fn start() -> FakeLab {
-            let state = Arc::new(FakeLabState::default());
+            let state = Arc::new(FakeLabState {
+                me: Mutex::new(FakeLab::hosted_me()),
+                ..Default::default()
+            });
             let app =
                 Router::new()
                     .route(
-                        "/internal/ping",
+                        "/internal/instances/me",
                         get(
                             |State(s): State<Arc<FakeLabState>>, h: HeaderMap| async move {
-                                gate(&s, &h).await.map(|_| Json(json!({"ok": true})))
+                                gate(&s, &h).await?;
+                                Ok::<_, StatusCode>(Json(s.me.lock().unwrap().clone()))
                             },
                         ),
                     )
@@ -885,9 +907,22 @@ pub(crate) mod testing {
             FakeLab { url, state }
         }
 
+        pub(crate) fn hosted_me() -> Value {
+            json!({"instance_id": INSTANCE_ID, "kind": "hosted", "product": "scrapix",
+                   "region": "eu-west-1", "lab_url": "http://lab"})
+        }
         pub(crate) fn identity(account: &str, tier: &str, balance: i64) -> Value {
+            let limits = match tier {
+                "pro" => {
+                    json!({"concurrent_jobs": 10, "rate_limit_rpm": 1200, "max_depth": 10, "js_rendering": true})
+                }
+                _ => {
+                    json!({"concurrent_jobs": 1, "rate_limit_rpm": 60, "max_depth": 3, "js_rendering": false})
+                }
+            };
             json!({"active": true, "account_id": account, "tier": tier, "role": null, "api_key_id": null,
-                   "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance}})
+                   "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance},
+                   "limits": limits})
         }
         pub(crate) fn set_credential(&self, kind: &str, credential: &str, v: Value) {
             self.state
@@ -914,9 +949,10 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{FakeLab, TOKEN};
+    use super::testing::{FakeLab, INSTANCE_ID, SECRET};
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     const ACCT: &str = "11111111-1111-1111-1111-111111111111";
 
@@ -945,22 +981,70 @@ mod tests {
 
     async fn setup() -> (FakeLab, LabClient) {
         let lab = FakeLab::start().await;
-        let client = LabClient::with_timing(&lab.url, TOKEN, fast());
+        let client = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, fast());
         (lab, client)
     }
 
     #[tokio::test]
-    async fn ping_ok_and_wrong_token_is_rejected() {
+    async fn instances_me_describes_the_deployment_and_a_wrong_secret_is_rejected() {
         let lab = FakeLab::start().await;
-        LabClient::with_timing(&lab.url, TOKEN, fast())
-            .ping()
+        let me = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, fast())
+            .instances_me()
             .await
             .unwrap();
-        let err = LabClient::with_timing(&lab.url, "wrong", fast())
-            .ping()
+        assert_eq!(me.instance_id.as_deref(), Some(INSTANCE_ID));
+        assert_eq!(me.kind, "hosted");
+        assert_eq!(me.product, "scrapix");
+        assert_eq!(me.region.as_deref(), Some("eu-west-1"));
+        let err = LabClient::with_timing(&lab.url, INSTANCE_ID, "wrong", fast())
+            .instances_me()
             .await
             .unwrap_err();
-        assert_eq!(err, LabError::ServiceTokenRejected);
+        assert_eq!(err, LabError::CredentialsRejected);
+        let err = LabClient::with_timing(
+            &lab.url,
+            "22222222-2222-4222-8222-222222222222",
+            SECRET,
+            fast(),
+        )
+        .instances_me()
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LabError::CredentialsRejected,
+            "the id is part of the credential"
+        );
+    }
+
+    #[test]
+    fn instances_me_accepts_a_null_instance_id_and_region() {
+        // The Lab's legacy service-token path has no deployment row.
+        let me: InstanceInfo = serde_json::from_value(json!({
+            "instance_id": null, "kind": "hosted", "product": "scrapix",
+            "region": null, "lab_url": "https://lab.example"
+        }))
+        .unwrap();
+        assert_eq!(me.instance_id, None);
+        assert_eq!(me.region, None);
+        assert_eq!(me.kind, "hosted");
+        assert_eq!(me.product, "scrapix");
+        assert_eq!(me.lab_url, "https://lab.example");
+    }
+
+    #[tokio::test]
+    async fn every_call_carries_the_instance_id_header() {
+        let (lab, c) = setup().await;
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(c.account(ACCT).await.is_ok());
+        // `authorized` in the fake requires X-Lab-Instance-Id on every gated
+        // route; a client without it would have been 401 (CredentialsRejected).
+        assert_eq!(lab.calls(), 2);
     }
 
     #[tokio::test]
@@ -973,6 +1057,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((id.account_id.as_str(), id.tier.as_str()), (ACCT, "pro"));
+        assert_eq!(
+            id.limits,
+            Some(scrapix_auth::Limits {
+                concurrent_jobs: 10,
+                rate_limit_rpm: 1200,
+                max_depth: 10,
+                js_rendering: true
+            })
+        );
         c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
             .await
             .unwrap();
@@ -1050,6 +1143,76 @@ mod tests {
         assert!(matches!(
             c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
                 .await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    /// An answer with `cache_ttl: 0` (a session or OAuth token about to
+    /// expire, "do not cache") is never served stale: with the Lab down the
+    /// next call is `Unavailable`, not the cached identity.
+    #[tokio::test]
+    async fn a_cache_ttl_0_answer_is_never_served_stale() {
+        let (lab, c) = setup().await; // grace 400 ms
+        let mut v = FakeLab::identity(ACCT, "pro", 50);
+        v["cache_ttl"] = json!(0);
+        lab.set_credential("session", "jwt_expiring", v);
+        assert!(c
+            .introspect(CredentialKind::Session, "jwt_expiring", None)
+            .await
+            .unwrap()
+            .is_some());
+        lab.set_down(true);
+        assert!(
+            matches!(
+                c.introspect(CredentialKind::Session, "jwt_expiring", None)
+                    .await,
+                Err(LabError::Unavailable(_))
+            ),
+            "well inside the stale grace, yet not served"
+        );
+
+        // A credential first cached with a positive ttl, then re-answered
+        // with cache_ttl 0: the zero-ttl answer replaces it and is not
+        // served stale either.
+        lab.set_down(false);
+        lab.set_credential("bearer", "tok", FakeLab::identity(ACCT, "pro", 50));
+        c.introspect(CredentialKind::Bearer, "tok", None)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await; // past the 200 ms ttl
+        let mut v = FakeLab::identity(ACCT, "pro", 50);
+        v["cache_ttl"] = json!(0);
+        lab.set_credential("bearer", "tok", v);
+        c.introspect(CredentialKind::Bearer, "tok", None)
+            .await
+            .unwrap()
+            .unwrap();
+        lab.set_down(true);
+        assert!(matches!(
+            c.introspect(CredentialKind::Bearer, "tok", None).await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    /// Same rule for the balance snapshot: one taken from a `cache_ttl: 0`
+    /// answer is not served while the Lab is down.
+    #[tokio::test]
+    async fn a_cache_ttl_0_balance_is_never_served_stale() {
+        let (lab, c) = setup().await;
+        lab.set_account(
+            ACCT,
+            json!({"active": true, "account_id": ACCT, "tier": "pro",
+                   "credits": {"balance": 100}, "cache_ttl": 0}),
+        );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
+        lab.set_down(true);
+        assert!(matches!(
+            credits(&c, ACCT).await,
+            Err(LabError::Unavailable(_))
+        ));
+        assert!(matches!(
+            c.account(ACCT).await,
             Err(LabError::Unavailable(_))
         ));
     }
@@ -1155,25 +1318,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn balance_subtracts_local_usage_and_resets_on_refresh() {
+    async fn balance_is_the_labs_number_and_refreshes_after_ttl() {
         let (lab, c) = setup().await;
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}}),
         );
         assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
-        c.note_usage(ACCT, 30);
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70));
         lab.set_account(
             ACCT,
             json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 70}}),
         );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100), "cached");
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(
-            credits(&c, ACCT).await.unwrap(),
-            Some(70),
-            "fresh snapshot, local usage reset"
-        );
+        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70), "fresh snapshot");
     }
 
     #[tokio::test]
@@ -1236,12 +1394,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_404_is_bad_response() {
+    async fn a_404_on_instances_me_is_bad_response() {
         let (lab, c) = setup().await;
         lab.state
             .status_override
             .store(404, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(c.ping().await, Err(LabError::BadResponse(404)));
+        assert_eq!(
+            c.instances_me().await.unwrap_err(),
+            LabError::BadResponse(404)
+        );
     }
 
     #[tokio::test]
@@ -1277,96 +1438,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    /// Important 1: usage recorded while the Lab was down is still spent
-    /// after the Lab comes back and the snapshot is refreshed, until the
-    /// outbox delivers it (then the Lab's own balance includes it).
-    #[tokio::test]
-    async fn refreshed_snapshot_still_counts_undelivered_usage() {
-        use crate::lab_events::{LabEvent, LabOutbox, MemoryOutbox};
-        let lab = FakeLab::start().await;
-        let outbox = Arc::new(MemoryOutbox::default());
-        let c =
-            LabClient::with_timing(&lab.url, TOKEN, fast()).with_undelivered_usage(outbox.clone());
-        let account = |balance: i64| json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": balance}});
-        lab.set_account(ACCT, account(100));
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
-
-        lab.set_down(true);
-        let spent = LabEvent::usage(ACCT, None, "scrape", 30, json!({}), "s".into(), None);
-        outbox.enqueue(std::slice::from_ref(&spent)).await.unwrap();
-        c.note_usage(ACCT, 30);
-        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl: stale
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70));
-
-        lab.set_down(false); // back, but has not received the 30 yet
-        tokio::time::sleep(Duration::from_millis(150)).await; // past the stale backoff
-        assert_eq!(
-            credits(&c, ACCT).await.unwrap(),
-            Some(70),
-            "a new snapshot must not hand the undelivered 30 back"
-        );
-
-        outbox.mark_delivered(&[spent.id]).await.unwrap();
-        lab.set_account(ACCT, account(70)); // the Lab debited it
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(70), "counted once");
-    }
-
-    /// An outbox that cannot be read: snapshots start at 0 (as before).
-    struct BrokenOutbox;
-
-    #[async_trait::async_trait]
-    impl LabOutbox for BrokenOutbox {
-        async fn enqueue(
-            &self,
-            _: &[crate::lab_events::LabEvent],
-        ) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn due(
-            &self,
-            _: i64,
-        ) -> Result<Vec<crate::lab_events::LabEvent>, crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn mark_delivered(
-            &self,
-            _: &[uuid::Uuid],
-        ) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn reschedule(&self, _: &[uuid::Uuid]) -> Result<(), crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn pending_stats(
-            &self,
-        ) -> Result<(i64, Option<chrono::DateTime<chrono::Utc>>), crate::job_store::StoreError>
-        {
-            unreachable!()
-        }
-        async fn purge_delivered(&self, _: i64) -> Result<u64, crate::job_store::StoreError> {
-            unreachable!()
-        }
-        async fn undelivered_usage_credits(
-            &self,
-            _: &str,
-        ) -> Result<i64, crate::job_store::StoreError> {
-            Err(crate::job_store::StoreError::Other("db down".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn unreadable_outbox_falls_back_to_the_labs_balance() {
-        let lab = FakeLab::start().await;
-        let c = LabClient::with_timing(&lab.url, TOKEN, fast())
-            .with_undelivered_usage(Arc::new(BrokenOutbox));
-        lab.set_account(
-            ACCT,
-            json!({"active": true, "account_id": ACCT, "tier": "pro", "credits": {"balance": 100}}),
-        );
-        assert_eq!(credits(&c, ACCT).await.unwrap(), Some(100));
     }
 
     /// Important 3: "no engine" is a negative answer, re-asked after
@@ -1448,7 +1519,8 @@ mod tests {
         let lab = FakeLab::start().await;
         let c = Arc::new(LabClient::with_timing(
             &lab.url,
-            TOKEN,
+            INSTANCE_ID,
+            SECRET,
             Timing {
                 max_in_flight: 1,
                 request_timeout: Duration::from_secs(2),
@@ -1566,8 +1638,8 @@ mod tests {
         let redirector = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let c = LabClient::with_timing(&redirector, TOKEN, fast());
-        assert_eq!(c.ping().await, Err(LabError::BadResponse(307)));
+        let c = LabClient::with_timing(&redirector, INSTANCE_ID, SECRET, fast());
+        assert_eq!(c.instances_me().await, Err(LabError::BadResponse(307)));
         lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 1));
         assert_eq!(
             c.introspect(CredentialKind::ApiKey, "sk_live_a", None)

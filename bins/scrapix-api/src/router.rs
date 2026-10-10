@@ -270,7 +270,8 @@ mod tests {
         // the Lab fails fast with a 503 instead of passing.
         let lab = std::sync::Arc::new(crate::lab_client::LabClient::new(
             "http://127.0.0.1:1",
-            "unused-service-token",
+            crate::lab_client::testing::INSTANCE_ID,
+            crate::lab_client::testing::SECRET,
         ));
         AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState::new(lab, None)))
     }

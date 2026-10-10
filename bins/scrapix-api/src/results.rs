@@ -448,8 +448,9 @@ async fn crawl_results(
 
 /// Where `job`'s documents live: the connection remembered at creation,
 /// else the Replace-strategy connection persisted with the job, else the
-/// resolver's target for the job's (redacted) config URL, else the
-/// resolver's default target.
+/// job's (redacted) config URL, with its key recovered from the resolver
+/// when known. Never the resolver's default target: a job's results are
+/// read only from the job's own Meilisearch.
 async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliTarget, ApiError> {
     if let Some(target) = state.results.crawl_target(&job.job_id) {
         return Ok(target);
@@ -483,14 +484,10 @@ async fn resolve_crawl_target(state: &AppState, job: &JobState) -> Result<MeiliT
             api_key: None,
         });
     }
-    match state.meili.default_target(account).await {
-        Ok(Some(t)) => Ok(t),
-        Ok(None) => Err(ApiError::new(
-            "The Meilisearch instance of this job is unknown",
-            "not_found",
-        )),
-        Err(e) => Err(e),
-    }
+    Err(ApiError::new(
+        "The Meilisearch instance of this job is unknown",
+        "not_found",
+    ))
 }
 
 /// Escape a value for a double-quoted Meilisearch filter string.
@@ -1132,5 +1129,24 @@ mod tests {
         assert!(results_page(&state, &job, None, Some("garbage"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn results_target_is_only_the_jobs_own() {
+        let bus = scrapix_queue::ChannelBus::new();
+        let mut state = test_support::test_state(&bus);
+        // An operator default that a job's results must never be read from.
+        Arc::get_mut(&mut state).unwrap().meili =
+            Arc::new(crate::meili::EnvResolver(Some(MeiliTarget {
+                url: "http://ops:7700".into(),
+                api_key: Some("ops".into()),
+            })));
+        let mut job = JobState::new("orphan", "idx");
+        job.config = Some(serde_json::json!({"meilisearch": {"url": ""}}));
+        let err = resolve_crawl_target(&state, &job).await.unwrap_err();
+        assert_eq!(err.code, "not_found");
+        job.config = Some(serde_json::json!({"meilisearch": {"url": "http://job:7700"}}));
+        let t = resolve_crawl_target(&state, &job).await.unwrap();
+        assert_eq!((t.url.as_str(), t.api_key), ("http://job:7700", None));
     }
 }

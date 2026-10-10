@@ -18,8 +18,8 @@
 //! Cost controls live here too: a per-document page cap, a per-account
 //! daily page budget ([`OcrBudget`]) and a cache keyed by page-image hash
 //! ([`OcrCache`]) so re-crawling a document never recognizes the same page
-//! twice. Credit pricing is `scrapix-billing`'s job
-//! (`OCR_PAGE_CREDITS`); [`OcrReport::billable_pages`] is what to charge.
+//! twice. Pricing is the Lab's job; [`OcrReport::billable_pages`] is what
+//! to report.
 
 pub mod backend;
 pub mod budget;

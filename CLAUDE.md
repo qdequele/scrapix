@@ -111,7 +111,10 @@ just stop         # Stop everything (services + infra)
   `meilisearch/lab` checkout (Rails on :8081, Postgres on :5433 with a
   `scrapix_engine` database) and use the commented "Hosted against a local
   Lab" block in `.env.example` (`SCRAPIX_MODE=hosted`, `LAB_URL`,
-  `LAB_EVENTS_SECRET`, `LAB_SERVICE_TOKEN`, `DATABASE_URL=…/scrapix_engine`).
+  `LAB_SERVICE_TOKEN` (pick it first), `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`
+  (minted on the Lab with `bin/rails lab:hosted_engine:create PRODUCT=scrapix
+  REGION=dev URL=http://localhost:8080 CREDENTIAL=<LAB_SERVICE_TOKEN>`),
+  `DATABASE_URL=…/scrapix_engine`).
 
 **Individual service commands** (when you only need one):
 ```bash
@@ -281,34 +284,57 @@ that names a Lab-owned table, reads included).
   (`DATABASE_URL`: jobs, job results, the lab-events outbox; SQLite by default
   or its own Postgres, migrated by the engine itself in **both** modes) and,
   when hosted, resolves everything it needs from the Lab through `LabClient`
-  (`{LAB_URL}/internal/*`, Bearer `LAB_SERVICE_TOKEN`): credentials are sent to
+  (`{LAB_URL}/internal/*`, `X-Lab-Instance-Id: LAB_INSTANCE_ID` + Bearer
+  `LAB_INSTANCE_SECRET`): credentials are sent to
   `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
-  30 s, stale up to 5 min if the Lab is down; an unknown credential while the
+  30 s, stale up to 5 min if the Lab is down, except answers with
+  `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the
   Lab is down is a 503 with `Retry-After: 5`; so a revoked key keeps working
   on the engine for up to `cache_ttl`, documented in
   `docs/configuration/environment-variables.mdx`), the Meilisearch target comes
-  from `GET /internal/accounts/{id}/meilisearch`, and credits from
-  `GET /internal/accounts/{id}`. It issues no credentials and reads no Lab
-  table. At startup it pings `{LAB_URL}/internal/ping` and refuses to start on
-  a wrong token or a 4xx (wrong `LAB_URL`); the metric
+  from `GET /internal/accounts/{id}/meilisearch` (a hosted tenant without one
+  cannot crawl; `MEILISEARCH_URL` is ignored in hosted mode, never a
+  fallback), and the balance and plan `limits` (`concurrent_jobs`,
+  `rate_limit_rpm`, `max_depth`, `js_rendering`) from introspect /
+  `GET /internal/accounts/{id}`. The engine enforces concurrent jobs,
+  `max_depth` (a hosted crawl without one gets the plan's) and JS rendering
+  (crawl, scrape, batch, extract, `/map` with `render_js`), not
+  `rate_limit_rpm`; it refuses billable work at a balance `<= 0` (402
+  `insufficient_credits`, 503 past the stale window). It reports raw units
+  (incl. `feature_pages`, the per-feature surcharge) and, for the contract
+  v2 transition release only, the pre-v2 `credits`
+  (`bins/scrapix-api/src/legacy_credits.rs`), which the Lab debits as
+  authoritative for scrapix (removed next release; never used for a
+  pre-check); `provider_cost_micro_usd` is 0 (the engine knows token
+  counts, not provider prices). It issues no
+  credentials and reads no Lab table. At startup it calls
+  `GET {LAB_URL}/internal/instances/me` and refuses to start on a 401
+  (re-issue the credentials), a 404 (wrong `LAB_URL` or a pre-v2 Lab) or an
+  instance that is not a hosted `scrapix` engine; the metric
   `scrapix_lab_requests_total{endpoint,outcome}` counts these calls. It also
   **reports lab events**: usage (`usage.recorded`) and job lifecycle (`job.completed` /
-  `job.failed`) go to an engine-owned `lab_events` outbox and are delivered,
-  HMAC-signed, to the Lab's `POST /internal/events` (contract:
-  `contracts/lab-events.schema.json`, docs `docs/api-reference/lab-events.mdx`).
+  `job.failed`) go to an engine-owned `lab_events` outbox and are delivered
+  in batches of up to 500, signed (`X-Lab-Instance-Id`, `X-Lab-Timestamp`,
+  `X-Lab-Signature: sha256=<hmac("<ts>.<body>", LAB_INSTANCE_SECRET)>`), to
+  the Lab's `POST /internal/events`; an event never acknowledged for 24 h is
+  dropped with an error log (contract: vendored at
+  `contracts/vendor/lab/lab-events.schema.json` (Lab-owned), docs
+  `docs/api-reference/lab-events.mdx`).
   The Lab owns everything that follows from them: credit debits, auto top-up,
   low-balance and job emails, the saved-config cron (which calls the engine
-  with `LAB_SERVICE_TOKEN`), and OAuth token cleanup. The hosted engine
-  refuses to start without `LAB_URL`, `LAB_EVENTS_SECRET` and
-  `LAB_SERVICE_TOKEN`, and uses its own `DATABASE_URL` (SQLite if unset; use
+  with `LAB_SERVICE_TOKEN`, inbound only), and OAuth token cleanup. The hosted
+  engine refuses to start without `LAB_URL`, `LAB_INSTANCE_ID`,
+  `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN` (`LAB_EVENTS_SECRET` is
+  ignored, with a warning), and uses its own `DATABASE_URL` (SQLite if unset; use
   its own Postgres in production); the engine never reads
   `STRIPE_SECRET_KEY` or `JWT_SECRET`.
 
 The engine owns `contracts/openapi.json` (the frozen full-platform spec the
-Lab implements), `contracts/openapi.engine.json` (the engine-only spec) and
-`contracts/lab-events.schema.json`; the Lab vendors byte copies of
-`openapi.json` and `lab-events.schema.json` and drift-checks them, so change
-them only intentionally (see `contracts/README.md`).
+Lab implements) and `contracts/openapi.engine.json` (the engine-only spec);
+the Lab vendors a byte copy of `openapi.json` and drift-checks it, so change
+it only intentionally (see `contracts/README.md`). The engine vendors two
+Lab-owned files under `contracts/vendor/lab/` (`lab-internal.openapi.json`,
+`lab-events.schema.json`).
 
 #### Standalone vs hosted
 
@@ -317,9 +343,11 @@ itself (SQLite by default, or a dedicated Postgres), and it refuses to start
 against a database that holds the Rails schema. `bins/scrapix-api` runs
 **standalone** (`SCRAPIX_MODE=standalone`, the default) with no Rails control
 plane at all: one operator key (`SCRAPIX_ADMIN_KEY`) instead of
-accounts/sessions/API keys. `SCRAPIX_MODE=hosted` adds the Lab: it requires
-`LAB_URL`, `LAB_EVENTS_SECRET` and `LAB_SERVICE_TOKEN` (plus the engine's own
-`DATABASE_URL` in production), fails closed if one of the three is missing, and ignores `JWT_SECRET`
+accounts/sessions/API keys, and it refuses `LAB_INSTANCE_ID` /
+`LAB_INSTANCE_SECRET` (a standalone engine has no Lab). `SCRAPIX_MODE=hosted`
+adds the Lab: it requires `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`
+and `LAB_SERVICE_TOKEN` (plus the engine's own `DATABASE_URL` in production),
+fails closed if one of them is missing, and ignores `JWT_SECRET`
 (the Lab verifies sessions). Docs for self-hosters live in `docs/` (this is the
 product repo's docs site); platform-only docs (accounts, billing, API key
 CRUD, OAuth) live in the `meilisearch/lab` repo. See
@@ -358,9 +386,8 @@ The project is organized as a Cargo workspace with two main directories:
 
 - **Message Queue:** Redpanda (Kafka-compatible, via rdkafka crate)
 - **Search:** Meilisearch (primary store for documents, metadata, vectors)
-- **Local State:** RocksDB (per-worker URL cache, robots.txt, DNS)
-- **Cache:** DragonflyDB/Redis (rate limiting, real-time counters)
-- **Object Storage:** S3-compatible (RustFS/MinIO) for HTML archives
+- **Cache:** DragonflyDB/Redis (frontier store, politeness, incremental-crawl headers)
+- **Job store:** SQLite (default) or Postgres, owned and migrated by the engine
 
 ### Near-Duplicate Detection
 
@@ -486,9 +513,11 @@ rename without updating the scrape config there. Current metrics:
 `scrapix_frontier_dispatched_total`, `scrapix_content_documents_total{outcome}`,
 `scrapix_content_flush_duration_seconds`, `scrapix_api_jobs{status}`,
 `scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
-`scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`),
+`scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`|`dropped`),
 `scrapix_lab_requests_total{endpoint,outcome}` (the engine's calls to the Lab's
-`/internal/*` API).
+`/internal/*` API; endpoint `instances_me`|`introspect`|`account`|`meilisearch`.
+The boot check was `endpoint="ping"` before contract v2: dashboards filtering
+on it go empty).
 
 ### Webhooks (SCR-72)
 
@@ -542,8 +571,9 @@ blank. OCR (`scrapix-ocr`) is opt-in (`off`/`auto`/`force`): PDFium
 rasterization (runtime-loaded, `PDFIUM_LIB_PATH`), vision-LLM (via
 `scrapix-ai`, usage tracked as feature `ocr`) or Tesseract backend, page cap,
 per-account daily budget, page-image-hash cache (hits not billed). OCR pages
-cost `OCR_PAGE_CREDITS` (5) each — separate `ocr` ledger entry on
-scrape/parse, `pages_ocr` in crawl accounting (`DocumentIndexed.ocr_pages`),
+are reported as a separate `ocr` usage event on scrape/parse
+(`{documents: <recognized pages>, pages_ocr}`; the Lab prices them),
+`pages_ocr` in crawl accounting (`DocumentIndexed.ocr_pages`),
 `request_events.ocr_pages` in ClickHouse. Fixtures + generator:
 `crates/scrapix-parser/tests/fixtures/`. Guide: `docs/guides/documents.mdx`.
 
@@ -566,12 +596,20 @@ The system tracks usage data for pricing/billing purposes.
 | `job_id` | String | Job attribution |
 | `domain` | String | Domain crawled |
 
-### Billing Types (scrapix-core)
+### Billing is the Lab's
 
-- `Account` - Billable entity with tier and quotas
-- `ApiKey` - Authentication token linked to account
-- `BillingTier` - Free/Starter/Pro/Enterprise with limits
-- `UsageMetrics` - Per-period usage tracking
+The engine has no tiers or plan constants (the old `scrapix-billing` crate
+and `scrapix-core::billing` are gone): it reports raw units in
+`usage.recorded` events (incl. `feature_pages`, counted by the permanent
+`bins/scrapix-api/src/usage_units.rs`) and enforces the plan `limits` the
+Lab returns. `bins/scrapix-api/src/billing.rs` is only the balance
+pre-check. **Transition release:** every `usage.recorded` also carries
+`credits`, the pre-v2 price from `bins/scrapix-api/src/legacy_credits.rs`
+(the only price formula left, used only for that field; it reuses the
+`usage_units` counters), which the Lab debits as authoritative for product
+scrapix; delete the module and the field next release (units, including
+`feature_pages`, are unaffected). `provider_cost_micro_usd` is 0: the engine knows token counts, not
+provider prices.
 
 ### ClickHouse Analytics Queries
 
@@ -604,7 +642,7 @@ GROUP BY date ORDER BY date;
 | `DATABASE_URL` | API: the engine's **own** job-history store in both modes; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema, so it can never be the Lab's). Hosted production should point it at a dedicated Postgres database (e.g. `scrapix_engine`). |
 | `JWT_SECRET` | Ignored by the engine (logs a line if set) — the Lab verifies sessions |
 | `KAFKA_BROKERS` | Kafka/Redpanda broker addresses |
-| `MEILISEARCH_URL` | Meilisearch server URL |
+| `MEILISEARCH_URL` | Meilisearch server URL (API: ignored in hosted mode, warned; tenants use their Lab-registered targets) |
 | `MEILISEARCH_API_KEY` | Meilisearch API key |
 | `REDIS_URL` | Redis/DragonflyDB URL |
 | `CLICKHOUSE_URL` | ClickHouse HTTP URL (enables analytics API) |
@@ -621,8 +659,9 @@ GROUP BY date ORDER BY date;
 | `CRAWL_BROWSER_AVAILABLE` | API: whether the crawlers can render pages; unset = unknown (browser crawls accepted), `false` = `POST /crawl` refuses `crawler_type: browser`. `scrapix all` sets it from `BROWSER_RENDER` |
 | `LAB_URL` | API, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone |
 | `LAB_EVENTS_URL` | **Deprecated** fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Do not set it |
-| `LAB_EVENTS_SECRET` | API, hosted only, required (≥32 chars, same value on the Lab): HMAC-SHA256 key signing lab-event deliveries (`X-Scrapix-Signature`). Generate with `openssl rand -hex 32` |
-| `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars, same value on the Lab): Bearer token in both directions: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron), and the engine presents it on `{LAB_URL}/internal/*` |
+| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API, hosted only, required; refused in standalone. Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` once; rotate with `lab:hosted_engine:rotate ID=`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
+| `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars; generated first and passed to the Lab at mint time as `CREDENTIAL=`, stored per engine), inbound only: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron). Never sent to the Lab |
+| `LAB_EVENTS_SECRET` | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET` |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |

@@ -91,11 +91,13 @@ Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET 
 
 ## Billing
 
-- each page fetched: what the same `/scrape` request costs (markdown: 1 credit);
-- each glob resolved: a `/map` (2 credits);
-- each AI call: an AI extraction (5 credits). A single-pass extraction makes one call; a large one makes one call per page plus one merge call.
+Hosted only. The engine reports usage units and the Lab prices them:
 
-The request is rejected with `402` when the balance cannot cover the minimum (the explicit URLs, the globs and one AI call).
+- each page fetched: reported like the same `/scrape` request;
+- each glob resolved: reported as a `/map`;
+- each AI call: an `extract` usage event (`documents: 1`). A single-pass extraction makes one call; a large one makes one call per page plus one merge call.
+
+The request is rejected with `402` when the account's credit balance is exhausted.
 
 ### Example
 

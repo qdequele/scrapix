@@ -5,13 +5,13 @@
 //! only *validates* credentials issued there — API keys, OAuth Bearer tokens,
 //! session JWTs and the Lab's service token — and resolves every one of them
 //! through the Lab's internal API over HTTP (`LabClient`); it never reads the
-//! Lab's database. Core primitives (JWT, types) are in `scrapix-auth`.
+//! Lab's database. Core identity types are in `scrapix-auth`.
 
 pub(crate) mod admin_key;
 pub(crate) mod middleware;
 
-// Re-export core auth primitives from the scrapix-auth crate.
-pub use scrapix_auth::{AuthenticatedAccount, Claims};
+// Re-export the core identity types from the scrapix-auth crate.
+pub use scrapix_auth::{AuthenticatedAccount, Limits};
 
 pub use admin_key::AdminKey;
 

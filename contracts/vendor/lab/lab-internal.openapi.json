@@ -3,9 +3,13 @@
   "info": {
     "title": "Meilisearch Lab internal API",
     "version": "1",
-    "description": "Service API the Rust crawl engine calls on the Lab (Rails) control plane instead of reading the Lab database. Every endpoint requires `Authorization: Bearer <LAB_SERVICE_TOKEN>`; a missing or wrong token gets 401."
+    "description": "Service API the hosted product engines (Scrapix, Lumen, glutony) call on the Lab (Rails) control plane instead of reading the Lab database. Every endpoint except `POST /internal/events` requires `X-Lab-Instance-Id` plus `Authorization: Bearer <LAB_INSTANCE_SECRET>`; a missing or wrong credential gets 401. For one transition release the legacy `Authorization: Bearer <LAB_SERVICE_TOKEN>` without an instance id is still accepted and acts as the hosted Scrapix engine. `POST /internal/events` is signed per deployment instead (see its description)."
   },
   "security": [
+    {
+      "instanceSecret": [],
+      "instanceId": []
+    },
     {
       "bearerAuth": []
     }
@@ -149,6 +153,154 @@
           }
         }
       }
+    },
+    "/internal/instances/me": {
+      "get": {
+        "operationId": "getSelf",
+        "summary": "What the Lab knows about the calling deployment",
+        "description": "On the legacy service-token path there is no deployment row, so `instance_id` and `region` can be null.",
+        "responses": {
+          "200": {
+            "description": "Self description",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "instance_id",
+                    "kind",
+                    "product",
+                    "region",
+                    "lab_url"
+                  ],
+                  "properties": {
+                    "instance_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "The deployment's LAB_INSTANCE_ID; null on the legacy service-token path"
+                    },
+                    "kind": {
+                      "enum": [
+                        "hosted"
+                      ]
+                    },
+                    "product": {
+                      "enum": [
+                        "scrapix",
+                        "lumen",
+                        "glutony"
+                      ]
+                    },
+                    "region": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Null when the deployment has no region (always on the legacy path)"
+                    },
+                    "lab_url": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/internal/events": {
+      "post": {
+        "operationId": "postEvents",
+        "summary": "Report usage and job events (contract v2 section 4)",
+        "description": "Signed per deployment: X-Lab-Instance-Id, X-Lab-Timestamp (unix seconds, within 300 s) and X-Lab-Signature: sha256=HMAC-SHA256(LAB_INSTANCE_SECRET, \"<timestamp>.<raw body>\"). For one transition release the legacy `X-Scrapix-Signature: sha256=HMAC-SHA256(LAB_EVENTS_SECRET, \"<raw body>\")` without an instance id is still accepted (503 when the Lab has no legacy secret configured). At most 500 events. Events are described by contracts/lab-events.schema.json. Ids missing from `accepted` were skipped (logged by the Lab) and must be dropped by the engine after 24 h.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Lab-Instance-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Lab-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Lab-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "events"
+                ],
+                "properties": {
+                  "events": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted ids",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "accepted"
+                  ],
+                  "properties": {
+                    "accepted": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body or more than 500 events"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "Legacy path only: the Lab has no legacy events secret configured"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -156,12 +308,23 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "LAB_SERVICE_TOKEN (at least 32 characters)"
+        "description": "Deprecated: legacy LAB_SERVICE_TOKEN, removed next release"
+      },
+      "instanceSecret": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "LAB_INSTANCE_SECRET of the calling hosted engine (64 hex chars), with X-Lab-Instance-Id"
+      },
+      "instanceId": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Lab-Instance-Id",
+        "description": "LAB_INSTANCE_ID (uuid)"
       }
     },
     "responses": {
       "Unauthorized": {
-        "description": "Missing or wrong service token"
+        "description": "Missing or wrong engine credentials (or, for events, a bad signature or stale timestamp)"
       }
     },
     "schemas": {
@@ -306,6 +469,9 @@
           "cache_ttl": {
             "type": "integer",
             "description": "Seconds the engine may cache this answer: 30, or fewer for a session or OAuth token that expires sooner (never past the credential's expiry; 0 = do not cache)"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/PlanLimits"
           }
         }
       },
@@ -351,6 +517,9 @@
           },
           "cache_ttl": {
             "type": "integer"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/PlanLimits"
           }
         }
       },
@@ -394,6 +563,30 @@
           "error": {
             "type": "string",
             "const": "not_found"
+          }
+        }
+      },
+      "PlanLimits": {
+        "type": "object",
+        "description": "Per-plan limits an engine enforces for the account's tier (contract v2 section 5)",
+        "required": [
+          "concurrent_jobs",
+          "rate_limit_rpm",
+          "max_depth",
+          "js_rendering"
+        ],
+        "properties": {
+          "concurrent_jobs": {
+            "type": "integer"
+          },
+          "rate_limit_rpm": {
+            "type": "integer"
+          },
+          "max_depth": {
+            "type": "integer"
+          },
+          "js_rendering": {
+            "type": "boolean"
           }
         }
       }

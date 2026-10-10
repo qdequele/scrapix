@@ -191,11 +191,17 @@ services:
       # there: Rails on :8081, Postgres on :5433 with a `scrapix_engine`
       # database). On plain Linux (not OrbStack / Docker Desktop) also add
       # `extra_hosts: ["host.docker.internal:host-gateway"]` to this service.
+      # Mint LAB_INSTANCE_ID / LAB_INSTANCE_SECRET on the Lab with the
+      # LAB_SERVICE_TOKEN below (`bin/rails lab:hosted_engine:create
+      # PRODUCT=scrapix REGION=dev URL=http://localhost:8080
+      # CREDENTIAL=<LAB_SERVICE_TOKEN>`). The API then ignores MEILISEARCH_URL:
+      # tenants use the Meilisearch targets registered in the Lab.
       # Replace the three standalone lines above with:
       # SCRAPIX_MODE: hosted
       # DATABASE_URL: postgres://scrapix:scrapix@host.docker.internal:5433/scrapix_engine
       # LAB_URL: http://host.docker.internal:8081
-      # LAB_EVENTS_SECRET: dev-lab-events-secret-change-in-production-0000
+      # LAB_INSTANCE_ID: <uuid printed by the Lab>
+      # LAB_INSTANCE_SECRET: <64 hex printed by the Lab>
       # LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
     volumes:
       - cargo-registry:/usr/local/cargo/registry
@@ -278,7 +284,7 @@ services:
       KAFKA_BROKERS: redpanda:9092
       KAFKA_GROUP_ID: scrapix-crawlers
       CONCURRENCY: 50
-      USER_AGENT: "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
+      USER_AGENT: "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)"
       REQUEST_TIMEOUT: 30
       MAX_RETRIES: 3
       MAX_DEPTH: 100

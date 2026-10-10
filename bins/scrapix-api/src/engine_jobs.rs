@@ -43,6 +43,7 @@ pub(crate) fn clone_account_ctx(ctx: &Option<AccountContext>) -> Option<AccountC
         api_key_id: c.api_key_id.clone(),
         tier: c.tier.clone(),
         user_role: c.user_role.clone(),
+        limits: c.limits.clone(),
     })
 }
 
@@ -56,29 +57,92 @@ pub(crate) fn validate_webhooks(hooks: &mut [WebhookConfig]) -> Result<(), ApiEr
     Ok(())
 }
 
-/// Credit pre-check and per-tier concurrent job limit, as for `/crawl`.
-pub(crate) async fn preflight(
-    state: &AppState,
-    account_ctx: &Option<AccountContext>,
-    required_credits: i64,
+/// What a job asks of the plan (the Lab's `limits`).
+#[derive(Debug, Clone)]
+pub(crate) struct PlanCheck {
+    pub max_depth: Option<u32>,
+    pub js_rendering: bool,
+}
+
+static LIMITS_MISSING_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Enforce the Lab's plan limits: concurrent jobs, crawl depth and JS
+/// rendering. A Lab that sent no `limits` enforces nothing (warned once).
+pub(crate) fn enforce_limits(
+    ctx: &AccountContext,
+    active_jobs: i64,
+    check: PlanCheck,
 ) -> Result<(), ApiError> {
-    let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) else {
+    let Some(limits) = ctx.limits.as_ref() else {
+        LIMITS_MISSING_WARNED.call_once(|| {
+            warn!("The Lab sent no plan limits (contract v1?): concurrent jobs, max_depth and JS rendering are not enforced")
+        });
         return Ok(());
     };
-    billing::check_credits(lab, &ctx.account_id, required_credits.max(1)).await?;
-    let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
-    let max_concurrent = tier.max_concurrent_jobs() as i64;
-    let active_count = state.active_job_count(&ctx.account_id).await;
-    if active_count >= max_concurrent {
+    // Each refusal names the plan (`ctx.tier`) and the limit, and says the
+    // limits come from the Lab: they are enforced since contract v2, so a
+    // request that used to pass can now be refused.
+    let plan = &ctx.tier;
+    if active_jobs >= limits.concurrent_jobs {
         return Err(ApiError::new(
             format!(
-                "Maximum concurrent jobs reached ({}/{}). Upgrade your plan for more.",
-                active_count, max_concurrent
+                "Maximum concurrent jobs reached for the {plan} plan ({}/{}). Plan limits come \
+                 from the Lab; wait for a running job to finish (or cancel one) or upgrade your plan.",
+                active_jobs, limits.concurrent_jobs
+            ),
+            "quota_exceeded",
+        ));
+    }
+    if let Some(depth) = check.max_depth {
+        if depth > limits.max_depth {
+            return Err(ApiError::new(
+                format!(
+                    "max_depth {depth} exceeds the {plan} plan's max_depth limit of {}. Plan \
+                     limits come from the Lab; lower max_depth (or remove it to use the plan \
+                     limit) or upgrade your plan.",
+                    limits.max_depth
+                ),
+                "quota_exceeded",
+            ));
+        }
+    }
+    if check.js_rendering && !limits.js_rendering {
+        return Err(ApiError::new(
+            format!(
+                "JS rendering (browser crawler, render_js, screenshots, actions) is not included \
+                 in the {plan} plan. Plan limits come from the Lab; disable it or upgrade your plan."
             ),
             "quota_exceeded",
         ));
     }
     Ok(())
+}
+
+/// Give a crawl that names no `max_depth` the plan's limit. The frontier
+/// reads `None` as unbounded, so without this the default crawl body would
+/// escape every plan's depth limit. An explicit depth is left to
+/// `enforce_limits`; with no `limits` (contract v1 Lab, standalone) the
+/// depth stays `None`.
+pub(crate) fn cap_unspecified_depth(max_depth: &mut Option<u32>, ctx: Option<&AccountContext>) {
+    if max_depth.is_none() {
+        *max_depth = ctx
+            .and_then(|c| c.limits.as_ref())
+            .map(|limits| limits.max_depth);
+    }
+}
+
+/// Balance pre-check and plan limits, as for `/crawl` (hosted only).
+pub(crate) async fn preflight(
+    state: &AppState,
+    account_ctx: Option<&AccountContext>,
+    check: PlanCheck,
+) -> Result<(), ApiError> {
+    let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) else {
+        return Ok(());
+    };
+    billing::check_credits(lab, &ctx.account_id).await?;
+    let active_count = state.active_job_count(&ctx.account_id).await;
+    enforce_limits(ctx, active_count, check)
 }
 
 /// Create, persist and start an engine-run job. `config` is the (already
@@ -255,4 +319,209 @@ pub(crate) async fn fail_interrupted(
         out.push(job);
     }
     out
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use scrapix_auth::Limits;
+
+    fn ctx(limits: Option<Limits>) -> AccountContext {
+        AccountContext {
+            account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
+            api_key_id: None,
+            tier: "free".into(),
+            user_role: None,
+            limits,
+        }
+    }
+
+    fn free() -> Limits {
+        Limits {
+            concurrent_jobs: 1,
+            rate_limit_rpm: 60,
+            max_depth: 3,
+            js_rendering: false,
+        }
+    }
+
+    #[test]
+    fn concurrent_jobs_max_depth_and_js_rendering_come_from_the_labs_limits() {
+        let ok = PlanCheck {
+            max_depth: Some(3),
+            js_rendering: false,
+        };
+        assert!(enforce_limits(&ctx(Some(free())), 0, ok.clone()).is_ok());
+        let e = enforce_limits(&ctx(Some(free())), 1, ok.clone()).unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert!(e.error.contains("for the free plan (1/1)"), "{}", e.error);
+        let e = enforce_limits(
+            &ctx(Some(free())),
+            0,
+            PlanCheck {
+                max_depth: Some(4),
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert!(
+            e.error
+                .contains("max_depth 4 exceeds the free plan's max_depth limit of 3"),
+            "{}",
+            e.error
+        );
+        let e = enforce_limits(
+            &ctx(Some(free())),
+            0,
+            PlanCheck {
+                max_depth: None,
+                js_rendering: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert!(e.error.contains("JS rendering"), "{}", e.error);
+        assert!(
+            e.error.contains("not included in the free plan"),
+            "{}",
+            e.error
+        );
+        let pro = Limits {
+            concurrent_jobs: 10,
+            rate_limit_rpm: 1200,
+            max_depth: 10,
+            js_rendering: true,
+        };
+        assert!(enforce_limits(
+            &ctx(Some(pro)),
+            9,
+            PlanCheck {
+                max_depth: Some(10),
+                js_rendering: true
+            }
+        )
+        .is_ok());
+    }
+
+    fn ctx_on(tier: &str, limits: Limits) -> AccountContext {
+        AccountContext {
+            tier: tier.into(),
+            ..ctx(Some(limits))
+        }
+    }
+
+    /// Each refusal names the plan, the limit, and why it can fail now
+    /// (the limits come from the Lab).
+    #[test]
+    fn refusals_name_the_plan_and_the_limit() {
+        let pro = Limits {
+            concurrent_jobs: 10,
+            rate_limit_rpm: 1200,
+            max_depth: 10,
+            js_rendering: true,
+        };
+        let e = enforce_limits(
+            &ctx_on("pro", pro),
+            0,
+            PlanCheck {
+                max_depth: Some(15),
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(
+            e.error,
+            "max_depth 15 exceeds the pro plan's max_depth limit of 10. Plan limits come from \
+             the Lab; lower max_depth (or remove it to use the plan limit) or upgrade your plan."
+        );
+
+        let e = enforce_limits(
+            &ctx_on("free", free()),
+            0,
+            PlanCheck {
+                max_depth: None,
+                js_rendering: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(
+            e.error,
+            "JS rendering (browser crawler, render_js, screenshots, actions) is not included in \
+             the free plan. Plan limits come from the Lab; disable it or upgrade your plan."
+        );
+
+        let starter = Limits {
+            concurrent_jobs: 3,
+            rate_limit_rpm: 300,
+            max_depth: 5,
+            js_rendering: true,
+        };
+        let e = enforce_limits(
+            &ctx_on("starter", starter),
+            3,
+            PlanCheck {
+                max_depth: None,
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+        assert!(
+            e.error
+                .starts_with("Maximum concurrent jobs reached for the starter plan (3/3). Plan limits come from the Lab;"),
+            "{}",
+            e.error
+        );
+        assert!(e.error.contains("upgrade your plan"), "{}", e.error);
+        use axum::response::IntoResponse;
+        assert_eq!(e.into_response().status(), 429);
+    }
+
+    #[test]
+    fn a_crawl_with_no_max_depth_is_capped_at_the_plans_limit() {
+        let free_ctx = ctx(Some(free()));
+        let mut depth = None;
+        cap_unspecified_depth(&mut depth, Some(&free_ctx));
+        assert_eq!(depth, Some(3), "unbounded becomes the plan's max_depth");
+
+        let mut depth = Some(2);
+        cap_unspecified_depth(&mut depth, Some(&free_ctx));
+        assert_eq!(depth, Some(2), "an explicit depth is kept");
+
+        // An explicit depth over the limit is still refused.
+        let e = enforce_limits(
+            &free_ctx,
+            0,
+            PlanCheck {
+                max_depth: Some(4),
+                js_rendering: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "quota_exceeded");
+
+        // No limits (contract v1 Lab) or no account (standalone): unbounded.
+        let mut depth = None;
+        cap_unspecified_depth(&mut depth, Some(&ctx(None)));
+        assert_eq!(depth, None);
+        cap_unspecified_depth(&mut depth, None);
+        assert_eq!(depth, None);
+    }
+
+    #[test]
+    fn missing_limits_skips_enforcement_with_one_warning() {
+        // A Lab that predates `limits` (contract v1): nothing to enforce.
+        assert!(enforce_limits(
+            &ctx(None),
+            100,
+            PlanCheck {
+                max_depth: Some(99),
+                js_rendering: true
+            }
+        )
+        .is_ok());
+    }
 }

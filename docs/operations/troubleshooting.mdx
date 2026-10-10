@@ -134,7 +134,7 @@ rpk group describe scrapix-frontier
 | Service | Memory Driver | Fix |
 |---------|--------------|-----|
 | Frontier | Bloom filters, URL queue | Reduce `BLOOM_CAPACITY`, `MAX_PENDING_PER_JOB` |
-| Crawler | HTTP connection pool, RocksDB | Reduce `CONCURRENCY`, check `ROCKSDB_PATH` disk space |
+| Crawler | HTTP connection pool, in-process robots.txt/DNS caches | Reduce `CONCURRENCY` |
 | Content | Batch buffer, AI responses | Reduce `BATCH_SIZE`, `AI_CONCURRENCY` |
 | Meilisearch | Index size | Add more RAM, optimize searchable attributes |
 
@@ -221,4 +221,4 @@ If you can't resolve an issue:
 
 1. Check logs with `RUST_LOG=debug`
 2. Run `scrapix stats -o json` and `scrapix errors -o json`
-3. Open an issue at [github.com/quentindequelen/scrapix/issues](https://github.com/quentindequelen/scrapix/issues) with the diagnostic output
+3. Open an issue at [github.com/qdequele/scrapix/issues](https://github.com/qdequele/scrapix/issues) with the diagnostic output

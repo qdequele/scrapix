@@ -55,11 +55,13 @@ pub mod job_store;
 pub(crate) mod lab_client;
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
+pub(crate) mod legacy_credits;
 pub mod meili;
 pub mod openapi;
 pub(crate) mod results;
 pub(crate) mod router;
 pub mod settings;
+pub(crate) mod usage_units;
 pub mod webhooks;
 
 #[cfg(test)]
@@ -166,13 +168,22 @@ pub struct Args {
     #[arg(long, env = "LAB_EVENTS_URL")]
     pub lab_events_url: Option<String>,
 
-    /// HMAC key signing event batches sent to the Lab (hosted only, min 32 chars).
+    /// Deprecated and ignored: event batches are signed with LAB_INSTANCE_SECRET.
     #[arg(long, env = "LAB_EVENTS_SECRET", hide_env_values = true)]
     pub lab_events_secret: Option<String>,
 
-    /// Bearer token for the Lab's internal service API (hosted only, min 32 chars).
+    /// Hosted only (min 32 chars): the token the Lab presents when it calls this engine for an account (X-Scrapix-Account-Id).
     #[arg(long, env = "LAB_SERVICE_TOKEN", hide_env_values = true)]
     pub lab_service_token: Option<String>,
+
+    /// The instance id the Lab minted for this hosted engine deployment
+    /// (uuid). Required in hosted mode, refused in standalone mode.
+    #[arg(long, env = "LAB_INSTANCE_ID")]
+    pub lab_instance_id: Option<String>,
+
+    /// The secret the Lab minted with LAB_INSTANCE_ID (64 hex chars).
+    #[arg(long, env = "LAB_INSTANCE_SECRET", hide_env_values = true)]
+    pub lab_instance_secret: Option<String>,
 
     /// Default Meilisearch for crawls and /search in standalone.
     #[arg(long, env = "MEILISEARCH_URL")]
@@ -307,10 +318,6 @@ struct DiagnosticsState {
     /// observability; one request per billed terminal job)
     job_bills_requested: std::sync::atomic::AtomicU64,
     pages_billed: std::sync::atomic::AtomicU64,
-    /// Total crawl credits computed by `bill_job` (test hook / observability;
-    /// incremented even without a DB pool configured, so tests can assert on
-    /// the computed amount without a live Postgres — D4/R4).
-    credits_billed: std::sync::atomic::AtomicI64,
 }
 
 /// ClickHouse analytics batchers
@@ -458,7 +465,6 @@ impl AppState {
                 job_emails_requested: std::sync::atomic::AtomicU64::new(0),
                 job_bills_requested: std::sync::atomic::AtomicU64::new(0),
                 pages_billed: std::sync::atomic::AtomicU64::new(0),
-                credits_billed: std::sync::atomic::AtomicI64::new(0),
             },
             analytics: AnalyticsState {
                 request_batcher,
@@ -636,12 +642,9 @@ impl AppState {
     fn record_unowned_lab_events(&self, job_id: &str) {
         let events = self.take_pending_lab_events(job_id);
         if let (false, Some(lab)) = (events.is_empty(), self.lab.clone()) {
-            let lab_api = self.lab_api.clone();
             tokio::spawn(async move {
                 // Failures are logged by `Lab::record`.
-                if lab.record(&events).await.is_ok() {
-                    note_recorded_usage(lab_api.as_deref(), &events);
-                }
+                let _ = lab.record(&events).await;
             });
         }
     }
@@ -770,10 +773,7 @@ impl AppState {
             return true; // not reachable: events are only owed with a Lab
         };
         match lab.record(&events).await {
-            Ok(()) => {
-                note_recorded_usage(self.lab_api.as_deref(), &events);
-                true
-            }
+            Ok(()) => true,
             Err(_) => {
                 // Logged by `Lab::record`.
                 self.requeue_pending_lab_events(job_id, events);
@@ -1239,19 +1239,18 @@ impl AppState {
         Ok(j.clone())
     }
 
-    /// Charge the crawled pages of a finished job: owes its crawl usage event
+    /// Report the crawled pages of a finished job: owes its crawl usage event
     /// (deterministic id, one per job) to the job's terminal write, so it
-    /// must be called before `write_terminal`. Cost per page depends on the
-    /// pages delivered and the job's enabled features. The single billing
-    /// path for terminal jobs.
-    /// D4/R4: credits are computed from what was actually delivered, not
-    /// from the job's static config — `pages_http`/`pages_browser` split the
-    /// crawled-ok page count by whether each page was actually rendered
-    /// with a browser (`PageCrawled.js_rendered`), and `pages_ai` counts
-    /// only pages that were actually AI-enriched (`DocumentIndexed.ai_enriched`),
-    /// regardless of whether the job merely had AI features enabled.
-    /// `pages_ocr` (OCR'd document pages, `DocumentIndexed.ocr_pages`) adds
-    /// the OCR page surcharge.
+    /// must be called before `write_terminal`. The event carries raw units
+    /// plus, for the contract v2 transition release, the pre-v2 `credits`
+    /// (`legacy_credits::crawl_credits` + `ocr_credits`, from the job's
+    /// enabled features). The single billing path for terminal jobs.
+    /// D4/R4: units count what was actually delivered, not the job's static
+    /// config — `pages_http`/`pages_browser` split the crawled-ok page count
+    /// by whether each page was actually rendered with a browser
+    /// (`PageCrawled.js_rendered`), `pages_ai` counts only pages that were
+    /// actually AI-enriched (`DocumentIndexed.ai_enriched`), and `pages_ocr`
+    /// counts OCR'd document pages (`DocumentIndexed.ocr_pages`).
     fn bill_job(
         &self,
         job_id: &str,
@@ -1272,25 +1271,6 @@ impl AppState {
             .pages_billed
             .fetch_add(total_pages, std::sync::atomic::Ordering::Relaxed);
 
-        // Extract features from persisted job config (crawler_type is no
-        // longer needed here: base rate now follows the per-page split
-        // above, not the job's declared crawler_type).
-        let features = {
-            let jobs = self.crawl.jobs.read();
-            jobs.get(job_id)
-                .and_then(|j| j.config.as_ref())
-                .and_then(|cfg| {
-                    cfg.get("features")
-                        .and_then(|v| serde_json::from_value::<FeaturesConfig>(v.clone()).ok())
-                })
-                .unwrap_or_default()
-        };
-        let credits = billing::crawl_credits(pages_http, pages_browser, pages_ai, &features)
-            + scrapix_billing::ocr_credits(pages_ocr);
-        self.diagnostics
-            .credits_billed
-            .fetch_add(credits, std::sync::atomic::Ordering::Relaxed);
-
         let (Some(_), Some(acct_id)) = (self.lab.as_ref(), account_id) else {
             return;
         };
@@ -1305,11 +1285,27 @@ impl AppState {
                 job_id, pages_http, pages_browser, pages_ai
             )
         };
+        // The job's enabled features (persisted config): they set the
+        // per-page feature surcharge, reported as `feature_pages`.
+        let features = {
+            let jobs = self.crawl.jobs.read();
+            jobs.get(job_id)
+                .and_then(|j| j.config.as_ref())
+                .and_then(|cfg| {
+                    cfg.get("features")
+                        .and_then(|v| serde_json::from_value::<FeaturesConfig>(v.clone()).ok())
+                })
+                .unwrap_or_default()
+        };
+        let feature_pages = total_pages.saturating_mul(usage_units::page_feature_count(&features));
+        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features)
+            + legacy_credits::ocr_credits(pages_ocr);
         let units = serde_json::json!({
             "pages_http": pages_http,
             "pages_browser": pages_browser,
             "pages_ai": pages_ai,
             "pages_ocr": pages_ocr,
+            "feature_pages": feature_pages,
         });
         let event =
             lab_events::LabEvent::crawl_final_usage(job_id, acct_id, credits, units, description);
@@ -2617,6 +2613,8 @@ pub(crate) struct AccountContext {
     pub tier: String,
     /// User role in this account (None for API keys and service calls — they are account-scoped).
     pub user_role: Option<String>,
+    /// The plan's limits from the Lab (`None`: a Lab that sent none).
+    pub limits: Option<scrapix_auth::Limits>,
 }
 
 /// Account context for the request: API key, OAuth, session or service call — the auth
@@ -2629,6 +2627,7 @@ async fn extract_account_context(
         api_key_id: acct.api_key_id.clone(),
         tier: acct.tier.clone(),
         user_role: acct.role.clone(),
+        limits: acct.limits.clone(),
     })
 }
 
@@ -3408,6 +3407,8 @@ async fn scrape_url(
 
 impl AppState {
     /// Record one usage event for `ctx` (hosted only; no-op without a Lab).
+    /// `credits` is the pre-v2 price (`legacy_credits`) sent next to the
+    /// units during the contract v2 transition release.
     pub(crate) async fn record_usage(
         &self,
         ctx: &AccountContext,
@@ -3433,20 +3434,7 @@ impl AppState {
     /// a Lab). Failures are logged by `Lab::record`.
     pub(crate) async fn record_events(&self, events: &[lab_events::LabEvent]) {
         let Some(ref lab) = self.lab else { return };
-        if lab.record(events).await.is_ok() {
-            note_recorded_usage(self.lab_api.as_deref(), events);
-        }
-    }
-}
-
-/// Feed recorded usage back to the Lab client so the balance pre-check
-/// counts credits the Lab has not yet folded into the balance it reports.
-fn note_recorded_usage(api: Option<&lab_client::LabClient>, events: &[lab_events::LabEvent]) {
-    let Some(api) = api else { return };
-    for e in events {
-        if let Some(credits) = e.usage_credits() {
-            api.note_usage(&e.account_id, credits);
-        }
+        let _ = lab.record(events).await;
     }
 }
 
@@ -3459,27 +3447,33 @@ pub(crate) fn with_memory_lab(state: &mut AppState) -> Arc<lab_events::MemoryOut
     outbox
 }
 
-/// Usage event for one successful scrape.
+/// Usage event for one successful scrape: one page, served by the browser
+/// or over HTTP, plus the AI work that produced a result. `formats` are the
+/// requested formats: their feature-format count is the page's
+/// `feature_pages` and, with the delivered AI flags, sets the pre-v2
+/// `credits`.
 async fn record_scrape_usage(
     state: &AppState,
     ctx: &AccountContext,
     formats: &[ScrapeFormat],
+    js_rendered: bool,
     ai_summary: bool,
     ai_extraction: bool,
-    credits: i64,
     final_url: &str,
 ) {
     state
         .record_usage(
             ctx,
             "scrape",
-            credits,
+            legacy_credits::scrape_credits(formats, ai_summary, ai_extraction),
             serde_json::json!({
-                "formats": formats,
-                "ai_summary": ai_summary,
-                "ai_extraction": ai_extraction,
+                "pages_http": u8::from(!js_rendered),
+                "pages_browser": u8::from(js_rendered),
+                "ai_summary": u8::from(ai_summary),
+                "ai_extraction": u8::from(ai_extraction),
+                "feature_pages": usage_units::feature_format_count(formats),
             }),
-            format!("{final_url} ({credits} credits)"),
+            final_url.to_string(),
             None,
         )
         .await;
@@ -3491,8 +3485,8 @@ async fn record_map_usage(state: &AppState, ctx: &AccountContext, url: &str, url
         .record_usage(
             ctx,
             "map",
-            billing::MAP_CREDITS,
-            serde_json::json!({ "urls_found": urls_found }),
+            legacy_credits::MAP_CREDITS,
+            serde_json::json!({ "requests": 1, "urls_found": urls_found }),
             url.to_string(),
             None,
         )
@@ -3515,16 +3509,16 @@ async fn record_search_usage(
         .record_usage(
             ctx,
             "search",
-            billing::SEARCH_CREDITS,
-            serde_json::json!({ "results": results }),
+            legacy_credits::SEARCH_CREDITS,
+            serde_json::json!({ "requests": 1, "results": results }),
             format!("{url} q={q}"),
             None,
         )
         .await;
 }
 
-/// The full /scrape pipeline for one URL: credit pre-check, fetch (HTTP or
-/// browser), extraction, AI enrichment, analytics and credit deduction.
+/// The full /scrape pipeline for one URL: balance and plan pre-check, fetch
+/// (HTTP or browser), extraction, AI enrichment, analytics and usage report.
 ///
 /// Shared by `POST /scrape` and the endpoints that scrape many URLs on the
 /// caller's behalf (batch scrape, extract). Permission checks are the
@@ -3540,16 +3534,22 @@ pub(crate) async fn perform_scrape(
 
     require_ai_provider(state, request.ai.as_ref())?;
 
-    // Credit estimate from the requested features (the charge is for what
-    // was delivered, see below)
-    let has_ai_summary_req = request.ai.as_ref().is_some_and(|ai| ai.wants_summary());
-    let has_ai_extraction_req = request.ai.as_ref().is_some_and(|ai| ai.wants_extraction());
-    let scrape_cost =
-        billing::scrape_credits(&request.formats, has_ai_summary_req, has_ai_extraction_req);
-
-    // Pre-flight credit check (soft UX check; real deduction is atomic below)
+    // Pre-flight (hosted): a positive balance, and JS rendering only on a
+    // plan that includes it.
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, scrape_cost).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
+        let wants_browser = request.render_js
+            || request.formats.contains(&ScrapeFormat::Screenshot)
+            || !request.actions.is_empty()
+            || request.mobile;
+        engine_jobs::enforce_limits(
+            ctx,
+            0,
+            engine_jobs::PlanCheck {
+                max_depth: None,
+                js_rendering: wants_browser,
+            },
+        )?;
     }
 
     let start_time = std::time::Instant::now();
@@ -3959,7 +3959,6 @@ pub(crate) async fn perform_scrape(
     // Only the AI work that produced a result is reported and billed.
     let has_ai_summary = ai_result.as_ref().is_some_and(|r| r.summary.is_some());
     let has_ai_extraction = ai_result.as_ref().is_some_and(|r| r.extract.is_some());
-    let charged = billing::scrape_credits(&request.formats, has_ai_summary, has_ai_extraction);
 
     // Track successful scrape in ClickHouse request_events
     if let Some(ref batcher) = state.analytics.request_batcher {
@@ -3995,9 +3994,9 @@ pub(crate) async fn perform_scrape(
             state,
             ctx,
             &request.formats,
+            js_rendered,
             has_ai_summary,
             has_ai_extraction,
-            charged,
             &final_url,
         )
         .await;
@@ -4553,25 +4552,19 @@ pub(crate) async fn do_create_crawl(
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
 
-    // Pre-flight credit check (1 credit minimum to start a crawl)
-    if let (Some(ref lab), Some(ctx)) = (&state.lab_api, account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, 1).await?;
-
-        // Enforce max concurrent jobs per billing tier
-        let tier: scrapix_core::BillingTier = ctx.tier.parse().unwrap_or_default();
-        let max_concurrent = tier.max_concurrent_jobs() as i64;
-        let active_count = state.active_job_count(&ctx.account_id).await;
-
-        if active_count >= max_concurrent {
-            return Err(ApiError::new(
-                format!(
-                    "Maximum concurrent jobs reached ({}/{}). Upgrade your plan for more.",
-                    active_count, max_concurrent
-                ),
-                "quota_exceeded",
-            ));
-        }
-    }
+    // Pre-flight (hosted): a positive balance and the plan's limits.
+    engine_jobs::preflight(
+        state,
+        account_ctx,
+        engine_jobs::PlanCheck {
+            max_depth: config.max_depth,
+            js_rendering: config.crawler_type == CrawlerType::Browser,
+        },
+    )
+    .await?;
+    // No depth given: cap it at the plan's limit before the job is stored
+    // and published, since the frontier treats `None` as unbounded.
+    engine_jobs::cap_unspecified_depth(&mut config.max_depth, account_ctx);
 
     // Generate job ID
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -5079,9 +5072,18 @@ async fn map_url(
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
-    // Pre-flight credit check (map costs 2 credits)
+    // Pre-flight (hosted): a positive balance, and JS rendering only on a
+    // plan that includes it.
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, billing::MAP_CREDITS).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
+        engine_jobs::enforce_limits(
+            ctx,
+            0,
+            engine_jobs::PlanCheck {
+                max_depth: None,
+                js_rendering: request.render_js,
+            },
+        )?;
     }
 
     let start_time = std::time::Instant::now();
@@ -5513,9 +5515,9 @@ async fn search_url(
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
 
-    // Pre-flight credit check
+    // Pre-flight balance check
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
-        billing::check_credits(lab, &ctx.account_id, billing::SEARCH_CREDITS).await?;
+        billing::check_credits(lab, &ctx.account_id).await?;
     }
 
     let start_time = std::time::Instant::now();
@@ -6736,16 +6738,38 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
     match (&settings.mode, &settings.auth, &settings.store) {
         (settings::Mode::Hosted, settings::AuthSetting::Lab, store_url) => {
             let lab_cfg = settings.lab.as_ref().expect("hosted has lab settings");
-            let lab_api = lab_client::LabClient::new(&lab_cfg.url, &lab_cfg.service_token);
-            match lab_api.ping().await {
-                Ok(()) => info!(url = %lab_cfg.url, "Lab reachable"),
-                Err(lab_client::LabError::ServiceTokenRejected) => anyhow::bail!(
-                    "the Lab at {} rejected LAB_SERVICE_TOKEN: set the same value on the engine and the Lab",
+            let lab_api = lab_client::LabClient::new(
+                &lab_cfg.url,
+                &lab_cfg.instance_id,
+                &lab_cfg.instance_secret,
+            );
+            match lab_api.instances_me().await {
+                Ok(me) if me.kind == "hosted" && me.product == "scrapix" => info!(
+                    url = %lab_cfg.url,
+                    instance_id = me.instance_id.as_deref().unwrap_or("-"),
+                    region = me.region.as_deref().unwrap_or("-"),
+                    lab_url = %me.lab_url,
+                    "Lab reachable; hosted Scrapix engine"
+                ),
+                Ok(me) => anyhow::bail!(
+                    "LAB_INSTANCE_ID {} is a {} {} deployment; this engine needs a hosted scrapix \
+                     credential (bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... \
+                     URL=... CREDENTIAL=<LAB_SERVICE_TOKEN> on the Lab)",
+                    me.instance_id.as_deref().unwrap_or(&lab_cfg.instance_id),
+                    me.kind,
+                    me.product
+                ),
+                Err(lab_client::LabError::CredentialsRejected) => anyhow::bail!(
+                    "the Lab at {} rejected LAB_INSTANCE_ID/LAB_INSTANCE_SECRET: re-issue them from the Lab",
+                    lab_cfg.url
+                ),
+                Err(lab_client::LabError::BadResponse(404)) => anyhow::bail!(
+                    "the Lab at LAB_URL ({}) has no GET /internal/instances/me: either LAB_URL is wrong \
+                     or the Lab predates contract v2",
                     lab_cfg.url
                 ),
                 Err(lab_client::LabError::BadResponse(code)) => anyhow::bail!(
-                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL \
-                     (a wrong URL typically 404s)",
+                    "the Lab at LAB_URL ({}) answered HTTP {code}: check LAB_URL points at the Lab base URL",
                     lab_cfg.url
                 ),
                 Err(e) => warn!(
@@ -6756,8 +6780,7 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
             }
             let store = open_store(store_url).await?;
             info!(backend = store.backend(), "Job store ready (engine-owned)");
-            // Balance snapshots count usage still waiting in the outbox.
-            let lab_api = Arc::new(lab_api.with_undelivered_usage(store.lab_outbox()));
+            let lab_api = Arc::new(lab_api);
             Ok(ModeWiring {
                 auth_mode: auth::AuthMode::Saas(Arc::new(auth::AuthState::new(
                     lab_api.clone(),
@@ -6767,7 +6790,6 @@ async fn wire_mode(settings: &settings::EngineSettings) -> anyhow::Result<ModeWi
                 job_store: store,
                 meili: Arc::new(meili::LabMeilisearchResolver {
                     lab: lab_api.clone(),
-                    server: settings.meilisearch.clone(),
                 }),
                 lab_api: Some(lab_api),
             })
@@ -7189,13 +7211,15 @@ pub async fn run_with_bus(
     );
 
     // Lab event delivery: hosted only (drains the lab outbox to the Lab).
-    // The Lab is loopback/private, so a plain client, not the SSRF-safe one.
+    // The Lab is loopback/private, so not the SSRF-safe client; it never
+    // follows a redirect (like `LabClient`).
     let lab_handle = settings.lab.as_ref().zip(lab_outbox).map(|(cfg, outbox)| {
         let sink = lab_sink::LabSink::new(
             outbox,
-            reqwest::Client::new(),
+            lab_sink::http_client(),
             format!("{}/internal/events", cfg.url),
-            cfg.events_secret.clone(),
+            cfg.instance_id.clone(),
+            cfg.instance_secret.clone(),
         );
         info!("Lab event delivery started");
         Arc::new(sink).spawn(shutdown_rx.clone())
@@ -8080,7 +8104,7 @@ mod tests {
 
     fn hosted_settings(
         lab_url: &str,
-        token: &str,
+        instance_secret: &str,
         store: settings::StoreUrl,
     ) -> settings::EngineSettings {
         settings::EngineSettings {
@@ -8090,8 +8114,9 @@ mod tests {
             meilisearch: None,
             lab: Some(settings::LabSettings {
                 url: lab_url.into(),
-                events_secret: "s".repeat(32),
-                service_token: token.into(),
+                instance_id: crate::lab_client::testing::INSTANCE_ID.into(),
+                instance_secret: instance_secret.into(),
+                service_token: "s".repeat(32),
             }),
         }
     }
@@ -8103,7 +8128,7 @@ mod tests {
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let w = wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url),
         ))
         .await
@@ -8113,19 +8138,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_wiring_refuses_a_wrong_service_token() {
+    async fn hosted_wiring_refuses_wrong_instance_credentials() {
         let lab = crate::lab_client::testing::FakeLab::start().await;
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let err = wire_mode(&hosted_settings(
             &lab.url,
-            &"wrong".repeat(8),
+            &"cd".repeat(32),
             settings::StoreUrl::Sqlite(url),
         ))
         .await
         .err()
         .unwrap();
-        assert!(err.to_string().contains("LAB_SERVICE_TOKEN"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("rejected"), "{msg}");
+        assert!(msg.contains("LAB_INSTANCE_ID/LAB_INSTANCE_SECRET"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_404_on_instances_me_aborts_startup() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.state
+            .status_override
+            .store(404, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings::EngineSettings {
+            mode: settings::Mode::Hosted,
+            auth: settings::AuthSetting::Lab,
+            store: settings::StoreUrl::Sqlite(format!(
+                "sqlite://{}/engine.db",
+                dir.path().display()
+            )),
+            meilisearch: None,
+            lab: Some(settings::LabSettings {
+                url: lab.url.clone(),
+                instance_id: crate::lab_client::testing::INSTANCE_ID.into(),
+                instance_secret: crate::lab_client::testing::SECRET.into(),
+                service_token: "0123456789abcdef0123456789abcdef".into(),
+            }),
+        };
+        let err = wire_mode(&settings).await.err().unwrap().to_string();
+        assert!(err.contains("/internal/instances/me"), "{err}");
+        assert!(err.contains("LAB_URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hosted_wiring_refuses_a_non_scrapix_instance() {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        let mut me = crate::lab_client::testing::FakeLab::hosted_me();
+        me["product"] = serde_json::json!("meilisearch");
+        *lab.state.me.lock().unwrap() = me;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/engine.db", dir.path().display());
+        let err = wire_mode(&hosted_settings(
+            &lab.url,
+            crate::lab_client::testing::SECRET,
+            settings::StoreUrl::Sqlite(url),
+        ))
+        .await
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("hosted meilisearch deployment"), "{msg}");
+        assert!(msg.contains("LAB_INSTANCE_ID"), "{msg}");
     }
 
     #[tokio::test]
@@ -8133,12 +8208,12 @@ mod tests {
         let lab = crate::lab_client::testing::FakeLab::start().await;
         lab.state
             .status_override
-            .store(404, std::sync::atomic::Ordering::SeqCst);
+            .store(403, std::sync::atomic::Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         let err = wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url),
         ))
         .await
@@ -8146,7 +8221,7 @@ mod tests {
         .unwrap();
         let msg = err.to_string();
         assert!(msg.contains("LAB_URL"), "{msg}");
-        assert!(msg.contains("404"), "{msg}");
+        assert!(msg.contains("403"), "{msg}");
     }
 
     #[tokio::test]
@@ -8157,7 +8232,7 @@ mod tests {
         let url = format!("sqlite://{}/engine.db", dir.path().display());
         assert!(wire_mode(&hosted_settings(
             &lab.url,
-            crate::lab_client::testing::TOKEN,
+            crate::lab_client::testing::SECRET,
             settings::StoreUrl::Sqlite(url)
         ))
         .await
@@ -8196,7 +8271,7 @@ mod tests {
             async move {
                 wire_mode(&hosted_settings(
                     &lab_url,
-                    crate::lab_client::testing::TOKEN,
+                    crate::lab_client::testing::SECRET,
                     settings::StoreUrl::Postgres(store),
                 ))
                 .await
@@ -8333,6 +8408,7 @@ mod lifecycle_tests {
             api_key_id: Some("k".into()),
             tier: "free".into(),
             user_role: None,
+            limits: None,
         }
     }
 
@@ -8345,9 +8421,9 @@ mod lifecycle_tests {
             .record_usage(
                 &ctx(),
                 "scrape",
-                3,
-                serde_json::json!({"formats":["markdown"]}),
-                "https://e.com (3 credits)".into(),
+                1,
+                serde_json::json!({"pages_http": 1}),
+                "https://e.com".into(),
                 None,
             )
             .await;
@@ -8357,7 +8433,8 @@ mod lifecycle_tests {
         assert_eq!(events[0].account_id, "7f1c2a8e-0000-4000-8000-000000000001");
         assert_eq!(events[0].api_key_id.as_deref(), Some("k"));
         assert_eq!(events[0].data["operation"], "scrape");
-        assert_eq!(events[0].data["credits"], 3);
+        assert_eq!(events[0].data["units"]["pages_http"], 1);
+        assert_eq!(events[0].data["credits"], 1);
         assert!(events[0].data.get("job_id").is_none());
     }
 
@@ -8370,6 +8447,7 @@ mod lifecycle_tests {
             api_key_id: None,
             tier: "free".into(),
             user_role: None,
+            limits: None,
         };
         state
             .record_usage(&ctx, "map", 2, serde_json::json!({}), "m".into(), None)
@@ -8377,19 +8455,18 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn scrape_usage_event_carries_formats_and_ai_flags() {
+    async fn scrape_usage_event_carries_page_kind_and_ai_flags() {
         let bus = ChannelBus::new();
         let mut state = test_state(&bus);
         let outbox = with_memory_lab(&mut state);
-        let formats = vec![ScrapeFormat::Markdown, ScrapeFormat::RawHtml];
-        let credits = billing::scrape_credits(&formats, true, false);
+        let formats = [ScrapeFormat::Markdown, ScrapeFormat::RawHtml];
         record_scrape_usage(
             &state,
             &ctx(),
             &formats,
             true,
+            true,
             false,
-            credits,
             "https://e.com/x",
         )
         .await;
@@ -8401,13 +8478,12 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "scrape",
-                "credits": credits,
-                "units": {
-                    "formats": ["markdown", "rawhtml"],
-                    "ai_summary": true,
-                    "ai_extraction": false,
-                },
-                "description": format!("https://e.com/x ({credits} credits)"),
+                // f2ab8d2: scrape_credits([markdown, rawhtml], true, false) = 1 + 5.
+                "credits": 6,
+                "units": {"pages_http": 0, "pages_browser": 1, "ai_summary": 1, "ai_extraction": 0,
+                          "feature_pages": 1},
+                "provider_cost_micro_usd": 0,
+                "description": "https://e.com/x",
             })
         );
     }
@@ -8424,8 +8500,9 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "map",
-                "credits": billing::MAP_CREDITS,
-                "units": {"urls_found": 17},
+                "credits": 2,
+                "units": {"requests": 1, "urls_found": 17},
+                "provider_cost_micro_usd": 0,
                 "description": "https://e.com",
             })
         );
@@ -8452,12 +8529,14 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "search",
-                "credits": billing::SEARCH_CREDITS,
-                "units": {"results": 3},
+                "credits": 2,
+                "units": {"requests": 1, "results": 3},
+                "provider_cost_micro_usd": 0,
                 "description": "https://e.com q=rust",
             })
         );
         assert_eq!(events[1].data["units"]["results"], 0);
+        lab_events::assert_contract_valid(&events);
     }
 
     #[tokio::test]
@@ -8710,6 +8789,7 @@ mod lifecycle_tests {
             tier: "free".into(),
             api_key_id: None,
             role: None,
+            limits: None,
         }))
     }
 
@@ -9155,6 +9235,9 @@ mod lifecycle_tests {
         async fn reschedule(&self, ids: &[uuid::Uuid]) -> Result<(), job_store::StoreError> {
             self.inner.reschedule(ids).await
         }
+        async fn abandon(&self, ids: &[uuid::Uuid]) -> Result<u64, job_store::StoreError> {
+            self.inner.abandon(ids).await
+        }
         async fn pending_stats(
             &self,
         ) -> Result<(i64, Option<chrono::DateTime<chrono::Utc>>), job_store::StoreError> {
@@ -9165,12 +9248,6 @@ mod lifecycle_tests {
             older_than_secs: i64,
         ) -> Result<u64, job_store::StoreError> {
             self.inner.purge_delivered(older_than_secs).await
-        }
-        async fn undelivered_usage_credits(
-            &self,
-            account_id: &str,
-        ) -> Result<i64, job_store::StoreError> {
-            self.inner.undelivered_usage_credits(account_id).await
         }
     }
 
@@ -9391,88 +9468,6 @@ mod lifecycle_tests {
         assert!(state.crawl.terminal_pending.read().is_empty());
     }
 
-    /// Important 1 (b): each record site feeds the recorded credits to the
-    /// Lab client's balance snapshot: request usage (`record_events`), a
-    /// crawl's final charge (`record_owed_lab_events`, via the flush) and a
-    /// terminal event for an unknown job (`record_unowned_lab_events`).
-    #[tokio::test]
-    async fn every_record_site_feeds_the_balance_snapshot() {
-        use crate::lab_client::{testing, LabClient};
-        let lab = testing::FakeLab::start().await;
-        lab.set_account(
-            ACCT,
-            serde_json::json!({"active": true, "account_id": ACCT, "tier": "free",
-                               "credits": {"balance": 100}}),
-        );
-        let bus = ChannelBus::new();
-        let mut state = test_state(&bus);
-        let outbox = with_memory_lab(&mut state);
-        let api = Arc::new(LabClient::new(&lab.url, testing::TOKEN));
-        state.lab_api = Some(api.clone());
-        let available = || {
-            let api = api.clone();
-            async move { api.available_credits(ACCT).await.unwrap().unwrap().credits }
-        };
-        assert_eq!(available().await, 100);
-
-        state
-            .record_events(&[lab_events::LabEvent::usage(
-                ACCT,
-                None,
-                "scrape",
-                3,
-                serde_json::json!({}),
-                "s".into(),
-                None,
-            )])
-            .await;
-        assert_eq!(available().await, 97, "record_events");
-
-        let store = TerminalStore::watching(&outbox);
-        complete_one_page_job(&state, "j1").await;
-        state.flush_to_db(&store).await;
-        let crawl: i64 = events_of(&outbox, "usage.recorded")
-            .iter()
-            .filter(|e| e.data["job_id"] == "j1")
-            .map(|e| e.usage_credits().unwrap())
-            .sum();
-        assert!(crawl > 0);
-        assert_eq!(available().await, 97 - crawl, "crawl final charge");
-
-        state.process_event(
-            "ghost",
-            &CrawlEvent::JobCompleted {
-                job_id: "ghost".into(),
-                account_id: Some(ACCT.into()),
-                pages_crawled: 2,
-                documents_indexed: 2,
-                errors: 0,
-                bytes_downloaded: 0,
-                duration_secs: 1,
-                timestamp: 0,
-            },
-        );
-        let ghost = || -> i64 {
-            events_of(&outbox, "usage.recorded")
-                .iter()
-                .filter(|e| e.data["job_id"] == "ghost")
-                .map(|e| e.usage_credits().unwrap())
-                .sum()
-        };
-        for _ in 0..100 {
-            if ghost() > 0 && available().await == 97 - crawl - ghost() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(ghost() > 0);
-        assert_eq!(
-            available().await,
-            97 - crawl - ghost(),
-            "unowned terminal charge"
-        );
-    }
-
     /// Standalone (no Lab): nothing is recorded, the job still finalizes and
     /// is persisted, and the billing diagnostics are computed as before.
     #[tokio::test]
@@ -9505,7 +9500,6 @@ mod lifecycle_tests {
         assert!(state.crawl.pending_lab_events.lock().is_empty());
         let d = &state.diagnostics;
         assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
-        assert_eq!(d.credits_billed.load(Ordering::Relaxed), 1);
         assert_eq!(emails(&state), 1);
     }
 
@@ -10274,8 +10268,10 @@ mod lifecycle_tests {
         let usage = events_of(&outbox, "usage.recorded");
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].data["operation"], "crawl");
-        assert_eq!(usage[0].data["credits"], 1);
         assert_eq!(usage[0].data["units"]["pages_http"], 1);
+        assert_eq!(usage[0].data["units"]["feature_pages"], 0);
+        // f2ab8d2: crawl_credits(1, 0, 0, no features) = 1.
+        assert_eq!(usage[0].data["credits"], 1);
         assert_eq!(usage[0].data["job_id"], "j1");
         assert_eq!(events_of(&outbox, "job.failed").len(), 1);
         assert_eq!(
@@ -10317,13 +10313,11 @@ mod lifecycle_tests {
     }
 
     /// D4/R4: a completed job with a mix of plain-HTTP, browser-rendered and
-    /// AI-enriched pages bills exactly the credits for what was delivered —
-    /// not the whole job at the browser rate, and not AI credits for pages
-    /// that were never AI-enriched. Uses the DB-less `credits_billed`
-    /// diagnostic hook (no Postgres needed, matching the other billing
-    /// tests in this module).
+    /// AI-enriched pages reports exactly the units that were delivered — not
+    /// the whole job as browser pages, and no AI units for pages that were
+    /// never AI-enriched. The Lab prices the units.
     #[tokio::test]
-    async fn completed_job_with_mixed_delivery_bills_expected_credits() {
+    async fn completed_job_with_mixed_delivery_reports_delivered_units() {
         let bus = ChannelBus::new();
         let mut state = test_state(&bus);
         let outbox = with_memory_lab(&mut state);
@@ -10331,9 +10325,9 @@ mod lifecycle_tests {
         with_account(&state, "mix");
         let (job_id, acct) = ("mix".to_string(), ACCT.to_string());
 
-        // AI features enabled on the job (surcharge = 5 + 5 = 10/page), no
-        // other features, crawler_type is irrelevant to billing now.
-        let features = FeaturesConfig::from_cli_args(
+        // AI features enabled on the job: `pages_ai` must still count only
+        // the pages that were actually AI-enriched.
+        let features = scrapix_core::FeaturesConfig::from_cli_args(
             false,
             false,
             false,
@@ -10408,10 +10402,6 @@ mod lifecycle_tests {
         assert_eq!(d.job_bills_requested.load(Ordering::Relaxed), 1);
         // 1 http page + 2 browser pages delivered.
         assert_eq!(d.pages_billed.load(Ordering::Relaxed), 3);
-        // 1 http (1 credit) + 2 browser (2 credits each = 4) + 1 AI-enriched
-        // page (10 credits surcharge) = 15. Not 3 * 12 = 36, which is what
-        // the old per-job browser+AI rate would have charged.
-        assert_eq!(d.credits_billed.load(Ordering::Relaxed), 15);
 
         state.flush_to_db(&TerminalStore::default()).await;
         let usage: Vec<_> = outbox
@@ -10421,7 +10411,15 @@ mod lifecycle_tests {
             .collect();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].data["operation"], "crawl");
+        assert_eq!(
+            usage[0].data["units"],
+            serde_json::json!({"pages_http": 1, "pages_browser": 2, "pages_ai": 1, "pages_ocr": 0,
+                               "feature_pages": 0})
+        );
+        // f2ab8d2: 1 http (1 credit) + 2 browser (2 credits each = 4) + 1
+        // AI-enriched page (10 credits surcharge) = 15. Not 3 * 12 = 36.
         assert_eq!(usage[0].data["credits"], 15);
+        lab_events::assert_contract_valid(&usage);
         assert_eq!(
             usage[0].data["units"]["pages_http"].as_u64().unwrap()
                 + usage[0].data["units"]["pages_browser"].as_u64().unwrap(),
@@ -10444,6 +10442,74 @@ mod lifecycle_tests {
             )
             .id
         );
+    }
+
+    /// Transition release: a crawl with non-AI features and OCR'd pages
+    /// carries the pre-v2 `credits` and reports the per-feature surcharge
+    /// as `feature_pages` = pages x enabled non-AI features.
+    #[tokio::test]
+    async fn crawl_usage_carries_pre_v2_credits_and_feature_pages() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        running_job(&state, "feat", 3);
+        with_account(&state, "feat");
+        // metadata + markdown: 2 non-AI features.
+        let features = scrapix_core::FeaturesConfig::from_cli_args(
+            true, true, false, false, false, false, None,
+        );
+        state.update_job("feat", |j| {
+            j.config = Some(serde_json::json!({ "features": features }));
+        });
+        state.process_event("feat", &progress("feat", 3, 3, 0));
+        for (id, js) in [("m1", false), ("m2", false), ("m3", true)] {
+            state.process_event(
+                "feat",
+                &CrawlEvent::PageCrawled {
+                    job_id: "feat".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    status: 200,
+                    content_length: 0,
+                    duration_ms: 0,
+                    timestamp: 0,
+                    links_published: 0,
+                    url_message_id: id.into(),
+                    js_rendered: js,
+                    sitemap_pending: false,
+                },
+            );
+        }
+        for (id, ocr_pages) in [("m1", 0), ("m2", 2), ("m3", 0)] {
+            state.process_event(
+                "feat",
+                &CrawlEvent::DocumentIndexed {
+                    job_id: "feat".into(),
+                    account_id: None,
+                    url: format!("https://a.test/{id}"),
+                    document_id: format!("d-{id}"),
+                    timestamp: 0,
+                    url_message_id: id.into(),
+                    ai_enriched: false,
+                    ocr_pages,
+                },
+            );
+        }
+        state
+            .finalize_job("feat", Finalize::Complete, Instant::now())
+            .await;
+        state.flush_to_db(&TerminalStore::default()).await;
+        let usage = events_of(&outbox, "usage.recorded");
+        assert_eq!(usage.len(), 1);
+        assert_eq!(
+            usage[0].data["units"],
+            serde_json::json!({"pages_http": 2, "pages_browser": 1, "pages_ai": 0, "pages_ocr": 2,
+                               "feature_pages": 6})
+        );
+        // f2ab8d2: crawl_credits(2, 1, 0, 2 features) = 2 * (1 + 2) +
+        // 1 * (2 + 2) = 10, + ocr_credits(2) = 10: 20.
+        assert_eq!(usage[0].data["credits"], 20);
+        lab_events::assert_contract_valid(&outbox.events());
     }
 
     /// A decision computed up front is re-validated right before finalizing
@@ -10576,6 +10642,8 @@ mod lifecycle_tests {
         state.flush_to_db(&store).await;
         let usage = events_of(&outbox, "usage.recorded");
         assert_eq!(usage.len(), 1, "one charge");
+        assert_eq!(usage[0].data["units"]["pages_http"], 3);
+        // f2ab8d2: crawl_credits(3, 0, 0, no features) = 3.
         assert_eq!(usage[0].data["credits"], 3);
         assert_eq!(outbox.events().len(), 1, "no lifecycle email for a cancel");
         assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);

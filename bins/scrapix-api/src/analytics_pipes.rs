@@ -430,6 +430,7 @@ mod tests {
             api_key_id: None,
             tier: "free".into(),
             user_role: None,
+            limits: None,
         })
     }
 
@@ -581,6 +582,7 @@ mod tests {
             tier: "free".into(),
             api_key_id: None,
             role: None,
+            limits: None,
         }))
     }
 

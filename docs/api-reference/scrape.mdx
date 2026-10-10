@@ -88,9 +88,7 @@ base64-encoded PNG in the `screenshot` field:
 - If the server has no browser available, the request fails with
   `render_js_unavailable` instead of silently omitting the screenshot.
 
-The screenshot format costs +1 credit, like the other feature formats
-(credits are a hosted-billing concept — see **Billing & Usage** in the
-Platform docs).
+On hosted the scrape is reported as one page (`pages_http` or `pages_browser`, whichever served it); `screenshot`, like every feature format, counts toward the page's `feature_pages`. Prices are set by the Lab (hosted only — see **Billing & Usage** in the Platform docs); during the contract v2 transition release the event also carries the pre-v2 `credits` (see [Lab Events](/api-reference/lab-events)).
 
 ### Page actions
 
@@ -319,8 +317,8 @@ The response adds a `document` object (`format`, `content_type`, `parser`,
 `has_tables`) and, when OCR was requested, an `ocr` object (`mode`,
 `backend`, `pages_processed`, `pages_cached`, `pages_skipped`,
 `pages_capped`, `pages_failed`, `pages`). `html`, `rawhtml`, `schema` and
-`blocks` do not apply to documents. OCR pages cost 5 credits each on top of
-the scrape. See [Documents & OCR](/guides/documents).
+`blocks` do not apply to documents. OCR pages are reported as a separate `ocr`
+usage event on top of the scrape (hosted only; the Lab prices them). See [Documents & OCR](/guides/documents).
 
 ### Response
 

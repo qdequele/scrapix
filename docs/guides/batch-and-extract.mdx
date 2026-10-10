@@ -131,9 +131,9 @@ How it works:
 Extract needs an AI provider on the server (see [AI enrichment](/guides/ai-enrichment));
 without one, `POST /extract` returns `503`.
 
-**Credits.** Each page fetched costs what `/scrape` costs, each glob costs a `/map`
-(2 credits) and each AI call costs 5 credits. A large extraction makes one AI call per
-page plus one merge call, so keep URL lists focused.
+**Usage.** Each page fetched is billed like a `/scrape`, each glob like a `/map`,
+and each AI call separately (prices are the Lab's, hosted only). A large extraction
+makes one AI call per page plus one merge call, so keep URL lists focused.
 
 ## Reading Results
 

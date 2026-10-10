@@ -395,46 +395,6 @@ pub struct TransactionRow {
 }
 
 // ============================================================================
-// Team
-// ============================================================================
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TeamMember {
-    pub user_id: String,
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    pub role: String,
-    #[serde(default)]
-    pub joined_at: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InviteMemberRequest {
-    pub email: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct UpdateRoleRequest {
-    pub role: String,
-}
-
-#[derive(Tabled)]
-pub struct TeamMemberRow {
-    #[tabled(rename = "User ID")]
-    pub user_id: String,
-    #[tabled(rename = "Email")]
-    pub email: String,
-    #[tabled(rename = "Name")]
-    pub name: String,
-    #[tabled(rename = "Role")]
-    pub role: String,
-}
-
-// ============================================================================
 // Auth
 // ============================================================================
 

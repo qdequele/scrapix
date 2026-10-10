@@ -11,16 +11,6 @@ pub struct CliConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub output: Option<String>,
-
-    // OAuth tokens (from `scrapix login`)
-    #[serde(default)]
-    pub access_token: Option<String>,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub token_expires_at: Option<i64>,
-    #[serde(default)]
-    pub oauth_client_id: Option<String>,
 }
 
 impl CliConfig {
@@ -62,35 +52,38 @@ impl CliConfig {
         Ok(())
     }
 
-    /// Returns true if we have a valid (non-expired) access token
-    pub fn has_valid_token(&self) -> bool {
-        if self.access_token.is_none() {
-            return false;
-        }
-        if let Some(expires_at) = self.token_expires_at {
-            let now = chrono::Utc::now().timestamp();
-            // Consider expired 60s before actual expiry for safety
-            expires_at > now + 60
-        } else {
-            // No expiry info — assume valid
-            true
-        }
-    }
-
-    /// Resolve the best auth credential: API key takes priority, then Bearer token
+    /// The stored credential: the API key saved by `scrapix login`.
     pub fn auth_credential(&self) -> Option<AuthCredential> {
-        if let Some(ref key) = self.api_key {
-            Some(AuthCredential::ApiKey(key.clone()))
-        } else {
-            self.access_token
-                .as_ref()
-                .map(|token| AuthCredential::Bearer(token.clone()))
-        }
+        self.api_key
+            .as_ref()
+            .map(|k| AuthCredential::ApiKey(k.clone()))
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum AuthCredential {
     ApiKey(String),
-    Bearer(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config written by an older CLI (OAuth browser login) still loads;
+    /// its token fields are ignored and only the API key counts.
+    #[test]
+    fn a_config_with_legacy_oauth_fields_still_parses() {
+        let cfg: CliConfig = toml::from_str(
+            r#"
+            api_url = "https://api.example.com"
+            access_token = "tok"
+            refresh_token = "ref"
+            token_expires_at = 1700000000
+            oauth_client_id = "cli"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.api_url.as_deref(), Some("https://api.example.com"));
+        assert!(cfg.auth_credential().is_none());
+    }
 }

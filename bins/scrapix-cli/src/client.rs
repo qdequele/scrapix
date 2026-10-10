@@ -30,9 +30,6 @@ impl ApiClient {
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             Some(AuthCredential::ApiKey(key)) => req.header("X-API-Key", key),
-            Some(AuthCredential::Bearer(token)) => {
-                req.header("Authorization", format!("Bearer {}", token))
-            }
             None => req,
         }
     }

@@ -10,7 +10,6 @@ members = [
     "crates/scrapix-ai",
     "crates/scrapix-storage",
     "crates/scrapix-queue",
-    "crates/scrapix-billing",
     "crates/scrapix-auth",
     "crates/scrapix-lifecycle",
     "crates/scrapix-ocr",
@@ -31,7 +30,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/quentindequelen/scrapix"
+repository = "https://github.com/qdequele/scrapix"
 authors = ["Quentin de Quelen"]
 
 [workspace.dependencies]

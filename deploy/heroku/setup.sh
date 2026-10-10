@@ -38,10 +38,19 @@ CLICKHOUSE_USER="default"
 CLICKHOUSE_PASSWORD=""
 
 # Lab (Rails control plane): the hosted engine reports usage events there,
-# calls its /internal/* API, and refuses to start without LAB_URL. Rails needs
-# the SAME LAB_EVENTS_SECRET / LAB_SERVICE_TOKEN (printed at the end of this
-# script).
-LAB_URL=""                # e.g. https://lab.example.com (the base URL, no path)
+# calls its /internal/* API, and refuses to start without LAB_URL,
+# LAB_INSTANCE_ID, LAB_INSTANCE_SECRET and LAB_SERVICE_TOKEN. Order:
+#   1. LAB_SERVICE_TOKEN: generate it first (`openssl rand -hex 32`; run this
+#      script with it empty and it prints one plus the mint command);
+#   2. on the Lab, mint this engine's credentials with that token:
+#      bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=eu \
+#        URL=https://<API_APP_NAME>.herokuapp.com CREDENTIAL=<LAB_SERVICE_TOKEN>
+#      It prints LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET once;
+#   3. fill in the four values below and run this script.
+LAB_SERVICE_TOKEN=""      # >= 32 chars; passed to the Lab at mint time as CREDENTIAL=
+LAB_URL=""                # LAB_URL printed by the Lab (the base URL, no path)
+LAB_INSTANCE_ID=""        # LAB_INSTANCE_ID printed by the Lab (uuid)
+LAB_INSTANCE_SECRET=""    # LAB_INSTANCE_SECRET printed by the Lab (64 hex)
 
 # AI enrichment (optional)
 AI_PROVIDER="anthropic"
@@ -55,6 +64,21 @@ CORS_ORIGINS=""
 # Validate configuration — before any `heroku` call, so a missing value never
 # leaves a half-created app or a paid add-on behind
 # ---------------------------------------------------------------------------
+if [ -z "${LAB_SERVICE_TOKEN}" ]; then
+    token=$(openssl rand -hex 32)
+    echo "LAB_SERVICE_TOKEN is not set. Generated one for you:" >&2
+    echo "  LAB_SERVICE_TOKEN=\"${token}\"" >&2
+    echo "Put it in the config block above, then mint this engine's credentials on the Lab:" >&2
+    echo "  bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=eu \\" >&2
+    echo "    URL=https://${API_APP_NAME}.herokuapp.com CREDENTIAL=${token}" >&2
+    echo "and fill in the LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET it prints." >&2
+    exit 1
+fi
+if [ "${#LAB_SERVICE_TOKEN}" -lt 32 ]; then
+    echo "LAB_SERVICE_TOKEN must be at least 32 characters (openssl rand -hex 32)" >&2
+    exit 1
+fi
+
 case "${LAB_URL}" in
     http://*|https://*) ;;
     *)
@@ -64,8 +88,14 @@ case "${LAB_URL}" in
         ;;
 esac
 
-LAB_EVENTS_SECRET=$(openssl rand -hex 32)
-LAB_SERVICE_TOKEN=$(openssl rand -hex 32)
+if [ -z "${LAB_INSTANCE_ID}" ] || [ -z "${LAB_INSTANCE_SECRET}" ]; then
+    echo "LAB_INSTANCE_ID and LAB_INSTANCE_SECRET must be set. Mint them on the Lab with" >&2
+    echo "this engine's LAB_SERVICE_TOKEN:" >&2
+    echo "  bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=eu \\" >&2
+    echo "    URL=https://${API_APP_NAME}.herokuapp.com CREDENTIAL=<LAB_SERVICE_TOKEN>" >&2
+    echo "then edit the config block above." >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Create API app
@@ -82,7 +112,8 @@ echo "==> Setting API config vars"
 CONFIG_VARS=(
     "SCRAPIX_MODE=hosted"
     "LAB_URL=${LAB_URL}"
-    "LAB_EVENTS_SECRET=${LAB_EVENTS_SECRET}"
+    "LAB_INSTANCE_ID=${LAB_INSTANCE_ID}"
+    "LAB_INSTANCE_SECRET=${LAB_INSTANCE_SECRET}"
     "LAB_SERVICE_TOKEN=${LAB_SERVICE_TOKEN}"
     "RUST_LOG=info"
 )
@@ -117,10 +148,6 @@ echo "     git push heroku-api main"
 echo ""
 echo "  2. Check logs:"
 echo "     heroku logs -a ${API_APP_NAME} --tail"
-echo ""
-echo "  Set the SAME LAB_EVENTS_SECRET and LAB_SERVICE_TOKEN on the Lab"
-echo "  (deployed from meilisearch/lab):"
-echo "     heroku config -a ${API_APP_NAME} | grep LAB_"
 echo ""
 echo "  API URL: ${API_URL}"
 echo ""

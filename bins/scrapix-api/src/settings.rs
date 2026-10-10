@@ -30,15 +30,19 @@ pub enum StoreUrl {
     Postgres(String),
 }
 
-/// Where and how the engine reports usage/job events to the Lab (hosted only).
+/// How the hosted engine reaches the Lab (`Some` iff hosted). A standalone
+/// engine has no Lab.
 #[derive(Debug, Clone)]
 pub struct LabSettings {
     /// The Lab base URL (no trailing `/`): events go to
     /// `{url}/internal/events`, lookups to `{url}/internal/*`.
     pub url: String,
-    /// HMAC key signing event batches.
-    pub events_secret: String,
-    /// Bearer token for the Lab's internal service API.
+    /// `LAB_INSTANCE_ID`: sent as `X-Lab-Instance-Id` on every call.
+    pub instance_id: String,
+    /// `LAB_INSTANCE_SECRET`: Bearer on service calls, HMAC key on events.
+    pub instance_secret: String,
+    /// `LAB_SERVICE_TOKEN`, which the Lab presents when it calls this
+    /// engine for an account. Never sent to the Lab.
     pub service_token: String,
 }
 
@@ -75,6 +79,58 @@ fn non_empty(v: &Option<String>) -> Option<String> {
 
 fn is_postgres(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+const INSTANCE_SECRET_LEN: usize = 64;
+
+fn lab_url_from(args: &Args) -> Result<Option<String>, ConfigError> {
+    let url = match (non_empty(&args.lab_url), non_empty(&args.lab_events_url)) {
+        (Some(u), _) => u,
+        (None, Some(e)) => {
+            tracing::warn!("LAB_EVENTS_URL is deprecated: set LAB_URL to the Lab base URL");
+            crate::lab_client::LabClient::base_from_events_url(&e)
+        }
+        (None, None) => return Ok(None),
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return err(format!(
+            "LAB_URL must start with http:// or https://, got `{url}`"
+        ));
+    }
+    Ok(Some(url.trim_end_matches('/').to_string()))
+}
+
+/// Hosted: `LAB_INSTANCE_ID` (uuid) and `LAB_INSTANCE_SECRET` (64 hex
+/// chars), both required.
+fn instance_credentials(args: &Args) -> Result<(String, String), ConfigError> {
+    let id = non_empty(&args.lab_instance_id);
+    let secret = non_empty(&args.lab_instance_secret);
+    match (id, secret) {
+        (None, _) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_ID (minted by the Lab: bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>)"),
+        (_, None) => err("SCRAPIX_MODE=hosted requires LAB_INSTANCE_SECRET (minted with LAB_INSTANCE_ID by the Lab)"),
+        (Some(id), Some(secret)) => {
+            if uuid::Uuid::parse_str(&id).is_err() {
+                // Never echo the value: a swapped id/secret would print the
+                // secret in the startup logs.
+                return err(format!(
+                    "LAB_INSTANCE_ID must be a uuid (got a {}-character value)",
+                    id.chars().count()
+                ));
+            }
+            if secret.len() != INSTANCE_SECRET_LEN || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return err("LAB_INSTANCE_SECRET must be the 64 hex characters the Lab minted");
+            }
+            Ok((id, secret))
+        }
+    }
+}
+
+fn warn_ignored_events_secret(args: &Args) {
+    if non_empty(&args.lab_events_secret).is_some() {
+        tracing::warn!(
+            "LAB_EVENTS_SECRET is ignored: event batches are signed with LAB_INSTANCE_SECRET (unset it)"
+        );
+    }
 }
 
 /// The engine's own job store, in both modes: SQLite by default, or a
@@ -129,42 +185,33 @@ impl EngineSettings {
                 if auth_disabled {
                     return err("SCRAPIX_AUTH=disabled is not allowed with SCRAPIX_MODE=hosted");
                 }
-                let url = match (non_empty(&args.lab_url), non_empty(&args.lab_events_url)) {
-                    (Some(u), _) => u,
-                    (None, Some(e)) => {
-                        tracing::warn!(
-                            "LAB_EVENTS_URL is deprecated: set LAB_URL to the Lab base URL"
-                        );
-                        crate::lab_client::LabClient::base_from_events_url(&e)
-                    }
-                    (None, None) => {
-                        return err(
-                            "SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL, e.g. http://127.0.0.1:8091)",
-                        )
-                    }
-                };
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return err(format!(
-                        "LAB_URL must start with http:// or https://, got `{url}`"
-                    ));
-                }
-                let url = url.trim_end_matches('/').to_string();
+                let url = lab_url_from(args)?.ok_or_else(|| {
+                    ConfigError(
+                        "SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL, e.g. http://127.0.0.1:8091)".into(),
+                    )
+                })?;
                 if non_empty(&args.jwt_secret).is_some() {
                     tracing::info!("JWT_SECRET is ignored: the Lab verifies sessions");
                 }
-                let secret = |name: &str, v: &Option<String>| -> Result<String, ConfigError> {
-                    match non_empty(v) {
-                        Some(s) if s.chars().count() >= MIN_LAB_SECRET_LEN => Ok(s),
-                        Some(_) => err(format!(
-                            "{name} must be at least {MIN_LAB_SECRET_LEN} characters"
-                        )),
-                        None => err(format!("SCRAPIX_MODE=hosted requires {name}")),
+                warn_ignored_events_secret(args);
+                let (instance_id, instance_secret) = instance_credentials(args)?;
+                let service_token = match non_empty(&args.lab_service_token) {
+                    Some(s) if s.chars().count() >= MIN_LAB_SECRET_LEN => s,
+                    Some(_) => {
+                        return err(format!(
+                            "LAB_SERVICE_TOKEN must be at least {MIN_LAB_SECRET_LEN} characters"
+                        ))
                     }
+                    None => return err("SCRAPIX_MODE=hosted requires LAB_SERVICE_TOKEN (the Lab presents it when it calls this engine)"),
                 };
+                if meilisearch.is_some() {
+                    tracing::warn!("MEILISEARCH_URL is ignored in hosted mode: tenants use the Meilisearch targets registered in the Lab");
+                }
                 let lab = LabSettings {
                     url,
-                    events_secret: secret("LAB_EVENTS_SECRET", &args.lab_events_secret)?,
-                    service_token: secret("LAB_SERVICE_TOKEN", &args.lab_service_token)?,
+                    instance_id,
+                    instance_secret,
+                    service_token,
                 };
                 if database_url.is_none() {
                     tracing::warn!(
@@ -177,13 +224,20 @@ impl EngineSettings {
                     mode,
                     auth: AuthSetting::Lab,
                     store: store_from(database_url)?,
-                    meilisearch,
+                    meilisearch: None,
                     lab: Some(lab),
                 })
             }
             Mode::Standalone => {
                 if non_empty(&args.jwt_secret).is_some() {
                     tracing::info!("JWT_SECRET is ignored in standalone mode");
+                }
+                if non_empty(&args.lab_instance_id).is_some()
+                    || non_empty(&args.lab_instance_secret).is_some()
+                {
+                    return err(
+                        "LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are hosted-engine credentials: set SCRAPIX_MODE=hosted, or unset them (a standalone engine has no Lab)",
+                    );
                 }
                 if non_empty(&args.lab_url).is_some()
                     || non_empty(&args.lab_events_url).is_some()
@@ -263,14 +317,20 @@ mod tests {
         parsed.lab_events_url = get("LAB_EVENTS_URL");
         parsed.lab_events_secret = get("LAB_EVENTS_SECRET");
         parsed.lab_service_token = get("LAB_SERVICE_TOKEN");
+        parsed.lab_instance_id = get("LAB_INSTANCE_ID");
+        parsed.lab_instance_secret = get("LAB_INSTANCE_SECRET");
         parsed
     }
 
     const KEY: &str = "0123456789abcdef";
     const SECRET32: &str = "0123456789abcdef0123456789abcdef";
-    const LAB: [(&str, &str); 3] = [
+    const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    const INSTANCE_SECRET: &str =
+        "abababababababababababababababababababababababababababababababab";
+    const LAB: [(&str, &str); 4] = [
         ("LAB_URL", "http://127.0.0.1:8091"),
-        ("LAB_EVENTS_SECRET", SECRET32),
+        ("LAB_INSTANCE_ID", INSTANCE_ID),
+        ("LAB_INSTANCE_SECRET", INSTANCE_SECRET),
         ("LAB_SERVICE_TOKEN", SECRET32),
     ];
 
@@ -373,7 +433,8 @@ mod tests {
         let env = [
             ("SCRAPIX_MODE", "hosted"),
             ("LAB_EVENTS_URL", "http://127.0.0.1:8091/internal/events"),
-            ("LAB_EVENTS_SECRET", SECRET32),
+            ("LAB_INSTANCE_ID", INSTANCE_ID),
+            ("LAB_INSTANCE_SECRET", INSTANCE_SECRET),
             ("LAB_SERVICE_TOKEN", SECRET32),
         ];
         assert_eq!(
@@ -387,27 +448,92 @@ mod tests {
     }
 
     #[test]
-    fn hosted_requires_lab_url_secret_and_token() {
+    fn hosted_requires_lab_url_instance_credentials_and_service_token() {
         let e = EngineSettings::resolve(&args(&[("SCRAPIX_MODE", "hosted")])).unwrap_err();
         assert!(e.0.contains("LAB_URL"), "{}", e.0);
+        let mut no_id = hosted(&[]);
+        no_id.retain(|(k, _)| *k != "LAB_INSTANCE_ID");
+        assert!(EngineSettings::resolve(&args(&no_id))
+            .unwrap_err()
+            .0
+            .contains("LAB_INSTANCE_ID"));
+        let mut bad_id = hosted(&[]);
+        bad_id[2] = ("LAB_INSTANCE_ID", "not-a-uuid");
+        assert!(EngineSettings::resolve(&args(&bad_id))
+            .unwrap_err()
+            .0
+            .contains("uuid"));
+        // A swapped id/secret never puts the secret in the error (startup logs).
+        const SECRET: &str = "abababababababababababababababababababababababababababababababab";
+        let mut swapped = hosted(&[]);
+        swapped[2] = ("LAB_INSTANCE_ID", SECRET);
+        let e = EngineSettings::resolve(&args(&swapped)).unwrap_err().0;
+        assert!(e.contains("uuid") && e.contains("64-character"), "{e}");
+        assert!(!e.contains(SECRET), "{e}");
         let mut short = hosted(&[]);
-        short[2] = ("LAB_EVENTS_SECRET", "short");
+        short[3] = ("LAB_INSTANCE_SECRET", "abcdef");
         assert!(EngineSettings::resolve(&args(&short))
             .unwrap_err()
             .0
-            .contains("LAB_EVENTS_SECRET"));
-        let mut bad = hosted(&[]);
-        bad[1] = ("LAB_URL", "127.0.0.1:8091");
-        assert!(EngineSettings::resolve(&args(&bad))
+            .contains("64 hex"));
+        let mut not_hex = hosted(&[]);
+        not_hex[3] = (
+            "LAB_INSTANCE_SECRET",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        );
+        assert!(EngineSettings::resolve(&args(&not_hex))
             .unwrap_err()
             .0
-            .contains("LAB_URL"));
+            .contains("64 hex"));
         let mut no_token = hosted(&[]);
         no_token.retain(|(k, _)| *k != "LAB_SERVICE_TOKEN");
         assert!(EngineSettings::resolve(&args(&no_token))
             .unwrap_err()
             .0
             .contains("LAB_SERVICE_TOKEN"));
+        let mut bad = hosted(&[]);
+        bad[1] = ("LAB_URL", "127.0.0.1:8091");
+        assert!(EngineSettings::resolve(&args(&bad))
+            .unwrap_err()
+            .0
+            .contains("LAB_URL"));
+    }
+
+    #[test]
+    fn hosted_keeps_the_instance_credentials_and_the_service_token() {
+        let s = EngineSettings::resolve(&args(&hosted(&[]))).unwrap();
+        let lab = s.lab.unwrap();
+        assert_eq!(lab.instance_id, INSTANCE_ID);
+        assert_eq!(lab.instance_secret, INSTANCE_SECRET);
+        assert_eq!(lab.service_token, SECRET32);
+    }
+
+    #[test]
+    fn hosted_accepts_but_ignores_lab_events_secret() {
+        let s =
+            EngineSettings::resolve(&args(&hosted(&[("LAB_EVENTS_SECRET", SECRET32)]))).unwrap();
+        assert!(s.lab.is_some());
+    }
+
+    #[test]
+    fn standalone_refuses_instance_credentials() {
+        // Spec 3.3: no "lab-connected standalone". A hosted env pasted onto a
+        // standalone engine must not run unbilled.
+        let e = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_ADMIN_KEY", KEY),
+            ("LAB_URL", "http://127.0.0.1:8091"),
+            ("LAB_INSTANCE_ID", INSTANCE_ID),
+            ("LAB_INSTANCE_SECRET", INSTANCE_SECRET),
+        ]))
+        .unwrap_err();
+        assert!(e.0.contains("LAB_INSTANCE_ID"), "{}", e.0);
+        assert!(e.0.contains("SCRAPIX_MODE=hosted"), "{}", e.0);
+        let e = EngineSettings::resolve(&args(&[
+            ("SCRAPIX_ADMIN_KEY", KEY),
+            ("LAB_INSTANCE_SECRET", INSTANCE_SECRET),
+        ]))
+        .unwrap_err();
+        assert!(e.0.contains("LAB_INSTANCE_SECRET"), "{}", e.0);
     }
 
     #[test]
@@ -433,6 +559,19 @@ mod tests {
     #[test]
     fn unknown_mode_refuses() {
         assert!(EngineSettings::resolve(&args(&[("SCRAPIX_MODE", "cloud")])).is_err());
+    }
+
+    #[test]
+    fn hosted_ignores_the_operator_meilisearch() {
+        let s = EngineSettings::resolve(&args(&hosted(&[
+            ("MEILISEARCH_URL", "http://ops:7700"),
+            ("MEILISEARCH_API_KEY", "ops"),
+        ])))
+        .unwrap();
+        assert!(
+            s.meilisearch.is_none(),
+            "a tenant must never land in the operator's Meilisearch"
+        );
     }
 
     #[test]

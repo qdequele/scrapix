@@ -193,7 +193,7 @@ pub struct FetcherConfig {
 impl Default for FetcherConfig {
     fn default() -> Self {
         Self {
-            user_agent: "Scrapix/1.0 (compatible; +https://github.com/quentindequelen/scrapix)"
+            user_agent: "Scrapix/1.0 (compatible; +https://github.com/qdequele/scrapix)"
                 .to_string(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),

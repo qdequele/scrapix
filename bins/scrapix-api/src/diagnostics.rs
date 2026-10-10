@@ -389,6 +389,7 @@ mod tests {
             tier: "free".to_string(),
             api_key_id: None,
             role: None,
+            limits: None,
         }))
     }
 

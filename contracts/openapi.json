@@ -2136,6 +2136,56 @@
         ]
       }
     },
+    "/parse": {
+      "post": {
+        "tags": [
+          "parse"
+        ],
+        "summary": "Parse an uploaded document",
+        "description": "Converts an uploaded file to Markdown with the same parsers the crawler\nuses, and returns the `/scrape` response shape. Billed per document\n(like `/scrape`), plus OCR pages when `parsers.ocr` recognizes scanned\npages.",
+        "operationId": "parse_upload",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ParseUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScrapeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "File larger than DOCUMENT_MAX_SIZE_MB"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/scrape": {
       "post": {
         "tags": [
@@ -3344,7 +3394,7 @@
           "scrape"
         ],
         "summary": "Scrape many URLs as one job",
-        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Credits: same as `/scrape`, per URL scraped.",
+        "description": "Starts a job that runs the `/scrape` pipeline for every URL (bounded\nconcurrency) and returns its `job_id` immediately. Track it with\n`GET /job/{id}/status`, `/job/{id}/events` or webhooks, read the pages\nwith `GET /job/{id}/results`, cancel with `DELETE /job/{id}`. A URL that\nfails is reported as a result with `success: false` and an `error`; it\ndoes not fail the batch. Usage is reported like `/scrape`, per URL\nscraped. Refused when the account's balance is gone; once a URL finds it\ngone, the remaining URLs are skipped with `insufficient_credits`.",
         "operationId": "batch_scrape",
         "requestBody": {
           "content": {
@@ -3378,7 +3428,7 @@
             }
           },
           "402": {
-            "description": "Not enough credits for the whole batch",
+            "description": "The account's credit balance is exhausted",
             "content": {
               "application/json": {
                 "schema": {
@@ -7623,6 +7673,34 @@
           }
         }
       },
+      "ParseUpload": {
+        "type": "object",
+        "description": "Multipart body of `POST /parse`.",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "description": "The document: PDF, DOC/DOCX, PPT/PPTX, XLS/XLSX/XLSB, ODT/ODS/ODP,\nRTF, EPUB or CSV (or a PNG/JPEG/GIF/WebP/TIFF image with\n`parsers.ocr`). Max 50 MB by default (`DOCUMENT_MAX_SIZE_MB`)."
+          },
+          "formats": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Shorthand for `options.formats`: a JSON array or comma-separated list."
+          },
+          "options": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "JSON options: `{\"formats\": [\"markdown\"], \"parsers\": {\"ocr\": \"auto\"}}`."
+          }
+        }
+      },
       "ParserOptions": {
         "type": "object",
         "description": "Document parsing options for `/scrape` and `/parse`.",
@@ -7693,6 +7771,10 @@
     {
       "name": "scrape",
       "description": "Single-page scraping"
+    },
+    {
+      "name": "parse",
+      "description": "Document parsing (uploads)"
     },
     {
       "name": "map",

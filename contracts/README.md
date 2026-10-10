@@ -1,16 +1,16 @@
 # Scrapix API Contracts
 
-The contracts the Scrapix engine owns, plus the one it vendors from the
+The contracts the Scrapix engine owns, plus the two it vendors from the
 Meilisearch Lab. The Lab (Rails control plane + console) lives in
-[`meilisearch/lab`](https://github.com/meilisearch/lab), which vendors byte
-copies of `openapi.json` and `lab-events.schema.json` and drift-checks them
+[`meilisearch/lab`](https://github.com/meilisearch/lab), which vendors a byte
+copy of `openapi.json` and drift-checks it
 (`openapi.engine.json` is not vendored); the Lab's contract test suite lives
 there too.
 
 ## Engine-owned files
 
-Change these only on an intentional, reviewed contract change — for the two
-vendored files, the Lab's drift check fails until it re-vendors them.
+Change these only on an intentional, reviewed contract change — for the
+vendored `openapi.json`, the Lab's drift check fails until it re-vendors it.
 
 - `openapi.json` — the **frozen full-platform public spec** (engine + Lab
   routes). It is the contract the Lab implements and the source its MCP
@@ -23,24 +23,37 @@ vendored files, the Lab's drift check fails until it re-vendors them.
   openapi_snapshot`. Regenerate after an intentional engine API change with
   `UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p scrapix-api --test
   openapi_snapshot`, and review the diff.
-- `lab-events.schema.json` — JSON Schema for the events the engine reports to
-  the Lab (`POST {LAB_URL}/internal/events`). The engine's `lab_events.rs`
-  tests and the Lab's receiver tests both validate against it; change it only
-  together with both sides.
 
 ## Vendored from the Lab
 
 - `vendor/lab/lab-internal.openapi.json` — the Lab's internal API
   (`/internal/*`: credential introspection, accounts, Meilisearch targets)
-  that the hosted engine calls with `LAB_SERVICE_TOKEN`. Owned by
-  `meilisearch/lab` (`contracts/lab-internal.openapi.json`); never edit the
-  vendored copy by hand.
+  that the engine calls with its `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`.
+  Owned by `meilisearch/lab` (`contracts/lab-internal.openapi.json`); never
+  edit the vendored copy by hand.
+- `vendor/lab/lab-events.schema.json`: the events contract (spec: Lab
+  platform contract v2 §4) every engine reports against at
+  `POST {LAB_URL}/internal/events`: `usage.recorded` carries raw `units`
+  (including `feature_pages`, the per-feature surcharge) and
+  `provider_cost_micro_usd` (always 0 from Scrapix: the engine knows token
+  counts, not provider prices). For the transition release Scrapix also
+  sends the deprecated `credits` (its pre-v2 price,
+  `bins/scrapix-api/src/legacy_credits.rs`), which the Lab debits as
+  authoritative for product `scrapix`; both go next release. Owned by
+  `meilisearch/lab` (`contracts/lab-events.schema.json`).
 
-`check-drift.sh` compares the vendored copy with the Lab's `main`:
+Both are byte copies of the Lab's contract v2 at commit
+`42c282ce6005b14b1705711680fa70c0858e78ac` (meilisearch/lab#17). Until that
+PR merges, the Lab's `main` still has v1 (and no `lab-events.schema.json`), so
+CI pins the drift check to that commit with `LAB_REF`.
+
+`check-drift.sh` compares the vendored copies with the Lab's `main`, or with
+`$LAB_REF` (a branch, tag or commit) when set:
 
 ```bash
 contracts/check-drift.sh          # or: just check-contracts
 contracts/check-drift.sh --fix    # re-vendor; or: just sync-contracts
+LAB_REF=<sha> contracts/check-drift.sh   # compare with a Lab branch/commit
 ```
 
 The owner copy comes from `$LAB_SRC/contracts/` when `LAB_SRC` points at a

@@ -142,6 +142,7 @@ pub(crate) async fn validate_api_key_or_session(
                     tier: id.tier,
                     api_key_id: None,
                     role: None,
+                    limits: id.limits,
                 });
                 return Ok(next.run(request).await);
             }
@@ -164,6 +165,7 @@ pub(crate) async fn validate_api_key_or_session(
             tier: id.tier,
             api_key_id: None,
             role: id.role,
+            limits: id.limits,
         });
         return Ok(next.run(request).await);
     }
@@ -192,6 +194,7 @@ pub(crate) async fn validate_api_key_or_session(
             tier: id.tier,
             api_key_id: id.api_key_id,
             role: None,
+            limits: id.limits,
         });
         return Ok(next.run(request).await);
     }
@@ -228,6 +231,7 @@ pub(crate) async fn validate_api_key_or_session(
         tier: id.tier,
         api_key_id: None,
         role: id.role,
+        limits: id.limits,
     });
 
     Ok(next.run(request).await)
@@ -237,7 +241,7 @@ pub(crate) async fn validate_api_key_or_session(
 mod tests {
     use super::*;
     use crate::lab_client::{
-        testing::{FakeLab, TOKEN},
+        testing::{FakeLab, INSTANCE_ID, SECRET},
         LabClient,
     };
     use axum::{
@@ -268,7 +272,7 @@ mod tests {
 
     async fn state() -> (FakeLab, Arc<AuthState>) {
         let lab = FakeLab::start().await;
-        let client = Arc::new(LabClient::new(&lab.url, TOKEN));
+        let client = Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET));
         (lab, Arc::new(AuthState::new(client, Some(SERVICE.into()))))
     }
 
@@ -288,6 +292,35 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(call(app(s), r).await, (200, format!("{ACCT}|pro|")));
+    }
+
+    #[tokio::test]
+    async fn the_labs_plan_limits_reach_the_request() {
+        let (lab, s) = state().await;
+        lab.set_credential("api_key", "sk_live_abc", FakeLab::identity(ACCT, "pro", 10));
+        let app = Router::new()
+            .route(
+                "/l",
+                get(|Extension(a): Extension<AuthenticatedAccount>| async move {
+                    format!(
+                        "{:?}",
+                        a.limits
+                            .map(|l| (l.concurrent_jobs, l.max_depth, l.js_rendering))
+                    )
+                }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                s,
+                validate_api_key_or_session,
+            ));
+        let r = HttpRequest::get("/l")
+            .header("X-API-Key", "sk_live_abc")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            call(app, r).await,
+            (200, "Some((10, 10, true))".to_string())
+        );
     }
 
     #[tokio::test]

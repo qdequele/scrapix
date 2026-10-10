@@ -51,12 +51,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     // ── Authentication ──────────────────────────────────
-    /// Authenticate via browser (OAuth) or API key
-    Login {
-        /// Use API key instead of browser login
-        #[arg(long)]
-        api_key: bool,
-    },
+    /// Store an API key for this CLI (prompted, hidden)
+    Login,
 
     /// Clear stored credentials
     Logout,
@@ -250,13 +246,6 @@ pub enum Commands {
         action: Option<BillingAction>,
     },
 
-    // ── Team ────────────────────────────────────────────
-    /// Manage team members
-    Team {
-        #[command(subcommand)]
-        action: Option<TeamAction>,
-    },
-
     // ── Diagnostics ─────────────────────────────────────
     /// System statistics
     Stats,
@@ -433,20 +422,6 @@ pub enum BillingAction {
         #[arg(long, default_value = "0")]
         offset: usize,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum TeamAction {
-    /// Invite a new team member
-    Invite {
-        email: String,
-        #[arg(long)]
-        role: Option<String>,
-    },
-    /// Remove a team member
-    Remove { user_id: String },
-    /// Change a member's role
-    Role { user_id: String, role: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -633,7 +608,7 @@ async fn run_inner(cli: Cli) -> Result<()> {
     let json = cli.json;
 
     // Resolve API URL and key: flags > env > config
-    let mut cfg = CliConfig::load().unwrap_or_default();
+    let cfg = CliConfig::load().unwrap_or_default();
     let api_url = cli
         .api_url
         .or(cfg.api_url.clone())
@@ -642,22 +617,18 @@ async fn run_inner(cli: Cli) -> Result<()> {
     // Also check if config says json
     let json = json || cfg.output.as_deref() == Some("json");
 
-    // Resolve auth: CLI flag > env > config (with token refresh)
-    let auth = if let Some(ref key) = cli.api_key {
-        Some(config::AuthCredential::ApiKey(key.clone()))
-    } else {
-        // Try auto-refresh if we have an expired OAuth token
-        if cfg.access_token.is_some() && !cfg.has_valid_token() {
-            let _ = commands::auth::refresh_token_if_needed(&api_url, &mut cfg).await;
-        }
-        cfg.auth_credential()
-    };
+    // Resolve auth: CLI flag > env > config
+    let auth = cli
+        .api_key
+        .as_ref()
+        .map(|k| config::AuthCredential::ApiKey(k.clone()))
+        .or_else(|| cfg.auth_credential());
 
     let client = ApiClient::new(&api_url, auth);
 
     match cli.command {
         // ── Authentication ──────────────────────────────
-        Commands::Login { api_key } => commands::auth::handle_login(&api_url, api_key).await,
+        Commands::Login => commands::auth::handle_login(&api_url).await,
         Commands::Logout => commands::auth::handle_logout().await,
         Commands::Whoami => commands::auth::handle_whoami(&client, json).await,
         Commands::Status => commands::auth::handle_status_auth(&client, json).await,
@@ -821,20 +792,6 @@ async fn run_inner(cli: Cli) -> Result<()> {
             None => commands::billing::handle_billing(&client, json).await,
             Some(BillingAction::Transactions { limit, offset }) => {
                 commands::billing::handle_billing_transactions(&client, limit, offset, json).await
-            }
-        },
-
-        // ── Team ────────────────────────────────────────
-        Commands::Team { action } => match action {
-            None => commands::team::handle_team_list(&client, json).await,
-            Some(TeamAction::Invite { email, role }) => {
-                commands::team::handle_team_invite(&client, email, role, json).await
-            }
-            Some(TeamAction::Remove { user_id }) => {
-                commands::team::handle_team_remove(&client, &user_id, json).await
-            }
-            Some(TeamAction::Role { user_id, role }) => {
-                commands::team::handle_team_role(&client, &user_id, role, json).await
             }
         },
 

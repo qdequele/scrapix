@@ -1958,6 +1958,8 @@ mod tests {
     }
 
     /// Decrement `n` if positive; true if a failure should be injected.
+    // `fetch_update` is renamed `try_update` on newer rustc; kept for rust-version 1.88.
+    #[allow(deprecated)]
     fn take_failure(n: &AtomicU64) -> bool {
         n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
             .is_ok()

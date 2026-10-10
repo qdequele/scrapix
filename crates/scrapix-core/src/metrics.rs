@@ -211,7 +211,8 @@ pub fn lab_events_pending() -> &'static Gauge {
     })
 }
 
-/// `scrapix_lab_events_delivered_total{outcome}` — accepted | rejected | failed.
+/// `scrapix_lab_events_delivered_total{outcome}` — accepted | rejected | failed | dropped
+/// (never acknowledged for 24 h).
 pub fn lab_events_delivered_total() -> &'static CounterVec {
     static METRIC: OnceLock<CounterVec> = OnceLock::new();
     METRIC.get_or_init(|| {
@@ -224,7 +225,7 @@ pub fn lab_events_delivered_total() -> &'static CounterVec {
 }
 
 /// `scrapix_lab_requests_total{endpoint,outcome}` — the engine's calls to the
-/// Lab's internal API. endpoint: ping | introspect | account | meilisearch;
+/// Lab's internal API. endpoint: instances_me | introspect | account | meilisearch;
 /// outcome: ok | inactive | unavailable | rejected | stale.
 pub fn lab_requests_total() -> &'static CounterVec {
     static METRIC: OnceLock<CounterVec> = OnceLock::new();

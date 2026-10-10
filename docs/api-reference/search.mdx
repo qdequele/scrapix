@@ -23,8 +23,8 @@ correct index automatically from the target URL.
 
 Search documents for a given domain.
 
-**Cost:** 2 credits per request (hosted only — see **Billing & Usage** in
-the Platform docs; standalone has no credit metering).
+**Usage:** one `search` request per call (hosted only, priced by the Lab —
+see **Billing & Usage** in the Platform docs; standalone has no credit metering).
 
 ### Request Body
 
@@ -95,5 +95,5 @@ For example, if you crawled `https://docs.example.com` with Scrapix, searching w
 |--------|------|-------------|
 | 400 | `bad_request` | Invalid URL scheme (must be http/https) or empty query |
 | 401 | `unauthorized` | Missing or invalid credentials |
-| 402 | `insufficient_credits` | Account has fewer than 2 credits |
+| 402 | `insufficient_credits` | The account's credit balance is exhausted |
 | 404 | `not_found` | No default Meilisearch engine configured for account |
