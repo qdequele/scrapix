@@ -5497,7 +5497,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5518,7 +5518,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-ai"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -5536,7 +5536,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-api"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5585,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-auth"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "uuid",
@@ -5593,7 +5593,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-benchmarks"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -5605,7 +5605,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5634,7 +5634,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5653,7 +5653,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-crawler"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5683,7 +5683,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-extractor"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "regex",
@@ -5698,7 +5698,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-frontier"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bloomfilter",
@@ -5722,7 +5722,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-frontier-service"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5742,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-lifecycle"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "scrapix-core",
  "tokio",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-mcp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "reqwest 0.12.28",
@@ -5767,7 +5767,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-ocr"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5790,7 +5790,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-parser"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anydoc",
  "async-trait",
@@ -5810,7 +5810,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-queue"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -5829,7 +5829,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-storage"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5855,7 +5855,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-tests"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5881,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-worker-content"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5911,7 +5911,7 @@ dependencies = [
 
 [[package]]
 name = "scrapix-worker-crawler"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
