@@ -5,7 +5,7 @@ description: Deploy Scrapix on Fly.io with aggressive scale-to-zero and CI-drive
 
 # Fly.io
 
-Scrapix runs as **five Fly apps** with GitHub Actions building Docker images and deploying via `flyctl deploy --image`. All services except the Kafka broker scale to zero when idle, giving a baseline cost of ~$18/mo.
+Scrapix runs as **five Fly apps**, each deployed from a prebuilt image with `flyctl deploy --image`. All services except the Kafka broker scale to zero when idle, giving a baseline cost of ~$18/mo.
 
 ## Architecture
 
@@ -41,16 +41,30 @@ KAFKA_BROKERS=scrapix-redpanda.internal:9092
 
 Topic partition counts (created by `deploy/fly/create-topics.sh`) must match `docker-compose.yml` so that worker horizontal scaling works — max useful worker count per service = its topic's partition count.
 
-## CI/CD
+## Build and deploy
 
-`.github/workflows/deploy-fly.yml` runs on every push to `main`:
+This repository ships no deploy workflow: build the images and deploy them from
+your own machine or CI. `Dockerfile.fly` has one target per binary, so every
+image shares the same dependency build:
 
-1. **Change detection** — `dorny/paths-filter` decides whether the Rust services need a rebuild.
-2. **Cargo fmt + check** — fails fast on lint.
-3. **Build** — one matrix job per binary (`scrapix-api`, `scrapix-frontier-service`, `scrapix-worker-crawler`, `scrapix-worker-content`), all sharing the same `Dockerfile.fly` multi-target build and the same GHA cache scope (`scrapix-rust`). Images pushed to `ghcr.io/<owner>/<name>:<sha>` and `:main`.
-4. **Deploy** — one `flyctl deploy --image` job per Fly app, parallel, using the pre-built GHCR image (no Fly builder).
+```bash
+TAG=$(git rev-parse --short HEAD)
+OWNER=<your GHCR owner>
 
-Only secret required: `FLY_API_TOKEN` (org-scoped deploy token). `GITHUB_TOKEN` handles GHCR auth.
+# One image per binary, all from the multi-target Dockerfile.fly.
+for target in scrapix-api scrapix-frontier-service scrapix-worker-crawler scrapix-worker-content; do
+  docker buildx build -f Dockerfile.fly --target "$target" \
+    -t "ghcr.io/$OWNER/$target:$TAG" --push .
+done
+
+# One Fly app per image (no Fly builder).
+flyctl deploy --config deploy/fly/api/fly.toml      --image "ghcr.io/$OWNER/scrapix-api:$TAG"              --app scrapix-api
+flyctl deploy --config deploy/fly/frontier/fly.toml --image "ghcr.io/$OWNER/scrapix-frontier-service:$TAG" --app scrapix-frontier
+flyctl deploy --config deploy/fly/crawler/fly.toml  --image "ghcr.io/$OWNER/scrapix-worker-crawler:$TAG"   --app scrapix-worker-crawler
+flyctl deploy --config deploy/fly/content/fly.toml  --image "ghcr.io/$OWNER/scrapix-worker-content:$TAG"   --app scrapix-worker-content
+```
+
+In CI, `flyctl` needs `FLY_API_TOKEN` (an org-scoped deploy token).
 
 ## Horizontal scaling
 

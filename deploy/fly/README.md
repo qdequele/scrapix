@@ -1,8 +1,9 @@
 # Fly.io Deployment Runbook
 
 Scrapix runs as five Fly apps. Redpanda is a durable singleton; every other app
-scale-to-zeros when idle. CI (`.github/workflows/deploy-fly.yml`) builds images
-in GitHub Actions, pushes them to GHCR, and deploys via `flyctl deploy --image`.
+scale-to-zeros when idle. Images are built from `Dockerfile.fly` (one target
+per binary), pushed to a registry, and deployed with `flyctl deploy --image`;
+this repository ships no deploy workflow.
 The console and the Rails control plane (the Lab) are deployed from
 `meilisearch/lab`, not from this repo.
 
@@ -109,13 +110,23 @@ flyctl secrets set \
 
 ### 4. First deploy
 
-Push to `main` — CI builds and deploys everything. Or deploy manually from a
-locally-pulled GHCR image:
+Build the four images and deploy each app:
 
 ```bash
-flyctl deploy --config deploy/fly/api/fly.toml \
-  --image ghcr.io/<owner>/scrapix-api:main \
-  --app scrapix-api
+TAG=$(git rev-parse --short HEAD)
+OWNER=<your GHCR owner>
+
+# One image per binary, all from the multi-target Dockerfile.fly.
+for target in scrapix-api scrapix-frontier-service scrapix-worker-crawler scrapix-worker-content; do
+  docker buildx build -f Dockerfile.fly --target "$target" \
+    -t "ghcr.io/$OWNER/$target:$TAG" --push .
+done
+
+# One Fly app per image (no Fly builder).
+flyctl deploy --config deploy/fly/api/fly.toml      --image "ghcr.io/$OWNER/scrapix-api:$TAG"              --app scrapix-api
+flyctl deploy --config deploy/fly/frontier/fly.toml --image "ghcr.io/$OWNER/scrapix-frontier-service:$TAG" --app scrapix-frontier
+flyctl deploy --config deploy/fly/crawler/fly.toml  --image "ghcr.io/$OWNER/scrapix-worker-crawler:$TAG"   --app scrapix-worker-crawler
+flyctl deploy --config deploy/fly/content/fly.toml  --image "ghcr.io/$OWNER/scrapix-worker-content:$TAG"   --app scrapix-worker-content
 ```
 
 ### 5. Custom domains
