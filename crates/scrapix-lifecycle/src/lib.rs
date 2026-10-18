@@ -16,6 +16,11 @@
 //!   (typically `messages_processed`); flips the shutdown flag if it doesn't
 //!   advance for `idle_minutes`. Lets Kafka-consumer workers exit cleanly
 //!   when idle so Fly can suspend them to zero cost.
+//! - [`spawn_shutdown_deadline`] with [`shutdown_timeout_from_env`]: bounds
+//!   the whole graceful shutdown (`SHUTDOWN_TIMEOUT_SECS`, default 90 s), so
+//!   a worker always exits before its orchestrator's SIGKILL (ECS sends it
+//!   120 s after SIGTERM by default). Anything not acked by then was never
+//!   committed and is redelivered.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -234,6 +239,137 @@ pub fn wake_port_from_env() -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8081)
+}
+
+/// Default for [`shutdown_timeout_from_env`].
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Time kept back from the shutdown budget for what follows the consumer
+/// drain (the final offset commit, producer flush, storage flush), see
+/// [`consumer_drain_timeout`].
+const POST_DRAIN_MARGIN: Duration = Duration::from_secs(15);
+
+/// Convenience: read `SHUTDOWN_TIMEOUT_SECS`, the most a graceful shutdown
+/// may take from the first SIGTERM/Ctrl-C (or idle exit) to process exit.
+/// Defaults to [`DEFAULT_SHUTDOWN_TIMEOUT`]; invalid or zero values fall
+/// back to it with a warning.
+pub fn shutdown_timeout_from_env() -> Duration {
+    parse_shutdown_timeout(std::env::var("SHUTDOWN_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn parse_shutdown_timeout(value: Option<&str>) -> Duration {
+    match value {
+        None => DEFAULT_SHUTDOWN_TIMEOUT,
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                warn!(
+                    value = %s,
+                    "SHUTDOWN_TIMEOUT_SECS is not a positive number of seconds, using default"
+                );
+                DEFAULT_SHUTDOWN_TIMEOUT
+            }
+        },
+    }
+}
+
+/// How long a Kafka consumer may wait for its in-flight handlers once
+/// shutdown starts: the shutdown budget minus a margin for what follows
+/// (at least 5 s).
+pub fn consumer_drain_timeout(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout
+        .saturating_sub(POST_DRAIN_MARGIN)
+        .max(Duration::from_secs(5))
+}
+
+/// Exit the process (code 1) if it is still running `timeout` after
+/// `shutdown` flipped to `true`: the hard stop behind every graceful drain,
+/// so a stuck handler, flush or blocking task can never outlive the
+/// orchestrator's stop timeout. Offsets are only ever committed for acked
+/// work, so whatever was in flight is redelivered.
+///
+/// Runs on a plain OS thread, not a tokio task, so it still fires while the
+/// runtime itself is shutting down. The thread ends with the process.
+pub fn spawn_shutdown_deadline(
+    shutdown: Arc<AtomicBool>,
+    timeout: Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("shutdown-deadline".into())
+        .spawn(move || {
+            wait_for_deadline(&shutdown, timeout, Duration::from_millis(200));
+            error!(
+                timeout_secs = timeout.as_secs(),
+                "Graceful shutdown did not finish within SHUTDOWN_TIMEOUT_SECS; exiting now \
+                 (unacked work is redelivered)"
+            );
+            std::process::exit(1);
+        })
+        .expect("spawn shutdown deadline thread")
+}
+
+/// Block until `shutdown` is set, then for `timeout` more.
+fn wait_for_deadline(shutdown: &AtomicBool, timeout: Duration, poll: Duration) {
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(poll);
+    }
+    std::thread::sleep(timeout);
+}
+
+#[cfg(test)]
+mod shutdown_deadline_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn shutdown_timeout_parsing() {
+        assert_eq!(parse_shutdown_timeout(None), DEFAULT_SHUTDOWN_TIMEOUT);
+        assert_eq!(parse_shutdown_timeout(Some("45")), Duration::from_secs(45));
+        assert_eq!(
+            parse_shutdown_timeout(Some(" 60 ")),
+            Duration::from_secs(60)
+        );
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(
+                parse_shutdown_timeout(Some(bad)),
+                DEFAULT_SHUTDOWN_TIMEOUT,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_budget_stays_well_under_the_ecs_stop_timeout() {
+        assert!(DEFAULT_SHUTDOWN_TIMEOUT < Duration::from_secs(120));
+        assert_eq!(
+            consumer_drain_timeout(DEFAULT_SHUTDOWN_TIMEOUT),
+            Duration::from_secs(75)
+        );
+        assert_eq!(
+            consumer_drain_timeout(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn deadline_starts_counting_only_once_shutdown_is_set() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        wait_for_deadline(
+            &shutdown,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        );
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
 }
 
 #[cfg(test)]
