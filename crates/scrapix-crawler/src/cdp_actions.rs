@@ -27,7 +27,7 @@ use tracing::debug;
 
 use scrapix_core::browser::Action;
 
-use crate::safe_dns::is_public_ip;
+use crate::safe_dns::{is_link_local_or_metadata, is_public_ip};
 
 /// Timeout for one action (a `wait` with `ms` gets `ms` plus a margin).
 pub const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -366,9 +366,9 @@ where
 }
 
 /// Whether the browser may request `url`: non-network schemes pass; IP
-/// literals must be public (always — even with `allow_private_ips`, like
+/// literals must be public (always, even with `allow_private_ips`, like
 /// raw-IP seeds); hostnames must resolve only to public addresses unless
-/// `allow_private_ips`.
+/// `allow_private_ips`, and never to a link-local or metadata address.
 async fn request_allowed(
     url: &str,
     allow_private_ips: bool,
@@ -383,22 +383,27 @@ async fn request_allowed(
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => return is_public_ip(ip.into()),
         Some(url::Host::Ipv6(ip)) => return is_public_ip(ip.into()),
-        Some(url::Host::Domain(_)) if allow_private_ips => return true,
         Some(url::Host::Domain(_)) => {}
         None => return false,
     }
     let host = parsed.host_str().unwrap_or_default().to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let key = format!("{host}:{port}");
+    // The opt-out changes the verdict, so it is part of the key.
+    let key = format!("{host}:{port}:{allow_private_ips}");
     if let Some(&verdict) = verdicts.lock().get(&key) {
         return verdict;
     }
     let verdict = match tokio::net::lookup_host((host.as_str(), port)).await {
         Ok(addrs) => {
             let addrs: Vec<_> = addrs.collect();
-            !addrs.is_empty() && addrs.iter().all(|a| is_public_ip(a.ip()))
+            if allow_private_ips {
+                !addrs.iter().any(|a| is_link_local_or_metadata(a.ip()))
+            } else {
+                !addrs.is_empty() && addrs.iter().all(|a| is_public_ip(a.ip()))
+            }
         }
-        Err(_) => false,
+        // With the opt-out a DNS failure is left to the browser.
+        Err(_) => allow_private_ips,
     };
     verdicts.lock().insert(key, verdict);
     verdict
@@ -465,6 +470,9 @@ mod tests {
         for url in [
             "http://127.0.0.1/",
             "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.170.2/v2/credentials/x",
+            "http://[fe80::1]/",
+            "http://[fd00:ec2::254]/",
             "http://[::1]:8080/",
             "http://10.0.0.1/",
         ] {

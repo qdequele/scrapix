@@ -55,6 +55,34 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Returns `true` if `ip` is link-local or a cloud metadata address:
+/// 169.254.0.0/16 (AWS/GCP/Azure instance metadata 169.254.169.254, the
+/// ECS/Fargate task credentials endpoint 169.254.170.2), IPv6 link-local
+/// fe80::/10, the EC2 IPv6 metadata endpoint fd00:ec2::254, or an
+/// IPv4-mapped IPv6 address wrapping 169.254.0.0/16.
+///
+/// These are refused even when `allow_private_ips` is set: that opt-out
+/// exists to reach local test servers and self-hosted private hosts, never
+/// the credential endpoints of the machine the engine runs on.
+pub fn is_link_local_or_metadata(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_link_local();
+            }
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
+    }
+}
+
+/// Whether a resolved address may be connected to: never a link-local or
+/// metadata address, and otherwise a public one unless `allow_private`.
+pub(crate) fn is_allowed_address(ip: IpAddr, allow_private: bool) -> bool {
+    !is_link_local_or_metadata(ip) && (allow_private || is_public_ip(ip))
+}
+
 /// Error returned by [`SafeResolver`] when a hostname resolves only to
 /// non-public addresses (SSRF refusal). A typed error — rather than a bare
 /// `String` boxed into `reqwest::dns::Resolving`'s `BoxError` — lets
@@ -78,7 +106,7 @@ impl std::error::Error for NonPublicAddress {}
 /// A `reqwest::dns::Resolve` implementation that resolves through the
 /// caching DNS resolver (so reqwest and the crawler's own cache don't
 /// double-resolve) and refuses to hand back non-public addresses unless
-/// `allow_private` is set.
+/// `allow_private` is set, and link-local or metadata addresses always.
 pub(crate) struct SafeResolver {
     pub cache: Option<Arc<CachingDnsResolver>>,
     pub allow_private: bool,
@@ -102,7 +130,7 @@ impl Resolve for SafeResolver {
             };
             let allowed: Vec<SocketAddr> = ips
                 .into_iter()
-                .filter(|ip| allow_private || is_public_ip(*ip))
+                .filter(|ip| is_allowed_address(*ip, allow_private))
                 .map(|ip| SocketAddr::new(ip, 0))
                 .collect();
             if allowed.is_empty() {
@@ -144,6 +172,9 @@ async fn resolve_host(
 /// - a hostname must resolve to at least one public address, and to no
 ///   non-public one.
 ///
+/// With `allow_private`, only a link-local or metadata IP literal is
+/// refused (see [`is_link_local_or_metadata`]).
+///
 /// Refusals are `ScrapixError::Refused` (terminal, never retried).
 pub async fn validate_proxy_url(
     proxy: &str,
@@ -161,6 +192,17 @@ pub async fn validate_proxy_url(
         )));
     }
     if allow_private {
+        let literal = match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+            _ => None,
+        };
+        if literal.is_some_and(is_link_local_or_metadata) {
+            return Err(ScrapixError::Refused(format!(
+                "proxy {} is a link-local address",
+                parsed.host_str().unwrap_or_default()
+            )));
+        }
         return Ok(());
     }
     let ips = match parsed.host() {
@@ -206,6 +248,44 @@ mod tests {
         assert!(validate_proxy_url("http://127.0.0.1:3128", None, true)
             .await
             .is_ok());
+        // ...but never a link-local or metadata one.
+        assert!(refused(
+            validate_proxy_url("http://169.254.170.2:80", None, true).await
+        ));
+        assert!(refused(
+            validate_proxy_url("http://[fd00:ec2::254]:80", None, true).await
+        ));
+    }
+
+    #[test]
+    fn link_local_and_metadata_addresses_are_never_allowed() {
+        for ip in [
+            "169.254.169.254", // EC2/GCP/Azure instance metadata
+            "169.254.170.2",   // ECS/Fargate task credentials
+            "169.254.0.1",
+            "169.254.255.255",
+            "fe80::1",
+            "febf::1",       // top of fe80::/10
+            "fd00:ec2::254", // EC2 IPv6 metadata
+            "::ffff:169.254.169.254",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_link_local_or_metadata(ip), "{ip} is link-local/metadata");
+            assert!(!is_public_ip(ip), "{ip} must be non-public");
+            assert!(!is_allowed_address(ip, false), "{ip} refused");
+            assert!(
+                !is_allowed_address(ip, true),
+                "{ip} refused even with the opt-out"
+            );
+        }
+        // The opt-out still lets other private addresses through.
+        for ip in ["127.0.0.1", "10.0.1.10", "::1", "fd00::1", "fd00:ec2::253"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_link_local_or_metadata(ip), "{ip}");
+            assert!(!is_allowed_address(ip, false), "{ip}");
+            assert!(is_allowed_address(ip, true), "{ip}");
+        }
+        assert!(is_allowed_address("1.1.1.1".parse().unwrap(), false));
     }
 
     #[test]
@@ -216,12 +296,14 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
+            "169.254.170.2",
             "100.64.0.1",
             "0.0.0.0",
             "224.0.0.1",
             "::1",
             "fe80::1",
             "fc00::1",
+            "fd00:ec2::254",
             "::ffff:127.0.0.1",
             // 198.18.0.0/15 benchmarking
             "198.18.0.1",
