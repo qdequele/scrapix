@@ -1802,7 +1802,10 @@ impl AppState {
                     operation: "crawl".to_string(),
                     url,
                     domain,
-                    status_code: if *errors > 0 { 0 } else { 200 },
+                    // One row per finished crawl: a success row carrying the
+                    // real counts, so analytics count its failed pages, not
+                    // all of its pages, as failures.
+                    status_code: 200,
                     duration_ms: (*duration_secs * 1000) as u32,
                     content_length: *bytes_downloaded,
                     error: String::new(),
@@ -1813,10 +1816,12 @@ impl AppState {
                     ai_completion_tokens: 0,
                     ai_model: String::new(),
                     urls_found: 0,
-                    pages_fetched: *pages_crawled as u32,
+                    pages_fetched: u32::try_from(pages_crawled.saturating_add(*errors))
+                        .unwrap_or(u32::MAX),
                     search_query: String::new(),
                     results_count: 0,
                     ocr_pages: u32::try_from(pages_ocr).unwrap_or(u32::MAX),
+                    pages_failed: u32::try_from(*errors).unwrap_or(u32::MAX),
                     timestamp: time::OffsetDateTime::now_utc(),
                 };
                 let batcher = batcher.clone();
@@ -4187,6 +4192,7 @@ fn log_scrape_request(
         search_query: String::new(),
         results_count: 0,
         ocr_pages: 0,
+        pages_failed: 0,
         timestamp: time::OffsetDateTime::now_utc(),
     };
     let batcher = batcher.clone();
@@ -5464,6 +5470,7 @@ async fn map_url(
             search_query: String::new(),
             results_count: 0,
             ocr_pages: 0,
+            pages_failed: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         };
         let batcher = batcher.clone();
@@ -5662,6 +5669,7 @@ async fn search_url(
             search_query: request.q.clone(),
             results_count,
             ocr_pages: 0,
+            pages_failed: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         };
         let batcher = batcher.clone();
