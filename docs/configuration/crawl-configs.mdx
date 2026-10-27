@@ -256,6 +256,18 @@ Configure the destination index:
 }
 ```
 
+Which instance is used:
+
+- `url` and `api_key` set: used as given.
+- `url` set, `api_key` empty: on a hosted engine, the key of the account's
+  instance at that URL (as registered in the Lab). A URL that is not one of
+  the account's instances is refused with a `400 validation_error`, never
+  crawled without a key. On a standalone engine, a `url` equal to
+  `MEILISEARCH_URL` gets `MEILISEARCH_API_KEY`; any other URL is used without
+  a key.
+- `url` empty: the account's default instance (hosted) or `MEILISEARCH_URL`
+  (standalone).
+
 ### Webhooks
 
 Receive notifications for crawl events:

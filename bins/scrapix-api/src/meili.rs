@@ -33,6 +33,10 @@ pub(crate) trait MeilisearchResolver: Send + Sync {
     ) -> Result<Option<MeiliTarget>, ApiError>;
     /// Message for the 400 returned when a crawl has no target.
     fn missing_message(&self) -> &'static str;
+    /// Message for the 400 returned when a crawl names a `meilisearch.url`
+    /// without an `api_key` and the URL is not a known target. `None` lets
+    /// the crawl go on without a key (an unsecured instance).
+    fn unknown_url_message(&self) -> Option<&'static str>;
 }
 
 /// Standalone: the server's own `MEILISEARCH_URL` / `MEILISEARCH_API_KEY`.
@@ -52,6 +56,9 @@ impl MeilisearchResolver for EnvResolver {
     }
     fn missing_message(&self) -> &'static str {
         "No Meilisearch configured: set MEILISEARCH_URL or pass meilisearch.url"
+    }
+    fn unknown_url_message(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -98,16 +105,34 @@ impl MeilisearchResolver for LabMeilisearchResolver {
     fn missing_message(&self) -> &'static str {
         "No Meilisearch engine configured. Add one in Settings."
     }
+    fn unknown_url_message(&self) -> Option<&'static str> {
+        Some(
+            "meilisearch.url is not one of this account's Meilisearch instances: \
+             add it in Settings, or pass meilisearch.api_key",
+        )
+    }
 }
 
 /// A crawl's own `meilisearch` block wins; else the resolver's default;
-/// else a 400.
+/// else a 400. A block with a `url` but no `api_key` gets the key of the
+/// known target at that URL (hosted: the account's instance, from the Lab);
+/// an unknown URL is a 400 in hosted mode, never a keyless crawl.
 pub(crate) async fn resolve_crawl_meilisearch(
     resolver: &dyn MeilisearchResolver,
     account_id: Option<&str>,
     mut cfg: MeilisearchConfig,
 ) -> Result<MeilisearchConfig, ApiError> {
     if !cfg.url.is_empty() {
+        if cfg.api_key.is_empty() {
+            match resolver.target_for_url(account_id, &cfg.url).await? {
+                Some(target) => cfg.api_key = target.api_key.unwrap_or_default(),
+                None => {
+                    if let Some(msg) = resolver.unknown_url_message() {
+                        return Err(ApiError::new(msg, "validation_error"));
+                    }
+                }
+            }
+        }
         return Ok(cfg);
     }
     let target = resolver
@@ -232,6 +257,84 @@ mod tests {
         let resp = axum::response::IntoResponse::into_response(err);
         assert_eq!(resp.status(), 503);
         assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+    }
+
+    /// A hosted crawl's `meilisearch` block, against an account with a
+    /// default instance (`http://m:7700`) and a second one (`http://b:7700`).
+    #[tokio::test]
+    async fn hosted_crawl_target_by_url() {
+        use crate::lab_client::{
+            testing::{FakeLab, INSTANCE_ID, SECRET},
+            LabClient,
+        };
+        let lab = FakeLab::start().await;
+        let acct = "11111111-1111-1111-1111-111111111111";
+        {
+            let mut m = lab.state.meili.lock().unwrap();
+            m.insert(
+                format!("{acct}|"),
+                serde_json::json!({"id": "d", "url": "http://m:7700", "api_key": "dkey"}),
+            );
+            m.insert(
+                format!("{acct}|http://b:7700"),
+                serde_json::json!({"id": "b", "url": "http://b:7700", "api_key": "bkey"}),
+            );
+        }
+        let r = LabMeilisearchResolver {
+            lab: std::sync::Arc::new(LabClient::new(&lab.url, INSTANCE_ID, SECRET)),
+        };
+        let block = |url: &str, key: &str| scrapix_core::MeilisearchConfig {
+            url: url.into(),
+            api_key: key.into(),
+            ..Default::default()
+        };
+        let pair = |c: &scrapix_core::MeilisearchConfig| (c.url.clone(), c.api_key.clone());
+
+        // URL + key: used as is, whatever the URL.
+        let out = resolve_crawl_meilisearch(&r, Some(acct), block("http://own:7700", "mine"))
+            .await
+            .unwrap();
+        assert_eq!(pair(&out), ("http://own:7700".into(), "mine".into()));
+
+        // URL without key: the key of the account's instance at that URL.
+        let out = resolve_crawl_meilisearch(&r, Some(acct), block("http://b:7700/", ""))
+            .await
+            .unwrap();
+        assert_eq!(pair(&out), ("http://b:7700/".into(), "bkey".into()));
+
+        // Unknown URL without key: refused, never crawled unauthenticated.
+        let err = resolve_crawl_meilisearch(&r, Some(acct), block("http://own:7700", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "validation_error");
+        assert!(err.error.contains("meilisearch.url"), "{}", err.error);
+
+        // No URL: the account's default instance, unchanged.
+        let out = resolve_crawl_meilisearch(&r, Some(acct), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(pair(&out), ("http://m:7700".into(), "dkey".into()));
+    }
+
+    #[tokio::test]
+    async fn standalone_url_without_key_uses_env_key_or_goes_keyless() {
+        let r = EnvResolver(Some(t("http://env:7700", Some("envkey"))));
+        let block = |url: &str| scrapix_core::MeilisearchConfig {
+            url: url.into(),
+            ..Default::default()
+        };
+        let out = resolve_crawl_meilisearch(&r, None, block("http://env:7700/"))
+            .await
+            .unwrap();
+        assert_eq!(out.api_key, "envkey");
+        // A self-hoster's unsecured instance stays reachable without a key.
+        let out = resolve_crawl_meilisearch(&r, None, block("http://other:7700"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (out.url.as_str(), out.api_key.as_str()),
+            ("http://other:7700", "")
+        );
     }
 
     #[test]
