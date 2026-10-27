@@ -145,7 +145,8 @@ pub struct RequestEvent {
     pub ai_model: String,
     /// For map: number of URLs discovered. 0 otherwise.
     pub urls_found: u32,
-    /// For map: number of internal HTTP requests made. 1 for scrape. pages_crawled for crawl.
+    /// For map: number of internal HTTP requests made. 1 for scrape. For
+    /// crawl: every page fetch attempt of the job, crawled or failed.
     pub pages_fetched: u32,
     /// Search query string (for search operations).
     #[serde(default)]
@@ -157,6 +158,11 @@ pub struct RequestEvent {
     /// at the OCR page rate — kept separate so OCR spend is attributable.
     #[serde(default)]
     pub ocr_pages: u32,
+    /// How many of `pages_fetched` failed, for a row that is otherwise a
+    /// success (a crawl: one row per finished job, status 200). A row with
+    /// a failing status or an `error` counts all its pages as failed.
+    #[serde(default)]
+    pub pages_failed: u32,
     /// When the request occurred.
     #[serde(with = "clickhouse::serde::time::datetime")]
     pub timestamp: time::OffsetDateTime,
@@ -186,6 +192,7 @@ impl Default for RequestEvent {
             search_query: String::new(),
             results_count: 0,
             ocr_pages: 0,
+            pages_failed: 0,
             timestamp: time::OffsetDateTime::now_utc(),
         }
     }
@@ -663,6 +670,16 @@ impl ClickHouseStorage {
             .execute()
             .await?;
 
+        // Migrate: add pages_failed (a crawl row's failed pages, so a crawl
+        // with one failed page no longer counts all its pages as failures)
+        self.client
+            .query(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS pages_failed UInt32 DEFAULT 0 AFTER ocr_pages",
+                request_events
+            ))
+            .execute()
+            .await?;
+
         // job_events — lifecycle only (JobStarted, JobCompleted, JobFailed)
         let job_events = self.table_name("job_events");
         self.client
@@ -909,6 +926,9 @@ impl ClickHouseStorage {
     // ========================================================================
     // Query Operations — request_events
     //
+    // Success and failure counts are pages, not rows: see `SUCCESSFUL_PAGES`
+    // and `FAILED_PAGES`.
+    //
     // These back the analytics pipes (`bins/scrapix-api/src/analytics_pipes.rs`)
     // and mirror the SQL of the Lab's Rails analytics controller
     // (meilisearch/lab `saas/app/controllers/analytics_controller.rb`).
@@ -930,8 +950,8 @@ impl ClickHouseStorage {
                 SELECT
                     toStartOfHour(timestamp) as hour,
                     sum(pages_fetched) as requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successes,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failures,
+                    {SUCCESSFUL_PAGES} as successes,
+                    {FAILED_PAGES} as failures,
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
@@ -963,8 +983,8 @@ impl ClickHouseStorage {
                 SELECT
                     toDate(timestamp) as date,
                     sum(pages_fetched) as requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successes,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failures,
+                    {SUCCESSFUL_PAGES} as successes,
+                    {FAILED_PAGES} as failures,
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
@@ -997,8 +1017,8 @@ impl ClickHouseStorage {
                 SELECT
                     domain,
                     sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
+                    {SUCCESSFUL_PAGES} as successful_requests,
+                    {FAILED_PAGES} as failed_requests,
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
@@ -1034,8 +1054,8 @@ impl ClickHouseStorage {
                 SELECT
                     domain,
                     sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
+                    {SUCCESSFUL_PAGES} as successful_requests,
+                    {FAILED_PAGES} as failed_requests,
                     avg(duration_ms) as avg_duration_ms,
                     sum(content_length) as total_bytes
                 FROM {}
@@ -1118,8 +1138,8 @@ impl ClickHouseStorage {
                 SELECT
                     account_id,
                     sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
+                    {SUCCESSFUL_PAGES} as successful_requests,
+                    {FAILED_PAGES} as failed_requests,
                     sum(content_length) as total_bytes,
                     avg(duration_ms) as avg_duration_ms,
                     uniqExact(domain) as unique_domains,
@@ -1234,8 +1254,8 @@ impl ClickHouseStorage {
                 SELECT
                     api_key_id,
                     sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
+                    {SUCCESSFUL_PAGES} as successful_requests,
+                    {FAILED_PAGES} as failed_requests,
                     sum(content_length) as total_bytes,
                     avg(duration_ms) as avg_duration_ms,
                     uniqExact(domain) as unique_domains,
@@ -1307,8 +1327,8 @@ impl ClickHouseStorage {
                 SELECT
                     job_id,
                     sum(pages_fetched) as total_requests,
-                    sumIf(pages_fetched, status_code >= 200 AND status_code < 400) as successful_requests,
-                    sumIf(pages_fetched, status_code >= 400 OR status_code = 0 OR error != '') as failed_requests,
+                    {SUCCESSFUL_PAGES} as successful_requests,
+                    {FAILED_PAGES} as failed_requests,
                     sum(content_length) as total_bytes,
                     avg(duration_ms) as avg_duration_ms,
                     uniqExact(domain) as unique_domains,
@@ -1525,6 +1545,27 @@ pub type PageEventBatcher = EventBatcher<PageEvent>;
 // Tests
 // ============================================================================
 
+/// SQL aggregate: the pages of the `request_events` rows that succeeded.
+///
+/// A row counts `pages_fetched` pages. A row with a 2xx/3xx status
+/// succeeded except for its `pages_failed` (a crawl writes one row per
+/// finished job, status 200, with its real counts). Crawl rows written
+/// before `pages_failed` existed carry status 0 whenever the crawl had any
+/// failed page, with `pages_fetched` = the pages crawled successfully: they
+/// count as successes, and their failures (never recorded on the row) as 0.
+/// They leave with the table's 90-day TTL.
+const SUCCESSFUL_PAGES: &str =
+    "toUInt64(sumIf(toInt64(pages_fetched) - least(pages_failed, pages_fetched), \
+     (status_code >= 200 AND status_code < 400) OR (operation = 'crawl' AND status_code = 0)))";
+
+/// SQL aggregate: the pages of the `request_events` rows that failed. A row
+/// with a failing status (`>= 400`, or `0` outside a pre-`pages_failed`
+/// crawl row) or an `error` failed all its pages; any other row failed its
+/// `pages_failed`. See [`SUCCESSFUL_PAGES`].
+const FAILED_PAGES: &str = "sum(if((status_code >= 400 OR status_code = 0 OR error != '') \
+     AND NOT (operation = 'crawl' AND status_code = 0), \
+     pages_fetched, least(pages_failed, pages_fetched)))";
+
 /// `" AND account_id = ?"` when a query is scoped to one account, else
 /// nothing. Pair with [`bind_account`] at the same position in the binds.
 fn account_filter(account_id: Option<&str>) -> &'static str {
@@ -1574,6 +1615,141 @@ mod tests {
         assert_eq!(event.status_code, 0);
         assert_eq!(event.pages_fetched, 1);
         assert!(!event.js_rendered);
+    }
+
+    /// Success/failure counts per page against a real ClickHouse, in tables
+    /// of their own (prefix). Set `CLICKHOUSE_TEST_URL` (and
+    /// `CLICKHOUSE_TEST_DATABASE`, default `default`, `CLICKHOUSE_TEST_USER`,
+    /// `CLICKHOUSE_TEST_PASSWORD` if needed) to run it; it skips itself
+    /// otherwise.
+    #[tokio::test]
+    async fn success_and_failure_counts_are_pages() {
+        let Ok(url) = std::env::var("CLICKHOUSE_TEST_URL") else {
+            eprintln!("CLICKHOUSE_TEST_URL unset: skipping");
+            return;
+        };
+        let prefix = format!(
+            "t{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let ch = ClickHouseStorage::new(ClickHouseConfig {
+            url,
+            database: std::env::var("CLICKHOUSE_TEST_DATABASE").unwrap_or("default".into()),
+            username: std::env::var("CLICKHOUSE_TEST_USER").ok(),
+            password: std::env::var("CLICKHOUSE_TEST_PASSWORD").ok(),
+            table_prefix: prefix.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let acct = "acct";
+        let row = |op: &str, domain: &str, status: u16, fetched: u32, failed: u32| RequestEvent {
+            account_id: acct.into(),
+            api_key_id: "key".into(),
+            job_id: "job".into(),
+            operation: op.into(),
+            domain: domain.into(),
+            status_code: status,
+            pages_fetched: fetched,
+            pages_failed: failed,
+            ..Default::default()
+        };
+        ch.insert_request_events(vec![
+            // A crawl of 500 pages, 1 of which failed.
+            row("crawl", "a.com", 200, 500, 1),
+            // A crawl written before `pages_failed`: 13 pages crawled, some
+            // failed (status 0), how many unknown.
+            row("crawl", "b.com", 0, 13, 0),
+            // A clean crawl.
+            row("crawl", "b.com", 200, 7, 0),
+            // A scrape that worked and one that failed.
+            row("scrape", "a.com", 200, 1, 0),
+            row("scrape", "a.com", 502, 1, 0),
+            // A search: no pages.
+            row("search", "a.com", 200, 0, 0),
+        ])
+        .await
+        .unwrap();
+
+        let a = Some(acct);
+        // 500 + 13 + 7 + 1 + 1 pages; 499 + 13 + 7 + 1 succeeded; 1 + 1 failed.
+        let (requests, ok, failed) = (522, 520, 2);
+
+        let hourly = ch.get_hourly_stats(24, a).await.unwrap();
+        assert_eq!(hourly.len(), 1);
+        let h = &hourly[0];
+        assert_eq!(
+            (h.requests, h.successes, h.failures),
+            (requests, ok, failed)
+        );
+
+        let daily = ch.get_daily_stats(2, a).await.unwrap();
+        let d = &daily[0];
+        assert_eq!(
+            (d.requests, d.successes, d.failures),
+            (requests, ok, failed)
+        );
+
+        let domains = ch.get_top_domains(24, 10, a).await.unwrap();
+        let counts = |d: &DomainStats| {
+            (
+                d.domain.clone(),
+                d.total_requests,
+                d.successful_requests,
+                d.failed_requests,
+            )
+        };
+        assert_eq!(
+            domains.iter().map(counts).collect::<Vec<_>>(),
+            vec![("a.com".into(), 502, 500, 2), ("b.com".into(), 20, 20, 0)]
+        );
+        let one = ch.get_domain_stats("a.com", 24, a).await.unwrap();
+        assert_eq!(counts(&one), ("a.com".into(), 502, 500, 2));
+
+        let usage = ch.get_account_usage(acct, 24).await.unwrap();
+        assert_eq!(
+            (
+                usage.total_requests,
+                usage.successful_requests,
+                usage.failed_requests
+            ),
+            (requests, ok, failed)
+        );
+        let keys = ch.get_api_key_usage(acct, 24).await.unwrap();
+        assert_eq!(
+            (
+                keys[0].total_requests,
+                keys[0].successful_requests,
+                keys[0].failed_requests
+            ),
+            (requests, ok, failed)
+        );
+        let job = ch.get_job_stats("job", a).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                job.total_requests,
+                job.successful_requests,
+                job.failed_requests
+            ),
+            (requests, ok, failed)
+        );
+
+        for t in [
+            "request_events",
+            "job_events",
+            "ai_usage_events",
+            "page_events",
+        ] {
+            ch.client
+                .query(&format!("DROP TABLE IF EXISTS {prefix}_{t}"))
+                .execute()
+                .await
+                .unwrap();
+        }
     }
 
     #[test]

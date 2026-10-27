@@ -124,6 +124,27 @@ curl "http://localhost:8080/analytics/v0/pipes/error_distribution.json?hours=24"
 | `links_extracted` | UInt32 | Links found on page |
 | `content_changed` | Bool | Changed since last crawl |
 
+### How successes and failures are counted
+
+The analytics pipes (`hourly_stats`, `daily_stats`, `top_domains`,
+`domain_stats`, `kpis`, `job_stats`, `account_usage`, `api_key_usage`) read
+the `request_events` table, one row per API call and one row per finished
+crawl. Their request, success and failure numbers count **pages**:
+
+- A row counts `pages_fetched` pages (1 for a scrape; every page fetch of a
+  crawl, crawled or failed).
+- A row with a failing status (`>= 400`, or `0`) or an `error` counts all its
+  pages as failures.
+- Any other row counts `pages_failed` of its pages as failures and the rest as
+  successes. A finished crawl is written this way (status `200`, with its real
+  failed-page count), so a 500-page crawl with one failed page counts 499
+  successes and 1 failure.
+- Crawl rows written before `pages_failed` existed have status `0` whenever
+  the crawl had any failed page, with `pages_fetched` = the pages crawled
+  successfully. They are counted as successes, and their failures (never
+  recorded on the row) as 0. The job's `job_events` row still has its real
+  `errors`, and these rows expire with the table's 90-day TTL.
+
 ## Direct SQL Queries
 
 For custom analytics beyond the pipe API:
