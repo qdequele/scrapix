@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use scrapix_lifecycle::{
-    idle_minutes_from_env, install_signal_handlers, spawn_idle_watchdog, spawn_wake_listener,
+    consumer_drain_timeout, idle_minutes_from_env, install_signal_handlers,
+    shutdown_timeout_from_env, spawn_idle_watchdog, spawn_shutdown_deadline, spawn_wake_listener,
     wake_port_from_env,
 };
 use tokio::sync::mpsc;
@@ -484,6 +485,7 @@ impl ContentWorker {
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)
             .client_id(format!("scrapix-content-{}", worker_id))
             .auto_offset_reset("earliest")
+            .drain_timeout(consumer_drain_timeout(shutdown_timeout_from_env()))
             .build()?;
         kafka_consumer.subscribe(&[topic_names::PAGES_RAW])?;
         info!(
@@ -978,6 +980,7 @@ impl ContentWorker {
         if let Some(handle) = control_handle {
             handle.abort();
         }
+        self.producer.flush(Duration::from_secs(5));
 
         result
     }
@@ -1895,6 +1898,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Install SIGTERM + Ctrl-C handler.
     let signal_handle = install_signal_handlers(worker.shutdown.clone());
+    // Hard stop SHUTDOWN_TIMEOUT_SECS after shutdown starts (before ECS's SIGKILL).
+    spawn_shutdown_deadline(worker.shutdown.clone(), shutdown_timeout_from_env());
 
     // Wake listener for Fly.io autostart.
     let wake_handle = spawn_wake_listener(wake_port_from_env(), worker.shutdown.clone());

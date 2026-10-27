@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use scrapix_lifecycle::{
-    idle_minutes_from_env, install_signal_handlers, spawn_idle_watchdog, spawn_wake_listener,
+    consumer_drain_timeout, idle_minutes_from_env, install_signal_handlers,
+    shutdown_timeout_from_env, spawn_idle_watchdog, spawn_shutdown_deadline, spawn_wake_listener,
     wake_port_from_env,
 };
 use tokio::sync::Semaphore;
@@ -433,6 +434,7 @@ impl CrawlerWorker {
         let kafka_consumer = ConsumerBuilder::new(&args.brokers, &args.group_id)
             .client_id(format!("scrapix-crawler-{}", worker_id))
             .auto_offset_reset("earliest")
+            .drain_timeout(consumer_drain_timeout(shutdown_timeout_from_env()))
             .build()?;
 
         // Subscribe to processing topic (URLs ready to crawl after dedup/politeness)
@@ -764,6 +766,9 @@ impl CrawlerWorker {
         if let Some(h) = control_handle {
             h.abort();
         }
+        // Acked messages were published before their ack; this only sends
+        // what abandoned handlers left queued (their input is redelivered).
+        self.producer.flush(Duration::from_secs(5));
 
         result
     }
@@ -1057,6 +1062,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     // Install SIGTERM + Ctrl-C handler — flips worker.shutdown on either signal.
     let signal_handle = install_signal_handlers(worker.shutdown.clone());
+    // Hard stop SHUTDOWN_TIMEOUT_SECS after shutdown starts (before ECS's SIGKILL).
+    spawn_shutdown_deadline(worker.shutdown.clone(), shutdown_timeout_from_env());
 
     // Bare-TCP wake listener on WAKE_PORT (default 8081) so Fly.io's proxy can
     // autostart this machine from a suspended state when the API fans out

@@ -37,6 +37,10 @@ pub struct ConsumerConfig {
     pub fetch_min_bytes: i32,
     /// Fetch max wait ms
     pub fetch_max_wait_ms: i32,
+    /// On shutdown, how long `process_with_ack` waits for in-flight
+    /// handlers before its final commit (unfinished ones stay uncommitted
+    /// and are redelivered).
+    pub drain_timeout: Duration,
 }
 
 impl Default for ConsumerConfig {
@@ -52,6 +56,7 @@ impl Default for ConsumerConfig {
             max_poll_interval: Duration::from_secs(300),
             fetch_min_bytes: 1,
             fetch_max_wait_ms: 500,
+            drain_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -301,11 +306,19 @@ impl KafkaConsumer {
         }
 
         // Drain: wait for in-flight handlers (bounded), then commit whatever finished.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(30),
+        if tokio::time::timeout(
+            self.config.drain_timeout,
             semaphore.acquire_many(concurrency.max(1) as u32),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!(
+                drain_secs = self.config.drain_timeout.as_secs(),
+                "In-flight messages still running after the drain timeout; \
+                 they stay uncommitted and will be redelivered"
+            );
+        }
         while let Ok((t, p, o)) = done_rx.try_recv() {
             tracker.complete(&t, p, o);
         }
@@ -686,6 +699,12 @@ impl ConsumerBuilder {
         self
     }
 
+    /// See [`ConsumerConfig::drain_timeout`].
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.config.drain_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> Result<KafkaConsumer> {
         KafkaConsumer::new(self.config)
     }
@@ -701,6 +720,9 @@ mod tests {
         assert_eq!(config.brokers, "localhost:9092");
         assert!(!config.enable_auto_commit);
         assert_eq!(config.auto_offset_reset, "earliest");
+        assert_eq!(config.drain_timeout, Duration::from_secs(30));
+        let built = ConsumerBuilder::new("b:9092", "g").drain_timeout(Duration::from_secs(75));
+        assert_eq!(built.config.drain_timeout, Duration::from_secs(75));
     }
 
     #[test]

@@ -15,6 +15,12 @@
 #   scrapix-frontier-service    — URL frontier Kafka consumer
 #   scrapix-worker-crawler      — Fetcher Kafka consumer (+ Chromium)
 #   scrapix-worker-content      — Content parser Kafka consumer
+#
+# Every target builds for linux/amd64 and linux/arm64 (Graviton):
+# `docker buildx build --platform linux/arm64 --target <name> -f Dockerfile.fly .`
+# Chromium (crawler and API targets) is Debian's `chromium` package, built
+# for both architectures (Google's google-chrome-stable has no linux/arm64
+# package), and PDFium is picked per TARGETARCH below.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -115,6 +121,15 @@ USER scrapix
 # Target: scrapix-api
 # -----------------------------------------------------------------------------
 FROM runtime-documents AS scrapix-api
+# Chromium for `render_js` on /scrape and /map (the API launches its own
+# browser and disables JS rendering when none is found on PATH).
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium \
+        fonts-liberation \
+        fonts-noto \
+    && rm -rf /var/lib/apt/lists/*
+USER scrapix
 COPY --from=builder --chown=scrapix:scrapix /app/target/release/scrapix-api /app/scrapix-api
 EXPOSE 8080
 ENV SCRAPIX_MODE=hosted

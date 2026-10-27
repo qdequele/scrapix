@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::{CookieParam, SetCookiesParams};
+use chromiumoxide::cdp::browser_protocol::network::{
+    CookieParam, SetBlockedUrLsParams, SetCookiesParams,
+};
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ClipRect,
 };
@@ -60,7 +62,7 @@ use crate::cdp_stealth::{
 use crate::fetcher::FetchOptions;
 use crate::robots::RobotsCache;
 use crate::safe_client::reject_ip_host;
-use crate::safe_dns::is_public_ip;
+use crate::safe_dns::{is_link_local_or_metadata, is_public_ip};
 
 /// Reason a browser render is refused when the job sets a proxy: the
 /// shared browser has a single, worker-level proxy.
@@ -179,25 +181,75 @@ pub(crate) async fn check_render_target(
 
 /// The SSRF half of [`check_render_target`]: raw-IP hosts are refused
 /// (always), and a hostname must resolve only to public addresses (unless
-/// `allow_private_ips`).
+/// `allow_private_ips`, which still never admits a link-local or metadata
+/// address, see [`is_link_local_or_metadata`]).
 async fn check_ssrf_target(parsed: &url::Url, allow_private_ips: bool) -> Result<()> {
     reject_ip_host(parsed)?;
-    if !allow_private_ips {
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| ScrapixError::Crawl(format!("URL has no host: {parsed}")))?;
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| ScrapixError::Connection(format!("DNS lookup failed for {host}: {e}")))?
-            .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| !is_public_ip(a.ip())) {
-            return Err(ScrapixError::Refused(format!(
-                "{host} resolves to a non-public address"
-            )));
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ScrapixError::Crawl(format!("URL has no host: {parsed}")))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup = tokio::net::lookup_host((host, port)).await;
+    if allow_private_ips {
+        // With the opt-out a DNS failure is left to the browser; only a
+        // resolved link-local or metadata address is refused.
+        if let Ok(addrs) = lookup {
+            if addrs.into_iter().any(|a| is_link_local_or_metadata(a.ip())) {
+                return Err(ScrapixError::Refused(format!(
+                    "{host} resolves to a link-local address"
+                )));
+            }
         }
+        return Ok(());
+    }
+    let addrs: Vec<std::net::SocketAddr> = lookup
+        .map_err(|e| ScrapixError::Connection(format!("DNS lookup failed for {host}: {e}")))?
+        .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| !is_public_ip(a.ip())) {
+        return Err(ScrapixError::Refused(format!(
+            "{host} resolves to a non-public address"
+        )));
     }
     Ok(())
+}
+
+/// URL patterns (`Network.setBlockedURLs`, `*` wildcards) every rendered
+/// page is barred from requesting, whatever its options: link-local and
+/// cloud metadata IP literals (169.254.0.0/16, which holds the EC2 metadata
+/// endpoint 169.254.169.254 and the ECS/Fargate credentials endpoint
+/// 169.254.170.2, IPv6 link-local fe80::/10, IPv4-mapped 169.254.x.x, and
+/// the EC2 IPv6 metadata endpoint fd00:ec2::254). Chromium matches them
+/// against the canonical URL, where decimal, octal or hex IPv4 hosts are
+/// already rewritten to dotted quads.
+///
+/// This is defense in depth for subresources, fetch/XHR and JS navigations
+/// of pages rendered without the request guard (crawl renders): the guard
+/// (`PageOptions::guard_requests`) is the full check, and hostnames that
+/// resolve to these ranges are left to it, to the navigation checks and to
+/// the network layer.
+pub(crate) const LINK_LOCAL_URL_PATTERNS: &[&str] = &[
+    "*://169.254.*",
+    "*@169.254.*",
+    "*://[fe8*",
+    "*://[fe9*",
+    "*://[fea*",
+    "*://[feb*",
+    "*://[::ffff:a9fe:*",
+    "*://[fd00:ec2::254]*",
+];
+
+/// Install [`LINK_LOCAL_URL_PATTERNS`] on `page`. A failure is logged, not
+/// fatal: the navigation checks still run on every render.
+async fn block_link_local_urls(page: &Page) {
+    let params = SetBlockedUrLsParams::new(
+        LINK_LOCAL_URL_PATTERNS
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect(),
+    );
+    if let Err(e) = page.execute(params).await {
+        warn!(error = %e, "Could not block link-local URLs on the page");
+    }
 }
 
 /// Check the URL the browser ended on after navigating to `requested`
@@ -757,6 +809,7 @@ impl CdpRenderer {
     ) -> Result<RenderResult> {
         // Setup page
         self.setup_page(page, req.mobile).await?;
+        block_link_local_urls(page).await;
 
         if req.guard_requests {
             *guard = Some(
@@ -1276,6 +1329,61 @@ mod tests {
         assert!(check_render_target("http://localhost/", true, None)
             .await
             .is_ok());
+        // Link-local and metadata literals are refused in every mode.
+        for url in [
+            "http://169.254.170.2/v2/credentials/x",
+            "http://[fe80::1]/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://2852039166/latest/meta-data/",
+        ] {
+            for allow in [false, true] {
+                let r = check_render_target(url, allow, None).await;
+                assert!(matches!(r, Err(ScrapixError::Refused(_))), "{url}: {r:?}");
+            }
+        }
+    }
+
+    /// `*` wildcard matching as Chromium applies `Network.setBlockedURLs`.
+    fn wildcard_match(pattern: &str, text: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == text,
+            Some((head, rest)) => {
+                text.starts_with(head)
+                    && (0..=text.len() - head.len())
+                        .any(|i| wildcard_match(rest, &text[head.len() + i..]))
+            }
+        }
+    }
+
+    #[test]
+    fn link_local_patterns_cover_metadata_endpoints() {
+        let blocked = |url: &str| {
+            LINK_LOCAL_URL_PATTERNS
+                .iter()
+                .any(|p| wildcard_match(p, url))
+        };
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.170.2/v2/credentials/abc",
+            "https://169.254.1.1:8443/",
+            "http://user:pw@169.254.169.254/",
+            "ws://169.254.169.254/",
+            "http://[fe80::1]/",
+            "http://[febf::1]:8080/",
+            "http://[::ffff:a9fe:a9fe]/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+        ] {
+            assert!(blocked(url), "{url} must be blocked");
+        }
+        for url in [
+            "https://example.com/",
+            "https://example.com/?ip=169.254.169.254",
+            "http://8.8.8.8/",
+            "http://[fd00:ec2::253]/",
+            "http://[2606:4700::1111]/",
+        ] {
+            assert!(!blocked(url), "{url} must not be blocked");
+        }
     }
 
     /// Final review fix 4: the page the browser ended on (after HTTP or JS
