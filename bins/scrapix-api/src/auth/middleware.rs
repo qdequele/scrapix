@@ -160,10 +160,12 @@ pub(crate) async fn validate_api_key_or_session(
             "invalid_bearer_token",
         )?;
         debug!(account_id = %id.account_id, tier = %id.tier, "Bearer token validated");
+        // An API key sent as Bearer is introspected as `api_key` and keeps its
+        // id, exactly as through `X-API-Key`; OAuth tokens carry none.
         request.extensions_mut().insert(AuthenticatedAccount {
             account_id: id.account_id,
             tier: id.tier,
-            api_key_id: None,
+            api_key_id: id.api_key_id,
             role: id.role,
             limits: id.limits,
         });
@@ -292,6 +294,54 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(call(app(s), r).await, (200, format!("{ACCT}|pro|")));
+    }
+
+    /// An API key gives the same principal and key id whether it is sent as
+    /// `X-API-Key` or `Authorization: Bearer` (the Lab introspects both as
+    /// `api_key`); an OAuth token keeps no key id.
+    #[tokio::test]
+    async fn api_key_id_is_kept_for_both_headers() {
+        const KEY_ID: &str = "22222222-2222-2222-2222-222222222222";
+        let (lab, s) = state().await;
+        let mut v = FakeLab::identity(ACCT, "pro", 10);
+        v["api_key_id"] = json!(KEY_ID);
+        lab.set_credential("api_key", "sk_live_abc", v.clone());
+        lab.set_credential("bearer", "sk_live_abc", v);
+        let mut oauth = FakeLab::identity(ACCT, "pro", 10);
+        oauth["principal"] = json!({"type": "oauth", "user_id": null});
+        lab.set_credential("bearer", "oauth_token", oauth);
+        let app = Router::new()
+            .route(
+                "/k",
+                get(|Extension(a): Extension<AuthenticatedAccount>| async move {
+                    format!(
+                        "{}|{}|{}",
+                        a.account_id,
+                        a.tier,
+                        a.api_key_id.unwrap_or_default()
+                    )
+                }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                s,
+                validate_api_key_or_session,
+            ));
+        let via_header = HttpRequest::get("/k")
+            .header("X-API-Key", "sk_live_abc")
+            .body(Body::empty())
+            .unwrap();
+        let via_bearer = HttpRequest::get("/k")
+            .header("Authorization", "Bearer sk_live_abc")
+            .body(Body::empty())
+            .unwrap();
+        let expected = (200, format!("{ACCT}|pro|{KEY_ID}"));
+        assert_eq!(call(app.clone(), via_header).await, expected);
+        assert_eq!(call(app.clone(), via_bearer).await, expected);
+        let via_oauth = HttpRequest::get("/k")
+            .header("Authorization", "Bearer oauth_token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(app, via_oauth).await, (200, format!("{ACCT}|pro|")));
     }
 
     #[tokio::test]
