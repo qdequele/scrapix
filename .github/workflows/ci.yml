@@ -13,6 +13,12 @@ on:
       - 'contracts/**'
       - 'justfile'
       - '.github/workflows/ci.yml'
+  # Every commit on main gets check runs, with no paths filter: the box that
+  # hosts the Lab deploys a main commit only once Format, Clippy and Tests are
+  # green on it (qdq-server platform/autodeploy.sh), and a commit with no runs
+  # would wait forever.
+  push:
+    branches: [main]
   workflow_call:
 
 concurrency:
