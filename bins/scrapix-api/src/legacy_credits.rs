@@ -61,12 +61,11 @@ pub(crate) fn crawl_credits(
     http_credits + browser_credits + ai_credits
 }
 
-/// OCR surcharge per page recognized by OCR (cache hits are free).
-pub(crate) const OCR_PAGE_CREDITS: i64 = 5;
-
-/// Credits for `pages` OCR'd pages.
-pub(crate) fn ocr_credits(pages: u64) -> i64 {
-    (pages as i64).saturating_mul(OCR_PAGE_CREDITS)
+/// Credits for `pages` OCR'd pages: none (f2ab8d2: +5 each). Vision OCR is
+/// AI work, metered by the team's AI gateway; the pages are still reported
+/// (`pages_ocr`).
+pub(crate) fn ocr_credits(_pages: u64) -> i64 {
+    0
 }
 
 /// Map credits: flat 2 per call.
@@ -78,13 +77,6 @@ pub(crate) const SEARCH_CREDITS: i64 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ocr_pages_cost_more_than_normal_pages() {
-        const { assert!(OCR_PAGE_CREDITS > 1) };
-        assert_eq!(ocr_credits(0), 0);
-        assert_eq!(ocr_credits(3), 15);
-    }
 
     #[test]
     fn scrape_credits_minimum_one() {

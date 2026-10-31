@@ -65,7 +65,7 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 }
 
 /// One OCR request for one document.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct OcrRequest {
     pub mode: OcrMode,
     /// Request/job page cap; only lowers `max_pages_per_document`.
@@ -76,6 +76,27 @@ pub struct OcrRequest {
     /// Attribution for vision-LLM usage events (`feature` is forced to
     /// `ocr`).
     pub usage_context: Option<AiUsageContext>,
+    /// AI client for vision OCR of this request (hosted: the team's
+    /// gateway). When set, a vision engine uses it instead of its own
+    /// startup client and `OCR_MODEL`; a local backend (Tesseract) ignores
+    /// it.
+    pub client: Option<Arc<AiClient>>,
+    /// Vision model to use with `client` (default: the client provider's
+    /// default vision model).
+    pub model: Option<String>,
+}
+
+impl std::fmt::Debug for OcrRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OcrRequest")
+            .field("mode", &self.mode)
+            .field("max_pages", &self.max_pages)
+            .field("account_id", &self.account_id)
+            .field("usage_context", &self.usage_context)
+            .field("client", &self.client.as_ref().map(|c| c.provider_name()))
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 /// What OCR did to a document (returned in API responses as `ocr`).
@@ -108,6 +129,17 @@ impl OcrReport {
         self.pages_processed.saturating_sub(self.pages_cached)
     }
 
+    /// OCR was not run on `parsed` (`warning` says why): every page stays
+    /// on the native path, and pages needing OCR stay flagged.
+    pub fn skipped(parsed: &ParsedDocument, mode: OcrMode, warning: impl Into<String>) -> Self {
+        Self {
+            mode,
+            pages_skipped: total_pages(parsed),
+            warning: Some(warning.into()),
+            ..Default::default()
+        }
+    }
+
     fn off(total_pages: u32) -> Self {
         Self {
             mode: OcrMode::Off,
@@ -117,6 +149,10 @@ impl OcrReport {
     }
 }
 
+fn total_pages(parsed: &ParsedDocument) -> u32 {
+    parsed.pages_processed.or(parsed.page_count).unwrap_or(1)
+}
+
 /// Rasterizer + backend + cache + budget + limits.
 pub struct OcrEngine {
     rasterizer: Arc<dyn PageRasterizer>,
@@ -124,6 +160,10 @@ pub struct OcrEngine {
     cache: Arc<dyn OcrCache>,
     budget: Arc<dyn OcrBudget>,
     settings: OcrSettings,
+    /// Whether a request carrying an AI client gets vision OCR even when
+    /// `backend` is local (`OCR_BACKEND` `auto`/`vision` started without an
+    /// AI provider).
+    request_vision: bool,
 }
 
 impl OcrEngine {
@@ -140,7 +180,15 @@ impl OcrEngine {
             cache,
             budget,
             settings,
+            request_vision: false,
         }
+    }
+
+    /// Let a request's AI client ([`OcrRequest::client`]) turn on vision
+    /// OCR when the engine's own backend is local.
+    pub fn with_request_vision(mut self, enabled: bool) -> Self {
+        self.request_vision = enabled;
+        self
     }
 
     /// Build the engine from the environment:
@@ -150,6 +198,8 @@ impl OcrEngine {
     ///   `OCR_TESSERACT_LANG`), `off`, or `auto` (default: vision when an
     ///   AI client is configured, else tesseract).
     /// - `OCR_MODEL` overrides the provider's default vision model.
+    /// - A request carrying its own AI client ([`OcrRequest::client`]) is
+    ///   recognized with it, unless `OCR_BACKEND=tesseract`.
     /// - `OCR_REDIS_URL` (falling back to `REDIS_URL`) shares the cache
     ///   and daily budget across instances; otherwise both are in-process.
     ///   `OCR_CACHE_TTL_DAYS` (default 30), `OCR_CACHE_CAPACITY` (in-memory
@@ -222,17 +272,45 @@ impl OcrEngine {
             daily_page_budget = settings.daily_page_budget,
             "OCR enabled (opt-in per request/job)"
         );
-        Some(Self::new(
-            Arc::new(PdfiumRasterizer::new()),
-            backend,
-            cache,
-            budget,
-            settings,
-        ))
+        let request_vision = !matches!(choice.as_str(), "tesseract" | "local");
+        Some(
+            Self::new(
+                Arc::new(PdfiumRasterizer::new()),
+                backend,
+                cache,
+                budget,
+                settings,
+            )
+            .with_request_vision(request_vision),
+        )
     }
 
     pub fn backend_name(&self) -> &str {
         self.backend.name()
+    }
+
+    /// Whether the engine's own backend calls an AI provider (its startup
+    /// client).
+    pub fn uses_ai(&self) -> bool {
+        self.backend.uses_ai()
+    }
+
+    /// Whether a request's AI client ([`OcrRequest::client`]) is used:
+    /// `false` for a local-only engine (`OCR_BACKEND=tesseract`).
+    pub fn accepts_request_client(&self) -> bool {
+        self.request_vision || self.uses_ai()
+    }
+
+    /// The backend for `request`: vision with the request's client and
+    /// model when it carries one the engine accepts, else the engine's own.
+    fn backend_for(&self, request: &OcrRequest) -> Arc<dyn OcrBackend> {
+        match &request.client {
+            Some(client) if self.accepts_request_client() => match &request.model {
+                Some(model) => Arc::new(VisionLlmOcr::new(client.clone(), model.as_str())),
+                None => Arc::new(VisionLlmOcr::with_default_model(client.clone())),
+            },
+            _ => self.backend.clone(),
+        }
     }
 
     pub fn settings(&self) -> &OcrSettings {
@@ -264,7 +342,7 @@ impl OcrEngine {
         parsed: &mut ParsedDocument,
         request: &OcrRequest,
     ) -> OcrReport {
-        let total_pages = parsed.pages_processed.or(parsed.page_count).unwrap_or(1);
+        let total_pages = total_pages(parsed);
         if request.mode.is_off() {
             return OcrReport::off(total_pages);
         }
@@ -298,7 +376,8 @@ impl OcrEngine {
         };
 
         // 2. Cache lookups; reserve budget for the misses.
-        let backend_name = self.backend.name().to_string();
+        let backend = self.backend_for(request);
+        let backend_name = backend.name().to_string();
         let mut recognized: Vec<(u32, String)> = Vec::new();
         let mut misses: Vec<(u32, Vec<u8>, String, String)> = Vec::new();
         for (page, (image, media_type)) in planned.iter().copied().zip(images) {
@@ -335,7 +414,6 @@ impl OcrEngine {
             c.feature = "ocr".to_string();
             c
         });
-        let backend = self.backend.clone();
         let results: Vec<(u32, String, Result<String, OcrError>)> = stream::iter(misses)
             .map(|(page, image, media_type, key)| {
                 let backend = backend.clone();
@@ -713,5 +791,130 @@ mod tests {
         assert_eq!(report.pages, vec![1]);
         assert!(doc.markdown.starts_with("OCR "));
         assert!(!doc.needs_ocr());
+    }
+
+    // ---- per-request AI client (hosted: the team's gateway) ----
+
+    /// An OpenAI-compatible provider transcribing every page as `reply`.
+    async fn vision_provider(reply: &str) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "mock",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn client(provider: &wiremock::MockServer, api_key: &str) -> Arc<AiClient> {
+        Arc::new(
+            AiClient::new(scrapix_ai::AiClientConfig {
+                api_key: api_key.into(),
+                provider: "openai".into(),
+                base_url: Some(format!("{}/v1", provider.uri())),
+                max_retries: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    fn engine_with(backend: Arc<dyn OcrBackend>) -> OcrEngine {
+        OcrEngine::new(
+            Arc::new(FakeRaster),
+            backend,
+            Arc::new(MemoryOcrCache::new(100)),
+            Arc::new(MemoryOcrBudget::new(0)),
+            OcrSettings::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ocr_request_client_overrides_the_engine_client() {
+        let a = vision_provider("from A").await;
+        let b = vision_provider("from B").await;
+        let e = engine_with(Arc::new(VisionLlmOcr::new(client(&a, "key-a"), "model-a")));
+        assert!(e.uses_ai() && e.accepts_request_client());
+        let mut doc = scanned_doc();
+        let with_b = OcrRequest {
+            client: Some(client(&b, "key-b")),
+            model: Some("model-b".into()),
+            ..request(OcrMode::Auto)
+        };
+        let report = e.apply(b"x", &mut doc, &with_b).await;
+        assert_eq!(report.pages, vec![2, 3], "{report:?}");
+        assert_eq!(report.backend.as_deref(), Some("vision:openai/model-b"));
+        assert!(doc.markdown.contains("from B"), "{}", doc.markdown);
+        assert!(a.received_requests().await.unwrap().is_empty());
+        let calls = b.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(call.headers.get("authorization").unwrap(), "Bearer key-b");
+            let body: serde_json::Value = call.body_json().unwrap();
+            assert_eq!(body["model"], "model-b");
+        }
+
+        // Without a request client, the engine's own client and model.
+        let report = e
+            .apply(b"y", &mut scanned_doc(), &request(OcrMode::Auto))
+            .await;
+        assert_eq!(report.backend.as_deref(), Some("vision:openai/model-a"));
+        assert_eq!(a.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn request_client_without_a_model_uses_the_provider_default() {
+        let b = vision_provider("from B").await;
+        let e = engine_with(Arc::new(FakeBackend::default())).with_request_vision(true);
+        let request = OcrRequest {
+            client: Some(client(&b, "key-b")),
+            ..request(OcrMode::Auto)
+        };
+        let report = e.apply(b"x", &mut scanned_doc(), &request).await;
+        let default = AiClient::default_vision_model("openai");
+        assert_eq!(report.backend, Some(format!("vision:openai/{default}")));
+        let body: serde_json::Value = b.received_requests().await.unwrap()[0].body_json().unwrap();
+        assert_eq!(body["model"], default);
+    }
+
+    /// `OCR_BACKEND=tesseract`: a request's AI client changes nothing.
+    #[tokio::test]
+    async fn a_local_backend_ignores_the_request_client() {
+        let b = vision_provider("from B").await;
+        let backend = Arc::new(FakeBackend::default());
+        let e = engine_with(backend.clone());
+        assert!(!e.uses_ai() && !e.accepts_request_client());
+        let request = OcrRequest {
+            client: Some(client(&b, "key-b")),
+            model: Some("model-b".into()),
+            ..request(OcrMode::Auto)
+        };
+        let report = e.apply(b"x", &mut scanned_doc(), &request).await;
+        assert_eq!(report.backend.as_deref(), Some("fake-ocr"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert!(b.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_skipped_report_keeps_every_page_on_the_native_path() {
+        let report = OcrReport::skipped(&scanned_doc(), OcrMode::Auto, "OCR skipped: no AI");
+        assert_eq!(report.mode, OcrMode::Auto);
+        assert_eq!(report.pages_skipped, 3);
+        assert_eq!(report.pages_processed, 0);
+        assert_eq!(report.billable_pages(), 0);
+        assert_eq!(report.warning.as_deref(), Some("OCR skipped: no AI"));
     }
 }

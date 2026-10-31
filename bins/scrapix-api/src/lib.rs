@@ -10661,8 +10661,8 @@ mod lifecycle_tests {
                                "feature_pages": 6})
         );
         // f2ab8d2: crawl_credits(2, 1, 0, 2 features) = 2 * (1 + 2) +
-        // 1 * (2 + 2) = 10, + ocr_credits(2) = 10: 20.
-        assert_eq!(usage[0].data["credits"], 20);
+        // 1 * (2 + 2) = 10; OCR pages add nothing (ocr_credits is 0).
+        assert_eq!(usage[0].data["credits"], 10);
         lab_events::assert_contract_valid(&outbox.events());
     }
 

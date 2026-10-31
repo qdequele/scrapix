@@ -1470,6 +1470,7 @@ impl ContentWorker {
                             feature: "ocr".to_string(),
                             url: msg.url.clone(),
                         }),
+                        ..Default::default()
                     };
                     let report = engine.apply(&bytes, &mut parsed, &request).await;
                     if let Some(ref warning) = report.warning {

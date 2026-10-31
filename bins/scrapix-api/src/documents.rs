@@ -26,15 +26,15 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use scrapix_ai::AiUsageContext;
 use scrapix_core::OcrMode;
-use scrapix_ocr::{OcrReport, OcrRequest};
+use scrapix_ocr::{OcrEngine, OcrReport, OcrRequest};
 use scrapix_parser::{document::markdown_links, DocumentKind, ParseOptions, ParsedDocument};
 use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 
-use crate::ai_access::ResolvedAi;
+use crate::ai_access::{resolve_ai, ResolvedAi, NO_AI_MESSAGE};
 use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
@@ -67,7 +67,8 @@ pub(crate) struct ParserOptions {
     /// are flagged in `document.pages_needing_ocr`, not recognized), `auto`
     /// (OCR only the pages that need it) or `force` (OCR every page, for
     /// PDFs whose broken font encodings extract as garbage). OCR pages are
-    /// billed at a higher per-page rate.
+    /// counted, not charged (hosted vision OCR runs on the team's AI
+    /// gateway).
     #[serde(default)]
     pub ocr: OcrMode,
     /// Per-document OCR page cap. Can only lower the server cap
@@ -231,9 +232,9 @@ fn document_units(
 }
 
 /// Usage events for one parsed document: the document itself (`units`, see
-/// `document_units`; `credits`, its pre-v2 price), plus its OCR pages (when
-/// any were billable) as a second event in the same write, at the pre-v2
-/// OCR page price.
+/// `document_units`; `credits`, its pre-v2 price), plus its freshly
+/// recognized OCR pages (when any) as a second event in the same write,
+/// counted but not charged (`credits` 0).
 async fn record_document_usage(
     state: &AppState,
     ctx: &AccountContext,
@@ -265,6 +266,43 @@ async fn record_document_usage(
         ));
     }
     state.record_events(&events).await;
+}
+
+/// Hosted: vision OCR runs on the team's AI gateway, with the account's AI
+/// service (the one resolved for the request's `ai` work when there is one,
+/// else resolved now) passed to the engine as the request's client, with
+/// the Lab's vision model. Never the engine's own (env) client: without
+/// team AI, or with the Lab unreachable, an engine whose own backend is an
+/// AI provider skips OCR with the returned warning (the request still
+/// succeeds; scanned pages stay flagged). `Ok(None)`: the engine runs as
+/// configured (standalone, a local backend, or no page to recognize).
+async fn hosted_ocr_ai(
+    state: &AppState,
+    ctx: Option<&AccountContext>,
+    engine: &OcrEngine,
+    has_pages: bool,
+    enrichment_ai: Option<&ResolvedAi>,
+) -> Result<Option<ResolvedAi>, String> {
+    if state.lab_api.is_none() || !has_pages || !engine.accepts_request_client() {
+        return Ok(None);
+    }
+    let resolved = match enrichment_ai {
+        Some(ai) => Ok(Some(ai.clone())),
+        None => resolve_ai(state, ctx, None).await,
+    };
+    let reason = match resolved {
+        Ok(Some(ai)) => return Ok(Some(ai)),
+        Ok(None) => NO_AI_MESSAGE.to_string(),
+        Err(e) => {
+            warn!(error = %e.error, "OCR: AI lookup failed");
+            e.error
+        }
+    };
+    if engine.uses_ai() {
+        Err(format!("OCR skipped: {reason}"))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parse (+ OCR, + AI) a document, bill it, and build the response.
@@ -315,18 +353,37 @@ pub(crate) async fn document_response(
                 if let (Some(lab), Some(ctx)) = (&state.lab_api, account_ctx) {
                     billing::check_credits(lab, &ctx.account_id).await?;
                 }
-                let request = OcrRequest {
-                    mode: ocr_mode,
-                    max_pages: job.parsers.ocr_max_pages,
-                    account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
-                    usage_context: Some(AiUsageContext {
-                        job_id: String::new(),
-                        account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
-                        feature: "ocr".to_string(),
-                        url: job.label.clone(),
-                    }),
+                let has_pages = !engine
+                    .plan(&parsed, ocr_mode, job.parsers.ocr_max_pages)
+                    .is_empty();
+                let enrichment_ai = job.ai.as_ref().map(|(_, ai)| ai);
+                let report = match hosted_ocr_ai(
+                    state,
+                    account_ctx.as_ref(),
+                    engine,
+                    has_pages,
+                    enrichment_ai,
+                )
+                .await
+                {
+                    Ok(ai) => {
+                        let request = OcrRequest {
+                            mode: ocr_mode,
+                            max_pages: job.parsers.ocr_max_pages,
+                            account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
+                            usage_context: Some(AiUsageContext {
+                                job_id: String::new(),
+                                account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
+                                feature: "ocr".to_string(),
+                                url: job.label.clone(),
+                            }),
+                            client: ai.as_ref().map(|ai| ai.service.client().clone()),
+                            model: ai.and_then(|ai| ai.vision_model),
+                        };
+                        engine.apply(&job.bytes, &mut parsed, &request).await
+                    }
+                    Err(warning) => OcrReport::skipped(&parsed, ocr_mode, warning),
                 };
-                let report = engine.apply(&job.bytes, &mut parsed, &request).await;
                 if let Some(ref w) = report.warning {
                     warnings.push(w.clone());
                 }
@@ -582,8 +639,8 @@ pub(crate) struct ParseUpload {
 ///
 /// Converts an uploaded file to Markdown with the same parsers the crawler
 /// uses, and returns the `/scrape` response shape. Billed per document
-/// (like `/scrape`), plus OCR pages when `parsers.ocr` recognizes scanned
-/// pages.
+/// (like `/scrape`); OCR pages recognized with `parsers.ocr` are reported,
+/// not charged.
 #[utoipa::path(
     post,
     path = "/parse",
@@ -1218,7 +1275,7 @@ mod tests {
             events[1].data,
             serde_json::json!({
                 "operation": "ocr",
-                "credits": 10, // f2ab8d2: ocr_credits(2) = 2 * 5
+                "credits": 0, // OCR pages are counted, not charged
                 "units": {"documents": 2, "pages_ocr": 2},
                 "provider_cost_micro_usd": 0,
                 "description": "https://e.com/s.pdf (2 OCR pages)",
@@ -1349,5 +1406,190 @@ mod tests {
                 "description": "https://e.com/t.csv",
             })
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Hosted OCR: the team's Lumen gateway
+    // -----------------------------------------------------------------
+
+    /// A site serving the scanned PDF fixture, addressed as `localhost`.
+    async fn scanned_pdf_site() -> (wiremock::MockServer, String) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/scan.pdf"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(fixture("scanned.pdf"), "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+        let url = format!(
+            "{}/files/scan.pdf",
+            server.uri().replace("127.0.0.1", "localhost")
+        );
+        (server, url)
+    }
+
+    /// A vision OCR engine whose own (startup, env) client is `env`, with a
+    /// fake rasterizer (no PDFium needed).
+    fn vision_ocr(env: &wiremock::MockServer) -> Arc<scrapix_ocr::OcrEngine> {
+        let client = scrapix_ai::AiClient::new(scrapix_ai::AiClientConfig {
+            api_key: "env-key".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", env.uri())),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        Arc::new(scrapix_ocr::OcrEngine::new(
+            Arc::new(FakeRaster),
+            Arc::new(scrapix_ocr::VisionLlmOcr::new(
+                Arc::new(client),
+                "env-model",
+            )),
+            Arc::new(scrapix_ocr::MemoryOcrCache::new(10)),
+            Arc::new(scrapix_ocr::MemoryOcrBudget::new(0)),
+            scrapix_ocr::OcrSettings::default(),
+        ))
+    }
+
+    /// `/scrape` of the scanned PDF with `parsers.ocr: auto` for the hosted
+    /// account, whose Lab AI target is `target`; the engine's env vision
+    /// client is `env`.
+    async fn hosted_ocr_scrape(
+        target: Option<crate::lab_client::AiTarget>,
+        env: &wiremock::MockServer,
+    ) -> (
+        crate::lab_client::testing::FakeLab,
+        serde_json::Value,
+        Arc<crate::lab_events::MemoryOutbox>,
+    ) {
+        use crate::results::test_support::{hosted_ai_state, hosted_ctx};
+        let (_site, url) = scanned_pdf_site().await;
+        let (lab, mut state, outbox) = hosted_ai_state(target).await;
+        Arc::get_mut(&mut state).unwrap().ocr = Some(vision_ocr(env));
+        let request: crate::ScrapeRequest = serde_json::from_value(serde_json::json!({
+            "url": url, "parsers": {"ocr": "auto"}
+        }))
+        .unwrap();
+        let response = crate::perform_scrape(&state, &hosted_ctx(), &request)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+        (lab, serde_json::to_value(&response).unwrap(), outbox)
+    }
+
+    #[tokio::test]
+    async fn hosted_document_ocr_uses_the_team_key_and_vision_model() {
+        use crate::results::test_support::{lumen_answering, lumen_metadata, lumen_target};
+        let lumen = lumen_answering("# SCANNED INVOICE\n\nTotal due 1250 EUR").await;
+        let env = lumen_answering("from the env key").await;
+        let (lab, body, _) = hosted_ocr_scrape(Some(lumen_target(&lumen, "fg-s")), &env).await;
+        assert_eq!(body["success"], true, "{body}");
+        assert!(
+            body["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Total due 1250 EUR"),
+            "{body}"
+        );
+        assert_eq!(body["ocr"]["pages_processed"], 1, "{body}");
+        assert_eq!(body["ocr"]["backend"], "vision:openai/lab-vision-model");
+        assert_eq!(body["document"]["needs_ocr"], false);
+        assert!(env.received_requests().await.unwrap().is_empty());
+        let calls = lumen.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].headers.get("authorization").unwrap(),
+            "Bearer fg-s"
+        );
+        let request: serde_json::Value = calls[0].body_json().unwrap();
+        assert_eq!(request["model"], "lab-vision-model");
+        assert_eq!(lumen_metadata(&calls[0])["feature"], "ocr");
+        // One AI lookup for the request.
+        assert_eq!(lab.ai_queries(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn ocr_is_not_charged() {
+        use crate::results::test_support::{lumen_answering, lumen_target};
+        assert_eq!(legacy_credits::ocr_credits(3), 0);
+        let lumen = lumen_answering("# SCANNED INVOICE").await;
+        let env = lumen_answering("from the env key").await;
+        let (_lab, body, outbox) =
+            hosted_ocr_scrape(Some(lumen_target(&lumen, "fg-s")), &env).await;
+        assert_eq!(body["ocr"]["pages_processed"], 1, "{body}");
+        let events = outbox.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data["operation"], "scrape");
+        assert_eq!(events[0].data["credits"], 1);
+        assert_eq!(events[1].data["operation"], "ocr");
+        assert_eq!(events[1].data["credits"], 0);
+        assert_eq!(
+            events[1].data["units"],
+            serde_json::json!({"documents": 1, "pages_ocr": 1})
+        );
+        crate::lab_events::assert_contract_valid(&events);
+    }
+
+    /// A team without AI: vision OCR is skipped (never the engine's env
+    /// key), the scrape still succeeds and the page stays flagged.
+    #[tokio::test]
+    async fn hosted_ocr_without_team_ai_is_skipped() {
+        use crate::results::test_support::lumen_answering;
+        let env = lumen_answering("from the env key").await;
+        let (_lab, body, outbox) = hosted_ocr_scrape(None, &env).await;
+        assert_eq!(body["success"], true, "{body}");
+        assert!(env.received_requests().await.unwrap().is_empty());
+        assert_eq!(body["ocr"]["pages_processed"], 0, "{body}");
+        assert_eq!(body["document"]["needs_ocr"], true);
+        let warning = body["ocr"]["warning"].as_str().unwrap();
+        assert!(
+            warning.contains("OCR skipped") && warning.contains(crate::ai_access::NO_AI_MESSAGE),
+            "{warning}"
+        );
+        assert!(body["warning"].as_str().unwrap().contains("OCR skipped"));
+        // Only the page is reported.
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["operation"], "scrape");
+    }
+
+    /// The Lab down during an OCR-only request: OCR is skipped with a
+    /// warning, the scrape does not fail.
+    #[tokio::test]
+    async fn hosted_ocr_with_the_lab_down_is_skipped() {
+        use crate::results::test_support::{lumen_answering, lumen_target};
+        let lumen = lumen_answering("# SCANNED INVOICE").await;
+        let env = lumen_answering("from the env key").await;
+        let (_site, url) = scanned_pdf_site().await;
+        let (lab, mut state, _) =
+            crate::results::test_support::hosted_ai_state(Some(lumen_target(&lumen, "fg-s"))).await;
+        Arc::get_mut(&mut state).unwrap().ocr = Some(vision_ocr(&env));
+        // The balance is cached (served while the Lab is down); the AI
+        // target never was.
+        let lab_api = state.lab_api.clone().unwrap();
+        billing::check_credits(&lab_api, crate::results::test_support::HOSTED_ACCOUNT)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+        lab.set_down(true);
+        let request: crate::ScrapeRequest = serde_json::from_value(serde_json::json!({
+            "url": url, "parsers": {"ocr": "auto"}
+        }))
+        .unwrap();
+        let response = crate::perform_scrape(
+            &state,
+            &crate::results::test_support::hosted_ctx(),
+            &request,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.error));
+        let body = serde_json::to_value(&response).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert!(lumen.received_requests().await.unwrap().is_empty());
+        assert!(env.received_requests().await.unwrap().is_empty());
+        let warning = body["ocr"]["warning"].as_str().unwrap();
+        assert!(warning.starts_with("OCR skipped"), "{warning}");
+        assert_eq!(body["document"]["needs_ocr"], true);
     }
 }
