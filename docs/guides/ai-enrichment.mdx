@@ -165,7 +165,7 @@ curl -X POST http://localhost:8080/scrape \
 }
 ```
 
-When absent, the hosted engine uses the Lab's default model for your team and a standalone engine the provider's default. A `model` must be one your team's gateway serves (hosted) or one the server's `AI_PROVIDER` serves (standalone); an unknown model fails with the gateway's error. For crawls, set `model` on `ai_summary` / `ai_extraction` in the job's `features`.
+When absent, the hosted engine uses the Lab's default model for your team and a standalone engine the provider's default. A `model` must be one your team's gateway serves (hosted) or one the server's `AI_PROVIDER` serves (standalone); an unknown model fails with the gateway's error. Crawls use the Lab's default model in hosted mode and the server provider's default model in standalone (a per-crawl model is not supported).
 
 ## Extract: One Result From Many Pages
 
@@ -221,8 +221,6 @@ Extract structured data from every crawled page:
     "ai_extraction": {
       "enabled": true,
       "prompt": "Extract the topic, target audience, and difficulty level",
-      "model": "gpt-4o-mini",
-      "max_tokens": 500,
       "include_pages": ["**/tutorials/**"]
     }
   }
