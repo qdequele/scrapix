@@ -5522,16 +5522,19 @@ version = "0.3.0"
 dependencies = [
  "async-openai",
  "async-trait",
+ "backoff",
  "base64 0.22.1",
  "chrono",
  "reqwest 0.12.28",
  "scrapix-core",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tiktoken-rs",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -17,6 +17,10 @@ thiserror = { workspace = true }
 
 # OpenAI client
 async-openai = { workspace = true }
+# Backoff policy handed to async-openai (its retry loop only)
+backoff = { workspace = true }
+# `Config::api_key` returns async-openai's secrecy type
+secrecy = { workspace = true }
 
 # HTTP client for non-OpenAI providers
 reqwest = { workspace = true }
@@ -32,3 +36,6 @@ chrono = { workspace = true }
 
 # Tracing
 tracing = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
