@@ -253,7 +253,7 @@ The engine exposes the outbox state at `GET /metrics`:
 |--------|-------------|
 | `scrapix_lab_events_pending` | Undelivered events in the outbox. Should hover near zero; a growing value means the Lab is unreachable or rejecting events. |
 | `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them), `failed` (unreachable or unreadable response) or `dropped` (never acknowledged for 24 h). |
-| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint (`instances_me`, `introspect`, `account`, `meilisearch`) and outcome. `instances_me` replaced `ping`: dashboards filtering on `endpoint="ping"` go empty. |
+| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint (`instances_me`, `introspect`, `account`, `meilisearch`, `ai`) and outcome. `instances_me` replaced `ping`: dashboards filtering on `endpoint="ping"` go empty. |
 
 ## Configuration
 

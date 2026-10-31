@@ -166,6 +166,40 @@ struct MeiliAnswer {
     api_key: Option<String>,
 }
 
+/// The Lab's `GET /internal/accounts/{id}/ai` answer.
+#[derive(Deserialize)]
+struct AiAnswer {
+    base_url: String,
+    api_key: String,
+    key_id: String,
+    default_model: String,
+    vision_model: String,
+    cache_ttl: i64,
+}
+
+/// Where an account's LLM calls go: the Lumen gateway, with the key the Lab
+/// minted for the account's team.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AiTarget {
+    pub base_url: String,
+    pub api_key: String,
+    pub key_id: String,
+    pub default_model: String,
+    pub vision_model: String,
+}
+
+impl std::fmt::Debug for AiTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiTarget")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"***")
+            .field("key_id", &self.key_id)
+            .field("default_model", &self.default_model)
+            .field("vision_model", &self.vision_model)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 struct Entry<T> {
     value: T,
@@ -281,6 +315,7 @@ pub(crate) struct LabClient {
     permits: tokio::sync::Semaphore,
     identities: Mutex<Lookups<Identity>>,
     meili: Mutex<Lookups<MeiliTarget>>,
+    ai: Mutex<Lookups<AiTarget>>,
     balances: Mutex<HashMap<String, Balance>>,
 }
 
@@ -343,6 +378,7 @@ impl LabClient {
             permits: tokio::sync::Semaphore::new(timing.max_in_flight.max(1)),
             identities: Mutex::new(Lookups::new(&timing)),
             meili: Mutex::new(Lookups::new(&timing)),
+            ai: Mutex::new(Lookups::new(&timing)),
             balances: Mutex::new(HashMap::new()),
             timing,
         }
@@ -387,8 +423,9 @@ impl LabClient {
             Err(e) => Err(LabError::Unavailable(e.to_string())),
             Ok(resp) => match resp.status().as_u16() {
                 401 => Err(LabError::CredentialsRejected),
-                // The Meilisearch lookup's 404 means "no engine", handled by the caller.
-                404 if endpoint == "meilisearch" => Ok(resp),
+                // The Meilisearch and AI lookups' 404 means "no engine" / "no AI",
+                // handled by the caller.
+                404 if matches!(endpoint, "meilisearch" | "ai") => Ok(resp),
                 c @ 300..=499 => Err(LabError::BadResponse(c)),
                 s if s >= 500 => Err(LabError::Unavailable(format!("HTTP {s}"))),
                 _ => Ok(resp),
@@ -719,6 +756,79 @@ impl LabClient {
         .await
     }
 
+    /// `GET /internal/accounts/{id}/ai`: the Lumen target for this account's
+    /// LLM calls; `None` when the Lab has none for it (404). A
+    /// `rejected_key_id` (the key Lumen just refused) skips the cache, asks
+    /// the Lab for a replacement and makes that the cached answer.
+    // No caller yet: the AI resolver (a later task of this PR) consumes it;
+    // drop the allow there.
+    #[allow(dead_code)]
+    pub(crate) async fn ai(
+        &self,
+        account_id: &str,
+        rejected_key_id: Option<&str>,
+    ) -> Result<Option<AiTarget>, LabError> {
+        let key = hashed(&["ai", account_id]);
+        let Some(rejected) = rejected_key_id else {
+            return self
+                .cached("ai", &self.ai, key, || self.fetch_ai(account_id, None))
+                .await;
+        };
+        // Never served stale: the cached entry is the key that was refused.
+        let (target, ttl) = self.fetch_ai(account_id, Some(rejected)).await?;
+        let mut c = self.ai.lock().unwrap();
+        match &target {
+            Some(t) => {
+                c.negative.remove(&key);
+                c.positive.put(key, t.clone(), ttl);
+            }
+            None => {
+                c.positive.remove(&key);
+                c.negative.put(key, (), ttl);
+            }
+        }
+        Ok(target)
+    }
+
+    async fn fetch_ai(
+        &self,
+        account_id: &str,
+        rejected_key_id: Option<&str>,
+    ) -> Result<(Option<AiTarget>, Duration), LabError> {
+        let mut req = self
+            .http
+            .get(format!("{}/internal/accounts/{account_id}/ai", self.base));
+        if let Some(id) = rejected_key_id {
+            req = req.query(&[("rejected_key_id", id)]);
+        }
+        let (status, body) = self.request("ai", req).await?;
+        if status == 404 {
+            // "No AI for this account" is a negative answer, re-asked after
+            // 5 s so one enabled in the Lab is picked up quickly.
+            count("ai", "inactive");
+            return Ok((None, self.timing.negative_ttl));
+        }
+        if !(200..300).contains(&status) {
+            count("ai", "unavailable");
+            return Err(LabError::Unavailable(format!("HTTP {status}")));
+        }
+        let a: AiAnswer = serde_json::from_slice(&body).map_err(|e| {
+            count("ai", "unavailable");
+            LabError::Unavailable(format!("malformed: {e}"))
+        })?;
+        count("ai", "ok");
+        Ok((
+            Some(AiTarget {
+                base_url: a.base_url,
+                api_key: a.api_key,
+                key_id: a.key_id,
+                default_model: a.default_model,
+                vision_model: a.vision_model,
+            }),
+            self.ttl_from(Some(a.cache_ttl)),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn debug_cache_keys(&self) -> Vec<String> {
         let c = self.identities.lock().unwrap();
@@ -751,6 +861,7 @@ impl LabClient {
 pub(crate) mod testing {
     //! In-process fake of the Lab's internal API
     //! (contracts/vendor/lab/lab-internal.openapi.json).
+    use super::AiTarget;
     use axum::{
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
@@ -761,7 +872,7 @@ pub(crate) mod testing {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
             Arc, Mutex,
         },
     };
@@ -777,6 +888,16 @@ pub(crate) mod testing {
         pub accounts: Mutex<HashMap<String, Value>>,
         /// "account|url" (url "" = default) → {"id","url","api_key"}.
         pub meili: Mutex<HashMap<String, Value>>,
+        /// account → `/ai` answer ({base_url, api_key, key_id, default_model,
+        /// vision_model, cache_ttl}).
+        pub ai: Mutex<HashMap<String, Value>>,
+        /// account → the answer served (and then made current) to a call that
+        /// carries a `rejected_key_id`.
+        pub ai_rotated: Mutex<HashMap<String, Value>>,
+        /// The `rejected_key_id` of every `/ai` call, in order.
+        pub ai_queries: Mutex<Vec<Option<String>>>,
+        /// `cache_ttl` (seconds) of the answers `set_ai` / `rotate_ai` build.
+        pub ai_cache_ttl: AtomicI64,
         pub down: AtomicBool,
         pub slow_ms: AtomicUsize,
         pub malformed: AtomicBool,
@@ -821,6 +942,7 @@ pub(crate) mod testing {
         pub(crate) async fn start() -> FakeLab {
             let state = Arc::new(FakeLabState {
                 me: Mutex::new(FakeLab::hosted_me()),
+                ai_cache_ttl: AtomicI64::new(30),
                 ..Default::default()
             });
             let app =
@@ -900,6 +1022,30 @@ pub(crate) mod testing {
                             },
                         ),
                     )
+                    .route(
+                        "/internal/accounts/{id}/ai",
+                        get(
+                            |State(s): State<Arc<FakeLabState>>,
+                             h: HeaderMap,
+                             Path(id): Path<String>,
+                             Query(q): Query<HashMap<String, String>>| async move {
+                                gate(&s, &h).await?;
+                                let rejected = q.get("rejected_key_id").cloned();
+                                s.ai_queries.lock().unwrap().push(rejected.clone());
+                                if rejected.is_some() {
+                                    if let Some(next) = s.ai_rotated.lock().unwrap().get(&id) {
+                                        s.ai.lock().unwrap().insert(id.clone(), next.clone());
+                                    }
+                                }
+                                s.ai.lock()
+                                    .unwrap()
+                                    .get(&id)
+                                    .cloned()
+                                    .map(Json)
+                                    .ok_or(StatusCode::NOT_FOUND)
+                            },
+                        ),
+                    )
                     .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -937,6 +1083,34 @@ pub(crate) mod testing {
                 .lock()
                 .unwrap()
                 .insert(account.to_string(), v);
+        }
+        fn ai_json(&self, t: &AiTarget) -> Value {
+            json!({"base_url": t.base_url, "api_key": t.api_key, "key_id": t.key_id,
+                   "default_model": t.default_model, "vision_model": t.vision_model,
+                   "cache_ttl": self.state.ai_cache_ttl.load(Ordering::SeqCst)})
+        }
+        /// The account's `/ai` answer (`None` → 404).
+        pub(crate) fn set_ai(&self, account: &str, target: Option<AiTarget>) {
+            let mut ai = self.state.ai.lock().unwrap();
+            match target {
+                Some(t) => ai.insert(account.to_string(), self.ai_json(&t)),
+                None => ai.remove(account),
+            };
+        }
+        /// What a call carrying a `rejected_key_id` is served (and is current
+        /// from then on).
+        pub(crate) fn rotate_ai(&self, account: &str, target: AiTarget) {
+            self.state
+                .ai_rotated
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), self.ai_json(&target));
+        }
+        pub(crate) fn set_ai_cache_ttl(&self, secs: i64) {
+            self.state.ai_cache_ttl.store(secs, Ordering::SeqCst)
+        }
+        pub(crate) fn ai_queries(&self) -> Vec<Option<String>> {
+            self.state.ai_queries.lock().unwrap().clone()
         }
         pub(crate) fn calls(&self) -> usize {
             self.state.calls.load(Ordering::SeqCst)
@@ -1460,6 +1634,89 @@ mod tests {
         assert_eq!(lab.calls(), 2);
         c.meilisearch(ACCT, None).await.unwrap();
         assert_eq!(lab.calls(), 2, "positive cached");
+    }
+
+    fn ai_target(key_id: &str) -> AiTarget {
+        AiTarget {
+            base_url: "https://lumen.test/v1".into(),
+            api_key: format!("sk-lumen-{key_id}"),
+            key_id: key_id.into(),
+            default_model: "gpt-x".into(),
+            vision_model: "gpt-x-vision".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_returns_the_target_and_caches_it() {
+        let (lab, c) = setup().await;
+        lab.set_ai(ACCT, Some(ai_target("k-1")));
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), Some(ai_target("k-1")));
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), Some(ai_target("k-1")));
+        assert_eq!(lab.calls(), 1, "second call served from the cache");
+        assert_eq!(lab.ai_queries(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn ai_honours_cache_ttl() {
+        let (lab, c) = setup().await;
+        lab.set_ai_cache_ttl(0);
+        lab.set_ai(ACCT, Some(ai_target("k-1")));
+        c.ai(ACCT, None).await.unwrap();
+        c.ai(ACCT, None).await.unwrap();
+        assert_eq!(lab.calls(), 2, "cache_ttl 0 is never cached");
+    }
+
+    #[tokio::test]
+    async fn ai_not_found_is_none() {
+        let (lab, c) = setup().await;
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), None);
+        assert_eq!(lab.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn ai_rejected_key_bypasses_the_cache() {
+        let (lab, c) = setup().await;
+        lab.set_ai(ACCT, Some(ai_target("k-1")));
+        lab.rotate_ai(ACCT, ai_target("k-2"));
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), Some(ai_target("k-1")));
+        assert_eq!(
+            c.ai(ACCT, Some("k-1")).await.unwrap(),
+            Some(ai_target("k-2")),
+            "the cached k-1 is bypassed"
+        );
+        assert_eq!(lab.ai_queries(), vec![None, Some("k-1".to_string())]);
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), Some(ai_target("k-2")));
+        assert_eq!(lab.calls(), 2, "the replacement is now the cached entry");
+    }
+
+    #[tokio::test]
+    async fn ai_serves_stale_while_the_lab_is_down() {
+        let lab = FakeLab::start().await;
+        let timing = Timing {
+            stale_grace: Duration::from_secs(5),
+            ..fast()
+        };
+        let c = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, timing);
+        lab.set_ai_cache_ttl(1);
+        lab.set_ai(ACCT, Some(ai_target("k-1")));
+        c.ai(ACCT, None).await.unwrap();
+        lab.set_down(true);
+        tokio::time::sleep(Duration::from_millis(1100)).await; // past the 1 s ttl
+        assert_eq!(c.ai(ACCT, None).await.unwrap(), Some(ai_target("k-1")));
+
+        let never_cached = "22222222-2222-2222-2222-222222222222";
+        assert!(matches!(
+            c.ai(never_cached, None).await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn ai_debug_redacts_the_key() {
+        let shown = format!("{:?}", ai_target("k-1"));
+        assert!(!shown.contains("sk-lumen-k-1"), "{shown}");
+        assert!(shown.contains("***"), "{shown}");
+        assert!(shown.contains("k-1") && shown.contains("gpt-x"), "{shown}");
     }
 
     /// Important 4a: a key just served stale is not retried for

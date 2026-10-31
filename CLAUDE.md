@@ -515,7 +515,7 @@ rename without updating the scrape config there. Current metrics:
 `scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
 `scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`|`dropped`),
 `scrapix_lab_requests_total{endpoint,outcome}` (the engine's calls to the Lab's
-`/internal/*` API; endpoint `instances_me`|`introspect`|`account`|`meilisearch`.
+`/internal/*` API; endpoint `instances_me`|`introspect`|`account`|`meilisearch`|`ai`.
 The boot check was `endpoint="ping"` before contract v2: dashboards filtering
 on it go empty).
 
