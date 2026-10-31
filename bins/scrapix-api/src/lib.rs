@@ -4270,9 +4270,10 @@ fn with_model(ai: &ai_access::ResolvedAi, model: Option<&str>) -> Arc<AiService>
 }
 
 /// The result of one AI call, or `None` with its failure noted in `errors`
-/// when the gateway refused it (a used-up budget as the 402 message, any
-/// other refusal with the gateway's own message). Other failures are only
-/// logged: their text is the provider's, not meant for the caller.
+/// when the gateway refused it (a used-up budget as the insufficient-credits
+/// message, any other known refusal with the gateway's own message). Other
+/// failures are only logged: their text is the provider's, not meant for the
+/// caller.
 fn ai_outcome<T>(
     result: Result<T, scrapix_core::ScrapixError>,
     errors: &mut Vec<String>,
@@ -4281,7 +4282,7 @@ fn ai_outcome<T>(
         Ok(value) => Some(value),
         Err(scrapix_core::ScrapixError::AiGateway { code, message }) => {
             errors.push(if code == gateway_codes::BUDGET_EXCEEDED {
-                billing::insufficient_credits_message(0)
+                scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string()
             } else {
                 message
             });

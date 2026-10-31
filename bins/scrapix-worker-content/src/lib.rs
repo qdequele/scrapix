@@ -42,7 +42,10 @@ use scrapix_lifecycle::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use scrapix_ai::{AiClient, AiService, AiUsageContext, AiUsageEvent, AI_USAGE_CONTEXT};
+use scrapix_ai::{
+    gateway_codes, AiClient, AiService, AiUsageContext, AiUsageEvent, AI_BUDGET_EXCEEDED_MESSAGE,
+    AI_USAGE_CONTEXT,
+};
 use scrapix_core::content_types;
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage, ScrapixError};
 use scrapix_extractor::{
@@ -182,6 +185,11 @@ pub struct Args {
     /// Hosted only: the Lab base URL (lookups go to {LAB_URL}/internal/*).
     #[arg(long, env = "LAB_URL")]
     pub lab_url: Option<String>,
+
+    /// Deprecated fallback for LAB_URL (the old `…/internal/events` URL),
+    /// accepted as the API accepts it: the Lab base is derived from it.
+    #[arg(long, env = "LAB_EVENTS_URL")]
+    pub lab_events_url: Option<String>,
 
     /// Hosted only: the instance id the Lab minted for this engine (uuid).
     #[arg(long, env = "LAB_INSTANCE_ID")]
@@ -1833,17 +1841,19 @@ impl ContentWorker {
 
     /// Log a failed AI call (`what`: "generate AI summary", "run AI
     /// extraction"). A refusal by the AI gateway (budget exceeded, unknown
-    /// model, ...) also becomes a `JobWarning` carrying the gateway's message:
-    /// the page is indexed without that enrichment, the job goes on.
+    /// model, ...) also becomes a `JobWarning`: Scrapix's insufficient-credits
+    /// message for a used-up budget, the gateway's message otherwise. The
+    /// page is indexed without that enrichment, the job goes on.
     async fn report_ai_error(&self, msg: &RawPageMessage, what: &str, err: &ScrapixError) {
         match err {
             ScrapixError::AiGateway { code, message } => {
                 warn!(url = %msg.url, code = %code, message = %message, "AI gateway refused to {what}");
-                self.warn_job_once(
-                    &msg.job_id,
-                    &format!("AI enrichment skipped by the AI gateway ({code}): {message}"),
-                )
-                .await;
+                let warning = if code == gateway_codes::BUDGET_EXCEEDED {
+                    format!("AI enrichment skipped: {AI_BUDGET_EXCEEDED_MESSAGE}")
+                } else {
+                    format!("AI enrichment skipped by the AI gateway ({code}): {message}")
+                };
+                self.warn_job_once(&msg.job_id, &warning).await;
             }
             e => warn!(url = %msg.url, error = %e, "Failed to {what}"),
         }
@@ -2060,21 +2070,30 @@ fn hosted_lab(args: &Args) -> anyhow::Result<Option<Arc<LabClient>>> {
     match args.mode.trim() {
         "standalone" => {
             if set(&args.lab_url).is_some()
+                || set(&args.lab_events_url).is_some()
                 || set(&args.lab_instance_id).is_some()
                 || set(&args.lab_instance_secret).is_some()
             {
                 warn!(
-                    "LAB_URL/LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are ignored in standalone mode: \
-                     AI uses the env provider. Set SCRAPIX_MODE=hosted (as on the API) for \
-                     each team's AI gateway"
+                    "LAB_URL/LAB_EVENTS_URL/LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are ignored in \
+                     standalone mode: AI uses the env provider. Set SCRAPIX_MODE=hosted (as on \
+                     the API) for each team's AI gateway"
                 );
             }
             Ok(None)
         }
         "hosted" => {
-            let url = set(&args.lab_url).ok_or_else(|| {
-                anyhow::anyhow!("SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL)")
-            })?;
+            // LAB_EVENTS_URL: the deprecated spelling the API still accepts.
+            let url = match (set(&args.lab_url), set(&args.lab_events_url)) {
+                (Some(url), _) => url,
+                (None, Some(events_url)) => {
+                    warn!("LAB_EVENTS_URL is deprecated: set LAB_URL to the Lab base URL");
+                    LabClient::base_from_events_url(&events_url)
+                }
+                (None, None) => {
+                    anyhow::bail!("SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL)")
+                }
+            };
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 anyhow::bail!("LAB_URL must start with http:// or https://, got `{url}`");
             }
@@ -3551,10 +3570,13 @@ mod tests {
         assert_eq!(lab.ai_queries(), vec![None]);
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        // Scrapix's insufficient-credits wording, not Lumen's raw code.
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CrawlEvent::JobWarning { message, .. } if message.contains("team budget exceeded")
+                CrawlEvent::JobWarning { message, .. }
+                    if message.contains(scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE)
+                        && !message.contains("LM-4001")
             )),
             "{events:?}"
         );
@@ -3649,6 +3671,45 @@ mod tests {
         let logs = logs.text();
         assert!(
             logs.contains("WARN") && logs.contains("ignored in standalone mode"),
+            "{logs}"
+        );
+    }
+
+    /// A bundle that only sets the deprecated LAB_EVENTS_URL (the API still
+    /// accepts it): the worker derives the Lab base from it, as the API does.
+    #[tokio::test]
+    async fn hosted_worker_falls_back_to_lab_events_url() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let events_url = format!("{}/internal/events", lab.url);
+        let w = started(build_worker(
+            &bus,
+            &ms,
+            &[
+                "--mode",
+                "hosted",
+                "--lab-events-url",
+                &events_url,
+                "--lab-instance-id",
+                INSTANCE_ID,
+                "--lab-instance-secret",
+                SECRET,
+            ],
+        ));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert_eq!(lab.ai_queries(), vec![None]);
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains("LAB_EVENTS_URL is deprecated"),
             "{logs}"
         );
     }

@@ -910,6 +910,18 @@ pub(crate) mod test_support {
         (Arc::new(state), outbox)
     }
 
+    /// Hosted-style, with an env AI service configured too (which hosted
+    /// requests must never get).
+    pub(crate) fn test_state_with_env_ai_and_lab_ai(
+        bus: &ChannelBus,
+        ai_service: Arc<scrapix_ai::AiService>,
+        lab: &crate::lab_client::testing::FakeLab,
+    ) -> Arc<AppState> {
+        let mut state = build_state(bus, Some(ai_service));
+        attach_lab_ai(&mut state, lab);
+        Arc::new(state)
+    }
+
     /// Same, with the hosted AI clients reporting their calls on a usage
     /// channel (what startup drains into ClickHouse `ai_usage_events`).
     pub(crate) fn test_state_with_lab_ai_usage(

@@ -115,7 +115,8 @@ mod tests {
     use crate::lab_client::testing::FakeLab;
     use crate::lab_client::AiTarget;
     use crate::results::test_support::{
-        test_state_with_ai, test_state_with_lab_ai, test_state_with_lab_ai_usage,
+        test_state_with_ai, test_state_with_env_ai_and_lab_ai, test_state_with_lab_ai,
+        test_state_with_lab_ai_usage,
     };
     use axum::response::IntoResponse;
     use scrapix_ai::{gateway_codes, AiClient, AiClientConfig};
@@ -220,6 +221,32 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn hosted_without_an_account_has_no_ai_never_the_env_service() {
+        let env = Arc::new(AiService::new(Arc::new(
+            AiClient::new(AiClientConfig {
+                api_key: "env-key".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )));
+        let lumen = lumen(&[], &[]).await;
+        let lab = FakeLab::start().await;
+        lab.set_ai(ACCOUNT, Some(target(&lumen, "k-1", "fg-1")));
+        let state = test_state_with_env_ai_and_lab_ai(&ChannelBus::new(), env.clone(), &lab);
+
+        assert!(resolve_ai(&state, None, None).await.unwrap().is_none());
+        assert!(lab.ai_queries().is_empty(), "no account, no Lab lookup");
+
+        // The state is hosted: an account gets its team's key, not the env service.
+        let ai = resolve_ai(&state, Some(&ctx()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&ai.service, &env));
+        assert_eq!(ai.key_id.as_deref(), Some("k-1"));
     }
 
     #[tokio::test]

@@ -33,12 +33,6 @@ impl std::fmt::Display for BillingError {
     }
 }
 
-/// The 402 refusal's message, for a refusal that comes without a balance
-/// (the team's Lumen budget is used up, `LM-4001`).
-pub(crate) fn insufficient_credits_message(available: i64) -> String {
-    BillingError::InsufficientCredits { available }.to_string()
-}
-
 impl From<BillingError> for ApiError {
     fn from(e: BillingError) -> Self {
         ApiError::new(e.to_string(), e.code())

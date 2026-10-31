@@ -70,7 +70,20 @@ pub mod gateway_codes {
     pub const UNKNOWN_MODEL: &str = "LM-2001";
     /// 400: the request itself is invalid.
     pub const INVALID_REQUEST: &str = "LM-1001";
+
+    /// One of the codes above: the gateway's final answer. Any other `LM-`
+    /// code is handled as an ordinary AI error.
+    pub fn is_known(code: &str) -> bool {
+        [BUDGET_EXCEEDED, KEY_REFUSED, UNKNOWN_MODEL, INVALID_REQUEST].contains(&code)
+    }
 }
+
+/// What Scrapix says when the team's AI budget is used up
+/// ([`gateway_codes::BUDGET_EXCEEDED`]): the insufficient-credits refusal,
+/// with no balance in it (the team's Scrapix balance is usually still
+/// positive; its AI budget is what ran out).
+pub const AI_BUDGET_EXCEEDED_MESSAGE: &str =
+    "Insufficient credits: the team's AI budget is used up, top up to continue";
 
 pub use providers::ImageInput;
 
@@ -304,6 +317,38 @@ mod tests {
             other => panic!("expected AiGateway, got {other:?}"),
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_gateway_codes_are_plain_ai_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"code": "LM-9999", "message": "something new", "type": "lumen_error"}
+            })))
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            AiClient::new(AiClientConfig {
+                api_key: "test-key".to_string(),
+                provider: "openai".to_string(),
+                base_url: Some(format!("{}/v1", server.uri())),
+                max_retries: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let err = AiService::new(client)
+            .extract("some page", "extract the title")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ScrapixError::Ai(_)), "{err:?}");
     }
 
     #[test]

@@ -446,6 +446,7 @@ fn build_content_args(args: &AllArgs, brokers: String) -> scrapix_worker_content
         // Same mode and Lab as the in-process API (see `build_api_args`).
         mode: std::env::var("SCRAPIX_MODE").unwrap_or_else(|_| "standalone".into()),
         lab_url: std::env::var("LAB_URL").ok(),
+        lab_events_url: std::env::var("LAB_EVENTS_URL").ok(),
         lab_instance_id: std::env::var("LAB_INSTANCE_ID").ok(),
         lab_instance_secret: std::env::var("LAB_INSTANCE_SECRET").ok(),
         enable_summary: false,

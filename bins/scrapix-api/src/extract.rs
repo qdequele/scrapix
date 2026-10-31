@@ -1042,14 +1042,15 @@ impl ExtractRunner {
     }
 }
 
-/// What a failed AI call means for the job. The gateway's refusals end it:
-/// a used-up budget with the 402 message, any other code (unknown model,
-/// invalid request, a key still refused after one replacement) with the
-/// gateway's own message. Anything else fails only this call.
+/// What a failed AI call means for the job. The gateway's known refusals
+/// end it: a used-up budget with the insufficient-credits message, the others
+/// (unknown model, invalid request, a key still refused after one
+/// replacement) with the gateway's own message. Anything else, an `LM-` code
+/// Scrapix does not know included, fails only this call.
 fn ai_call_error(err: ScrapixError, what: &str) -> AiCallError {
     match err {
         ScrapixError::AiGateway { code, .. } if code == gateway_codes::BUDGET_EXCEEDED => {
-            AiCallError::fatal(billing::insufficient_credits_message(0))
+            AiCallError::fatal(scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string())
         }
         ScrapixError::AiGateway { message, .. } => AiCallError::fatal(message),
         other => AiCallError {
@@ -1471,10 +1472,35 @@ mod tests {
         assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(
             job.error_message,
-            Some(billing::insufficient_credits_message(0))
+            Some(scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string())
         );
         // The first refusal ends the job: no other page, no retry.
         assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// An `LM-` code Scrapix does not know is an ordinary AI error: it fails
+    /// only its page, not the job.
+    #[tokio::test]
+    async fn extract_unknown_gateway_code_fails_only_its_page() {
+        let site = site(true).await;
+        let lumen = lumen_refusing(409, "LM-9999", "something new").await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let base = base(&site);
+        let urls = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|n| format!("{base}/blog/{n}"))
+            .collect();
+        let created = start_extract(&state, &hosted_ctx(), request(urls))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            job.error_message.as_deref(),
+            Some("AI extraction failed for every page")
+        );
+        // Every page was tried (each call retried as any AI error).
+        assert!(lumen.received_requests().await.unwrap().len() > 3);
     }
 
     #[tokio::test]

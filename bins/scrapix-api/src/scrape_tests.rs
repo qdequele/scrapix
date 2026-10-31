@@ -297,7 +297,7 @@ async fn scrape_ai_gateway_error_is_a_warning() {
             402,
             "LM-4001",
             "budget exceeded",
-            billing::insufficient_credits_message(0),
+            scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string(),
         ),
     ] {
         let lumen = lumen_refusing(status, code, message).await;
@@ -335,8 +335,13 @@ async fn scrape_ai_hosted_without_ai_is_503() {
     assert_eq!(status_of(err), StatusCode::SERVICE_UNAVAILABLE);
     assert!(charged(&outbox).is_empty(), "nothing billed");
     assert_eq!(lab.ai_queries(), vec![None]);
+}
 
-    // No AI work asked: the account's AI is never looked up.
+#[tokio::test]
+async fn scrape_without_ai_work_never_looks_up_the_account_ai() {
+    let (_site, url) = site().await;
+    // A fresh state: nothing cached, so any lookup would reach the Lab.
+    let (lab, state, _) = hosted_ai_state(None).await;
     for body in [
         serde_json::json!({"url": url, "formats": ["markdown"]}),
         serde_json::json!({"url": url, "formats": ["markdown"], "ai": {"model": "m-1"}}),
@@ -345,7 +350,7 @@ async fn scrape_ai_hosted_without_ai_is_503() {
             .await
             .unwrap_or_else(|e| panic!("{}", e.error));
     }
-    assert_eq!(lab.ai_queries(), vec![None]);
+    assert!(lab.ai_queries().is_empty(), "{:?}", lab.ai_queries());
 }
 
 #[tokio::test]

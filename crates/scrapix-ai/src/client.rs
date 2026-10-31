@@ -58,13 +58,14 @@ impl AiClientError {
         }
     }
 
-    /// The Lumen gateway code (`LM-…`, see [`crate::gateway_codes`]) of an
-    /// error the gateway answered with, if this is one.
+    /// The Lumen gateway code (one of [`crate::gateway_codes`]) of an error
+    /// the gateway answered with, if this is one. An `LM-` code Scrapix does
+    /// not know is not one: that error stays an ordinary API error.
     pub fn gateway_code(&self) -> Option<&str> {
         self.api_error()?
             .code
             .as_deref()
-            .filter(|code| code.starts_with("LM-"))
+            .filter(|code| crate::gateway_codes::is_known(code))
     }
 
     /// The gateway's own message for a [`gateway_code`](Self::gateway_code) error.
@@ -508,8 +509,8 @@ impl AiClient {
 
     /// Check if an error is retryable
     fn is_retryable(error: &AiClientError) -> bool {
-        // A gateway refusal (budget, key, model, request) is final: asking
-        // again gets the same answer.
+        // A known gateway refusal (budget, key, model, request) is final:
+        // asking again gets the same answer.
         if error.gateway_code().is_some() {
             return false;
         }
@@ -726,6 +727,61 @@ mod gateway_tests {
                 "{code} must not be retried"
             );
         }
+    }
+
+    /// Only the four known codes are final: an unknown `LM-` code is an
+    /// ordinary API error, retried as any other.
+    #[tokio::test]
+    async fn unknown_gateway_codes_are_retried_like_other_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(lumen_error("LM-9999")))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.gateway_code(), None);
+        assert_eq!(err.gateway_message(), None);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_gateway_code_on_a_503_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(lumen_error("LM-5003")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let response = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "ok");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
