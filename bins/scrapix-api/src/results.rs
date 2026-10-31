@@ -906,13 +906,33 @@ pub(crate) mod test_support {
         lab: &crate::lab_client::testing::FakeLab,
     ) -> (Arc<AppState>, Arc<crate::lab_events::MemoryOutbox>) {
         let mut state = build_state(bus, None);
+        let outbox = attach_lab_ai(&mut state, lab);
+        (Arc::new(state), outbox)
+    }
+
+    /// Same, with the hosted AI clients reporting their calls on a usage
+    /// channel (what startup drains into ClickHouse `ai_usage_events`).
+    pub(crate) fn test_state_with_lab_ai_usage(
+        bus: &ChannelBus,
+        lab: &crate::lab_client::testing::FakeLab,
+    ) -> (Arc<AppState>, scrapix_ai::AiUsageReceiver) {
+        let mut state = build_state(bus, None);
+        attach_lab_ai(&mut state, lab);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.hosted_ai = crate::ai_access::HostedAiClients::new(Some(tx));
+        (Arc::new(state), rx)
+    }
+
+    fn attach_lab_ai(
+        state: &mut AppState,
+        lab: &crate::lab_client::testing::FakeLab,
+    ) -> Arc<crate::lab_events::MemoryOutbox> {
         state.lab_api = Some(Arc::new(crate::lab_client::LabClient::new(
             &lab.url,
             crate::lab_client::testing::INSTANCE_ID,
             crate::lab_client::testing::SECRET,
         )));
-        let outbox = crate::with_memory_lab(&mut state);
-        (Arc::new(state), outbox)
+        crate::with_memory_lab(state)
     }
 
     fn build_state(bus: &ChannelBus, ai_service: Option<Arc<scrapix_ai::AiService>>) -> AppState {

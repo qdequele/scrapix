@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use scrapix_ai::{
     ai_gateway_code, gateway_codes, AiClient, AiClientConfig, AiClientError, AiService,
-    ExtractionConfig, SummaryConfig,
+    AiUsageSender, ExtractionConfig, SummaryConfig,
 };
 use scrapix_core::ScrapixError;
 
@@ -51,18 +51,30 @@ impl std::fmt::Debug for ResolvedAi {
 /// client (connection pool, concurrency limit). Keyed by `key_id`; an entry
 /// whose target changed (URL, models, secret) is rebuilt.
 #[derive(Default)]
-pub(crate) struct HostedAiClients(parking_lot::Mutex<HashMap<String, (AiTarget, Arc<AiService>)>>);
+pub(crate) struct HostedAiClients {
+    clients: parking_lot::Mutex<HashMap<String, (AiTarget, Arc<AiService>)>>,
+    /// Where every built client reports its calls (ClickHouse
+    /// `ai_usage_events`, like the env client); `None` without ClickHouse.
+    usage_tx: Option<AiUsageSender>,
+}
 
 impl HostedAiClients {
+    pub(crate) fn new(usage_tx: Option<AiUsageSender>) -> Self {
+        Self {
+            clients: Default::default(),
+            usage_tx,
+        }
+    }
+
     /// The service for `target`, built on first use.
     pub(crate) fn get_or_build(&self, target: &AiTarget) -> Result<Arc<AiService>, AiClientError> {
-        let mut clients = self.0.lock();
+        let mut clients = self.clients.lock();
         if let Some((cached, service)) = clients.get(&target.key_id) {
             if cached == target {
                 return Ok(service.clone());
             }
         }
-        let service = Arc::new(build_service(target)?);
+        let service = Arc::new(build_service(target, self.usage_tx.clone())?);
         if clients.len() >= MAX_HOSTED_CLIENTS {
             clients.clear();
         }
@@ -72,14 +84,17 @@ impl HostedAiClients {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.0.lock().len()
+        self.clients.lock().len()
     }
 }
 
 /// An OpenAI-compatible service pointed at the target's Lumen gateway, with
 /// the Lab's default model for extraction and summaries.
-fn build_service(target: &AiTarget) -> Result<AiService, AiClientError> {
-    let client = Arc::new(AiClient::new(AiClientConfig {
+fn build_service(
+    target: &AiTarget,
+    usage_tx: Option<AiUsageSender>,
+) -> Result<AiService, AiClientError> {
+    let mut client = AiClient::new(AiClientConfig {
         api_key: target.api_key.clone(),
         provider: "openai".to_string(),
         // The Lab may send `…/v1/`: keep request URLs free of `//`.
@@ -87,8 +102,11 @@ fn build_service(target: &AiTarget) -> Result<AiService, AiClientError> {
         max_retries: 2,
         lumen_metadata: true,
         ..Default::default()
-    })?);
-    Ok(AiService::minimal(client)
+    })?;
+    if let Some(tx) = usage_tx {
+        client = client.with_usage_sender(tx);
+    }
+    Ok(AiService::minimal(Arc::new(client))
         .with_extraction_config(ExtractionConfig {
             model: target.default_model.clone(),
             ..Default::default()
@@ -190,7 +208,9 @@ where
 mod tests {
     use super::*;
     use crate::lab_client::testing::FakeLab;
-    use crate::results::test_support::{test_state_with_ai, test_state_with_lab_ai};
+    use crate::results::test_support::{
+        test_state_with_ai, test_state_with_lab_ai, test_state_with_lab_ai_usage,
+    };
     use axum::response::IntoResponse;
     use scrapix_queue::ChannelBus;
     use serde_json::json;
@@ -348,6 +368,37 @@ mod tests {
         assert!(requests[0].headers.get("x-lumen-metadata").is_some());
         let body: serde_json::Value = requests[0].body_json().unwrap();
         assert_eq!(body["model"], "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn hosted_calls_are_recorded_for_clickhouse() {
+        let lumen = lumen(&["fg-u"], &[]).await;
+        let lab = FakeLab::start().await;
+        lab.set_ai(ACCOUNT, Some(target(&lumen, "k-u", "fg-u")));
+        let (state, mut usage) = test_state_with_lab_ai_usage(&ChannelBus::new(), &lab);
+
+        let ai = resolve_ai(&state, Some(&ctx()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let attribution = scrapix_ai::AiUsageContext {
+            job_id: "j-1".into(),
+            account_id: Some(ACCOUNT.into()),
+            feature: "extract".into(),
+            url: String::new(),
+        };
+        scrapix_ai::AI_USAGE_CONTEXT
+            .scope(attribution.clone(), extract(ai))
+            .await
+            .unwrap();
+
+        // Same channel as the env client: drained into ClickHouse `ai_usage_events`.
+        let event = usage.try_recv().unwrap();
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.model, "gpt-4o-mini");
+        assert_eq!(event.total_tokens, 15);
+        assert_eq!(event.context, Some(attribution));
+        assert!(usage.try_recv().is_err());
     }
 
     #[tokio::test]

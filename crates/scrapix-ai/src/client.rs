@@ -216,12 +216,15 @@ tokio::task_local! {
 /// Receiver end of the AI usage tracking channel.
 pub type AiUsageReceiver = tokio::sync::mpsc::UnboundedReceiver<AiUsageEvent>;
 
+/// Sending end of the AI usage tracking channel.
+pub type AiUsageSender = tokio::sync::mpsc::UnboundedSender<AiUsageEvent>;
+
 /// AI client wrapper with rate limiting and retries
 pub struct AiClient {
     provider: Box<dyn LlmProvider>,
     config: AiClientConfig,
     semaphore: Arc<Semaphore>,
-    usage_tx: Option<tokio::sync::mpsc::UnboundedSender<AiUsageEvent>>,
+    usage_tx: Option<AiUsageSender>,
 }
 
 impl AiClient {
@@ -266,6 +269,13 @@ impl AiClient {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.usage_tx = Some(tx);
         Ok((client, rx))
+    }
+
+    /// Emit an `AiUsageEvent` on `tx` for every successful LLM call (for
+    /// several clients feeding one receiver).
+    pub fn with_usage_sender(mut self, tx: AiUsageSender) -> Self {
+        self.usage_tx = Some(tx);
+        self
     }
 
     /// Create a client from environment variables.
@@ -650,6 +660,39 @@ mod gateway_tests {
             role: MessageRole::User,
             content: "hi".to_string(),
         }]
+    }
+
+    #[tokio::test]
+    async fn a_usage_sender_gets_one_event_per_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client(&server).with_usage_sender(tx);
+
+        client
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.total_tokens, 5);
+        assert!(rx.try_recv().is_err());
     }
 
     fn lumen_error(code: &str) -> serde_json::Value {

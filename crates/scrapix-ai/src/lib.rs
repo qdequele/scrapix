@@ -56,7 +56,7 @@ pub mod summary;
 // Re-export main types from client
 pub use client::{
     AiClient, AiClientConfig, AiClientError, AiUsageContext, AiUsageEvent, AiUsageReceiver,
-    ChatResponse, AI_USAGE_CONTEXT,
+    AiUsageSender, ChatResponse, AI_USAGE_CONTEXT,
 };
 
 /// Error codes of the Lumen AI gateway (the `code` of its

@@ -6930,18 +6930,28 @@ pub async fn run_with_bus(
     };
 
     // Initialize AI service from environment (supports multiple providers via AI_PROVIDER)
-    // Use with_tracking when ClickHouse is available for per-call token tracking
-    let (ai_service, ai_usage_rx) = if ai_usage_batcher.is_some() {
-        match AiClient::from_env_with_tracking() {
-            Ok((client, rx)) => {
+    // With ClickHouse, AI clients report per-call token usage on one channel:
+    // the env client and, hosted, every per-key Lumen client.
+    let hosted = lab_api.is_some();
+    let (ai_service, ai_usage_rx, hosted_ai_usage_tx) = if ai_usage_batcher.is_some() {
+        let (usage_tx, usage_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hosted_tx = hosted.then(|| usage_tx.clone());
+        match AiClient::from_env() {
+            Ok(client) => {
                 let provider =
                     std::env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
                 info!(provider = %provider, "AI service initialized with usage tracking");
-                (Some(Arc::new(AiService::new(Arc::new(client)))), Some(rx))
+                let client = client.with_usage_sender(usage_tx);
+                (
+                    Some(Arc::new(AiService::new(Arc::new(client)))),
+                    Some(usage_rx),
+                    hosted_tx,
+                )
             }
             Err(e) => {
                 info!(reason = %e, "AI enrichment disabled");
-                (None, None)
+                // Hosted: the Lumen clients still report on the channel.
+                (None, hosted.then_some(usage_rx), hosted_tx)
             }
         }
     } else {
@@ -6950,11 +6960,11 @@ pub async fn run_with_bus(
                 let provider =
                     std::env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
                 info!(provider = %provider, "AI service initialized");
-                (Some(Arc::new(AiService::new(Arc::new(client)))), None)
+                (Some(Arc::new(AiService::new(Arc::new(client)))), None, None)
             }
             Err(e) => {
                 info!(reason = %e, "AI enrichment disabled");
-                (None, None)
+                (None, None, None)
             }
         }
     };
@@ -6990,6 +7000,7 @@ pub async fn run_with_bus(
         webhook_dispatcher,
     );
     state.ocr = ocr;
+    state.hosted_ai = ai_access::HostedAiClients::new(hosted_ai_usage_tx);
     state.meili = meili;
     state.lab = lab_outbox
         .clone()
