@@ -1,5 +1,5 @@
 //! The engine must not touch Lab-owned tables at all (Lab split spec §4.5): it
-//! reaches the Lab only over HTTP (`lab_client.rs`, `lab_sink.rs`).
+//! reaches the Lab only over HTTP (`crates/scrapix-lab`, `lab_sink.rs`).
 //!
 //! Scan scope: every `.rs` file under `bins/` and `crates/` (this file
 //! excluded), skipping `target/` and `migrations/` directories. SQL `.sql`

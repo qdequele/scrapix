@@ -5561,6 +5561,7 @@ dependencies = [
  "scrapix-core",
  "scrapix-crawler",
  "scrapix-extractor",
+ "scrapix-lab",
  "scrapix-ocr",
  "scrapix-parser",
  "scrapix-queue",
@@ -5741,6 +5742,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "scrapix-lab"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "hex",
+ "reqwest 0.12.28",
+ "scrapix-auth",
+ "scrapix-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

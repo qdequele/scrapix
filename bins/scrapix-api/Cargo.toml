@@ -24,6 +24,7 @@ scrapix-extractor = { path = "../../crates/scrapix-extractor" }
 scrapix-crawler = { path = "../../crates/scrapix-crawler", features = ["browser-cdp"] }
 scrapix-ai = { path = "../../crates/scrapix-ai" }
 scrapix-ocr = { path = "../../crates/scrapix-ocr" }
+scrapix-lab = { path = "../../crates/scrapix-lab" }
 
 # Config validation (CrawlConfig::validate())
 validator = { workspace = true }
@@ -78,6 +79,7 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
+scrapix-lab = { path = "../../crates/scrapix-lab", features = ["testing"] }
 wiremock = { workspace = true }
 tower = { workspace = true }
 tempfile = "3"

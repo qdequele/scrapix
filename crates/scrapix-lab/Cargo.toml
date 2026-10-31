@@ -1,0 +1,30 @@
+[package]
+name = "scrapix-lab"
+description = "Engine → Lab client: credential introspection, account limits and balance, Meilisearch and AI targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# `testing::FakeLab`, an in-process fake of the Lab's internal API, for the
+# tests of crates that use the client.
+testing = ["dep:axum"]
+
+[dependencies]
+scrapix-core = { path = "../scrapix-core" }
+scrapix-auth = { path = "../scrapix-auth" }
+
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+axum = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }

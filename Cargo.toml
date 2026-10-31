@@ -13,6 +13,7 @@ members = [
     "crates/scrapix-auth",
     "crates/scrapix-lifecycle",
     "crates/scrapix-ocr",
+    "crates/scrapix-lab",
 
     "bins/scrapix-api",
     "bins/scrapix-worker-crawler",

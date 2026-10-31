@@ -53,7 +53,17 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
-pub(crate) mod lab_client;
+/// The Lab client lives in the `scrapix-lab` crate (the content worker needs
+/// the same lookups); re-exported here so call sites keep their
+/// `crate::lab_client::…` paths.
+pub(crate) mod lab_client {
+    pub(crate) use scrapix_lab::{
+        log_lab_error, AiTarget, CredentialKind, Identity, LabClient, LabError,
+    };
+
+    #[cfg(test)]
+    pub(crate) use scrapix_lab::{testing, Timing};
+}
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
 pub(crate) mod legacy_credits;

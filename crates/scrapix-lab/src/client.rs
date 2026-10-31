@@ -15,21 +15,26 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use bytes::Bytes;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::meili::MeiliTarget;
+/// Where documents are indexed / searched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeiliTarget {
+    pub url: String,
+    pub api_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CredentialKind {
+pub enum CredentialKind {
     ApiKey,
     Bearer,
     Session,
 }
 
 impl CredentialKind {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ApiKey => "api_key",
             Self::Bearer => "bearer",
@@ -39,7 +44,7 @@ impl CredentialKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Identity {
+pub struct Identity {
     pub account_id: String,
     pub tier: String,
     pub role: Option<String>,
@@ -49,7 +54,7 @@ pub(crate) struct Identity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LabError {
+pub enum LabError {
     Unavailable(String),
     CredentialsRejected,
     /// Lab answered a 3xx (redirects are never followed) or a 4xx other than
@@ -75,7 +80,7 @@ impl std::fmt::Display for LabError {
 /// `instance_id` and `region` are null on the Lab's legacy service-token
 /// path (no deployment row).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(crate) struct InstanceInfo {
+pub struct InstanceInfo {
     #[serde(default)]
     pub instance_id: Option<String>,
     pub kind: String,
@@ -87,7 +92,7 @@ pub(crate) struct InstanceInfo {
 
 /// An account's spendable credits as the engine sees them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Available {
+pub struct Available {
     pub credits: i64,
     /// Served from a fresh snapshot without asking the Lab (a refresh may
     /// show a top-up made since).
@@ -95,7 +100,7 @@ pub(crate) struct Available {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Timing {
+pub struct Timing {
     pub default_ttl: Duration,
     pub max_ttl: Duration,
     pub negative_ttl: Duration,
@@ -180,7 +185,7 @@ struct AiAnswer {
 /// Where an account's LLM calls go: the Lumen gateway, with the key the Lab
 /// minted for the account's team.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct AiTarget {
+pub struct AiTarget {
     pub base_url: String,
     pub api_key: String,
     pub key_id: String,
@@ -306,7 +311,7 @@ impl<T: Clone> Lookups<T> {
     }
 }
 
-pub(crate) struct LabClient {
+pub struct LabClient {
     base: String,
     instance_id: String,
     secret: String,
@@ -323,7 +328,7 @@ pub(crate) struct LabClient {
 /// operator error (revoked or mistyped LAB_INSTANCE_ID/LAB_INSTANCE_SECRET),
 /// so it is logged at `error`; everything else is transient and logged at
 /// `warn`.
-pub(crate) fn log_lab_error(e: &LabError, during: &str) {
+pub fn log_lab_error(e: &LabError, during: &str) {
     match e {
         LabError::CredentialsRejected => tracing::error!(
             error = %e,
@@ -352,11 +357,11 @@ fn hashed(parts: &[&str]) -> String {
 }
 
 impl LabClient {
-    pub(crate) fn new(base_url: &str, instance_id: &str, instance_secret: &str) -> Self {
+    pub fn new(base_url: &str, instance_id: &str, instance_secret: &str) -> Self {
         Self::with_timing(base_url, instance_id, instance_secret, Timing::default())
     }
 
-    pub(crate) fn with_timing(
+    pub fn with_timing(
         base_url: &str,
         instance_id: &str,
         instance_secret: &str,
@@ -384,7 +389,7 @@ impl LabClient {
         }
     }
 
-    pub(crate) fn base_from_events_url(events_url: &str) -> String {
+    pub fn base_from_events_url(events_url: &str) -> String {
         let trimmed = events_url.trim_end_matches('/');
         trimmed
             .strip_suffix("/internal/events")
@@ -578,7 +583,7 @@ impl LabClient {
 
     /// `GET /internal/instances/me`: confirms the instance credentials and
     /// tells which deployment they belong to (checked once at boot).
-    pub(crate) async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
+    pub async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
         let (status, body) = self
             .request(
                 "instances_me",
@@ -598,7 +603,7 @@ impl LabClient {
         Ok(me)
     }
 
-    pub(crate) async fn introspect(
+    pub async fn introspect(
         &self,
         kind: CredentialKind,
         credential: &str,
@@ -612,7 +617,7 @@ impl LabClient {
         }).await
     }
 
-    pub(crate) async fn account(&self, account_id: &str) -> Result<Option<Identity>, LabError> {
+    pub async fn account(&self, account_id: &str) -> Result<Option<Identity>, LabError> {
         let key = hashed(&["a", account_id]);
         self.cached("account", &self.identities, key, || async {
             let a = self
@@ -638,10 +643,7 @@ impl LabClient {
 
     /// Spendable credits as the Lab last reported them (from a fresh
     /// snapshot, or a new one).
-    pub(crate) async fn available_credits(
-        &self,
-        account_id: &str,
-    ) -> Result<Option<Available>, LabError> {
+    pub async fn available_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.fetched.elapsed() < b.ttl {
                 return Ok(Some(Available {
@@ -658,10 +660,7 @@ impl LabClient {
     /// last snapshot is served for `stale_grace` past its expiry (unless it
     /// came from a `cache_ttl: 0` answer), asking the Lab again at most
     /// every `stale_retry`.
-    pub(crate) async fn refresh_credits(
-        &self,
-        account_id: &str,
-    ) -> Result<Option<Available>, LabError> {
+    pub async fn refresh_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
         let stale = |b: &Balance| b.servable_stale(self.timing.stale_grace);
         let served = |credits| {
             Ok(Some(Available {
@@ -709,7 +708,7 @@ impl LabClient {
         }
     }
 
-    pub(crate) async fn meilisearch(
+    pub async fn meilisearch(
         &self,
         account_id: &str,
         url: Option<&str>,
@@ -760,7 +759,7 @@ impl LabClient {
     /// LLM calls; `None` when the Lab has none for it (404). A
     /// `rejected_key_id` (the key Lumen just refused) skips the cache, asks
     /// the Lab for a replacement and makes that the cached answer.
-    pub(crate) async fn ai(
+    pub async fn ai(
         &self,
         account_id: &str,
         rejected_key_id: Option<&str>,
@@ -827,7 +826,7 @@ impl LabClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_cache_keys(&self) -> Vec<String> {
+    pub fn debug_cache_keys(&self) -> Vec<String> {
         let c = self.identities.lock().unwrap();
         c.positive
             .map
@@ -838,7 +837,7 @@ impl LabClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_ttl_for_test(
+    pub fn cached_ttl_for_test(
         &self,
         kind: CredentialKind,
         credential: &str,
@@ -854,8 +853,8 @@ impl LabClient {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     //! In-process fake of the Lab's internal API
     //! (contracts/vendor/lab/lab-internal.openapi.json).
     use super::AiTarget;
@@ -874,12 +873,11 @@ pub(crate) mod testing {
         },
     };
 
-    pub(crate) const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
-    pub(crate) const SECRET: &str =
-        "abababababababababababababababababababababababababababababababab";
+    pub const INSTANCE_ID: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    pub const SECRET: &str = "abababababababababababababababababababababababababababababababab";
 
     #[derive(Default)]
-    pub(crate) struct FakeLabState {
+    pub struct FakeLabState {
         /// "kind:credential" → introspection JSON.
         pub credentials: Mutex<HashMap<String, Value>>,
         pub accounts: Mutex<HashMap<String, Value>>,
@@ -905,7 +903,7 @@ pub(crate) mod testing {
         pub me: Mutex<Value>,
     }
 
-    pub(crate) struct FakeLab {
+    pub struct FakeLab {
         pub url: String,
         pub state: Arc<FakeLabState>,
     }
@@ -936,7 +934,7 @@ pub(crate) mod testing {
     }
 
     impl FakeLab {
-        pub(crate) async fn start() -> FakeLab {
+        pub async fn start() -> FakeLab {
             let state = Arc::new(FakeLabState {
                 me: Mutex::new(FakeLab::hosted_me()),
                 ai_cache_ttl: AtomicI64::new(30),
@@ -1050,11 +1048,11 @@ pub(crate) mod testing {
             FakeLab { url, state }
         }
 
-        pub(crate) fn hosted_me() -> Value {
+        pub fn hosted_me() -> Value {
             json!({"instance_id": INSTANCE_ID, "kind": "hosted", "product": "scrapix",
                    "region": "eu-west-1", "lab_url": "http://lab"})
         }
-        pub(crate) fn identity(account: &str, tier: &str, balance: i64) -> Value {
+        pub fn identity(account: &str, tier: &str, balance: i64) -> Value {
             let limits = match tier {
                 "pro" => {
                     json!({"concurrent_jobs": 10, "rate_limit_rpm": 1200, "max_depth": 10, "js_rendering": true})
@@ -1067,14 +1065,14 @@ pub(crate) mod testing {
                    "principal": {"type": "api_key", "user_id": null}, "credits": {"balance": balance},
                    "limits": limits})
         }
-        pub(crate) fn set_credential(&self, kind: &str, credential: &str, v: Value) {
+        pub fn set_credential(&self, kind: &str, credential: &str, v: Value) {
             self.state
                 .credentials
                 .lock()
                 .unwrap()
                 .insert(format!("{kind}:{credential}"), v);
         }
-        pub(crate) fn set_account(&self, account: &str, v: Value) {
+        pub fn set_account(&self, account: &str, v: Value) {
             self.state
                 .accounts
                 .lock()
@@ -1087,7 +1085,7 @@ pub(crate) mod testing {
                    "cache_ttl": self.state.ai_cache_ttl.load(Ordering::SeqCst)})
         }
         /// The account's `/ai` answer (`None` → 404).
-        pub(crate) fn set_ai(&self, account: &str, target: Option<AiTarget>) {
+        pub fn set_ai(&self, account: &str, target: Option<AiTarget>) {
             let mut ai = self.state.ai.lock().unwrap();
             match target {
                 Some(t) => ai.insert(account.to_string(), self.ai_json(&t)),
@@ -1096,23 +1094,23 @@ pub(crate) mod testing {
         }
         /// What a call carrying a `rejected_key_id` is served (and is current
         /// from then on).
-        pub(crate) fn rotate_ai(&self, account: &str, target: AiTarget) {
+        pub fn rotate_ai(&self, account: &str, target: AiTarget) {
             self.state
                 .ai_rotated
                 .lock()
                 .unwrap()
                 .insert(account.to_string(), self.ai_json(&target));
         }
-        pub(crate) fn set_ai_cache_ttl(&self, secs: i64) {
+        pub fn set_ai_cache_ttl(&self, secs: i64) {
             self.state.ai_cache_ttl.store(secs, Ordering::SeqCst)
         }
-        pub(crate) fn ai_queries(&self) -> Vec<Option<String>> {
+        pub fn ai_queries(&self) -> Vec<Option<String>> {
             self.state.ai_queries.lock().unwrap().clone()
         }
-        pub(crate) fn calls(&self) -> usize {
+        pub fn calls(&self) -> usize {
             self.state.calls.load(Ordering::SeqCst)
         }
-        pub(crate) fn set_down(&self, down: bool) {
+        pub fn set_down(&self, down: bool) {
             self.state.down.store(down, Ordering::SeqCst)
         }
     }
