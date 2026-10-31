@@ -31,34 +31,21 @@ fn non_ai_feature_credits(features: &FeaturesConfig) -> i64 {
     page_feature_count(features) as i64
 }
 
-/// AI per-page surcharge: +5 for AI extraction, +5 for AI summary, applied
-/// only per page that was actually AI-enriched.
-fn ai_surcharge_per_page(features: &FeaturesConfig) -> i64 {
-    let mut surcharge: i64 = 0;
-    if features.ai_extraction.as_ref().is_some_and(|a| a.enabled) {
-        surcharge += 5;
-    }
-    if features.ai_summary.as_ref().is_some_and(|f| f.enabled) {
-        surcharge += 5;
-    }
-    surcharge
-}
-
 /// Credits for a terminal `/crawl` job from what was delivered: 1 per HTTP
-/// page, 2 per browser page, +1 per enabled non-AI feature per page, and
-/// the AI surcharge only for the `pages_ai` pages that were AI-enriched.
-/// `pages_http` and `pages_browser` are disjoint; `pages_ai` is a subset.
+/// page, 2 per browser page, +1 per enabled non-AI feature per page.
+/// `pages_http` and `pages_browser` are disjoint. The AI-enriched pages
+/// (`pages_ai`, f2ab8d2: +5 per AI feature each) add nothing: the team's AI
+/// gateway meters them.
 pub(crate) fn crawl_credits(
     pages_http: u64,
     pages_browser: u64,
-    pages_ai: u64,
+    _pages_ai: u64,
     features: &FeaturesConfig,
 ) -> i64 {
     let feature_credits = non_ai_feature_credits(features);
     let http_credits = pages_http as i64 * (1 + feature_credits);
     let browser_credits = pages_browser as i64 * (2 + feature_credits);
-    let ai_credits = pages_ai as i64 * ai_surcharge_per_page(features);
-    http_credits + browser_credits + ai_credits
+    http_credits + browser_credits
 }
 
 /// Credits for `pages` OCR'd pages: none (f2ab8d2: +5 each). Vision OCR is
@@ -164,16 +151,16 @@ mod tests {
             true,
             Some("extract".to_string()),
         );
-        // 2 base + 4 features + 5 ai_extraction + 5 ai_summary = 16
-        assert_eq!(crawl_credits(0, 1, 1, &f), 16);
+        // 2 base + 4 features; the AI features add nothing.
+        assert_eq!(crawl_credits(0, 1, 1, &f), 6);
     }
 
-    /// 10 pages with only 3 AI-enriched pays the AI surcharge on exactly
-    /// those 3 pages, not all 10.
+    /// The team's AI gateway meters crawl AI and OCR: AI-enriched and OCR'd
+    /// pages cost what any other page costs.
     #[test]
-    fn ai_surcharge_charged_only_for_ai_enriched_pages() {
+    fn crawl_credits_ignore_ai_and_ocr_pages() {
         let f = FeaturesConfig::from_cli_args(
-            false,
+            true,
             false,
             false,
             false,
@@ -181,9 +168,10 @@ mod tests {
             true,
             Some("extract".to_string()),
         );
-        assert_eq!(crawl_credits(1, 0, 1, &f), 11, "1 base + 5 + 5");
-        let none_enriched = crawl_credits(10, 0, 0, &f);
-        let three_enriched = crawl_credits(10, 0, 3, &f);
-        assert_eq!(three_enriched - none_enriched, 10 * 3);
+        assert_eq!(crawl_credits(10, 0, 10, &f), crawl_credits(10, 0, 0, &f));
+        assert_eq!(crawl_credits(0, 4, 4, &f), crawl_credits(0, 4, 0, &f));
+        // 1 base + 1 feature (metadata) per http page.
+        assert_eq!(crawl_credits(10, 0, 10, &f), 20);
+        assert_eq!(ocr_credits(10), 0);
     }
 }

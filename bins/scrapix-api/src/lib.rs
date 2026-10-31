@@ -1260,8 +1260,9 @@ impl AppState {
     /// (deterministic id, one per job) to the job's terminal write, so it
     /// must be called before `write_terminal`. The event carries raw units
     /// plus, for the contract v2 transition release, the pre-v2 `credits`
-    /// (`legacy_credits::crawl_credits` + `ocr_credits`, from the job's
-    /// enabled features). The single billing path for terminal jobs.
+    /// (`legacy_credits::crawl_credits`, from the job's enabled features;
+    /// AI-enriched and OCR'd pages add nothing, the team's AI gateway meters
+    /// them). The single billing path for terminal jobs.
     /// D4/R4: units count what was actually delivered, not the job's static
     /// config — `pages_http`/`pages_browser` split the crawled-ok page count
     /// by whether each page was actually rendered with a browser
@@ -1315,8 +1316,7 @@ impl AppState {
                 .unwrap_or_default()
         };
         let feature_pages = total_pages.saturating_mul(usage_units::page_feature_count(&features));
-        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features)
-            + legacy_credits::ocr_credits(pages_ocr);
+        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features);
         let units = serde_json::json!({
             "pages_http": pages_http,
             "pages_browser": pages_browser,
@@ -4695,8 +4695,11 @@ pub(crate) async fn do_create_crawl(
     // values in place (SCR-72 fix round 1); `config` is already `mut`.
     validate_crawl_config(&mut config)?;
 
-    // Features the server cannot run fail the request, not the job.
-    check_crawl_capabilities(&config, state.ai_service.is_some(), state.crawl_browser)?;
+    // Features the server cannot run fail the request, not the job. Hosted
+    // crawl AI runs on each team's AI gateway (the content workers resolve
+    // it per page from the Lab), so it needs no env provider.
+    let ai_available = state.ai_service.is_some() || state.lab_api.is_some();
+    check_crawl_capabilities(&config, ai_available, state.crawl_browser)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
@@ -8161,6 +8164,27 @@ mod tests {
         assert!(check_crawl_capabilities(&disabled, false, None).is_ok());
     }
 
+    /// Hosted crawl AI runs on each team's AI gateway (the content
+    /// workers ask the Lab per page): no env AI provider is needed.
+    #[tokio::test]
+    async fn hosted_crawl_with_ai_is_accepted_without_env_key() {
+        let (_lab, state, _) = crate::results::test_support::hosted_ai_state(None).await;
+        assert!(state.ai_service.is_none(), "no env AI provider");
+        let config = crawl_config(serde_json::json!({
+            "start_urls": ["https://a.test/"],
+            "index_uid": "a",
+            "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k"},
+            "features": {
+                "ai_summary": {"enabled": true},
+                "ai_extraction": {"enabled": true, "prompt": "p"}
+            }
+        }));
+        let ctx = crate::results::test_support::hosted_ctx();
+
+        let created = do_create_crawl(&state, config, ctx.as_ref()).await;
+        assert!(created.is_ok(), "{:?}", created.err());
+    }
+
     #[test]
     fn browser_crawls_are_refused_only_without_a_browser() {
         let browser = crawl_config(serde_json::json!({
@@ -10578,9 +10602,9 @@ mod lifecycle_tests {
             serde_json::json!({"pages_http": 1, "pages_browser": 2, "pages_ai": 1, "pages_ocr": 0,
                                "feature_pages": 0})
         );
-        // f2ab8d2: 1 http (1 credit) + 2 browser (2 credits each = 4) + 1
-        // AI-enriched page (10 credits surcharge) = 15. Not 3 * 12 = 36.
-        assert_eq!(usage[0].data["credits"], 15);
+        // 1 http (1 credit) + 2 browser (2 credits each = 4) = 5: the
+        // AI-enriched page adds nothing (the team's AI gateway meters it).
+        assert_eq!(usage[0].data["credits"], 5);
         lab_events::assert_contract_valid(&usage);
         assert_eq!(
             usage[0].data["units"]["pages_http"].as_u64().unwrap()
@@ -10669,7 +10693,7 @@ mod lifecycle_tests {
                                "feature_pages": 6})
         );
         // f2ab8d2: crawl_credits(2, 1, 0, 2 features) = 2 * (1 + 2) +
-        // 1 * (2 + 2) = 10; OCR pages add nothing (ocr_credits is 0).
+        // 1 * (2 + 2) = 10; OCR pages add nothing.
         assert_eq!(usage[0].data["credits"], 10);
         lab_events::assert_contract_valid(&outbox.events());
     }

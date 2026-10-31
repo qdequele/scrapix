@@ -24,6 +24,7 @@ scrapix-queue = { path = "../../crates/scrapix-queue" }
 scrapix-lifecycle = { path = "../../crates/scrapix-lifecycle" }
 scrapix-ai = { path = "../../crates/scrapix-ai" }
 scrapix-ocr = { path = "../../crates/scrapix-ocr" }
+scrapix-lab = { path = "../../crates/scrapix-lab" }
 
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -40,6 +41,7 @@ base64 = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+scrapix-lab = { path = "../../crates/scrapix-lab", features = ["testing"] }
 wiremock = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }

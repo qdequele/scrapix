@@ -219,12 +219,10 @@ For fine-grained control, configure the content worker directly:
 ```bash
 # Enable AI summary for all pages
 ENABLE_SUMMARY=true
-SUMMARY_MODEL=gpt-4o-mini
 
 # Enable AI extraction with a custom prompt
 ENABLE_EXTRACTION=true
 EXTRACTION_PROMPT="Extract the main topic and list of technologies mentioned from: {content}"
-EXTRACTION_MODEL=gpt-4o-mini
 AI_MAX_TOKENS=1000
 
 # Limit concurrent AI requests (avoid rate limiting)
