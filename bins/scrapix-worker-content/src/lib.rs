@@ -2044,11 +2044,12 @@ impl ContentWorker {
     }
 }
 
-/// The Lab for `SCRAPIX_MODE=hosted` (`None` in standalone). Like the API:
-/// hosted refuses to start without LAB_URL, LAB_INSTANCE_ID and
-/// LAB_INSTANCE_SECRET (fail closed: never the env AI provider for a
-/// tenant), and standalone refuses the instance credentials (a standalone
-/// engine has no Lab).
+/// The Lab for `SCRAPIX_MODE=hosted` (`None` in standalone). Hosted refuses
+/// to start without LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET (fail
+/// closed: never the env AI provider for a tenant). Standalone ignores the
+/// Lab settings with a warning: workers often share an env or secret bundle
+/// with the API, so refusing them would crash-loop a worker whose mode was
+/// not set.
 fn hosted_lab(args: &Args) -> anyhow::Result<Option<Arc<LabClient>>> {
     let set = |v: &Option<String>| {
         v.as_deref()
@@ -2058,14 +2059,15 @@ fn hosted_lab(args: &Args) -> anyhow::Result<Option<Arc<LabClient>>> {
     };
     match args.mode.trim() {
         "standalone" => {
-            if set(&args.lab_instance_id).is_some() || set(&args.lab_instance_secret).is_some() {
-                anyhow::bail!(
-                    "LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are hosted-engine credentials: set \
-                     SCRAPIX_MODE=hosted, or unset them (a standalone engine has no Lab)"
+            if set(&args.lab_url).is_some()
+                || set(&args.lab_instance_id).is_some()
+                || set(&args.lab_instance_secret).is_some()
+            {
+                warn!(
+                    "LAB_URL/LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are ignored in standalone mode: \
+                     AI uses the env provider. Set SCRAPIX_MODE=hosted (as on the API) for \
+                     each team's AI gateway"
                 );
-            }
-            if set(&args.lab_url).is_some() {
-                info!("LAB_URL is ignored in standalone mode");
             }
             Ok(None)
         }
@@ -3599,6 +3601,58 @@ mod tests {
         assert_eq!(meta["job_id"], "job-1");
     }
 
+    /// A standalone worker given the API's Lab settings (a shared secret
+    /// bundle) starts, warns, and keeps using its env provider: no Lab call.
+    #[tokio::test]
+    async fn standalone_worker_ignores_lab_settings() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let env_ai = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&env_ai, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let mut w = build_worker(
+            &bus,
+            &ms,
+            &[
+                "--lab-url",
+                &lab.url,
+                "--lab-instance-id",
+                INSTANCE_ID,
+                "--lab-instance-secret",
+                SECRET,
+            ],
+        );
+        assert!(w.hosted_ai.is_none());
+        let client = AiClient::new(scrapix_ai::AiClientConfig {
+            api_key: "env-key".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", env_ai.uri())),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        w.ai_service = Some(Arc::new(
+            AiService::minimal(Arc::new(client)).with_summarization(),
+        ));
+        let w = started(w);
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert!(lab.ai_queries().is_empty());
+        let requests = env_ai.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(bearer(&requests[0]), "Bearer env-key");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains("ignored in standalone mode"),
+            "{logs}"
+        );
+    }
+
     #[test]
     fn hosted_mode_needs_the_lab_settings() {
         let parse = |extra: &[&str]| {
@@ -3626,8 +3680,9 @@ mod tests {
             let err = parse(&partial).unwrap_err().to_string();
             assert!(err.contains("SCRAPIX_MODE=hosted requires"), "{err}");
         }
-        // Standalone refuses the instance credentials, like the API.
-        assert!(parse(&lab).is_err());
+        // Standalone ignores the Lab settings (shared env bundles): it
+        // starts, with no Lab.
+        assert!(!parse(&lab).unwrap());
         assert!(!parse(&["--lab-url", "http://lab.test"]).unwrap());
         assert!(parse(&["--mode", "cloud"]).is_err());
     }

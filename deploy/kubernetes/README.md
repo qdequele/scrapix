@@ -1,11 +1,13 @@
 # Kubernetes manifests (hosted engine)
 
 `base/` deploys the Scrapix engine in **hosted** mode (`SCRAPIX_MODE=hosted`
-on the API): it keeps its own `scrapix_engine` Postgres and talks to the
-Lab (`meilisearch/lab`, deployed separately) over `LAB_URL`. To self-host
-without the Lab, patch the API to `SCRAPIX_MODE=standalone` with
-`SCRAPIX_ADMIN_KEY` and drop the `LAB_*` values (see
-`docs/deployment/self-hosting.mdx`).
+on the API and the content worker): it keeps its own `scrapix_engine`
+Postgres and talks to the Lab (`meilisearch/lab`, deployed separately) over
+`LAB_URL`. The content worker uses the same `LAB_URL`, `LAB_INSTANCE_ID` and
+`LAB_INSTANCE_SECRET` to fetch each team's AI gateway key for crawl-time AI
+and OCR. To self-host without the Lab, patch the API and the content worker
+to `SCRAPIX_MODE=standalone`, give the API `SCRAPIX_ADMIN_KEY`, and drop the
+`LAB_*` values (see `docs/deployment/self-hosting.mdx`).
 
 ## Secrets the API needs
 
