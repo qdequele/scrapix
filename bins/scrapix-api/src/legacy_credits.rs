@@ -38,12 +38,6 @@ pub(crate) fn scrape_credits(
     )
 }
 
-/// Credits of one AI call made by `POST /extract` (the price of an AI
-/// extraction on `/scrape`).
-pub(crate) fn extract_ai_call_credits() -> i64 {
-    scrape_credits_for_count(0, false, true)
-}
-
 /// Non-AI per-page feature surcharge of a crawl: +1 per enabled feature
 /// (metadata, markdown, block_split, schema, custom_selectors).
 fn non_ai_feature_credits(features: &FeaturesConfig) -> i64 {
@@ -150,11 +144,6 @@ mod tests {
         // 2 feature formats + AI summary + AI extraction = 2 + 5 + 5 = 12
         let two = [ScrapeFormat::Markdown, ScrapeFormat::Links];
         assert_eq!(scrape_credits(&two, true, true), 12);
-    }
-
-    #[test]
-    fn extract_ai_call_costs_an_ai_extraction() {
-        assert_eq!(extract_ai_call_credits(), 5);
     }
 
     #[test]

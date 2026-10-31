@@ -14,9 +14,13 @@
 //!    context; otherwise one extraction per page, then a merge pass that
 //!    reduces the partial results to one.
 //!
+//! AI: standalone, the server's AI provider; hosted, the team's Lumen
+//! gateway (resolved through the Lab), with an optional `model`.
+//!
 //! Billing: each URL fetched costs what `/scrape` costs (deducted by
-//! `perform_scrape`), each glob resolution costs a `/map`, and each AI call
-//! costs what an AI extraction on `/scrape` costs.
+//! `perform_scrape`) and each glob resolution costs a `/map`. The AI calls
+//! are not charged by the engine (hosted, the team's gateway meters them);
+//! a gone balance still stops them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,13 +36,15 @@ use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use scrapix_ai::{
-    AiClient, AiExtractor, AiService, ExtractionConfig, ExtractionSchema, FieldDefinition,
-    DEFAULT_EXTRACTION_MODEL,
+    gateway_codes, AiClient, AiService, AiUsageContext, ExtractionConfig, ExtractionSchema,
+    FieldDefinition, AI_USAGE_CONTEXT, DEFAULT_EXTRACTION_MODEL,
 };
 use scrapix_core::config::WebhookConfig;
 use scrapix_core::url_glob::matches_glob;
+use scrapix_core::ScrapixError;
 use scrapix_crawler::{is_non_page_url, SitemapParser};
 
+use crate::ai_access::{resolve_ai, with_key_retry, ResolvedAi, NO_AI_MESSAGE};
 use crate::auth::AuthenticatedAccount;
 use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
@@ -88,6 +94,10 @@ pub(crate) struct ExtractRequest {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub schema: Option<Value>,
+    /// Model to extract with, from the team's Gateway; the default model when absent
+    #[serde(default)]
+    #[schema(example = "gpt-4o-mini")]
+    pub model: Option<String>,
     /// Render JavaScript when fetching pages (requires Chrome/Chromium)
     #[serde(default)]
     pub render_js: bool,
@@ -389,7 +399,8 @@ fn token_count(model: &str) -> impl Fn(&str) -> usize + '_ {
 /// `https://example.com/blog/*` are resolved first, 50 URLs max), then runs
 /// one AI extraction over their content following `prompt` and/or `schema`.
 /// Poll `GET /extract/{id}` for the result; the fetched pages are available
-/// from `GET /job/{id}/results`. Requires an AI provider on the server.
+/// from `GET /job/{id}/results`. Requires an AI provider on the server
+/// (hosted: the team's AI Gateway).
 #[utoipa::path(
     post,
     path = "/extract",
@@ -399,7 +410,7 @@ fn token_count(model: &str) -> impl Fn(&str) -> usize + '_ {
         (status = 200, body = CreateExtractResponse),
         (status = 400, body = ApiError),
         (status = 402, description = "Not enough credits", body = ApiError),
-        (status = 503, description = "No AI provider is configured on the server", body = ApiError)
+        (status = 503, description = "No AI provider is configured on the server (hosted: no AI for this account)", body = ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -423,19 +434,29 @@ pub(crate) async fn start_extract(
         urls,
         prompt,
         schema,
+        model,
         render_js,
         only_main_content,
         timeout_ms,
         headers,
         mut webhooks,
     } = request;
-    let ai = state.ai_service.clone().ok_or_else(|| {
-        ApiError::new(
-            "Extraction requires an AI provider: set AI_PROVIDER and the matching API key \
-             (e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY) on the server",
-            "service_unavailable",
-        )
-    })?;
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let ai = match resolve_ai(state, account_ctx.as_ref(), None).await? {
+        Some(ai) => ai,
+        None if state.lab_api.is_some() => {
+            return Err(ApiError::new(NO_AI_MESSAGE, "service_unavailable"))
+        }
+        None => {
+            return Err(ApiError::new(
+                "Extraction requires an AI provider: set AI_PROVIDER and the matching API key \
+                 (e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY) on the server",
+                "service_unavailable",
+            ))
+        }
+    };
     let instruction = build_instruction(prompt.as_deref(), schema.as_ref())?;
 
     let mut inputs: Vec<String> = Vec::new();
@@ -498,6 +519,7 @@ pub(crate) async fn start_extract(
         "urls": inputs,
         "prompt": prompt,
         "schema": schema,
+        "model": model,
         "render_js": render_js,
         "only_main_content": only_main_content,
         "headers": headers.keys().map(|k| (k.clone(), Value::from("***"))).collect::<Map<_, _>>(),
@@ -521,6 +543,7 @@ pub(crate) async fn start_extract(
         options: Arc::new(options),
         instruction,
         ai,
+        model,
     };
     tokio::spawn(async move { runner.run(inputs).await });
 
@@ -573,7 +596,26 @@ struct ExtractRunner {
     job_id: String,
     options: Arc<Map<String, Value>>,
     instruction: String,
-    ai: Arc<AiService>,
+    ai: ResolvedAi,
+    /// The requested model; the service's extraction model when `None`.
+    model: Option<String>,
+}
+
+/// Why an AI call produced nothing.
+struct AiCallError {
+    message: String,
+    /// The job cannot go on (no balance, or the gateway refused the call):
+    /// no further AI call is made.
+    fatal: bool,
+}
+
+impl AiCallError {
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            fatal: true,
+        }
+    }
 }
 
 /// A page's markdown, ready for the AI phase.
@@ -825,45 +867,65 @@ impl ExtractRunner {
         pages
     }
 
-    fn extractor(&self, budget: usize) -> (AiExtractor, String) {
-        let base = self
-            .ai
+    /// The model the extraction runs with (also what counts its tokens).
+    fn model(&self) -> String {
+        self.model.clone().unwrap_or_else(|| {
+            self.ai
+                .service
+                .extractor()
+                .map(|e| e.config().model.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| DEFAULT_EXTRACTION_MODEL.to_string())
+        })
+    }
+
+    /// An extraction service on `ai`'s client: the requested model (else
+    /// the service's) and a `budget`-token content cap.
+    fn extractor(&self, ai: &ResolvedAi, budget: usize) -> AiService {
+        let base = ai
+            .service
             .extractor()
             .map(|e| e.config().clone())
             .unwrap_or_default();
-        let model = if base.model.is_empty() {
-            DEFAULT_EXTRACTION_MODEL.to_string()
-        } else {
-            base.model.clone()
-        };
+        let model = self.model.clone().unwrap_or_else(|| base.model.clone());
         let config = ExtractionConfig {
+            model,
             max_content_tokens: budget,
             ..base
         };
-        (AiExtractor::new(self.ai.client().clone(), config), model)
+        AiService::minimal(ai.service.client().clone()).with_extraction_config(config)
     }
 
-    /// One AI call (credit-checked, billed, logged).
+    /// One AI call (balance-checked, attributed to the job, logged). A key
+    /// the gateway refuses is replaced once.
     async fn ai_call(
         &self,
-        extractor: &AiExtractor,
         content: &str,
         instruction: &str,
         what: &str,
+        budget: usize,
         summary: &mut ExtractSummary,
-    ) -> Result<Value, String> {
-        self.can_afford_ai().await?;
-        let result = extractor
-            .extract_with_prompt(content, instruction)
+    ) -> Result<Value, AiCallError> {
+        self.can_afford_ai().await.map_err(AiCallError::fatal)?;
+        let attribution = AiUsageContext {
+            job_id: self.job_id.clone(),
+            account_id: self.account_id(),
+            feature: "extract".to_string(),
+            url: String::new(),
+        };
+        let call = with_key_retry(
+            &self.state,
+            self.account_ctx.as_ref().as_ref(),
+            self.ai.clone(),
+            |ai| {
+                let service = self.extractor(&ai, budget);
+                async move { service.extract(content, instruction).await }
+            },
+        );
+        let result = AI_USAGE_CONTEXT
+            .scope(attribution, call)
             .await
-            .map_err(|e| format!("AI extraction failed ({what}): {e}"))?;
-        self.charge(
-            legacy_credits::extract_ai_call_credits(),
-            serde_json::json!({"documents": 1}),
-            "extract",
-            &format!("Extract {} ({what})", self.job_id),
-        )
-        .await;
+            .map_err(|e| ai_call_error(e, what))?;
         if result.truncated {
             summary.warnings.push(format!(
                 "Content was truncated to fit the AI context ({what})"
@@ -886,7 +948,7 @@ impl ExtractRunner {
         summary: &mut ExtractSummary,
     ) -> Result<Value, String> {
         let budget = context_budget_tokens();
-        let (extractor, model) = self.extractor(budget);
+        let model = self.model();
         let docs: Vec<(String, String)> = pages
             .iter()
             .map(|p| (p.url.clone(), p.markdown.clone()))
@@ -895,16 +957,10 @@ impl ExtractRunner {
             return Err("cancelled".to_string());
         }
         match plan_context(&docs, budget, token_count(&model)) {
-            ContextPlan::Single(combined) => {
-                self.ai_call(
-                    &extractor,
-                    &combined,
-                    &self.instruction,
-                    "all pages",
-                    summary,
-                )
+            ContextPlan::Single(combined) => self
+                .ai_call(&combined, &self.instruction, "all pages", budget, summary)
                 .await
-            }
+                .map_err(|e| e.message),
             ContextPlan::PerPage => {
                 // Map: one extraction per page.
                 let page_instruction = format!(
@@ -915,9 +971,8 @@ impl ExtractRunner {
                 let mut partials: Vec<(usize, String, Result<Value, String>)> = Vec::new();
                 // Futures collected first (owned inputs), so the stream's type
                 // holds no closure over a borrowed page (keeps it `Send`).
-                let extractor = &extractor;
                 let page_instruction = &page_instruction;
-                let calls: Vec<_> = pages
+                let mut calls = pages
                     .iter()
                     .map(|p| {
                         (
@@ -930,17 +985,26 @@ impl ExtractRunner {
                         let mut local = ExtractSummary::default();
                         let what = format!("page {}", index + 1);
                         let r = self
-                            .ai_call(extractor, &content, page_instruction, &what, &mut local)
+                            .ai_call(&content, page_instruction, &what, budget, &mut local)
                             .await;
                         (index, url, r, local.warnings)
                     })
-                    .collect();
-                let mut stream = futures::stream::iter(calls).buffer_unordered(AI_CONCURRENCY);
-                while let Some((index, url, r, warnings)) = stream.next().await {
-                    summary.warnings.extend(warnings);
-                    partials.push((index, url, r));
+                    .collect::<Vec<_>>()
+                    .into_iter();
+                // The first page runs alone: a call the gateway refuses
+                // (budget, model, request) costs one request, not one per page.
+                let first: Vec<_> = calls.next().into_iter().collect();
+                for batch in [first, calls.collect()] {
+                    let mut stream = futures::stream::iter(batch).buffer_unordered(AI_CONCURRENCY);
+                    while let Some((index, url, r, warnings)) = stream.next().await {
+                        summary.warnings.extend(warnings);
+                        match r {
+                            // Ends the job; the calls in flight are dropped.
+                            Err(e) if e.fatal => return Err(e.message),
+                            r => partials.push((index, url, r.map_err(|e| e.message))),
+                        }
+                    }
                 }
-                drop(stream);
                 partials.sort_by_key(|(i, _, _)| *i);
                 let ok: Vec<Value> = partials
                     .iter()
@@ -970,10 +1034,28 @@ impl ExtractRunner {
                     self.instruction
                 );
                 let content = serde_json::to_string_pretty(&Value::Array(ok)).unwrap_or_default();
-                self.ai_call(extractor, &content, &merge_instruction, "merge", summary)
+                self.ai_call(&content, &merge_instruction, "merge", budget, summary)
                     .await
+                    .map_err(|e| e.message)
             }
         }
+    }
+}
+
+/// What a failed AI call means for the job. The gateway's refusals end it:
+/// a used-up budget with the 402 message, any other code (unknown model,
+/// invalid request, a key still refused after one replacement) with the
+/// gateway's own message. Anything else fails only this call.
+fn ai_call_error(err: ScrapixError, what: &str) -> AiCallError {
+    match err {
+        ScrapixError::AiGateway { code, .. } if code == gateway_codes::BUDGET_EXCEEDED => {
+            AiCallError::fatal(billing::insufficient_credits_message(0))
+        }
+        ScrapixError::AiGateway { message, .. } => AiCallError::fatal(message),
+        other => AiCallError {
+            message: format!("AI extraction failed ({what}): {other}"),
+            fatal: false,
+        },
     }
 }
 
@@ -1094,7 +1176,8 @@ mod tests {
                 format!("{name} costs 42 euros.")
             }
         };
-        for name in ["alpha", "beta"] {
+        // `gamma` is not linked from `/blog/`: only explicit URLs reach it.
+        for name in ["alpha", "beta", "gamma"] {
             Mock::given(method("GET"))
                 .and(path(format!("/blog/{name}")))
                 .respond_with(page(name, &body(name)))
@@ -1279,26 +1362,216 @@ mod tests {
             .all(|src| src.from_glob.as_deref() == Some(glob.as_str())));
     }
 
+    // ---- hosted: the team's Lumen gateway, resolved through the Lab ----
+
+    use crate::ai_access::NO_AI_MESSAGE;
+    use crate::lab_client::{testing::FakeLab, AiTarget};
+    use crate::lab_events::MemoryOutbox;
+    use crate::results::test_support::test_state_with_lab_ai;
+
+    const ACCOUNT: &str = "7f1c2a8e-0000-4000-8000-000000000001";
+
+    fn hosted_ctx() -> Option<AccountContext> {
+        Some(AccountContext {
+            account_id: ACCOUNT.into(),
+            api_key_id: Some("k".into()),
+            tier: "pro".into(),
+            user_role: None,
+            limits: None,
+        })
+    }
+
+    /// A hosted state whose account has credits and, when `lumen` is set,
+    /// a Lumen target there (the Lab answers 404 otherwise).
+    async fn hosted(lumen: Option<&MockServer>) -> (FakeLab, Arc<AppState>, Arc<MemoryOutbox>) {
+        let lab = FakeLab::start().await;
+        lab.set_account(ACCOUNT, FakeLab::identity(ACCOUNT, "pro", 1000));
+        lab.set_ai(
+            ACCOUNT,
+            lumen.map(|lumen| AiTarget {
+                base_url: format!("{}/v1", lumen.uri()),
+                api_key: "fg-1".into(),
+                key_id: "k-1".into(),
+                default_model: "lab-default-model".into(),
+                vision_model: "lab-vision-model".into(),
+            }),
+        );
+        let (state, outbox) = test_state_with_lab_ai(&scrapix_queue::ChannelBus::new(), &lab);
+        (lab, state, outbox)
+    }
+
+    /// Lumen refusing every chat call with `status` and a gateway `code`.
+    async fn lumen_refusing(status: u16, code: &str, message: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": { "code": code, "message": message, "type": "lumen_error" }
+                })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn with_model(mut request: ExtractRequest, model: &str) -> ExtractRequest {
+        request.model = Some(model.into());
+        request
+    }
+
+    async fn chat_bodies(lumen: &MockServer) -> Vec<Value> {
+        lumen
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn extract_uses_the_requested_model() {
+        let site = site(false).await;
+        let lumen = llm(r#"{"prices": [42]}"#).await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let urls = vec![format!("{}/blog/alpha", base(&site))];
+        let created = start_extract(
+            &state,
+            &hosted_ctx(),
+            with_model(request(urls), "claude-haiku-4-5"),
+        )
+        .await
+        .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        let bodies = chat_bodies(&lumen).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["model"], "claude-haiku-4-5");
+        // The job's config shows the requested model.
+        assert_eq!(job.config.unwrap()["model"], "claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn extract_defaults_to_the_lab_model() {
+        let site = site(false).await;
+        let lumen = llm(r#"{"prices": [42]}"#).await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let urls = vec![format!("{}/blog/alpha", base(&site))];
+        let created = start_extract(&state, &hosted_ctx(), request(urls))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        let bodies = chat_bodies(&lumen).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["model"], "lab-default-model");
+    }
+
+    #[tokio::test]
+    async fn extract_sends_its_job_in_lumen_metadata() {
+        let site = site(false).await;
+        let lumen = llm(r#"{"prices": [42]}"#).await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let urls = vec![format!("{}/blog/alpha", base(&site))];
+        let created = start_extract(&state, &hosted_ctx(), request(urls))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        let calls = lumen.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1);
+        let metadata: Value = serde_json::from_str(
+            calls[0]
+                .headers
+                .get("x-lumen-metadata")
+                .expect("x-lumen-metadata")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "product": "scrapix",
+                "feature": "extract",
+                "job_id": created.job_id,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_budget_exceeded_fails_with_the_credits_message() {
+        let site = site(true).await;
+        let lumen = lumen_refusing(402, "LM-4001", "budget exceeded").await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let base = base(&site);
+        // Three ~15k-token pages: one extraction per page.
+        let urls = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|n| format!("{base}/blog/{n}"))
+            .collect();
+        let created = start_extract(&state, &hosted_ctx(), request(urls))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            job.error_message,
+            Some(billing::insufficient_credits_message(0))
+        );
+        // The first refusal ends the job: no other page, no retry.
+        assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_unknown_model_fails_with_lumen_message() {
+        let site = site(false).await;
+        let lumen = lumen_refusing(404, "LM-2001", "model 'nope' not found").await;
+        let (_lab, state, _) = hosted(Some(&lumen)).await;
+        let urls = vec![format!("{}/blog/alpha", base(&site))];
+        let created = start_extract(&state, &hosted_ctx(), with_model(request(urls), "nope"))
+            .await
+            .unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        assert_eq!(job.status, JobStatus::Failed);
+        let error = job.error_message.unwrap_or_default();
+        assert!(error.contains("model 'nope' not found"), "{error}");
+        assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_hosted_without_ai_is_503() {
+        use axum::response::IntoResponse;
+        let (_lab, state, _) = hosted(None).await;
+        let err = start_extract(
+            &state,
+            &hosted_ctx(),
+            request(vec!["https://a.test/".into()]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, "service_unavailable");
+        assert_eq!(err.error, NO_AI_MESSAGE);
+        assert!(state.list_jobs(10, 0).is_empty(), "no job is created");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     /// Transition release: every usage event of an extract job carries the
     /// credits f2ab8d2 charged at its site: a glob resolution is a map
     /// (`MAP_CREDITS` = 2), each fetched page a markdown `/scrape` (1, with
-    /// `feature_pages` 1), each AI call an AI extraction (5).
+    /// `feature_pages` 1). The AI calls are not charged (the team's Lumen
+    /// gateway meters them): no `extract` event.
     #[tokio::test]
-    async fn extract_usage_carries_pre_v2_credits_per_site() {
+    async fn extract_no_longer_charges_ai() {
         let site = site(false).await;
-        let llm = llm(r#"{"prices": []}"#).await;
-        let bus = scrapix_queue::ChannelBus::new();
-        let (state, outbox) =
-            crate::results::test_support::test_state_with_ai_and_lab(&bus, Some(ai(&llm)));
-        let ctx = Some(AccountContext {
-            account_id: "7f1c2a8e-0000-4000-8000-000000000001".into(),
-            api_key_id: Some("k".into()),
-            tier: "free".into(),
-            user_role: None,
-            limits: None,
-        });
+        let lumen = llm(r#"{"prices": []}"#).await;
+        let (_lab, state, outbox) = hosted(Some(&lumen)).await;
         let glob = format!("{}/blog/*", base(&site));
-        let created = start_extract(&state, &ctx, request(vec![glob]))
+        let created = start_extract(&state, &hosted_ctx(), request(vec![glob]))
             .await
             .unwrap();
         let job = wait_terminal(&state, &created.job_id).await;
@@ -1329,10 +1602,8 @@ mod tests {
             assert_eq!(credits, 1);
             assert_eq!(units["feature_pages"], 1);
         }
-        assert_eq!(
-            of("extract"),
-            vec![(5, serde_json::json!({"documents": 1}))]
-        );
+        assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
+        assert!(of("extract").is_empty(), "no AI charge: {usage:?}");
         crate::lab_events::assert_contract_valid(&outbox.events());
     }
 
@@ -1375,14 +1646,19 @@ mod tests {
             job_id: "job-1".into(),
             options: Arc::new(Map::new()),
             instruction: String::new(),
-            ai: ai(&llm),
+            ai: ResolvedAi {
+                service: ai(&llm),
+                vision_model: None,
+                key_id: None,
+            },
+            model: None,
         };
         runner
             .charge(
-                15,
-                serde_json::json!({"documents": 3}),
-                "extract",
-                "extract: 3 pages",
+                legacy_credits::MAP_CREDITS,
+                serde_json::json!({"requests": 1}),
+                "map",
+                "https://example.com/blog/*",
             )
             .await;
         let events = outbox.events();
@@ -1391,11 +1667,11 @@ mod tests {
         assert_eq!(
             events[0].data,
             serde_json::json!({
-                "operation": "extract",
-                "credits": 15,
-                "units": {"documents": 3},
+                "operation": "map",
+                "credits": 2,
+                "units": {"requests": 1},
                 "provider_cost_micro_usd": 0,
-                "description": "extract: 3 pages",
+                "description": "https://example.com/blog/*",
                 "job_id": "job-1",
             })
         );

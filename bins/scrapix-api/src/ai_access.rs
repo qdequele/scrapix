@@ -16,17 +16,12 @@ use crate::lab_client::{log_lab_error, AiTarget, LabError};
 use crate::{AccountContext, ApiError, AppState};
 
 /// Refusal for AI work when the account has no AI service.
-// No caller yet: the AI call sites (later tasks of this PR) go through it;
-// drop the allow there.
-#[allow(dead_code)]
 pub(crate) const NO_AI_MESSAGE: &str = "AI is not available for this account";
 
 /// Past this many keys the hosted service cache starts over.
 const MAX_HOSTED_CLIENTS: usize = 1024;
 
 /// The AI service for one request, and what is needed to call it.
-// `service` is read by the AI call sites (later tasks of this PR).
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct ResolvedAi {
     pub service: Arc<AiService>,
@@ -121,9 +116,6 @@ fn build_service(
 /// no provider is configured). Hosted: the account's Lumen target from the
 /// Lab (`None` when it has none); `rejected_key_id` is the key Lumen just
 /// refused, so the Lab replaces it.
-// No caller yet: the AI call sites (later tasks of this PR) go through it;
-// drop the allow there.
-#[allow(dead_code)]
 pub(crate) async fn resolve_ai(
     state: &AppState,
     ctx: Option<&AccountContext>,
@@ -171,9 +163,6 @@ pub(crate) async fn resolve_ai(
 /// Run an AI call; when Lumen refuses the key (`LM-4004`), ask the Lab for a
 /// new one and run it once more. If no new key comes back, the original
 /// gateway error is returned.
-// No caller yet: the AI call sites (later tasks of this PR) go through it;
-// drop the allow there.
-#[allow(dead_code)]
 pub(crate) async fn with_key_retry<T, F, Fut>(
     state: &AppState,
     ctx: Option<&AccountContext>,
