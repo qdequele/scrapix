@@ -57,12 +57,10 @@ pub mod job_store;
 /// the same lookups); re-exported here so call sites keep their
 /// `crate::lab_client::…` paths.
 pub(crate) mod lab_client {
-    pub(crate) use scrapix_lab::{
-        log_lab_error, AiTarget, CredentialKind, Identity, LabClient, LabError,
-    };
+    pub(crate) use scrapix_lab::{log_lab_error, CredentialKind, Identity, LabClient, LabError};
 
     #[cfg(test)]
-    pub(crate) use scrapix_lab::{testing, Timing};
+    pub(crate) use scrapix_lab::{testing, AiTarget, Timing};
 }
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
@@ -367,7 +365,7 @@ struct AppState {
     ai_service: Option<Arc<AiService>>,
     /// Hosted: the per-key Lumen services `ai_access::resolve_ai` builds
     /// from the Lab's AI targets (unused in standalone).
-    pub(crate) hosted_ai: ai_access::HostedAiClients,
+    pub(crate) hosted_ai: scrapix_lab::HostedAiClients,
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
@@ -493,7 +491,7 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
-            hosted_ai: ai_access::HostedAiClients::default(),
+            hosted_ai: scrapix_lab::HostedAiClients::default(),
             ocr: None,
             lab: None,
             accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),
@@ -7139,7 +7137,7 @@ pub async fn run_with_bus(
         webhook_dispatcher,
     );
     state.ocr = ocr;
-    state.hosted_ai = ai_access::HostedAiClients::new(hosted_ai_usage_tx);
+    state.hosted_ai = scrapix_lab::HostedAiClients::new(hosted_ai_usage_tx);
     state.meili = meili;
     state.lab = lab_outbox
         .clone()

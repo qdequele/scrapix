@@ -14,6 +14,7 @@ testing = ["dep:axum"]
 [dependencies]
 scrapix-core = { path = "../scrapix-core" }
 scrapix-auth = { path = "../scrapix-auth" }
+scrapix-ai = { path = "../scrapix-ai" }
 
 reqwest = { workspace = true }
 tokio = { workspace = true }
@@ -23,6 +24,7 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+parking_lot = { workspace = true }
 
 axum = { workspace = true, optional = true }
 

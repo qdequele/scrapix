@@ -919,7 +919,7 @@ pub(crate) mod test_support {
         let mut state = build_state(bus, None);
         attach_lab_ai(&mut state, lab);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hosted_ai = crate::ai_access::HostedAiClients::new(Some(tx));
+        state.hosted_ai = scrapix_lab::HostedAiClients::new(Some(tx));
         (Arc::new(state), rx)
     }
 

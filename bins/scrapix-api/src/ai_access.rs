@@ -2,24 +2,17 @@
 //! service. Hosted: the team's Lumen gateway, with the key the Lab serves
 //! (`GET /internal/accounts/{id}/ai`), one service per key.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use scrapix_ai::{
-    ai_gateway_code, gateway_codes, AiClient, AiClientConfig, AiClientError, AiService,
-    AiUsageSender, ExtractionConfig, SummaryConfig,
-};
+use scrapix_ai::AiService;
 use scrapix_core::ScrapixError;
 
-use crate::lab_client::{log_lab_error, AiTarget, LabError};
+use crate::lab_client::{log_lab_error, LabError};
 use crate::{AccountContext, ApiError, AppState};
 
 /// Refusal for AI work when the account has no AI service.
 pub(crate) const NO_AI_MESSAGE: &str = "AI is not available for this account";
-
-/// Past this many keys the hosted service cache starts over.
-const MAX_HOSTED_CLIENTS: usize = 1024;
 
 /// The AI service for one request, and what is needed to call it.
 #[derive(Clone)]
@@ -40,76 +33,6 @@ impl std::fmt::Debug for ResolvedAi {
             .field("key_id", &self.key_id)
             .finish_non_exhaustive()
     }
-}
-
-/// Hosted: one [`AiService`] per Lab-minted key, so calls for a team share a
-/// client (connection pool, concurrency limit). Keyed by `key_id`; an entry
-/// whose target changed (URL, models, secret) is rebuilt.
-#[derive(Default)]
-pub(crate) struct HostedAiClients {
-    clients: parking_lot::Mutex<HashMap<String, (AiTarget, Arc<AiService>)>>,
-    /// Where every built client reports its calls (ClickHouse
-    /// `ai_usage_events`, like the env client); `None` without ClickHouse.
-    usage_tx: Option<AiUsageSender>,
-}
-
-impl HostedAiClients {
-    pub(crate) fn new(usage_tx: Option<AiUsageSender>) -> Self {
-        Self {
-            clients: Default::default(),
-            usage_tx,
-        }
-    }
-
-    /// The service for `target`, built on first use.
-    pub(crate) fn get_or_build(&self, target: &AiTarget) -> Result<Arc<AiService>, AiClientError> {
-        let mut clients = self.clients.lock();
-        if let Some((cached, service)) = clients.get(&target.key_id) {
-            if cached == target {
-                return Ok(service.clone());
-            }
-        }
-        let service = Arc::new(build_service(target, self.usage_tx.clone())?);
-        if clients.len() >= MAX_HOSTED_CLIENTS {
-            clients.clear();
-        }
-        clients.insert(target.key_id.clone(), (target.clone(), service.clone()));
-        Ok(service)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.clients.lock().len()
-    }
-}
-
-/// An OpenAI-compatible service pointed at the target's Lumen gateway, with
-/// the Lab's default model for extraction and summaries.
-fn build_service(
-    target: &AiTarget,
-    usage_tx: Option<AiUsageSender>,
-) -> Result<AiService, AiClientError> {
-    let mut client = AiClient::new(AiClientConfig {
-        api_key: target.api_key.clone(),
-        provider: "openai".to_string(),
-        // The Lab may send `…/v1/`: keep request URLs free of `//`.
-        base_url: Some(target.base_url.trim_end_matches('/').to_string()),
-        max_retries: 2,
-        lumen_metadata: true,
-        ..Default::default()
-    })?;
-    if let Some(tx) = usage_tx {
-        client = client.with_usage_sender(tx);
-    }
-    Ok(AiService::minimal(Arc::new(client))
-        .with_extraction_config(ExtractionConfig {
-            model: target.default_model.clone(),
-            ..Default::default()
-        })
-        .with_summary_config(SummaryConfig {
-            model: target.default_model.clone(),
-            ..Default::default()
-        }))
 }
 
 /// The AI service for a request. Standalone: the env service (`None` when
@@ -161,8 +84,8 @@ pub(crate) async fn resolve_ai(
 }
 
 /// Run an AI call; when Lumen refuses the key (`LM-4004`), ask the Lab for a
-/// new one and run it once more. If no new key comes back, the original
-/// gateway error is returned.
+/// new one and run it once more (`scrapix_lab::retry_on_key_refused`). If no
+/// new key comes back, the original gateway error is returned.
 pub(crate) async fn with_key_retry<T, F, Fut>(
     state: &AppState,
     ctx: Option<&AccountContext>,
@@ -174,33 +97,28 @@ where
     Fut: Future<Output = Result<T, ScrapixError>>,
 {
     let key_id = ai.key_id.clone();
-    let err = match call(ai).await {
-        Ok(value) => return Ok(value),
-        Err(err) => err,
-    };
-    let Some(rejected) =
-        key_id.filter(|_| ai_gateway_code(&err) == Some(gateway_codes::KEY_REFUSED))
-    else {
-        return Err(err);
-    };
-    match resolve_ai(state, ctx, Some(&rejected)).await {
-        Ok(Some(next)) => call(next).await,
-        Ok(None) => Err(err),
-        Err(e) => {
-            tracing::warn!(error = %e.error, key_id = %rejected, "no replacement for a refused AI key");
-            Err(err)
+    scrapix_lab::retry_on_key_refused(ai, key_id, call, |rejected| async move {
+        match resolve_ai(state, ctx, Some(&rejected)).await {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::warn!(error = %e.error, key_id = %rejected, "no replacement for a refused AI key");
+                None
+            }
         }
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lab_client::testing::FakeLab;
+    use crate::lab_client::AiTarget;
     use crate::results::test_support::{
         test_state_with_ai, test_state_with_lab_ai, test_state_with_lab_ai_usage,
     };
     use axum::response::IntoResponse;
+    use scrapix_ai::{gateway_codes, AiClient, AiClientConfig};
     use scrapix_queue::ChannelBus;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -467,22 +385,5 @@ mod tests {
             Some(gateway_codes::KEY_REFUSED)
         );
         assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
-    }
-
-    #[test]
-    fn the_client_cache_is_bounded() {
-        let clients = HostedAiClients::default();
-        for i in 0..=MAX_HOSTED_CLIENTS {
-            clients
-                .get_or_build(&AiTarget {
-                    base_url: "http://lumen/v1".into(),
-                    api_key: format!("fg-{i}"),
-                    key_id: format!("k-{i}"),
-                    default_model: "m".into(),
-                    vision_model: "v".into(),
-                })
-                .unwrap();
-        }
-        assert!(clients.len() <= MAX_HOSTED_CLIENTS);
     }
 }
