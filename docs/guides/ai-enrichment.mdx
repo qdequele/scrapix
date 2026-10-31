@@ -5,9 +5,15 @@ description: Add AI-powered summarization, extraction, and embeddings to crawled
 
 # AI Enrichment
 
-Scrapix integrates with OpenAI (and other providers via `AI_PROVIDER`) to enrich crawled content with summaries, structured data extraction, and embeddings.
+Scrapix enriches crawled content with summaries, structured data extraction, and embeddings. Self-hosted (standalone) engines call the provider you configure (OpenAI, Anthropic and others via `AI_PROVIDER`); the hosted platform sends every LLM call through your team's AI gateway.
 
 ## Setup
+
+### Hosted
+
+Nothing to configure: no `AI_PROVIDER`, no provider key. Every AI feature (`/scrape` `ai`, `/extract`, `/parse`, crawl `ai_summary` / `ai_extraction`, vision OCR) runs through your team's Lumen gateway with a key the Lab issues for your team. Lumen bills the tokens to the team, so Scrapix charges credits for pages, maps and searches only, never for AI. A team without AI gets `503 service_unavailable` ("AI is not available for this account") on AI requests to `/scrape`, `/extract` and `/parse`; a crawl is still accepted, and its pages are indexed without enrichment (the job carries a warning). The `model` options below default to the Lab's default model for your team.
+
+### Standalone
 
 Set the API key for your AI provider:
 
@@ -20,7 +26,7 @@ AI_PROVIDER=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-AI enrichment works in two contexts:
+The API and the content workers read these variables. AI enrichment works in two contexts:
 - **`/scrape` endpoint** — Per-request AI processing
 - **Crawl jobs** — Content worker applies AI to every page (or a subset via patterns)
 
@@ -148,6 +154,19 @@ curl -X POST http://localhost:8080/scrape \
 | `boolean` | True/false |
 | `array` | List of values |
 
+## Choosing the model
+
+`POST /extract` and `/scrape`'s `ai` options take an optional `model`:
+
+```json
+{
+  "url": "https://blog.example.com/long-article",
+  "ai": { "summary": true, "model": "gpt-4o-mini" }
+}
+```
+
+When absent, the hosted engine uses the Lab's default model for your team and a standalone engine the provider's default. A `model` must be one your team's gateway serves (hosted) or one the server's `AI_PROVIDER` serves (standalone); an unknown model fails with the gateway's error. For crawls, set `model` on `ai_summary` / `ai_extraction` in the job's `features`.
+
 ## Extract: One Result From Many Pages
 
 `POST /extract` runs one AI extraction over several pages at once (URL globs such as
@@ -270,7 +289,7 @@ curl "http://localhost:8080/analytics/v0/pipes/ai_usage.json?hours=24"
 ## Cost Considerations
 
 - AI enrichment adds latency (1-3 seconds per page for summarization)
-- Token costs scale with page content length
+- Token costs scale with page content length (hosted: billed by the gateway to your team, not in Scrapix credits)
 - Use `include_pages` / `exclude_pages` patterns to limit processing to valuable content
 - Set `AI_CONCURRENCY` to control parallel AI requests (default: 5)
 - The `gpt-4o-mini` model is recommended for cost-effective bulk processing

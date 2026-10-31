@@ -211,4 +211,6 @@ as a hardened production setup. The [Kubernetes](/deployment/kubernetes)
 manifests are the hosted platform's stack (`SCRAPIX_MODE=hosted`: the engine
 on its own database plus `LAB_URL` pointing at the Lab, deployed from
 `meilisearch/lab`); to self-host with them, set the API to
-`SCRAPIX_MODE=standalone` as above and drop the `LAB_*` settings.
+`SCRAPIX_MODE=standalone` as above (the content worker too: its manifest sets
+`SCRAPIX_MODE=hosted`, so AI comes from the env provider, `AI_PROVIDER` and its
+key, once it runs standalone) and drop the `LAB_*` settings.

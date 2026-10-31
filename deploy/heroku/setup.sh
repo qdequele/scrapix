@@ -52,7 +52,8 @@ LAB_URL=""                # LAB_URL printed by the Lab (the base URL, no path)
 LAB_INSTANCE_ID=""        # LAB_INSTANCE_ID printed by the Lab (uuid)
 LAB_INSTANCE_SECRET=""    # LAB_INSTANCE_SECRET printed by the Lab (64 hex)
 
-# AI enrichment (optional)
+# AI enrichment (optional, standalone only: hosted AI uses the team's Lumen
+# key from the Lab, so leave these empty)
 AI_PROVIDER="anthropic"
 ANTHROPIC_API_KEY=""
 

@@ -212,7 +212,8 @@ Toggle individual extraction features:
 | `ocr.max_pages` | server cap (50) | Per-document OCR page cap (only lowers `OCR_MAX_PAGES_PER_DOCUMENT`) |
 
 With `pdf` / `documents` enabled, links to those files are followed instead
-of being skipped as non-page resources. OCR pages are billed at a higher rate.
+of being skipped as non-page resources. OCR pages are counted, not charged in
+Scrapix credits (hosted vision OCR runs on the team's AI gateway).
 See [Documents & OCR](/guides/documents).
 
 Each feature supports page-level filtering:

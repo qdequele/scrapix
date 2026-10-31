@@ -222,7 +222,7 @@ Extract JSON-LD and microdata from a page:
 
 ## AI Enrichment
 
-Add AI-powered summarization and extraction (requires `OPENAI_API_KEY`):
+Add AI-powered summarization and extraction (standalone: requires an AI provider such as `OPENAI_API_KEY`; hosted: runs on your team's AI gateway, with an optional `ai.model`):
 
 ### Summarization
 
@@ -439,12 +439,12 @@ Failed scrapes return `success: false` with the HTTP status code:
 }
 ```
 
-When AI is requested but `OPENAI_API_KEY` is not set, content is still returned with a warning:
+When AI is requested but the provider fails, content is still returned with a warning (a server with no provider at all refuses the request with `503` instead):
 
 ```json
 {
   "success": true,
   "markdown": "...",
-  "warning": "AI enrichment requires OPENAI_API_KEY environment variable"
+  "warning": "AI summary could not be generated and was not billed: <provider error>"
 }
 ```

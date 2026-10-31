@@ -10,7 +10,7 @@ description: Structured data extraction over one or many pages, with URL globs
 Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET /extract/{id}` for the result. The job also shows up in `GET /jobs`, streams events (`GET /job/{id}/events`), delivers webhooks and can be cancelled with `DELETE /job/{id}`. The fetched pages are available from [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results).
 
 <Note>
-  Extraction requires an AI provider on the server (`AI_PROVIDER` and the matching API key, see [AI enrichment](/guides/ai-enrichment)). Without one, `POST /extract` fails with `503` and code `service_unavailable`.
+  Extraction requires an AI provider on the server: standalone, `AI_PROVIDER` and the matching API key; hosted, your team's AI gateway (see [AI enrichment](/guides/ai-enrichment)). Without one (hosted: a team without AI), `POST /extract` fails with `503` and code `service_unavailable`.
 </Note>
 
 ## POST /extract
@@ -42,6 +42,7 @@ Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET 
 | `urls` | string[] | **required** | URLs and URL globs, 50 URLs max in total after glob resolution |
 | `prompt` | string | — | What to extract, in natural language. Required when there is no `schema` |
 | `schema` | object \| array | — | A JSON Schema object, or a list of fields `[{ "name", "description", "field_type", "required" }]` (the `/scrape` `ai.extract.schema` form) |
+| `model` | string | — | Model to extract with, e.g. `gpt-4o-mini`. Hosted: a model from the team's AI gateway, the Lab's default model when absent. Standalone: a model of the server's provider, the provider's default when absent |
 | `render_js` | boolean | `false` | Render JavaScript when fetching pages (requires Chrome/Chromium) |
 | `only_main_content` | boolean | `true` | Only use each page's main content |
 | `timeout_ms` | integer | `30000` | Per-page fetch timeout |
@@ -95,7 +96,7 @@ Hosted only. The engine reports usage units and the Lab prices them:
 
 - each page fetched: reported like the same `/scrape` request;
 - each glob resolved: reported as a `/map`;
-- each AI call: an `extract` usage event (`documents: 1`). A single-pass extraction makes one call; a large one makes one call per page plus one merge call.
+- AI calls: not charged by Scrapix. They run on the team's AI gateway, which bills the tokens to the team. A single-pass extraction makes one call; a large one makes one call per page plus one merge call.
 
 The request is rejected with `402` when the account's credit balance is exhausted.
 

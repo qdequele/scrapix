@@ -1606,6 +1606,11 @@ export interface components {
         /** @description AI enrichment options for /scrape */
         AiOptions: {
             extract?: null | components["schemas"]["AiExtractOptions"];
+            /**
+             * @description Model to summarize and extract with, from the team's Gateway; the default model when absent
+             * @example gpt-4o-mini
+             */
+            model?: string | null;
             /** @description Generate a TL;DR summary */
             summary?: boolean;
         };
@@ -1991,6 +1996,11 @@ export interface components {
             headers?: {
                 [key: string]: string;
             };
+            /**
+             * @description Model to extract with, from the team's Gateway; the default model when absent
+             * @example gpt-4o-mini
+             */
+            model?: string | null;
             /** @description Only use each page's main content (default true) */
             only_main_content?: boolean;
             /** @description What to extract, in natural language */

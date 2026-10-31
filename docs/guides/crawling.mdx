@@ -283,7 +283,7 @@ Extract structured data from page content:
 }
 ```
 
-Requires `OPENAI_API_KEY` environment variable.
+Standalone: requires an AI provider on the content worker (`AI_PROVIDER` and its key, e.g. `OPENAI_API_KEY`). Hosted: runs on your team's AI gateway (the content worker needs `SCRAPIX_MODE=hosted` and `LAB_*`), with no Scrapix credit charge for AI.
 
 ## Proxies
 

@@ -19,18 +19,24 @@ All Scrapix services are configured through environment variables. When running 
 
 ## Lab Boundary (hosted only)
 
-In hosted mode the engine reports usage and job lifecycle to the Lab ([`meilisearch/lab`](https://github.com/meilisearch/lab)) as signed events and calls the Lab's `/internal/*` API (credential introspection, balance and plan limits, Meilisearch targets): see [Lab Events](/api-reference/lab-events). Every call carries the engine's instance identity. A standalone engine never talks to a Lab: `LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET` set on a standalone engine are refused at startup.
+In hosted mode the engine reports usage and job lifecycle to the Lab ([`meilisearch/lab`](https://github.com/meilisearch/lab)) as signed events and calls the Lab's `/internal/*` API (credential introspection, balance and plan limits, Meilisearch targets): see [Lab Events](/api-reference/lab-events). Every call carries the engine's instance identity. A standalone engine never talks to a Lab: `LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET` set on a standalone **API** are refused at startup (a standalone content worker ignores every `LAB_*` setting, with a warning).
 
 The hosted engine **refuses to start** without `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`. At startup it calls `GET {LAB_URL}/internal/instances/me` and refuses to start on a `401` (wrong or revoked credentials: re-issue them on the Lab), a `404` (wrong `LAB_URL`, or a Lab that predates contract v2), or an instance the Lab does not describe as a hosted `scrapix` engine.
 
 | Variable | Where | Default | Description |
 |----------|-------|---------|-------------|
-| `LAB_URL` | engine | none | **Required (hosted).** The Lab's base URL, e.g. `https://lab.meilisearch.com` (no path), as printed by the Lab's mint task. Events go to `{LAB_URL}/internal/events`; the rest of the boundary to `{LAB_URL}/internal/*`. |
-| `LAB_INSTANCE_ID` | engine | none | **Required (hosted).** The uuid the Lab's operator minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>`, which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
-| `LAB_INSTANCE_SECRET` | engine | none | **Required with `LAB_INSTANCE_ID`.** 64 hex characters minted with the id. Bearer token on `/internal/*` calls, HMAC key on event batches. Rotate it with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` on the Lab; the old value stays valid for 10 minutes. |
+| `LAB_URL` | engine, content worker | none | **Required (hosted).** The Lab's base URL, e.g. `https://lab.meilisearch.com` (no path), as printed by the Lab's mint task. Events go to `{LAB_URL}/internal/events`; the rest of the boundary to `{LAB_URL}/internal/*`. |
+| `LAB_INSTANCE_ID` | engine, content worker | none | **Required (hosted).** The uuid the Lab's operator minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>`, which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused by a standalone API; a hosted content worker needs the API's value too (see below). |
+| `LAB_INSTANCE_SECRET` | engine, content worker | none | **Required with `LAB_INSTANCE_ID`.** 64 hex characters minted with the id. Bearer token on `/internal/*` calls, HMAC key on event batches. Rotate it with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` on the Lab; the old value stays valid for 10 minutes. |
 | `LAB_SERVICE_TOKEN` | engine | none | **Required (hosted).** The token the Lab presents (with `X-Scrapix-Account-Id`) when it calls this engine for an account; at least 32 characters (`openssl rand -hex 32`). Generate it first: it is passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). The engine never sends it to the Lab. |
 | `LAB_EVENTS_URL` | engine | none | **Deprecated.** Fallback for `LAB_URL` (the old `…/internal/events` URL). |
 | `LAB_EVENTS_SECRET` | engine | none | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |
+
+#### AI through the team's Gateway
+
+Hosted Scrapix needs no AI provider and no provider key (`AI_PROVIDER`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` are not read for tenants). Every LLM call (`/scrape` `ai`, `/extract`, `/parse`, crawl `ai_summary` / `ai_extraction`, vision OCR) goes through the team's Lumen gateway with a `lab-scrapix` key the engine fetches from the Lab (`GET /internal/accounts/{id}/ai`, cached for the `cache_ttl` the Lab returns; a team without AI gets no AI work, and Lumen bills the tokens to the team).
+
+The **content workers** resolve that key per message, so a hosted content worker needs `SCRAPIX_MODE=hosted` plus the API's `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET`. A hosted worker refuses to start without them. A worker left on the default `SCRAPIX_MODE=standalone` ignores `LAB_*` (with a warning) and enriches with the env provider (see [AI Enrichment](#ai-enrichment)), so a hosted deployment that forgets `SCRAPIX_MODE=hosted` on its workers gets no crawl AI.
 
 <Note>
 **Credential revocation is not instant.** The engine caches each credential's introspection answer for the `cache_ttl` the Lab returns (30 s by default, capped at 5 min), so a revoked or deleted API key keeps working on the engine for up to that long. While the Lab is unreachable, a credential that was valid is served stale for up to 5 more minutes, except answers with `cache_ttl` 0 (expired or expiring), which are never served stale. Lower the Lab's `cache_ttl` to shorten the window.
@@ -211,10 +217,12 @@ modes.
 
 ### AI Enrichment
 
+In standalone mode the env provider below serves every AI feature. In hosted mode none of the provider variables applies: AI uses the team's Gateway key from the Lab, and the content worker needs `SCRAPIX_MODE=hosted` and `LAB_*` ([Lab Boundary](#lab-boundary-hosted-only)).
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AI_PROVIDER` | `openai` | AI provider (`openai`, `anthropic`, etc.) |
-| `OPENAI_API_KEY` | — | OpenAI API key |
+| `AI_PROVIDER` | `anthropic` | **Standalone only.** AI provider (`openai`, `anthropic`, `gemini`, `mistral`). Hosted mode ignores it: AI goes through the team's Gateway ([Lab Boundary](#lab-boundary-hosted-only)) |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | **Standalone only.** API key of the provider chosen by `AI_PROVIDER` |
 | `ENABLE_SUMMARY` | `false` | Enable AI summarization |
 | `ENABLE_EXTRACTION` | `false` | Enable AI extraction |
 | `EXTRACTION_PROMPT` | — | Custom extraction prompt |
@@ -229,7 +237,7 @@ Read by the API (`/scrape`, `/parse`) and the content workers. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DOCUMENT_MAX_SIZE_MB` | `50` | API: maximum document size for `/scrape` of a document URL and `/parse` uploads |
-| `OCR_BACKEND` | `auto` | `auto` (vision LLM when an AI provider is configured, else Tesseract), `vision`, `tesseract`, or `off` |
+| `OCR_BACKEND` | `auto` | `auto` (vision LLM when an AI provider is configured, else Tesseract), `vision`, `tesseract`, or `off`. Hosted vision OCR runs on the team's Gateway with the Lab's vision model |
 | `OCR_MODEL` | provider default | Vision model for `OCR_BACKEND=vision` (default: `claude-haiku-4-5-20251001` / `gpt-5-mini` / `gemini-2.5-flash` / `mistral-small-latest`) |
 | `TESSERACT_PATH` | `tesseract` | Tesseract binary |
 | `OCR_TESSERACT_LANG` | `eng` | Tesseract languages (e.g. `eng+fra`) |
