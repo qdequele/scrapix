@@ -376,6 +376,10 @@ struct PageAi {
 enum NoAi {
     /// Standalone: no AI provider configured.
     NoProvider,
+    /// Standalone, yet the page carries an account: it comes from a hosted
+    /// engine, so this worker is misconfigured (SCRAPIX_MODE). Never the
+    /// env provider for a tenant.
+    HostedPage,
     /// Hosted: the page has no account, so no team (never another team's
     /// key, never the env provider).
     NoAccount,
@@ -390,6 +394,9 @@ impl NoAi {
     fn reason(&self) -> &'static str {
         match self {
             NoAi::NoProvider => "no AI provider configured",
+            NoAi::HostedPage => {
+                "the page belongs to a hosted account but this worker runs standalone"
+            }
             NoAi::NoAccount => "the page has no account",
             NoAi::NoTeamAi => "AI is not available for this account",
             NoAi::Unavailable => "AI configuration unavailable",
@@ -1755,17 +1762,17 @@ impl ContentWorker {
         rejected_key_id: Option<&str>,
     ) -> Result<PageAi, NoAi> {
         let Some(hosted) = self.hosted_ai.as_ref() else {
-            return self
-                .ai_service
-                .clone()
-                .map(|service| PageAi {
-                    service,
-                    vision_model: None,
-                    key_id: None,
-                })
-                .ok_or(NoAi::NoProvider);
+            let service = self.ai_service.clone().ok_or(NoAi::NoProvider)?;
+            if page_account(msg).is_some() {
+                return Err(NoAi::HostedPage);
+            }
+            return Ok(PageAi {
+                service,
+                vision_model: None,
+                key_id: None,
+            });
         };
-        let Some(account_id) = msg.account_id.as_deref().filter(|a| !a.is_empty()) else {
+        let Some(account_id) = page_account(msg) else {
             return Err(NoAi::NoAccount);
         };
         let target = match hosted.lab.ai(account_id, rejected_key_id).await {
@@ -1792,6 +1799,15 @@ impl ContentWorker {
     async fn report_no_ai(&self, msg: &RawPageMessage, why: &NoAi) {
         match why {
             NoAi::NoProvider => self.warn_job_once(&msg.job_id, WARN_AI_NO_PROVIDER).await,
+            NoAi::HostedPage => {
+                error!(
+                    job_id = %msg.job_id,
+                    url = %msg.url,
+                    "AI enrichment skipped: the page belongs to a hosted account but this content \
+                     worker runs standalone; set SCRAPIX_MODE=hosted and the API's LAB_* on it"
+                );
+                self.warn_job_once(&msg.job_id, WARN_AI_UNAVAILABLE).await;
+            }
             NoAi::NoAccount => warn!(
                 job_id = %msg.job_id,
                 url = %msg.url,
@@ -1864,6 +1880,9 @@ impl ContentWorker {
     /// team AI (no account, none for the team, Lab unreachable) an engine
     /// whose own backend is an AI provider skips OCR with the returned
     /// warning, and a local engine (Tesseract) runs as configured.
+    /// Standalone: a page carrying an account comes from a hosted engine
+    /// (misconfigured worker), so an AI backend skips OCR rather than spend
+    /// the env key on a tenant.
     /// `Ok(None)`: the engine runs as configured (standalone, a local-only
     /// engine, or no page to recognize).
     async fn ocr_ai(
@@ -1872,7 +1891,19 @@ impl ContentWorker {
         engine: &OcrEngine,
         has_pages: bool,
     ) -> Result<Option<PageAi>, String> {
-        if self.hosted_ai.is_none() || !has_pages || !engine.accepts_request_client() {
+        if self.hosted_ai.is_none() {
+            if has_pages && engine.uses_ai() && page_account(msg).is_some() {
+                error!(
+                    job_id = %msg.job_id,
+                    url = %msg.url,
+                    "Vision OCR skipped: {}; set SCRAPIX_MODE=hosted on this worker",
+                    NoAi::HostedPage.reason()
+                );
+                return Err(format!("OCR skipped: {}", NoAi::Unavailable.reason()));
+            }
+            return Ok(None);
+        }
+        if !has_pages || !engine.accepts_request_client() {
             return Ok(None);
         }
         let why = match self.resolve_ai(msg, None).await {
@@ -2052,6 +2083,12 @@ impl ContentWorker {
             _ => None,
         }
     }
+}
+
+/// The page's account, if it carries one (hosted engines stamp it; a
+/// standalone engine never does).
+fn page_account(msg: &RawPageMessage) -> Option<&str> {
+    msg.account_id.as_deref().filter(|a| !a.is_empty())
 }
 
 /// The Lab for `SCRAPIX_MODE=hosted` (`None` in standalone). Hosted refuses
@@ -3447,8 +3484,27 @@ mod tests {
         let env_ai = lumen_answering("A short summary.").await;
         let bus = ChannelBus::new();
         let events = events_reader(&bus);
-        let mut w = build_worker(&bus, &ms, &[]);
-        // The env provider (AI_PROVIDER + its key), pointed at the mock.
+        let w = started(standalone_worker_with_env_ai(&bus, &ms, &env_ai));
+
+        index_all(&w, vec![ai_page("https://a.test/1", None)]).await;
+
+        let requests = env_ai.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(bearer(&requests[0]), "Bearer env-key");
+        // Not a Lumen target: no metadata header.
+        assert!(requests[0].headers.get("x-lumen-metadata").is_none());
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+    }
+
+    /// A standalone worker with the env provider (AI_PROVIDER + its key)
+    /// pointed at `env_ai`.
+    fn standalone_worker_with_env_ai(
+        bus: &ChannelBus,
+        ms: &MockServer,
+        env_ai: &MockServer,
+    ) -> ContentWorker {
+        let mut w = build_worker(bus, ms, &[]);
         let client = AiClient::new(scrapix_ai::AiClientConfig {
             api_key: "env-key".into(),
             provider: "openai".into(),
@@ -3460,17 +3516,86 @@ mod tests {
         w.ai_service = Some(Arc::new(
             AiService::minimal(Arc::new(client)).with_summarization(),
         ));
-        let w = started(w);
+        w
+    }
 
+    #[tokio::test]
+    async fn standalone_worker_never_spends_env_ai_on_a_hosted_page() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let env_ai = lumen_answering("A short summary.").await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(standalone_worker_with_env_ai(&bus, &ms, &env_ai));
+
+        // An account on the page: it comes from a hosted engine, and this
+        // worker was left on the default standalone mode.
         index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
 
-        let requests = env_ai.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(bearer(&requests[0]), "Bearer env-key");
-        // Not a Lumen target: no metadata header.
-        assert!(requests[0].headers.get("x-lumen-metadata").is_none());
+        assert!(env_ai.received_requests().await.unwrap().is_empty());
         let events: Vec<CrawlEvent> = drain(&events).await;
-        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::JobWarning { message, .. } if message == WARN_AI_UNAVAILABLE
+            )),
+            "{events:?}"
+        );
+        let logs = logs.text();
+        assert!(
+            logs.contains("ERROR") && logs.contains("SCRAPIX_MODE=hosted"),
+            "{logs}"
+        );
+    }
+
+    struct FakeVision;
+    #[async_trait::async_trait]
+    impl scrapix_ocr::OcrBackend for FakeVision {
+        fn name(&self) -> &str {
+            "fake-vision"
+        }
+        async fn recognize(&self, _: &[u8], _: &str) -> Result<String, scrapix_ocr::OcrError> {
+            Ok("Invoice number 4821".to_string())
+        }
+        fn uses_ai(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_worker_skips_ai_ocr_on_a_hosted_page() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let mut w = build_worker(&bus, &ms, &[]);
+        w.ocr = Some(Arc::new(OcrEngine::new(
+            Arc::new(FakeRaster),
+            Arc::new(FakeVision),
+            Arc::new(scrapix_ocr::MemoryOcrCache::new(10)),
+            Arc::new(scrapix_ocr::MemoryOcrBudget::new(0)),
+            scrapix_ocr::OcrSettings::default(),
+        )));
+        let w = started(w);
+        let mut msg = doc_page(
+            "https://a.test/mixed.pdf",
+            "application/pdf",
+            &fixture("mixed.pdf"),
+            pdf_on(scrapix_core::OcrMode::Auto),
+        );
+
+        // No account (a standalone engine's page): the env-backed engine
+        // runs as configured.
+        msg.account_id = None;
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 1);
+        assert!(doc.markdown.unwrap().contains("Invoice number 4821"));
+
+        // An account: skipped, the scanned page stays flagged.
+        msg.account_id = Some("acct".into());
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 0);
+        assert!(!doc.markdown.unwrap().contains("Invoice number 4821"));
+        assert_eq!(doc.metadata.unwrap()["needs_ocr"], "true");
     }
 
     #[tokio::test]
@@ -3660,7 +3785,7 @@ mod tests {
         ));
         let w = started(w);
 
-        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+        index_all(&w, vec![ai_page("https://a.test/1", None)]).await;
 
         assert!(lab.ai_queries().is_empty());
         let requests = env_ai.received_requests().await.unwrap();

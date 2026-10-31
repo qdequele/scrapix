@@ -651,7 +651,7 @@ GROUP BY date ORDER BY date;
 
 | Variable | Description |
 |----------|-------------|
-| `SCRAPIX_MODE` | API and content worker: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start. A hosted content worker resolves each team's AI key from the Lab (crawl AI and vision OCR), so it needs `LAB_*` too; a standalone one ignores `LAB_*` (warned) and uses the env AI provider |
+| `SCRAPIX_MODE` | API and content worker: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start. A hosted content worker resolves each team's AI key from the Lab (crawl AI and vision OCR), so it needs `LAB_*` too; a standalone one ignores `LAB_*` (warned) and uses the env AI provider, except for pages carrying an account (a hosted engine's): it skips their AI and AI OCR rather than spend the env key on a tenant |
 | `SCRAPIX_ADMIN_KEY` | API, standalone only: the operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; `?token=` on WebSocket routes). Required unless `SCRAPIX_AUTH=disabled`; must be ≥16 chars after trimming |
 | `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode and together with `SCRAPIX_ADMIN_KEY`) |
 | `DATABASE_URL` | API: the engine's **own** job-history store in both modes; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema, so it can never be the Lab's). Hosted production should point it at a dedicated Postgres database (e.g. `scrapix_engine`). |

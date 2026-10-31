@@ -91,6 +91,7 @@ done
 # It prints LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET once.
 flyctl secrets set \
   DATABASE_URL=... \
+  OPENAI_API_KEY=... \
   LAB_URL=<LAB_URL printed by the Lab> \
   LAB_INSTANCE_ID=<LAB_INSTANCE_ID printed by the Lab> \
   LAB_INSTANCE_SECRET=<LAB_INSTANCE_SECRET printed by the Lab> \
@@ -105,19 +106,6 @@ flyctl secrets set \
 # with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` — see
 # deploy/kubernetes/README.md and docs/operations/crawl-engine-rollout.mdx. Stripe is configured on the
 # Lab only; the engine never reads STRIPE_SECRET_KEY.
-#
-# Hosted AI goes through each team's Lumen gateway with the key the Lab
-# serves, so no AI_PROVIDER / provider key. The content worker resolves that
-# key per message: its fly.toml sets SCRAPIX_MODE=hosted, so it refuses to
-# start without the API's LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET.
-# Set them BEFORE deploying it, and remove any provider key it still has (a
-# standalone worker would spend it on every tenant's crawl AI and OCR):
-flyctl secrets set \
-  LAB_URL=<the API's LAB_URL> \
-  LAB_INSTANCE_ID=<the API's LAB_INSTANCE_ID> \
-  LAB_INSTANCE_SECRET=<the API's LAB_INSTANCE_SECRET> \
-  --app scrapix-worker-content
-flyctl secrets unset OPENAI_API_KEY ANTHROPIC_API_KEY --app scrapix-worker-content  # if set
 ```
 
 ### 4. First deploy
