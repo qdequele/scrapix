@@ -1365,54 +1365,16 @@ mod tests {
     // ---- hosted: the team's Lumen gateway, resolved through the Lab ----
 
     use crate::ai_access::NO_AI_MESSAGE;
-    use crate::lab_client::{testing::FakeLab, AiTarget};
+    use crate::lab_client::testing::FakeLab;
     use crate::lab_events::MemoryOutbox;
-    use crate::results::test_support::test_state_with_lab_ai;
-
-    const ACCOUNT: &str = "7f1c2a8e-0000-4000-8000-000000000001";
-
-    fn hosted_ctx() -> Option<AccountContext> {
-        Some(AccountContext {
-            account_id: ACCOUNT.into(),
-            api_key_id: Some("k".into()),
-            tier: "pro".into(),
-            user_role: None,
-            limits: None,
-        })
-    }
+    use crate::results::test_support::{
+        hosted_ai_state, hosted_ctx, lumen_metadata, lumen_refusing, lumen_target,
+    };
 
     /// A hosted state whose account has credits and, when `lumen` is set,
     /// a Lumen target there (the Lab answers 404 otherwise).
     async fn hosted(lumen: Option<&MockServer>) -> (FakeLab, Arc<AppState>, Arc<MemoryOutbox>) {
-        let lab = FakeLab::start().await;
-        lab.set_account(ACCOUNT, FakeLab::identity(ACCOUNT, "pro", 1000));
-        lab.set_ai(
-            ACCOUNT,
-            lumen.map(|lumen| AiTarget {
-                base_url: format!("{}/v1", lumen.uri()),
-                api_key: "fg-1".into(),
-                key_id: "k-1".into(),
-                default_model: "lab-default-model".into(),
-                vision_model: "lab-vision-model".into(),
-            }),
-        );
-        let (state, outbox) = test_state_with_lab_ai(&scrapix_queue::ChannelBus::new(), &lab);
-        (lab, state, outbox)
-    }
-
-    /// Lumen refusing every chat call with `status` and a gateway `code`.
-    async fn lumen_refusing(status: u16, code: &str, message: &str) -> MockServer {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(status).set_body_json(serde_json::json!({
-                    "error": { "code": code, "message": message, "type": "lumen_error" }
-                })),
-            )
-            .mount(&server)
-            .await;
-        server
+        hosted_ai_state(lumen.map(|lumen| lumen_target(lumen, "fg-1"))).await
     }
 
     fn with_model(mut request: ExtractRequest, model: &str) -> ExtractRequest {
@@ -1481,17 +1443,8 @@ mod tests {
         assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
         let calls = lumen.received_requests().await.unwrap();
         assert_eq!(calls.len(), 1);
-        let metadata: Value = serde_json::from_str(
-            calls[0]
-                .headers
-                .get("x-lumen-metadata")
-                .expect("x-lumen-metadata")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
         assert_eq!(
-            metadata,
+            lumen_metadata(&calls[0]),
             serde_json::json!({
                 "product": "scrapix",
                 "feature": "extract",

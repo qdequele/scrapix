@@ -14,28 +14,15 @@ use crate::usage_units::{feature_format_count, page_feature_count};
 use crate::ScrapeFormat;
 use scrapix_core::FeaturesConfig;
 
-/// Credits for one scraped page: +1 per feature format, +5 for a delivered
-/// AI summary, +5 for a delivered AI extraction, at least 1.
-fn scrape_credits_for_count(
-    feature_formats: i64,
-    has_ai_summary: bool,
-    has_ai_extraction: bool,
-) -> i64 {
-    let ai_cost = if has_ai_summary { 5 } else { 0 } + if has_ai_extraction { 5 } else { 0 };
-    (feature_formats + ai_cost).max(1)
-}
-
-/// Credits for a `/scrape` (and a document scrape or `/parse` upload).
+/// Credits for a `/scrape` (and a document scrape or `/parse` upload): +1
+/// per feature format, at least 1. The delivered AI summary and extraction
+/// (f2ab8d2: +5 each) add nothing: the team's AI gateway meters them.
 pub(crate) fn scrape_credits(
     formats: &[ScrapeFormat],
-    has_ai_summary: bool,
-    has_ai_extraction: bool,
+    _has_ai_summary: bool,
+    _has_ai_extraction: bool,
 ) -> i64 {
-    scrape_credits_for_count(
-        feature_format_count(formats) as i64,
-        has_ai_summary,
-        has_ai_extraction,
-    )
+    (feature_format_count(formats) as i64).max(1)
 }
 
 /// Non-AI per-page feature surcharge of a crawl: +1 per enabled feature
@@ -137,13 +124,14 @@ mod tests {
     }
 
     #[test]
-    fn scrape_credits_ai() {
-        assert_eq!(scrape_credits(&[], true, false), 5);
-        assert_eq!(scrape_credits(&[], false, true), 5);
-        assert_eq!(scrape_credits(&[], true, true), 10);
-        // 2 feature formats + AI summary + AI extraction = 2 + 5 + 5 = 12
+    fn scrape_credits_ignore_ai() {
+        // The team's AI gateway meters AI: a summary or an extraction adds
+        // nothing to the page.
+        assert_eq!(scrape_credits(&[], true, false), 1);
+        assert_eq!(scrape_credits(&[], false, true), 1);
+        assert_eq!(scrape_credits(&[], true, true), 1);
         let two = [ScrapeFormat::Markdown, ScrapeFormat::Links];
-        assert_eq!(scrape_credits(&two, true, true), 12);
+        assert_eq!(scrape_credits(&two, true, true), 2);
     }
 
     #[test]

@@ -34,6 +34,7 @@ use scrapix_ocr::{OcrReport, OcrRequest};
 use scrapix_parser::{document::markdown_links, DocumentKind, ParseOptions, ParsedDocument};
 use scrapix_storage::clickhouse::RequestEvent as ClickHouseRequestEvent;
 
+use crate::ai_access::ResolvedAi;
 use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
@@ -181,7 +182,9 @@ pub(crate) struct DocumentJob<'a> {
     pub formats: Vec<ScrapeFormat>,
     pub include_links: bool,
     pub parsers: ParserOptions,
-    pub ai: Option<&'a AiOptions>,
+    /// The requested AI work, with the service resolved for it (`None`
+    /// when no AI work is asked).
+    pub ai: Option<(&'a AiOptions, ResolvedAi)>,
     pub status_code: u16,
     pub js_rendered: bool,
 }
@@ -411,16 +414,29 @@ pub(crate) async fn document_response(
         prompt_tokens,
         completion_tokens,
         model,
-    } = run_ai_enrichment(
-        state,
-        job.ai,
-        if parsed.markdown.is_empty() {
-            &text
-        } else {
-            &parsed.markdown
-        },
-    )
-    .await;
+    } = match job.ai {
+        Some((options, ref ai)) => {
+            let usage = AiUsageContext {
+                account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
+                url: job.label.clone(),
+                ..Default::default()
+            };
+            run_ai_enrichment(
+                state,
+                account_ctx.as_ref(),
+                ai,
+                options,
+                if parsed.markdown.is_empty() {
+                    &text
+                } else {
+                    &parsed.markdown
+                },
+                usage,
+            )
+            .await
+        }
+        None => AiRun::default(),
+    };
     if let Some(w) = ai_warning {
         warnings.push(w);
     }
@@ -657,7 +673,7 @@ pub(crate) async fn parse_upload(
     // detection falls back to the bytes. The filename is never trusted.
     let content_type = part_content_type.filter(|ct| !ct.trim().is_empty());
 
-    require_ai_provider(&state, options.ai.as_ref())?;
+    let ai = require_ai_provider(&state, account_ctx.as_ref(), options.ai.as_ref()).await?;
     if let (Some(lab), Some(ctx)) = (&state.lab_api, &account_ctx) {
         billing::check_credits(lab, &ctx.account_id).await?;
     }
@@ -682,7 +698,7 @@ pub(crate) async fn parse_upload(
             formats: options.formats.clone(),
             include_links: options.include_links,
             parsers: options.parsers.clone(),
-            ai: options.ai.as_ref(),
+            ai: options.ai.as_ref().zip(ai),
             status_code: 200,
             js_rendered: false,
         },
@@ -838,10 +854,22 @@ mod tests {
         state: Arc<AppState>,
         parts: &[Part<'_>],
     ) -> (StatusCode, serde_json::Value) {
-        let app = Router::new()
+        post_parse_as(state, None, parts).await
+    }
+
+    /// `POST /parse`, authenticated as `account` when set.
+    async fn post_parse_as(
+        state: Arc<AppState>,
+        account: Option<AuthenticatedAccount>,
+        parts: &[Part<'_>],
+    ) -> (StatusCode, serde_json::Value) {
+        let mut app = Router::new()
             .route("/parse", post(parse_upload))
-            .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))
-            .with_state(state);
+            .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024));
+        if let Some(account) = account {
+            app = app.layer(Extension(account));
+        }
+        let app = app.with_state(state);
         let response = app
             .oneshot(
                 Request::post("/parse")
@@ -1030,6 +1058,50 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["code"], "service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn parse_ai_goes_through_lumen() {
+        use crate::results::test_support::{
+            hosted_ai_state, lumen_answering, lumen_metadata, lumen_target, HOSTED_ACCOUNT,
+        };
+        let lumen = lumen_answering("A short summary.").await;
+        let (_lab, state, outbox) = hosted_ai_state(Some(lumen_target(&lumen, "fg-1"))).await;
+        let account = AuthenticatedAccount {
+            account_id: HOSTED_ACCOUNT.into(),
+            tier: "pro".into(),
+            api_key_id: Some("k".into()),
+            role: None,
+            limits: None,
+        };
+        let (status, body) = post_parse_as(
+            state,
+            Some(account),
+            &[
+                ("options", None, None, br#"{"ai":{"summary":true}}"#),
+                (
+                    "file",
+                    Some("t.csv"),
+                    Some("text/csv"),
+                    b"name,price\nwidget,42\n",
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ai"]["summary"], "A short summary.", "{body}");
+        let calls = lumen.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].headers.get("authorization").unwrap(),
+            "Bearer fg-1"
+        );
+        assert_eq!(lumen_metadata(&calls[0])["feature"], "ai_summary");
+        // The document is charged; the summary only counted.
+        let events = outbox.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["credits"], 1);
+        assert_eq!(events[0].data["units"]["ai_summary"], 1);
     }
 
     #[tokio::test]

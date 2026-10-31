@@ -923,6 +923,110 @@ pub(crate) mod test_support {
         (Arc::new(state), rx)
     }
 
+    /// The account of the hosted helpers below.
+    pub(crate) const HOSTED_ACCOUNT: &str = "7f1c2a8e-0000-4000-8000-000000000001";
+
+    /// A request context for [`HOSTED_ACCOUNT`].
+    pub(crate) fn hosted_ctx() -> Option<crate::AccountContext> {
+        Some(crate::AccountContext {
+            account_id: HOSTED_ACCOUNT.into(),
+            api_key_id: Some("k".into()),
+            tier: "pro".into(),
+            user_role: None,
+            limits: None,
+        })
+    }
+
+    /// The Lab's AI target for `lumen` (`/v1` on the mock), with `api_key`
+    /// as key `k-1`.
+    pub(crate) fn lumen_target(
+        lumen: &wiremock::MockServer,
+        api_key: &str,
+    ) -> crate::lab_client::AiTarget {
+        crate::lab_client::AiTarget {
+            base_url: format!("{}/v1", lumen.uri()),
+            api_key: api_key.into(),
+            key_id: "k-1".into(),
+            default_model: "lab-default-model".into(),
+            vision_model: "lab-vision-model".into(),
+        }
+    }
+
+    /// A hosted state whose [`HOSTED_ACCOUNT`] has credits and, with
+    /// `target`, an AI target (the Lab answers 404 otherwise).
+    pub(crate) async fn hosted_ai_state(
+        target: Option<crate::lab_client::AiTarget>,
+    ) -> (
+        crate::lab_client::testing::FakeLab,
+        Arc<AppState>,
+        Arc<crate::lab_events::MemoryOutbox>,
+    ) {
+        let lab = crate::lab_client::testing::FakeLab::start().await;
+        lab.set_account(
+            HOSTED_ACCOUNT,
+            crate::lab_client::testing::FakeLab::identity(HOSTED_ACCOUNT, "pro", 1000),
+        );
+        lab.set_ai(HOSTED_ACCOUNT, target);
+        let (state, outbox) = test_state_with_lab_ai(&ChannelBus::new(), &lab);
+        (lab, state, outbox)
+    }
+
+    /// Lumen answering every chat call with `reply`.
+    pub(crate) async fn lumen_answering(reply: &str) -> wiremock::MockServer {
+        lumen_responding(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "mock",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": reply },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })),
+        )
+        .await
+    }
+
+    /// Lumen refusing every chat call with `status` and a gateway `code`.
+    pub(crate) async fn lumen_refusing(
+        status: u16,
+        code: &str,
+        message: &str,
+    ) -> wiremock::MockServer {
+        lumen_responding(
+            wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "error": { "code": code, "message": message, "type": "lumen_error" }
+            })),
+        )
+        .await
+    }
+
+    async fn lumen_responding(response: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The `x-lumen-metadata` object of a Lumen request.
+    pub(crate) fn lumen_metadata(request: &wiremock::Request) -> serde_json::Value {
+        serde_json::from_str(
+            request
+                .headers
+                .get("x-lumen-metadata")
+                .expect("x-lumen-metadata")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
     fn attach_lab_ai(
         state: &mut AppState,
         lab: &crate::lab_client::testing::FakeLab,
