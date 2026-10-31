@@ -760,9 +760,6 @@ impl LabClient {
     /// LLM calls; `None` when the Lab has none for it (404). A
     /// `rejected_key_id` (the key Lumen just refused) skips the cache, asks
     /// the Lab for a replacement and makes that the cached answer.
-    // No caller yet: the AI resolver (a later task of this PR) consumes it;
-    // drop the allow there.
-    #[allow(dead_code)]
     pub(crate) async fn ai(
         &self,
         account_id: &str,

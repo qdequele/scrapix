@@ -899,6 +899,22 @@ pub(crate) mod test_support {
         (Arc::new(state), outbox)
     }
 
+    /// Hosted-style: AI resolved through `lab` (`GET /internal/accounts/{id}/ai`),
+    /// no env AI service, and an in-memory Lab outbox.
+    pub(crate) fn test_state_with_lab_ai(
+        bus: &ChannelBus,
+        lab: &crate::lab_client::testing::FakeLab,
+    ) -> (Arc<AppState>, Arc<crate::lab_events::MemoryOutbox>) {
+        let mut state = build_state(bus, None);
+        state.lab_api = Some(Arc::new(crate::lab_client::LabClient::new(
+            &lab.url,
+            crate::lab_client::testing::INSTANCE_ID,
+            crate::lab_client::testing::SECRET,
+        )));
+        let outbox = crate::with_memory_lab(&mut state);
+        (Arc::new(state), outbox)
+    }
+
     fn build_state(bus: &ChannelBus, ai_service: Option<Arc<scrapix_ai::AiService>>) -> AppState {
         let robots = Arc::new(
             RobotsCache::new(RobotsConfig {

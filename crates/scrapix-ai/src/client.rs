@@ -107,6 +107,11 @@ pub struct AiClientConfig {
     /// Request timeout (ms)
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// Send the `x-lumen-metadata` header (OpenAI provider only): set when
+    /// `base_url` is a Lumen gateway.
+    #[serde(default)]
+    pub lumen_metadata: bool,
 }
 
 fn default_provider() -> String {
@@ -136,6 +141,7 @@ impl Default for AiClientConfig {
             max_retries: default_max_retries(),
             retry_delay_ms: default_retry_delay_ms(),
             timeout_ms: default_timeout_ms(),
+            lumen_metadata: false,
         }
     }
 }
@@ -226,10 +232,10 @@ impl AiClient {
         }
 
         let provider: Box<dyn LlmProvider> = match config.provider.as_str() {
-            "openai" => Box::new(OpenAiProvider::new(
-                &config.api_key,
-                config.base_url.as_deref(),
-            )),
+            "openai" => Box::new(
+                OpenAiProvider::new(&config.api_key, config.base_url.as_deref())
+                    .with_lumen_metadata(config.lumen_metadata),
+            ),
             "anthropic" => Box::new(AnthropicProvider::new(&config.api_key)),
             "gemini" => Box::new(GeminiProvider::new(&config.api_key)),
             "mistral" => Box::new(MistralProvider::new(&config.api_key)),

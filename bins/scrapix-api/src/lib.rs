@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) mod ai_access;
 pub mod analytics;
 pub(crate) mod analytics_pipes;
 pub mod auth;
@@ -348,8 +349,12 @@ struct AppState {
     fetcher: Arc<HttpFetcher>,
     /// Optional browser renderer for JS rendering in /scrape and /map
     browser_renderer: Option<Arc<CdpRenderer>>,
-    /// Optional AI service for /scrape enrichment
+    /// Optional AI service for /scrape enrichment (standalone; hosted
+    /// requests resolve theirs with [`ai_access::resolve_ai`]).
     ai_service: Option<Arc<AiService>>,
+    /// Hosted: the per-key Lumen services `ai_access::resolve_ai` builds
+    /// from the Lab's AI targets (unused in standalone).
+    pub(crate) hosted_ai: ai_access::HostedAiClients,
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
@@ -475,6 +480,7 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
+            hosted_ai: ai_access::HostedAiClients::default(),
             ocr: None,
             lab: None,
             accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),

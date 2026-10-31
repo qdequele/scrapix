@@ -33,19 +33,24 @@ const RETRY_MAX_ELAPSED: Duration = Duration::from_secs(60);
 pub struct OpenAiProvider {
     config: OpenAIConfig,
     http: reqwest::Client,
+    /// Send `x-lumen-metadata` (only to a Lumen gateway, see
+    /// [`OpenAiProvider::with_lumen_metadata`]).
+    lumen_metadata: bool,
 }
 
-/// An [`OpenAIConfig`] that also sends the Lumen metadata header.
+/// An [`OpenAIConfig`] that also sends the Lumen metadata header, if any.
 #[derive(Clone)]
 struct MetadataConfig {
     inner: OpenAIConfig,
-    metadata: HeaderValue,
+    metadata: Option<HeaderValue>,
 }
 
 impl Config for MetadataConfig {
     fn headers(&self) -> HeaderMap {
         let mut headers = self.inner.headers();
-        headers.insert(LUMEN_METADATA_HEADER, self.metadata.clone());
+        if let Some(metadata) = &self.metadata {
+            headers.insert(LUMEN_METADATA_HEADER, metadata.clone());
+        }
         headers
     }
 
@@ -130,14 +135,25 @@ impl OpenAiProvider {
         Self {
             config,
             http: reqwest::Client::new(),
+            lumen_metadata: false,
         }
+    }
+
+    /// Attach `x-lumen-metadata` to every call: set for a Lumen gateway
+    /// (hosted), never for a provider's own API (standalone), which gets no
+    /// job ids.
+    pub fn with_lumen_metadata(mut self, enabled: bool) -> Self {
+        self.lumen_metadata = enabled;
+        self
     }
 
     /// A client for one call, carrying that call's metadata header.
     fn client(&self) -> OpenAIClient<MetadataConfig> {
-        let ctx = AI_USAGE_CONTEXT.try_with(|c| c.clone()).ok();
-        let metadata = HeaderValue::from_str(&lumen_metadata(ctx.as_ref()))
-            .unwrap_or_else(|_| HeaderValue::from_static(r#"{"product":"scrapix"}"#));
+        let metadata = self.lumen_metadata.then(|| {
+            let ctx = AI_USAGE_CONTEXT.try_with(|c| c.clone()).ok();
+            HeaderValue::from_str(&lumen_metadata(ctx.as_ref()))
+                .unwrap_or_else(|_| HeaderValue::from_static(r#"{"product":"scrapix"}"#))
+        });
         OpenAIClient::with_config(MetadataConfig {
             inner: self.config.clone(),
             metadata,
@@ -314,8 +330,10 @@ mod tests {
         server
     }
 
+    /// A provider for a Lumen target (sends the metadata header).
     fn provider(server: &MockServer) -> OpenAiProvider {
         OpenAiProvider::new("test-key", Some(&format!("{}/v1", server.uri())))
+            .with_lumen_metadata(true)
     }
 
     fn user_message() -> Vec<Message> {
@@ -380,6 +398,31 @@ mod tests {
             metadata_header(&only_request(&server).await),
             json!({"product": "scrapix"})
         );
+    }
+
+    #[tokio::test]
+    async fn openai_sends_no_lumen_metadata_unless_enabled() {
+        let server = lumen_mock().await;
+        let provider = OpenAiProvider::new("test-key", Some(&format!("{}/v1", server.uri())));
+        let ctx = AiUsageContext {
+            job_id: "j-1".to_string(),
+            feature: "extract".to_string(),
+            ..Default::default()
+        };
+
+        AI_USAGE_CONTEXT
+            .scope(
+                ctx,
+                provider.chat(user_message(), "gpt-4o-mini", Some(50), None),
+            )
+            .await
+            .unwrap();
+
+        // Standalone calls (e.g. to api.openai.com) carry no job ids.
+        let request = only_request(&server).await;
+        assert!(request.headers.get("x-lumen-metadata").is_none());
+        let body: Value = request.body_json().unwrap();
+        assert_eq!(body["max_completion_tokens"], 50);
     }
 
     #[tokio::test]
