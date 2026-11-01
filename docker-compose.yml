@@ -203,6 +203,9 @@ services:
       # LAB_INSTANCE_ID: <uuid printed by the Lab>
       # LAB_INSTANCE_SECRET: <64 hex printed by the Lab>
       # LAB_SERVICE_TOKEN: dev-lab-service-token-change-in-production-0000
+      # Hosted AI needs no AI_PROVIDER or provider key (the team's Lumen key
+      # comes from the Lab); give the scrapix-content service below
+      # SCRAPIX_MODE, LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET too.
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
@@ -332,6 +335,11 @@ services:
       BATCH_SIZE: 2000
       CONCURRENCY: 40
       BATCH_TIMEOUT_SECS: 5
+      # Hosted (see the API's commented block): crawl AI needs the Lab too.
+      # SCRAPIX_MODE: hosted
+      # LAB_URL: http://host.docker.internal:8081
+      # LAB_INSTANCE_ID: <uuid printed by the Lab>
+      # LAB_INSTANCE_SECRET: <64 hex printed by the Lab>
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git

@@ -101,7 +101,11 @@ To run the engine in **hosted** mode against a local Lab, start the Lab from a
 `scrapix_engine` database) and switch the API to the commented hosted block
 in `docker-compose.yml` (or in `.env.example` for native `just dev`):
 `SCRAPIX_MODE=hosted`, `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET`,
-`LAB_SERVICE_TOKEN` and a Postgres `DATABASE_URL` on `scrapix_engine`. Pick
+`LAB_SERVICE_TOKEN` and a Postgres `DATABASE_URL` on `scrapix_engine`. Give
+the content worker the same `SCRAPIX_MODE=hosted`, `LAB_URL`, `LAB_INSTANCE_ID`
+and `LAB_INSTANCE_SECRET` (it fetches each team's AI gateway key from the Lab
+for crawl AI; without them its crawls get no AI). Hosted mode needs no
+`AI_PROVIDER` or provider key. Pick
 the `LAB_SERVICE_TOKEN` first, then mint the engine's credentials on the Lab
 with it (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=dev URL=http://localhost:8080 CREDENTIAL=<LAB_SERVICE_TOKEN>`),
 which prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once.

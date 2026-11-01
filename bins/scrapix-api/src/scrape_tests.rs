@@ -7,7 +7,11 @@ use scrapix_queue::ChannelBus;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::results::test_support::{test_state_with_ai_and_lab, test_state_with_lab};
+use crate::ai_access::NO_AI_MESSAGE;
+use crate::results::test_support::{
+    hosted_ai_state, hosted_ctx, lumen_answering, lumen_metadata, lumen_refusing, lumen_target,
+    test_state_with_ai_and_lab, test_state_with_lab,
+};
 
 fn ctx() -> Option<AccountContext> {
     Some(AccountContext {
@@ -197,8 +201,8 @@ async fn a_successful_ai_summary_is_billed() {
                                "feature_pages": 1})
         ]
     );
-    // f2ab8d2: scrape_credits([markdown], true, false) = 1 + 5.
-    assert_eq!(credits(&outbox), vec![6]);
+    // AI adds no credits: scrape_credits([markdown], true, false) = 1.
+    assert_eq!(credits(&outbox), vec![1]);
 }
 
 /// Transition release: the pre-v2 scrape formula counted feature formats
@@ -216,6 +220,137 @@ async fn feature_formats_are_reported_as_feature_pages_with_pre_v2_credits() {
     // f2ab8d2: scrape_credits(3 feature formats, false, false) = 3.
     assert_eq!(credits(&outbox), vec![3]);
     lab_events::assert_contract_valid(&outbox.events());
+}
+
+// ---- hosted: the team's Lumen gateway, resolved through the Lab ----
+
+#[tokio::test]
+async fn scrape_ai_uses_the_team_key_and_requested_model() {
+    let (_site, url) = site().await;
+    let lumen = lumen_answering("A short summary.").await;
+    let (_lab, state, _) = hosted_ai_state(Some(lumen_target(&lumen, "fg-s"))).await;
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown"], "ai": {"summary": true, "model": "m-1"}
+    }));
+    let res = perform_scrape(&state, &hosted_ctx(), &req).await.unwrap();
+    assert_eq!(
+        res.ai.and_then(|a| a.summary).as_deref(),
+        Some("A short summary.")
+    );
+    assert!(res.warning.is_none(), "{:?}", res.warning);
+    let calls = lumen.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].headers.get("authorization").unwrap(),
+        "Bearer fg-s"
+    );
+    let body: serde_json::Value = calls[0].body_json().unwrap();
+    assert_eq!(body["model"], "m-1");
+    // A scrape has no job: only the feature is sent.
+    assert_eq!(
+        lumen_metadata(&calls[0]),
+        serde_json::json!({"product": "scrapix", "feature": "ai_summary"})
+    );
+}
+
+#[tokio::test]
+async fn scrape_ai_credits_are_pages_only() {
+    let formats = [ScrapeFormat::Markdown, ScrapeFormat::Links];
+    assert_eq!(
+        legacy_credits::scrape_credits(&formats, true, true),
+        legacy_credits::scrape_credits(&formats, false, false)
+    );
+
+    let (_site, url) = site().await;
+    let lumen = lumen_answering(r#"{"prices": [42]}"#).await;
+    let (_lab, state, outbox) = hosted_ai_state(Some(lumen_target(&lumen, "fg-1"))).await;
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown"],
+        "ai": {"summary": true, "extract": {"prompt": "prices"}}
+    }));
+    let res = perform_scrape(&state, &hosted_ctx(), &req).await.unwrap();
+    assert!(res.warning.is_none(), "{:?}", res.warning);
+    assert_eq!(lumen.received_requests().await.unwrap().len(), 2);
+    // The delivered AI work is still counted in the units.
+    assert_eq!(
+        charged(&outbox),
+        vec![
+            serde_json::json!({"pages_http": 1, "pages_browser": 0, "ai_summary": 1, "ai_extraction": 1,
+                               "feature_pages": 1})
+        ]
+    );
+    assert_eq!(credits(&outbox), vec![1]);
+    lab_events::assert_contract_valid(&outbox.events());
+}
+
+#[tokio::test]
+async fn scrape_ai_gateway_error_is_a_warning() {
+    let (_site, url) = site().await;
+    for (status, code, message, expected) in [
+        (
+            404,
+            "LM-2001",
+            "model 'm-1' not found",
+            "model 'm-1' not found".to_string(),
+        ),
+        (
+            402,
+            "LM-4001",
+            "budget exceeded",
+            scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string(),
+        ),
+    ] {
+        let lumen = lumen_refusing(status, code, message).await;
+        let (_lab, state, outbox) = hosted_ai_state(Some(lumen_target(&lumen, "fg-1"))).await;
+        let req = request(serde_json::json!({
+            "url": url, "formats": ["markdown"], "ai": {"summary": true, "model": "m-1"}
+        }));
+        let res = perform_scrape(&state, &hosted_ctx(), &req)
+            .await
+            .unwrap_or_else(|e| panic!("{code}: {}", e.error));
+        assert!(res.success);
+        assert!(res.ai.is_none());
+        let warning = res.warning.expect("the failure is reported");
+        assert!(warning.contains(&expected), "{code}: {warning}");
+        // Not retried; the page is still charged.
+        assert_eq!(lumen.received_requests().await.unwrap().len(), 1, "{code}");
+        assert_eq!(credits(&outbox), vec![1], "{code}");
+        assert_eq!(charged(&outbox)[0]["ai_summary"], 0, "{code}");
+    }
+}
+
+#[tokio::test]
+async fn scrape_ai_hosted_without_ai_is_503() {
+    let (_site, url) = site().await;
+    let (lab, state, outbox) = hosted_ai_state(None).await;
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown"], "ai": {"summary": true}
+    }));
+    let err = perform_scrape(&state, &hosted_ctx(), &req)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("AI without a Lab target must be refused"));
+    assert_eq!(err.code, "service_unavailable");
+    assert_eq!(err.error, NO_AI_MESSAGE);
+    assert_eq!(status_of(err), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(charged(&outbox).is_empty(), "nothing billed");
+    assert_eq!(lab.ai_queries(), vec![None]);
+}
+
+#[tokio::test]
+async fn scrape_without_ai_work_never_looks_up_the_account_ai() {
+    let (_site, url) = site().await;
+    // A fresh state: nothing cached, so any lookup would reach the Lab.
+    let (lab, state, _) = hosted_ai_state(None).await;
+    for body in [
+        serde_json::json!({"url": url, "formats": ["markdown"]}),
+        serde_json::json!({"url": url, "formats": ["markdown"], "ai": {"model": "m-1"}}),
+    ] {
+        perform_scrape(&state, &hosted_ctx(), &request(body))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.error));
+    }
+    assert!(lab.ai_queries().is_empty(), "{:?}", lab.ai_queries());
 }
 
 #[tokio::test]

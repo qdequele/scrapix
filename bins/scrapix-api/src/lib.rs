@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) mod ai_access;
 pub mod analytics;
 pub(crate) mod analytics_pipes;
 pub mod auth;
@@ -52,7 +53,15 @@ pub(crate) mod engine_jobs;
 pub(crate) mod extract;
 pub(crate) mod job_kind;
 pub mod job_store;
-pub(crate) mod lab_client;
+/// The Lab client lives in the `scrapix-lab` crate (the content worker needs
+/// the same lookups); re-exported here so call sites keep their
+/// `crate::lab_client::…` paths.
+pub(crate) mod lab_client {
+    pub(crate) use scrapix_lab::{log_lab_error, CredentialKind, Identity, LabClient, LabError};
+
+    #[cfg(test)]
+    pub(crate) use scrapix_lab::{testing, AiTarget, Timing};
+}
 pub(crate) mod lab_events;
 pub(crate) mod lab_sink;
 pub(crate) mod legacy_credits;
@@ -91,7 +100,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
 
-use scrapix_ai::{AiClient, AiService, FieldDefinition as AiFieldDefinition, SchemaBuilder};
+use scrapix_ai::{
+    gateway_codes, AiClient, AiService, AiUsageContext, ExtractionConfig,
+    FieldDefinition as AiFieldDefinition, SchemaBuilder, SummaryConfig, AI_USAGE_CONTEXT,
+};
 use scrapix_core::browser::{Action, RequestCookie};
 use scrapix_core::{
     ConcurrencyConfig, CrawlConfig, CrawlUrl, CrawlerType, FeaturesConfig, JobSpec, JobState,
@@ -348,8 +360,12 @@ struct AppState {
     fetcher: Arc<HttpFetcher>,
     /// Optional browser renderer for JS rendering in /scrape and /map
     browser_renderer: Option<Arc<CdpRenderer>>,
-    /// Optional AI service for /scrape enrichment
+    /// Optional AI service for /scrape enrichment (standalone; hosted
+    /// requests resolve theirs with [`ai_access::resolve_ai`]).
     ai_service: Option<Arc<AiService>>,
+    /// Hosted: the per-key Lumen services `ai_access::resolve_ai` builds
+    /// from the Lab's AI targets (unused in standalone).
+    pub(crate) hosted_ai: scrapix_lab::HostedAiClients,
     /// OCR engine for scanned documents on /scrape and /parse (opt-in per
     /// request via `parsers.ocr`); `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<scrapix_ocr::OcrEngine>>,
@@ -475,6 +491,7 @@ impl AppState {
             fetcher,
             browser_renderer,
             ai_service,
+            hosted_ai: scrapix_lab::HostedAiClients::default(),
             ocr: None,
             lab: None,
             accounting_persisted: std::sync::atomic::AtomicBool::new(job_store.is_some()),
@@ -1243,8 +1260,9 @@ impl AppState {
     /// (deterministic id, one per job) to the job's terminal write, so it
     /// must be called before `write_terminal`. The event carries raw units
     /// plus, for the contract v2 transition release, the pre-v2 `credits`
-    /// (`legacy_credits::crawl_credits` + `ocr_credits`, from the job's
-    /// enabled features). The single billing path for terminal jobs.
+    /// (`legacy_credits::crawl_credits`, from the job's enabled features;
+    /// AI-enriched and OCR'd pages add nothing, the team's AI gateway meters
+    /// them). The single billing path for terminal jobs.
     /// D4/R4: units count what was actually delivered, not the job's static
     /// config — `pages_http`/`pages_browser` split the crawled-ok page count
     /// by whether each page was actually rendered with a browser
@@ -1298,8 +1316,7 @@ impl AppState {
                 .unwrap_or_default()
         };
         let feature_pages = total_pages.saturating_mul(usage_units::page_feature_count(&features));
-        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features)
-            + legacy_credits::ocr_credits(pages_ocr);
+        let credits = legacy_credits::crawl_credits(pages_http, pages_browser, pages_ai, &features);
         let units = serde_json::json!({
             "pages_http": pages_http,
             "pages_browser": pages_browser,
@@ -2969,6 +2986,11 @@ struct AiOptions {
     /// Extract structured data (prompt-based or schema-based)
     #[serde(default)]
     extract: Option<AiExtractOptions>,
+
+    /// Model to summarize and extract with, from the team's Gateway; the default model when absent
+    #[serde(default)]
+    #[schema(example = "gpt-4o-mini")]
+    model: Option<String>,
 }
 
 impl AiOptions {
@@ -2979,16 +3001,37 @@ impl AiOptions {
     fn wants_extraction(&self) -> bool {
         self.extract.is_some()
     }
+
+    /// The requested model, when one is named.
+    fn model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
 }
 
-/// `ai` asks for AI work (a summary or an extraction) but no AI provider is
-/// configured: refuse up front, before anything is fetched or billed.
-fn require_ai_provider(state: &AppState, ai: Option<&AiOptions>) -> Result<(), ApiError> {
-    let wanted = ai.is_some_and(|ai| ai.wants_summary() || ai.wants_extraction());
-    if wanted && state.ai_service.is_none() {
-        return Err(no_ai_provider("AI features (ai.summary, ai.extract)"));
+/// The AI service for `ai`'s work (a summary or an extraction), resolved
+/// once per request: standalone, the server's provider; hosted, the team's
+/// Lumen gateway. `None` when no AI work is asked (nothing is resolved).
+/// Refused up front, before anything is fetched or billed, when there is
+/// no AI service.
+async fn require_ai_provider(
+    state: &AppState,
+    ctx: Option<&AccountContext>,
+    ai: Option<&AiOptions>,
+) -> Result<Option<ai_access::ResolvedAi>, ApiError> {
+    if !ai.is_some_and(|ai| ai.wants_summary() || ai.wants_extraction()) {
+        return Ok(None);
     }
-    Ok(())
+    match ai_access::resolve_ai(state, ctx, None).await? {
+        Some(resolved) => Ok(Some(resolved)),
+        None if state.lab_api.is_some() => Err(ApiError::new(
+            ai_access::NO_AI_MESSAGE,
+            "service_unavailable",
+        )),
+        None => Err(no_ai_provider("AI features (ai.summary, ai.extract)")),
+    }
 }
 
 /// The 503 for `what` when the server has no AI provider (same as
@@ -3453,10 +3496,10 @@ pub(crate) fn with_memory_lab(state: &mut AppState) -> Arc<lab_events::MemoryOut
 }
 
 /// Usage event for one successful scrape: one page, served by the browser
-/// or over HTTP, plus the AI work that produced a result. `formats` are the
-/// requested formats: their feature-format count is the page's
-/// `feature_pages` and, with the delivered AI flags, sets the pre-v2
-/// `credits`.
+/// or over HTTP, plus the AI work that produced a result (counted, not
+/// charged: the team's AI gateway meters it). `formats` are the requested
+/// formats: their feature-format count is the page's `feature_pages` and
+/// sets the pre-v2 `credits`.
 async fn record_scrape_usage(
     state: &AppState,
     ctx: &AccountContext,
@@ -3537,7 +3580,7 @@ pub(crate) async fn perform_scrape(
         debug!(account_id = %ctx.account_id, "Scrape request from account");
     }
 
-    require_ai_provider(state, request.ai.as_ref())?;
+    let ai = require_ai_provider(state, account_ctx.as_ref(), request.ai.as_ref()).await?;
 
     // Pre-flight (hosted): a positive balance, and JS rendering only on a
     // plan that includes it.
@@ -3815,7 +3858,7 @@ pub(crate) async fn perform_scrape(
                 formats: request.formats.clone(),
                 include_links: request.include_links,
                 parsers: request.parsers.clone(),
-                ai: request.ai.as_ref(),
+                ai: request.ai.as_ref().zip(ai),
                 status_code,
                 js_rendered,
             },
@@ -3950,7 +3993,17 @@ pub(crate) async fn perform_scrape(
 
     // (e) AI enrichment (optional)
     let ai_text = content.as_deref().or(markdown.as_deref()).unwrap_or("");
-    let ai_run = run_ai_enrichment(state, request.ai.as_ref(), ai_text).await;
+    let ai_run = match (request.ai.as_ref(), ai.as_ref()) {
+        (Some(options), Some(ai)) => {
+            let usage = AiUsageContext {
+                account_id: account_ctx.as_ref().map(|c| c.account_id.clone()),
+                url: final_url.clone(),
+                ..Default::default()
+            };
+            run_ai_enrichment(state, account_ctx.as_ref(), ai, options, ai_text, usage).await
+        }
+        _ => AiRun::default(),
+    };
     let AiRun {
         result: ai_result,
         warning,
@@ -4048,98 +4101,134 @@ struct AiRun {
     model: String,
 }
 
-/// Run the requested AI summary/extraction on `ai_text`.
-async fn run_ai_enrichment(state: &AppState, ai: Option<&AiOptions>, ai_text: &str) -> AiRun {
+/// Run the requested AI summary/extraction on `ai_text` with `ai` (the
+/// requested model, if any, overriding the service's), each call attributed
+/// to `usage` under its own feature. A key the gateway refuses is replaced
+/// once. Failures never fail the request: they become the `warning`, with
+/// the gateway's message when it refused the call.
+async fn run_ai_enrichment(
+    state: &AppState,
+    ctx: Option<&AccountContext>,
+    ai: &ai_access::ResolvedAi,
+    options: &AiOptions,
+    ai_text: &str,
+    usage: AiUsageContext,
+) -> AiRun {
     let mut ai_result = None;
     let mut warning = None;
     let mut total_prompt_tokens: u32 = 0;
     let mut total_completion_tokens: u32 = 0;
     let mut ai_model_name = String::new();
+    let mut errors: Vec<String> = Vec::new();
 
-    if let Some(ai_opts) = ai {
-        if let Some(ref ai_service) = state.ai_service {
-            if !ai_text.is_empty() {
-                // Run AI operations concurrently
-                let summary_fut = async {
-                    if ai_opts.summary {
-                        ai_service.summarize(ai_text).await.ok()
-                    } else {
-                        None
+    if !ai_text.is_empty() {
+        let model = options.model();
+        let attributed = |feature: &str| AiUsageContext {
+            feature: feature.to_string(),
+            ..usage.clone()
+        };
+
+        // Run AI operations concurrently
+        let summary_fut = async {
+            if !options.summary {
+                return None;
+            }
+            let call = ai_access::with_key_retry(state, ctx, ai.clone(), |ai| {
+                let service = with_model(&ai, model);
+                async move { service.summarize(ai_text).await }
+            });
+            Some(AI_USAGE_CONTEXT.scope(attributed("ai_summary"), call).await)
+        };
+
+        let extract_fut = async {
+            let extract_opts = options.extract.as_ref()?;
+            let schema = match extract_opts.schema {
+                Some(ref schema_fields) => {
+                    // Schema-based extraction
+                    let mut builder = SchemaBuilder::new();
+                    for field in schema_fields {
+                        builder = builder.field(AiFieldDefinition {
+                            name: field.name.clone(),
+                            description: field.description.clone(),
+                            field_type: field.field_type.clone(),
+                            required: field.required,
+                            default: None,
+                            example: None,
+                        });
                     }
-                };
-
-                let extract_fut = async {
-                    if let Some(ref extract_opts) = ai_opts.extract {
-                        if let Some(ref schema_fields) = extract_opts.schema {
-                            // Schema-based extraction
-                            let mut builder = SchemaBuilder::new();
-                            for field in schema_fields {
-                                builder = builder.field(AiFieldDefinition {
-                                    name: field.name.clone(),
-                                    description: field.description.clone(),
-                                    field_type: field.field_type.clone(),
-                                    required: field.required,
-                                    default: None,
-                                    example: None,
-                                });
-                            }
-                            let schema = builder.build();
-                            ai_service.extract_schema(ai_text, &schema).await.ok()
-                        } else if !extract_opts.prompt.is_empty() {
-                            // Prompt-based extraction
-                            ai_service.extract(ai_text, &extract_opts.prompt).await.ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                let (ai_summary_result, ai_extract_result) = tokio::join!(summary_fut, extract_fut);
-
-                // Accumulate AI token usage
-                if let Some(ref summary) = ai_summary_result {
-                    total_prompt_tokens += summary.prompt_tokens;
-                    total_completion_tokens += summary.completion_tokens;
-                    if ai_model_name.is_empty() {
-                        ai_model_name = summary.model.clone();
+                    Some(builder.build())
+                }
+                // Prompt-based extraction
+                None if !extract_opts.prompt.is_empty() => None,
+                None => return None,
+            };
+            let schema = schema.as_ref();
+            let prompt = extract_opts.prompt.as_str();
+            let call = ai_access::with_key_retry(state, ctx, ai.clone(), |ai| {
+                let service = with_model(&ai, model);
+                async move {
+                    match schema {
+                        Some(schema) => service.extract_schema(ai_text, schema).await,
+                        None => service.extract(ai_text, prompt).await,
                     }
                 }
-                if let Some(ref extraction) = ai_extract_result {
-                    total_prompt_tokens += extraction.prompt_tokens;
-                    total_completion_tokens += extraction.completion_tokens;
-                    if ai_model_name.is_empty() {
-                        ai_model_name = extraction.model.clone();
-                    }
-                }
+            });
+            Some(
+                AI_USAGE_CONTEXT
+                    .scope(attributed("ai_extraction"), call)
+                    .await,
+            )
+        };
 
-                let ai_summary_text = ai_summary_result.map(|r| r.summary);
-                let ai_extract_data = ai_extract_result.map(|r| r.data);
+        let (ai_summary_result, ai_extract_result) = tokio::join!(summary_fut, extract_fut);
+        let ai_summary_result = ai_summary_result.and_then(|r| ai_outcome(r, &mut errors));
+        let ai_extract_result = ai_extract_result.and_then(|r| ai_outcome(r, &mut errors));
 
-                if ai_summary_text.is_some() || ai_extract_data.is_some() {
-                    ai_result = Some(AiResult {
-                        summary: ai_summary_text,
-                        extract: ai_extract_data,
-                    });
-                }
+        // Accumulate AI token usage
+        if let Some(ref summary) = ai_summary_result {
+            total_prompt_tokens += summary.prompt_tokens;
+            total_completion_tokens += summary.completion_tokens;
+            if ai_model_name.is_empty() {
+                ai_model_name = summary.model.clone();
             }
         }
-        // Requested but not produced (provider error, nothing to work on,
-        // or no provider — which callers refuse up front): not billed.
-        let mut failed = Vec::new();
-        if ai_opts.wants_summary() && ai_result.as_ref().is_none_or(|r| r.summary.is_none()) {
-            failed.push("summary");
+        if let Some(ref extraction) = ai_extract_result {
+            total_prompt_tokens += extraction.prompt_tokens;
+            total_completion_tokens += extraction.completion_tokens;
+            if ai_model_name.is_empty() {
+                ai_model_name = extraction.model.clone();
+            }
         }
-        if ai_opts.wants_extraction() && ai_result.as_ref().is_none_or(|r| r.extract.is_none()) {
-            failed.push("extraction");
+
+        let ai_summary_text = ai_summary_result.map(|r| r.summary);
+        let ai_extract_data = ai_extract_result.map(|r| r.data);
+
+        if ai_summary_text.is_some() || ai_extract_data.is_some() {
+            ai_result = Some(AiResult {
+                summary: ai_summary_text,
+                extract: ai_extract_data,
+            });
         }
-        if !failed.is_empty() {
-            warning = Some(format!(
-                "AI {} could not be generated and was not billed",
-                failed.join(" and ")
-            ));
+    }
+    // Requested but not produced (provider error or nothing to work on):
+    // not billed.
+    let mut failed = Vec::new();
+    if options.wants_summary() && ai_result.as_ref().is_none_or(|r| r.summary.is_none()) {
+        failed.push("summary");
+    }
+    if options.wants_extraction() && ai_result.as_ref().is_none_or(|r| r.extract.is_none()) {
+        failed.push("extraction");
+    }
+    if !failed.is_empty() {
+        let mut message = format!(
+            "AI {} could not be generated and was not billed",
+            failed.join(" and ")
+        );
+        errors.dedup();
+        if !errors.is_empty() {
+            message = format!("{message}: {}", errors.join("; "));
         }
+        warning = Some(message);
     }
 
     AiRun {
@@ -4148,6 +4237,61 @@ async fn run_ai_enrichment(state: &AppState, ai: Option<&AiOptions>, ai_text: &s
         prompt_tokens: total_prompt_tokens,
         completion_tokens: total_completion_tokens,
         model: ai_model_name,
+    }
+}
+
+/// `ai`'s service, with `model` (when requested) for its summaries and
+/// extractions.
+fn with_model(ai: &ai_access::ResolvedAi, model: Option<&str>) -> Arc<AiService> {
+    let Some(model) = model else {
+        return ai.service.clone();
+    };
+    let extraction = ai
+        .service
+        .extractor()
+        .map(|e| e.config().clone())
+        .unwrap_or_default();
+    let summary = ai
+        .service
+        .summarizer()
+        .map(|s| s.config().clone())
+        .unwrap_or_default();
+    Arc::new(
+        AiService::minimal(ai.service.client().clone())
+            .with_extraction_config(ExtractionConfig {
+                model: model.to_string(),
+                ..extraction
+            })
+            .with_summary_config(SummaryConfig {
+                model: model.to_string(),
+                ..summary
+            }),
+    )
+}
+
+/// The result of one AI call, or `None` with its failure noted in `errors`
+/// when the gateway refused it (a used-up budget as the insufficient-credits
+/// message, any other known refusal with the gateway's own message). Other
+/// failures are only logged: their text is the provider's, not meant for the
+/// caller.
+fn ai_outcome<T>(
+    result: Result<T, scrapix_core::ScrapixError>,
+    errors: &mut Vec<String>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(scrapix_core::ScrapixError::AiGateway { code, message }) => {
+            errors.push(if code == gateway_codes::BUDGET_EXCEEDED {
+                scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE.to_string()
+            } else {
+                message
+            });
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "AI enrichment failed");
+            None
+        }
     }
 }
 
@@ -4552,8 +4696,11 @@ pub(crate) async fn do_create_crawl(
     // values in place (SCR-72 fix round 1); `config` is already `mut`.
     validate_crawl_config(&mut config)?;
 
-    // Features the server cannot run fail the request, not the job.
-    check_crawl_capabilities(&config, state.ai_service.is_some(), state.crawl_browser)?;
+    // Features the server cannot run fail the request, not the job. Hosted
+    // crawl AI runs on each team's AI gateway (the content workers resolve
+    // it per page from the Lab), so it needs no env provider.
+    let ai_available = state.ai_service.is_some() || state.lab_api.is_some();
+    check_crawl_capabilities(&config, ai_available, state.crawl_browser)?;
 
     // Non-fatal warnings for accepted-but-unhonored (worker-level) fields.
     let warnings = crawl_config_warnings(&config);
@@ -6924,18 +7071,28 @@ pub async fn run_with_bus(
     };
 
     // Initialize AI service from environment (supports multiple providers via AI_PROVIDER)
-    // Use with_tracking when ClickHouse is available for per-call token tracking
-    let (ai_service, ai_usage_rx) = if ai_usage_batcher.is_some() {
-        match AiClient::from_env_with_tracking() {
-            Ok((client, rx)) => {
+    // With ClickHouse, AI clients report per-call token usage on one channel:
+    // the env client and, hosted, every per-key Lumen client.
+    let hosted = lab_api.is_some();
+    let (ai_service, ai_usage_rx, hosted_ai_usage_tx) = if ai_usage_batcher.is_some() {
+        let (usage_tx, usage_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hosted_tx = hosted.then(|| usage_tx.clone());
+        match AiClient::from_env() {
+            Ok(client) => {
                 let provider =
                     std::env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
                 info!(provider = %provider, "AI service initialized with usage tracking");
-                (Some(Arc::new(AiService::new(Arc::new(client)))), Some(rx))
+                let client = client.with_usage_sender(usage_tx);
+                (
+                    Some(Arc::new(AiService::new(Arc::new(client)))),
+                    Some(usage_rx),
+                    hosted_tx,
+                )
             }
             Err(e) => {
                 info!(reason = %e, "AI enrichment disabled");
-                (None, None)
+                // Hosted: the Lumen clients still report on the channel.
+                (None, hosted.then_some(usage_rx), hosted_tx)
             }
         }
     } else {
@@ -6944,11 +7101,11 @@ pub async fn run_with_bus(
                 let provider =
                     std::env::var("AI_PROVIDER").unwrap_or_else(|_| "anthropic".to_string());
                 info!(provider = %provider, "AI service initialized");
-                (Some(Arc::new(AiService::new(Arc::new(client)))), None)
+                (Some(Arc::new(AiService::new(Arc::new(client)))), None, None)
             }
             Err(e) => {
                 info!(reason = %e, "AI enrichment disabled");
-                (None, None)
+                (None, None, None)
             }
         }
     };
@@ -6984,6 +7141,7 @@ pub async fn run_with_bus(
         webhook_dispatcher,
     );
     state.ocr = ocr;
+    state.hosted_ai = scrapix_lab::HostedAiClients::new(hosted_ai_usage_tx);
     state.meili = meili;
     state.lab = lab_outbox
         .clone()
@@ -8007,6 +8165,27 @@ mod tests {
         assert!(check_crawl_capabilities(&disabled, false, None).is_ok());
     }
 
+    /// Hosted crawl AI runs on each team's AI gateway (the content
+    /// workers ask the Lab per page): no env AI provider is needed.
+    #[tokio::test]
+    async fn hosted_crawl_with_ai_is_accepted_without_env_key() {
+        let (_lab, state, _) = crate::results::test_support::hosted_ai_state(None).await;
+        assert!(state.ai_service.is_none(), "no env AI provider");
+        let config = crawl_config(serde_json::json!({
+            "start_urls": ["https://a.test/"],
+            "index_uid": "a",
+            "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k"},
+            "features": {
+                "ai_summary": {"enabled": true},
+                "ai_extraction": {"enabled": true, "prompt": "p"}
+            }
+        }));
+        let ctx = crate::results::test_support::hosted_ctx();
+
+        let created = do_create_crawl(&state, config, ctx.as_ref()).await;
+        assert!(created.is_ok(), "{:?}", created.err());
+    }
+
     #[test]
     fn browser_crawls_are_refused_only_without_a_browser() {
         let browser = crawl_config(serde_json::json!({
@@ -8486,8 +8665,8 @@ mod lifecycle_tests {
             events[0].data,
             serde_json::json!({
                 "operation": "scrape",
-                // f2ab8d2: scrape_credits([markdown, rawhtml], true, false) = 1 + 5.
-                "credits": 6,
+                // AI adds no credits: scrape_credits([markdown, rawhtml], true, false) = 1.
+                "credits": 1,
                 "units": {"pages_http": 0, "pages_browser": 1, "ai_summary": 1, "ai_extraction": 0,
                           "feature_pages": 1},
                 "provider_cost_micro_usd": 0,
@@ -10424,9 +10603,9 @@ mod lifecycle_tests {
             serde_json::json!({"pages_http": 1, "pages_browser": 2, "pages_ai": 1, "pages_ocr": 0,
                                "feature_pages": 0})
         );
-        // f2ab8d2: 1 http (1 credit) + 2 browser (2 credits each = 4) + 1
-        // AI-enriched page (10 credits surcharge) = 15. Not 3 * 12 = 36.
-        assert_eq!(usage[0].data["credits"], 15);
+        // 1 http (1 credit) + 2 browser (2 credits each = 4) = 5: the
+        // AI-enriched page adds nothing (the team's AI gateway meters it).
+        assert_eq!(usage[0].data["credits"], 5);
         lab_events::assert_contract_valid(&usage);
         assert_eq!(
             usage[0].data["units"]["pages_http"].as_u64().unwrap()
@@ -10515,8 +10694,8 @@ mod lifecycle_tests {
                                "feature_pages": 6})
         );
         // f2ab8d2: crawl_credits(2, 1, 0, 2 features) = 2 * (1 + 2) +
-        // 1 * (2 + 2) = 10, + ocr_credits(2) = 10: 20.
-        assert_eq!(usage[0].data["credits"], 20);
+        // 1 * (2 + 2) = 10; OCR pages add nothing.
+        assert_eq!(usage[0].data["credits"], 10);
         lab_events::assert_contract_valid(&outbox.events());
     }
 

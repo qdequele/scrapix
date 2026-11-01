@@ -249,7 +249,7 @@ pub(crate) async fn start_batch(
     account_ctx: &Option<AccountContext>,
     batch: ParsedBatch,
 ) -> Result<BatchScrapeResponse, ApiError> {
-    crate::require_ai_provider(state, batch.sample.ai.as_ref())?;
+    crate::require_ai_provider(state, account_ctx.as_ref(), batch.sample.ai.as_ref()).await?;
     if batch.sample.render_js && state.browser_renderer.is_none() {
         return Err(ApiError::new(
             "JS rendering is not available (Chrome/Chromium not found on this server)",

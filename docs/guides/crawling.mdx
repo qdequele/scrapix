@@ -276,14 +276,13 @@ Extract structured data from page content:
     "ai_extraction": {
       "enabled": true,
       "prompt": "Extract the main topic, difficulty level, and prerequisites",
-      "model": "gpt-4o-mini",
       "include_pages": ["**/tutorials/**"]
     }
   }
 }
 ```
 
-Requires `OPENAI_API_KEY` environment variable.
+Standalone: requires an AI provider on the content worker (`AI_PROVIDER` and its key, e.g. `OPENAI_API_KEY`). Hosted: runs on your team's AI gateway (the content worker needs `SCRAPIX_MODE=hosted` and `LAB_*`), with no Scrapix credit charge for AI.
 
 ## Proxies
 

@@ -179,9 +179,7 @@ Toggle individual extraction features:
     },
     "ai_extraction": {
       "enabled": true,
-      "prompt": "Extract the product name, price, and description from: {content}",
-      "model": "gpt-4o-mini",
-      "max_tokens": 500
+      "prompt": "Extract the product name, price, and description from: {content}"
     },
     "ai_summary": { "enabled": true }
   }
@@ -212,7 +210,8 @@ Toggle individual extraction features:
 | `ocr.max_pages` | server cap (50) | Per-document OCR page cap (only lowers `OCR_MAX_PAGES_PER_DOCUMENT`) |
 
 With `pdf` / `documents` enabled, links to those files are followed instead
-of being skipped as non-page resources. OCR pages are billed at a higher rate.
+of being skipped as non-page resources. OCR pages are counted, not charged in
+Scrapix credits (hosted vision OCR runs on the team's AI gateway).
 See [Documents & OCR](/guides/documents).
 
 Each feature supports page-level filtering:
@@ -409,7 +408,6 @@ Auth methods:
     "ai_extraction": {
       "enabled": true,
       "prompt": "Extract structured product data from: {content}",
-      "model": "gpt-4o-mini",
       "include_pages": ["**/product/**"]
     }
   },

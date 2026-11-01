@@ -3,12 +3,7 @@
 use crate::ApiError;
 use scrapix_core::MeilisearchConfig; // the crawl config's `meilisearch` block type
 
-/// Where documents are indexed / searched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeiliTarget {
-    pub url: String,
-    pub api_key: Option<String>,
-}
+pub use scrapix_lab::MeiliTarget;
 
 /// Compares two Meilisearch URLs ignoring a trailing slash.
 pub fn same_url(a: &str, b: &str) -> bool {

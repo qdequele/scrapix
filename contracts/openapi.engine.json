@@ -1225,7 +1225,7 @@
           "extract"
         ],
         "summary": "Extract structured data from web pages",
-        "description": "Starts a job that fetches every URL (globs such as\n`https://example.com/blog/*` are resolved first, 50 URLs max), then runs\none AI extraction over their content following `prompt` and/or `schema`.\nPoll `GET /extract/{id}` for the result; the fetched pages are available\nfrom `GET /job/{id}/results`. Requires an AI provider on the server.",
+        "description": "Starts a job that fetches every URL (globs such as\n`https://example.com/blog/*` are resolved first, 50 URLs max), then runs\none AI extraction over their content following `prompt` and/or `schema`.\nPoll `GET /extract/{id}` for the result; the fetched pages are available\nfrom `GET /job/{id}/results`. Requires an AI provider on the server\n(hosted: the team's AI Gateway).",
         "operationId": "create_extract",
         "requestBody": {
           "content": {
@@ -1269,7 +1269,7 @@
             }
           },
           "503": {
-            "description": "No AI provider is configured on the server",
+            "description": "No AI provider is configured on the server (hosted: no AI for this account)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1822,7 +1822,7 @@
           "parse"
         ],
         "summary": "Parse an uploaded document",
-        "description": "Converts an uploaded file to Markdown with the same parsers the crawler\nuses, and returns the `/scrape` response shape. Billed per document\n(like `/scrape`), plus OCR pages when `parsers.ocr` recognizes scanned\npages.",
+        "description": "Converts an uploaded file to Markdown with the same parsers the crawler\nuses, and returns the `/scrape` response shape. Billed per document\n(like `/scrape`); OCR pages recognized with `parsers.ocr` are reported,\nnot charged.",
         "operationId": "parse_upload",
         "requestBody": {
           "content": {
@@ -2222,6 +2222,14 @@
                 "description": "Extract structured data (prompt-based or schema-based)"
               }
             ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model to summarize and extract with, from the team's Gateway; the default model when absent",
+            "example": "gpt-4o-mini"
           },
           "summary": {
             "type": "boolean",
@@ -3159,6 +3167,14 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model to extract with, from the team's Gateway; the default model when absent",
+            "example": "gpt-4o-mini"
           },
           "only_main_content": {
             "type": "boolean",
@@ -4447,7 +4463,7 @@
           },
           "ocr": {
             "$ref": "#/components/schemas/OcrMode",
-            "description": "OCR for scanned / image-only pages: `off` (default — scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\nbilled at a higher per-page rate."
+            "description": "OCR for scanned / image-only pages: `off` (default — scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\ncounted, not charged (hosted vision OCR runs on the team's AI\ngateway)."
           },
           "ocr_max_pages": {
             "type": [

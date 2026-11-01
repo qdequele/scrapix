@@ -64,6 +64,12 @@ pub enum ScrapixError {
     #[error("AI error: {0}")]
     Ai(String),
 
+    /// The AI gateway (Lumen) refused a call with one of its `LM-` codes
+    /// (budget exceeded, key refused, unknown model, invalid request). Never
+    /// retried by the AI client: the caller decides what the code means.
+    #[error("AI gateway error {code}: {message}")]
+    AiGateway { code: String, message: String },
+
     /// A browser page action (`/scrape` `actions`) failed: `index` is its
     /// position in the request, `action` its type (e.g. `click`).
     #[error("actions[{index}] ({action}) failed: {message}")]

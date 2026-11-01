@@ -28,6 +28,7 @@ mod features;
 pub use features::feature_applies;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,14 +42,18 @@ use scrapix_lifecycle::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use scrapix_ai::{AiClient, AiService, AiUsageContext, AiUsageEvent, AI_USAGE_CONTEXT};
+use scrapix_ai::{
+    gateway_codes, AiClient, AiService, AiUsageContext, AiUsageEvent, AI_BUDGET_EXCEEDED_MESSAGE,
+    AI_USAGE_CONTEXT,
+};
 use scrapix_core::content_types;
-use scrapix_core::{Ack, Document, FeaturesConfig, RawPage};
+use scrapix_core::{Ack, Document, FeaturesConfig, RawPage, ScrapixError};
 use scrapix_extractor::{
     BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor, SelectorExtractor,
 };
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
-use scrapix_ocr::{OcrEngine, OcrRequest};
+use scrapix_lab::{log_lab_error, HostedAiClients, LabClient};
+use scrapix_ocr::{OcrEngine, OcrReport, OcrRequest};
 use scrapix_parser::ParseOptions;
 use scrapix_parser::{HtmlParser, HtmlParserConfig};
 use scrapix_queue::{
@@ -61,6 +66,14 @@ use scrapix_storage::{DocAck, MeilisearchStorage, MeilisearchStorageBuilder};
 /// AI provider.
 pub const WARN_AI_NO_PROVIDER: &str =
     "AI enrichment requested but no AI provider configured on content workers";
+/// `JobWarning` (hosted) when a job asks for AI enrichment and its account's
+/// team has no AI gateway (the Lab serves no key for it).
+pub const WARN_AI_NO_TEAM_AI: &str =
+    "AI enrichment requested but AI is not available for this account";
+/// `JobWarning` (hosted) when the Lab could not say which AI gateway to use
+/// for a page (it was indexed without AI enrichment).
+pub const WARN_AI_UNAVAILABLE: &str =
+    "AI enrichment skipped for some pages: the AI configuration was unavailable";
 /// Metadata keys describing a parsed document, kept on indexed documents
 /// even when `features.metadata` is off.
 const DOCUMENT_DESCRIPTOR_KEYS: &[&str] = &[
@@ -163,14 +176,33 @@ pub struct Args {
     #[arg(short, long)]
     pub verbose: bool,
 
+    // === DEPLOYMENT MODE ===
+    /// `standalone` (default: AI through the env provider) or `hosted`
+    /// (AI through each team's Lumen gateway, with the key the Lab serves).
+    #[arg(long, env = "SCRAPIX_MODE", default_value = "standalone")]
+    pub mode: String,
+
+    /// Hosted only: the Lab base URL (lookups go to {LAB_URL}/internal/*).
+    #[arg(long, env = "LAB_URL")]
+    pub lab_url: Option<String>,
+
+    /// Deprecated fallback for LAB_URL (the old `…/internal/events` URL),
+    /// accepted as the API accepts it: the Lab base is derived from it.
+    #[arg(long, env = "LAB_EVENTS_URL")]
+    pub lab_events_url: Option<String>,
+
+    /// Hosted only: the instance id the Lab minted for this engine (uuid).
+    #[arg(long, env = "LAB_INSTANCE_ID")]
+    pub lab_instance_id: Option<String>,
+
+    /// Hosted only: the secret the Lab minted with LAB_INSTANCE_ID.
+    #[arg(long, env = "LAB_INSTANCE_SECRET", hide_env_values = true)]
+    pub lab_instance_secret: Option<String>,
+
     // === AI ENRICHMENT OPTIONS ===
     /// Enable AI summarization (generates ai_summary field)
     #[arg(long, env = "ENABLE_SUMMARY")]
     pub enable_summary: bool,
-
-    /// Summary model to use
-    #[arg(long, env = "SUMMARY_MODEL", default_value = "gpt-5-nano")]
-    pub summary_model: String,
 
     /// Enable AI extraction with custom prompt (generates ai_extraction field)
     #[arg(long, env = "ENABLE_EXTRACTION")]
@@ -180,10 +212,6 @@ pub struct Args {
     /// Use {content} as placeholder for the page content
     #[arg(long, env = "EXTRACTION_PROMPT")]
     pub extraction_prompt: Option<String>,
-
-    /// Extraction model to use
-    #[arg(long, env = "EXTRACTION_MODEL", default_value = "gpt-5-nano")]
-    pub extraction_model: String,
 
     /// Maximum tokens for AI responses
     #[arg(long, env = "AI_MAX_TOKENS", default_value = "1000")]
@@ -321,9 +349,59 @@ struct AiConfig {
     enable_summary: bool,
     enable_extraction: bool,
     extraction_prompt: Option<String>,
-    summary_model: String,
-    extraction_model: String,
     max_tokens: u32,
+}
+
+/// Hosted mode: a page's AI goes through its account's team gateway, with
+/// the key the Lab serves (`GET /internal/accounts/{id}/ai`).
+struct HostedAi {
+    lab: Arc<LabClient>,
+    /// One AI service per Lab-minted key.
+    clients: HostedAiClients,
+}
+
+/// The AI service for one page, and what calling it needs.
+#[derive(Clone)]
+struct PageAi {
+    service: Arc<AiService>,
+    /// Hosted: the Lab's vision model (OCR). `None` in standalone, where the
+    /// OCR engine picks its own.
+    vision_model: Option<String>,
+    /// Hosted: the key's Lab id, sent back as `rejected_key_id` when Lumen
+    /// refuses it. `None` in standalone.
+    key_id: Option<String>,
+}
+
+/// Why a page gets no AI.
+enum NoAi {
+    /// Standalone: no AI provider configured.
+    NoProvider,
+    /// Standalone, yet the page carries an account: it comes from a hosted
+    /// engine, so this worker is misconfigured (SCRAPIX_MODE). Never the
+    /// env provider for a tenant.
+    HostedPage,
+    /// Hosted: the page has no account, so no team (never another team's
+    /// key, never the env provider).
+    NoAccount,
+    /// Hosted: the account's team has no AI gateway.
+    NoTeamAi,
+    /// Hosted: the Lab could not answer (and nothing is cached), or its
+    /// answer is unusable.
+    Unavailable,
+}
+
+impl NoAi {
+    fn reason(&self) -> &'static str {
+        match self {
+            NoAi::NoProvider => "no AI provider configured",
+            NoAi::HostedPage => {
+                "the page belongs to a hosted account but this worker runs standalone"
+            }
+            NoAi::NoAccount => "the page has no account",
+            NoAi::NoTeamAi => "AI is not available for this account",
+            NoAi::Unavailable => "AI configuration unavailable",
+        }
+    }
 }
 
 /// What processing a page produced.
@@ -434,7 +512,11 @@ struct ContentWorker {
     /// Per-job buffered storages. A storage's index is configured (created,
     /// settings applied unless `keep_settings`) when it is first created.
     storage_cache: tokio::sync::Mutex<HashMap<StorageKey, Arc<MeilisearchStorage>>>,
+    /// Standalone: the env AI provider (`None` without one, and always in
+    /// hosted mode).
     ai_service: Option<Arc<AiService>>,
+    /// Hosted: AI through each page's team gateway (`None` in standalone).
+    hosted_ai: Option<HostedAi>,
     /// OCR for scanned PDF pages (opt-in per job via `features.ocr`);
     /// `None` with `OCR_BACKEND=off`.
     ocr: Option<Arc<OcrEngine>>,
@@ -515,7 +597,7 @@ impl ContentWorker {
             Arc::new(kafka_consumer.into()),
             Arc::new(kafka_producer.into()),
             !args.skip_meilisearch,
-        );
+        )?;
         worker.control_consumer = Some(Arc::new(control.into()));
         worker.init_ocr().await;
         Ok(worker)
@@ -535,7 +617,7 @@ impl ContentWorker {
         let worker_id = worker_id(args);
         info!(worker_id = %worker_id, "Initializing content worker (pre-built bus)");
         startup_check(args).await;
-        let mut worker = Self::build(args, worker_id, consumer, producer, !args.skip_meilisearch);
+        let mut worker = Self::build(args, worker_id, consumer, producer, !args.skip_meilisearch)?;
         worker.control_consumer = control;
         worker.init_ocr().await;
         Ok(worker)
@@ -543,20 +625,24 @@ impl ContentWorker {
 
     /// Build the OCR engine (`OCR_BACKEND`, see `scrapix_ocr::OcrEngine`).
     /// The vision backend reuses the AI client, so its calls are tracked as
-    /// `AiUsage` events with feature `ocr`.
+    /// `AiUsage` events with feature `ocr`. Hosted: no env client, so the
+    /// engine's own backend is local and vision OCR runs with each page's
+    /// team client (see [`Self::ocr_ai`]).
     async fn init_ocr(&mut self) {
         let client = self.ai_service.as_ref().map(|s| s.client().clone());
         self.ocr = OcrEngine::from_env(client).await.map(Arc::new);
     }
 
-    /// Shared construction once the bus exists.
+    /// Shared construction once the bus exists. Fails on an invalid mode or
+    /// Lab configuration (see [`hosted_lab`]).
     fn build(
         args: &Args,
         worker_id: String,
         consumer: Arc<AnyConsumer>,
         producer: Arc<AnyProducer>,
         indexing_enabled: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let lab = hosted_lab(args)?;
         // Always extract everything; per-job features are applied as a
         // post-parse filter so the parser can be reused.
         let parser = HtmlParser::new(HtmlParserConfig {
@@ -582,32 +668,45 @@ impl ContentWorker {
             enable_summary: args.enable_summary,
             enable_extraction: args.enable_extraction,
             extraction_prompt: args.extraction_prompt.clone(),
-            summary_model: args.summary_model.clone(),
-            extraction_model: args.extraction_model.clone(),
             max_tokens: args.ai_max_tokens,
         };
 
-        // The AI service is built whenever an AI provider is configured
-        // (AI_PROVIDER + its API key), so per-job `ai_summary` /
+        // Every AI client (env or hosted) reports its calls on one channel,
+        // forwarded as `AiUsage` events.
+        let (usage_tx, usage_rx) = mpsc::unbounded_channel();
+        // Standalone: the AI service is built whenever an AI provider is
+        // configured (AI_PROVIDER + its API key), so per-job `ai_summary` /
         // `ai_extraction` work without worker-level ENABLE_* flags (those
         // only set the default features for messages without features).
-        let (ai_service, ai_usage_rx) = match AiClient::from_env_with_tracking() {
-            Ok((client, rx)) => {
-                let service = AiService::minimal(Arc::new(client))
-                    .with_summarization()
-                    .with_extraction();
-                info!("AI provider configured; AI enrichment available to jobs");
-                (Some(Arc::new(service)), Some(rx))
-            }
-            Err(e) => {
-                if args.enable_summary || args.enable_extraction {
-                    warn!(error = %e, "Failed to create AI client, AI features disabled");
-                } else {
-                    info!(reason = %e, "No AI provider configured; AI enrichment unavailable");
+        // Hosted: never the env provider; each page's team gateway instead.
+        let ai_service = if lab.is_some() {
+            info!("Hosted mode: AI enrichment and vision OCR go through each account's team AI gateway");
+            None
+        } else {
+            match AiClient::from_env() {
+                Ok(client) => {
+                    let service =
+                        AiService::minimal(Arc::new(client.with_usage_sender(usage_tx.clone())))
+                            .with_summarization()
+                            .with_extraction();
+                    info!("AI provider configured; AI enrichment available to jobs");
+                    Some(Arc::new(service))
                 }
-                (None, None)
+                Err(e) => {
+                    if args.enable_summary || args.enable_extraction {
+                        warn!(error = %e, "Failed to create AI client, AI features disabled");
+                    } else {
+                        info!(reason = %e, "No AI provider configured; AI enrichment unavailable");
+                    }
+                    None
+                }
             }
         };
+        let hosted_ai = lab.map(|lab| HostedAi {
+            lab,
+            clients: HostedAiClients::new(Some(usage_tx.clone())),
+        });
+        let ai_usage_rx = (ai_service.is_some() || hosted_ai.is_some()).then_some(usage_rx);
 
         let dedup_detector = if args.enable_dedup {
             let config = NearDuplicateConfig {
@@ -650,7 +749,7 @@ impl ContentWorker {
 
         let (indexed_tx, indexed_rx) = mpsc::unbounded_channel();
 
-        Self {
+        Ok(Self {
             consumer,
             producer,
             parser,
@@ -659,6 +758,7 @@ impl ContentWorker {
             default_meilisearch_key: args.meilisearch_key.clone().unwrap_or_default(),
             storage_cache: tokio::sync::Mutex::new(HashMap::new()),
             ai_service,
+            hosted_ai,
             ocr: None,
             ai_config,
             ai_usage_rx: parking_lot::Mutex::new(ai_usage_rx),
@@ -679,7 +779,7 @@ impl ContentWorker {
             default_features,
             cancelled: Arc::new(CancelledJobs::default()),
             control_consumer: None,
-        }
+        })
     }
 
     /// The Meilisearch target for a message: `(url, key)` from the message
@@ -1460,18 +1560,27 @@ impl ContentWorker {
         if !ocr_mode.is_off() {
             match self.ocr.as_ref() {
                 Some(engine) => {
-                    let request = OcrRequest {
-                        mode: ocr_mode,
-                        max_pages: job_features.ocr_max_pages(),
-                        account_id: msg.account_id.clone(),
-                        usage_context: Some(AiUsageContext {
-                            job_id: msg.job_id.clone(),
-                            account_id: msg.account_id.clone(),
-                            feature: "ocr".to_string(),
-                            url: msg.url.clone(),
-                        }),
+                    let max_pages = job_features.ocr_max_pages();
+                    let has_pages = !engine.plan(&parsed, ocr_mode, max_pages).is_empty();
+                    let report = match self.ocr_ai(msg, engine, has_pages).await {
+                        Ok(ai) => {
+                            let request = OcrRequest {
+                                mode: ocr_mode,
+                                max_pages,
+                                account_id: msg.account_id.clone(),
+                                usage_context: Some(AiUsageContext {
+                                    job_id: msg.job_id.clone(),
+                                    account_id: msg.account_id.clone(),
+                                    feature: "ocr".to_string(),
+                                    url: msg.url.clone(),
+                                }),
+                                client: ai.as_ref().map(|ai| ai.service.client().clone()),
+                                model: ai.and_then(|ai| ai.vision_model),
+                            };
+                            engine.apply(&bytes, &mut parsed, &request).await
+                        }
+                        Err(warning) => OcrReport::skipped(&parsed, ocr_mode, warning),
                     };
-                    let report = engine.apply(&bytes, &mut parsed, &request).await;
                     if let Some(ref warning) = report.warning {
                         self.warn_job_once(&msg.job_id, warning).await;
                     }
@@ -1643,6 +1752,177 @@ impl ContentWorker {
         }
     }
 
+    /// The AI service for a page. Standalone: the env provider. Hosted: the
+    /// page account's team gateway, with the key the Lab serves (cached by
+    /// the client; served stale while the Lab is down); `rejected_key_id` is
+    /// the key Lumen just refused, so the Lab replaces it.
+    async fn resolve_ai(
+        &self,
+        msg: &RawPageMessage,
+        rejected_key_id: Option<&str>,
+    ) -> Result<PageAi, NoAi> {
+        let Some(hosted) = self.hosted_ai.as_ref() else {
+            let service = self.ai_service.clone().ok_or(NoAi::NoProvider)?;
+            if page_account(msg).is_some() {
+                return Err(NoAi::HostedPage);
+            }
+            return Ok(PageAi {
+                service,
+                vision_model: None,
+                key_id: None,
+            });
+        };
+        let Some(account_id) = page_account(msg) else {
+            return Err(NoAi::NoAccount);
+        };
+        let target = match hosted.lab.ai(account_id, rejected_key_id).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return Err(NoAi::NoTeamAi),
+            Err(e) => {
+                log_lab_error(&e, "AI lookup");
+                return Err(NoAi::Unavailable);
+            }
+        };
+        let service = hosted.clients.get_or_build(&target).map_err(|e| {
+            error!(error = %e, key_id = %target.key_id, "cannot build the Lumen AI client");
+            NoAi::Unavailable
+        })?;
+        Ok(PageAi {
+            service,
+            vision_model: Some(target.vision_model),
+            key_id: Some(target.key_id),
+        })
+    }
+
+    /// Report why a page is enriched without AI: a `JobWarning` (once per
+    /// job) when the job can act on it, a log line otherwise.
+    async fn report_no_ai(&self, msg: &RawPageMessage, why: &NoAi) {
+        match why {
+            NoAi::NoProvider => self.warn_job_once(&msg.job_id, WARN_AI_NO_PROVIDER).await,
+            NoAi::HostedPage => {
+                error!(
+                    job_id = %msg.job_id,
+                    url = %msg.url,
+                    "AI enrichment skipped: the page belongs to a hosted account but this content \
+                     worker runs standalone; set SCRAPIX_MODE=hosted and the API's LAB_* on it"
+                );
+                self.warn_job_once(&msg.job_id, WARN_AI_UNAVAILABLE).await;
+            }
+            NoAi::NoAccount => warn!(
+                job_id = %msg.job_id,
+                url = %msg.url,
+                "AI enrichment skipped: the page has no account (hosted AI needs the team's key)"
+            ),
+            NoAi::NoTeamAi => self.warn_job_once(&msg.job_id, WARN_AI_NO_TEAM_AI).await,
+            NoAi::Unavailable => {
+                warn!(
+                    job_id = %msg.job_id,
+                    url = %msg.url,
+                    "AI enrichment skipped for this page: AI configuration unavailable"
+                );
+                self.warn_job_once(&msg.job_id, WARN_AI_UNAVAILABLE).await;
+            }
+        }
+    }
+
+    /// Run an AI call for a page with `ai`. Hosted: a key Lumen refuses
+    /// (`LM-4004`) is replaced once through the Lab and the call retried.
+    async fn call_ai<T, F, Fut>(
+        &self,
+        msg: &RawPageMessage,
+        ai: PageAi,
+        call: F,
+    ) -> Result<T, ScrapixError>
+    where
+        F: Fn(Arc<AiService>) -> Fut,
+        Fut: Future<Output = Result<T, ScrapixError>>,
+    {
+        let key_id = ai.key_id.clone();
+        scrapix_lab::retry_on_key_refused(
+            ai,
+            key_id,
+            |ai: PageAi| call(ai.service),
+            |rejected| async move {
+                match self.resolve_ai(msg, Some(&rejected)).await {
+                    Ok(next) => Some(next),
+                    Err(why) => {
+                        warn!(key_id = %rejected, reason = why.reason(), "no replacement for a refused AI key");
+                        None
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// Log a failed AI call (`what`: "generate AI summary", "run AI
+    /// extraction"). A refusal by the AI gateway (budget exceeded, unknown
+    /// model, ...) also becomes a `JobWarning`: Scrapix's insufficient-credits
+    /// message for a used-up budget, the gateway's message otherwise. The
+    /// page is indexed without that enrichment, the job goes on.
+    async fn report_ai_error(&self, msg: &RawPageMessage, what: &str, err: &ScrapixError) {
+        match err {
+            ScrapixError::AiGateway { code, message } => {
+                warn!(url = %msg.url, code = %code, message = %message, "AI gateway refused to {what}");
+                let warning = if code == gateway_codes::BUDGET_EXCEEDED {
+                    format!("AI enrichment skipped: {AI_BUDGET_EXCEEDED_MESSAGE}")
+                } else {
+                    format!("AI enrichment skipped by the AI gateway ({code}): {message}")
+                };
+                self.warn_job_once(&msg.job_id, &warning).await;
+            }
+            e => warn!(url = %msg.url, error = %e, "Failed to {what}"),
+        }
+    }
+
+    /// Hosted: vision OCR runs on the page account's team gateway (its client
+    /// and the Lab's vision model), never the worker's env client. Without
+    /// team AI (no account, none for the team, Lab unreachable) an engine
+    /// whose own backend is an AI provider skips OCR with the returned
+    /// warning, and a local engine (Tesseract) runs as configured.
+    /// Standalone: a page carrying an account comes from a hosted engine
+    /// (misconfigured worker), so an AI backend skips OCR rather than spend
+    /// the env key on a tenant.
+    /// `Ok(None)`: the engine runs as configured (standalone, a local-only
+    /// engine, or no page to recognize).
+    async fn ocr_ai(
+        &self,
+        msg: &RawPageMessage,
+        engine: &OcrEngine,
+        has_pages: bool,
+    ) -> Result<Option<PageAi>, String> {
+        if self.hosted_ai.is_none() {
+            if has_pages && engine.uses_ai() && page_account(msg).is_some() {
+                error!(
+                    job_id = %msg.job_id,
+                    url = %msg.url,
+                    "Vision OCR skipped: {}; set SCRAPIX_MODE=hosted on this worker",
+                    NoAi::HostedPage.reason()
+                );
+                return Err(format!("OCR skipped: {}", NoAi::Unavailable.reason()));
+            }
+            return Ok(None);
+        }
+        if !has_pages || !engine.accepts_request_client() {
+            return Ok(None);
+        }
+        let why = match self.resolve_ai(msg, None).await {
+            Ok(ai) => return Ok(Some(ai)),
+            Err(why) => why,
+        };
+        warn!(
+            job_id = %msg.job_id,
+            url = %msg.url,
+            reason = why.reason(),
+            "Vision OCR skipped: no AI gateway for this page"
+        );
+        if engine.uses_ai() {
+            Err(format!("OCR skipped: {}", why.reason()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Enrich document with AI-generated content (summary, extraction).
     /// Returns whether any enrichment was actually produced.
     async fn enrich_with_ai(
@@ -1654,9 +1934,12 @@ impl ContentWorker {
         if !ai_requested(features) {
             return (document, false);
         }
-        let Some(ai_service) = self.ai_service.as_ref() else {
-            self.warn_job_once(&msg.job_id, WARN_AI_NO_PROVIDER).await;
-            return (document, false);
+        let ai = match self.resolve_ai(msg, None).await {
+            Ok(ai) => ai,
+            Err(why) => {
+                self.report_no_ai(msg, &why).await;
+                return (document, false);
+            }
         };
 
         // Get content to process - prefer markdown, fallback to content
@@ -1681,6 +1964,7 @@ impl ContentWorker {
         } else {
             content
         };
+        let content_for_ai = content_for_ai.as_str();
 
         let context = |feature: &str| AiUsageContext {
             job_id: msg.job_id.clone(),
@@ -1690,15 +1974,21 @@ impl ContentWorker {
         };
 
         // Independent calls run concurrently; each carries its own usage
-        // attribution. Individual failures are logged.
+        // attribution (also sent to the AI gateway as metadata). Individual
+        // failures are logged.
         let summary_fut = AI_USAGE_CONTEXT.scope(context("ai_summary"), async {
             if !features.ai_summary_enabled() {
                 return None;
             }
-            match ai_service.tldr(&content_for_ai).await {
+            let summary = self
+                .call_ai(msg, ai.clone(), |service| async move {
+                    service.tldr(content_for_ai).await
+                })
+                .await;
+            match summary {
                 Ok(summary) => Some(summary),
                 Err(e) => {
-                    warn!(url = %document.url, error = %e, "Failed to generate AI summary");
+                    self.report_ai_error(msg, "generate AI summary", &e).await;
                     None
                 }
             }
@@ -1719,10 +2009,16 @@ impl ContentWorker {
                 warn!(url = %document.url, "AI extraction enabled but no prompt provided");
                 return None;
             };
-            match ai_service.extract(&content_for_ai, prompt).await {
+            let prompt = prompt.as_str();
+            let extraction = self
+                .call_ai(msg, ai.clone(), |service| async move {
+                    service.extract(content_for_ai, prompt).await
+                })
+                .await;
+            match extraction {
                 Ok(result) => Some(result.data),
                 Err(e) => {
-                    warn!(url = %document.url, error = %e, "Failed to run AI extraction");
+                    self.report_ai_error(msg, "run AI extraction", &e).await;
                     None
                 }
             }
@@ -1786,6 +2082,68 @@ impl ContentWorker {
             Ok(extracted) if !extracted.values.is_empty() => Some(extracted.values),
             _ => None,
         }
+    }
+}
+
+/// The page's account, if it carries one (hosted engines stamp it; a
+/// standalone engine never does).
+fn page_account(msg: &RawPageMessage) -> Option<&str> {
+    msg.account_id.as_deref().filter(|a| !a.is_empty())
+}
+
+/// The Lab for `SCRAPIX_MODE=hosted` (`None` in standalone). Hosted refuses
+/// to start without LAB_URL, LAB_INSTANCE_ID and LAB_INSTANCE_SECRET (fail
+/// closed: never the env AI provider for a tenant). Standalone ignores the
+/// Lab settings with a warning: workers often share an env or secret bundle
+/// with the API, so refusing them would crash-loop a worker whose mode was
+/// not set.
+fn hosted_lab(args: &Args) -> anyhow::Result<Option<Arc<LabClient>>> {
+    let set = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    match args.mode.trim() {
+        "standalone" => {
+            if set(&args.lab_url).is_some()
+                || set(&args.lab_events_url).is_some()
+                || set(&args.lab_instance_id).is_some()
+                || set(&args.lab_instance_secret).is_some()
+            {
+                warn!(
+                    "LAB_URL/LAB_EVENTS_URL/LAB_INSTANCE_ID/LAB_INSTANCE_SECRET are ignored in \
+                     standalone mode: AI uses the env provider. Set SCRAPIX_MODE=hosted (as on \
+                     the API) for each team's AI gateway"
+                );
+            }
+            Ok(None)
+        }
+        "hosted" => {
+            // LAB_EVENTS_URL: the deprecated spelling the API still accepts.
+            let url = match (set(&args.lab_url), set(&args.lab_events_url)) {
+                (Some(url), _) => url,
+                (None, Some(events_url)) => {
+                    warn!("LAB_EVENTS_URL is deprecated: set LAB_URL to the Lab base URL");
+                    LabClient::base_from_events_url(&events_url)
+                }
+                (None, None) => {
+                    anyhow::bail!("SCRAPIX_MODE=hosted requires LAB_URL (the Lab base URL)")
+                }
+            };
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                anyhow::bail!("LAB_URL must start with http:// or https://, got `{url}`");
+            }
+            let id = set(&args.lab_instance_id).ok_or_else(|| {
+                anyhow::anyhow!("SCRAPIX_MODE=hosted requires LAB_INSTANCE_ID (the API's)")
+            })?;
+            let secret = set(&args.lab_instance_secret).ok_or_else(|| {
+                anyhow::anyhow!("SCRAPIX_MODE=hosted requires LAB_INSTANCE_SECRET (the API's)")
+            })?;
+            info!(url = %url, "Hosted mode: AI targets from the Lab");
+            Ok(Some(Arc::new(LabClient::new(&url, &id, &secret))))
+        }
+        other => anyhow::bail!("SCRAPIX_MODE must be `standalone` or `hosted`, got `{other}`"),
     }
 }
 
@@ -2032,6 +2390,7 @@ mod tests {
             Arc::new(AnyProducer::from(bus.producer())),
             true,
         )
+        .unwrap()
     }
 
     fn started(w: ContentWorker) -> Arc<ContentWorker> {
@@ -2872,5 +3231,645 @@ mod tests {
             e,
             CrawlEvent::JobWarning { message, .. } if message == WARN_OCR_UNAVAILABLE
         )));
+    }
+
+    // === Hosted: AI through each team's Lumen gateway ===
+
+    use scrapix_lab::testing::{FakeLab, INSTANCE_ID, SECRET};
+
+    /// A chat completion answering `reply`.
+    fn completion(reply: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "mock",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": reply},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        }))
+    }
+
+    fn gateway_error(status: u16, code: &str, message: &str) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "error": {"code": code, "message": message, "type": "lumen_error"}
+        }))
+    }
+
+    /// Lumen answering every chat call with `reply`.
+    async fn lumen_answering(reply: &str) -> MockServer {
+        let lumen = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(completion(reply))
+            .mount(&lumen)
+            .await;
+        lumen
+    }
+
+    /// The Lab's AI target for `lumen`: key `api_key`, with id `key_id`.
+    fn lumen_target(lumen: &MockServer, key_id: &str, api_key: &str) -> scrapix_lab::AiTarget {
+        scrapix_lab::AiTarget {
+            base_url: format!("{}/v1/", lumen.uri()),
+            api_key: api_key.into(),
+            key_id: key_id.into(),
+            default_model: "lab-default-model".into(),
+            vision_model: "lab-vision-model".into(),
+        }
+    }
+
+    /// A hosted worker against `ms`, resolving AI through `lab`.
+    fn hosted_worker(bus: &ChannelBus, ms: &MockServer, lab: &FakeLab) -> ContentWorker {
+        build_worker(
+            bus,
+            ms,
+            &[
+                "--mode",
+                "hosted",
+                "--lab-url",
+                &lab.url,
+                "--lab-instance-id",
+                INSTANCE_ID,
+                "--lab-instance-secret",
+                SECRET,
+            ],
+        )
+    }
+
+    fn summary_features() -> FeaturesConfig {
+        FeaturesConfig {
+            ai_summary: Some(FeatureToggle {
+                enabled: true,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A page of `account` asking for an AI summary.
+    fn ai_page(url: &str, account: Option<&str>) -> RawPageMessage {
+        let mut msg = page(url, 200, None);
+        msg.account_id = account.map(Into::into);
+        msg.features = Some(summary_features());
+        msg
+    }
+
+    /// Handle `msgs`, flush, and wait until every page is acked.
+    async fn index_all(w: &Arc<ContentWorker>, msgs: Vec<RawPageMessage>) {
+        let mut acks = Vec::new();
+        for msg in msgs {
+            let (ack, acked) = tracked_ack();
+            w.handle_message(msg, ack).await;
+            acks.push(acked);
+        }
+        w.flush_all_storages().await;
+        for acked in &acks {
+            assert!(wait_for(acked).await);
+        }
+    }
+
+    fn ai_enriched(events: &[CrawlEvent]) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                CrawlEvent::DocumentIndexed { ai_enriched, .. } => Some(*ai_enriched),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn bearer(request: &wiremock::Request) -> String {
+        request.headers["authorization"]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn lumen_metadata(request: &wiremock::Request) -> serde_json::Value {
+        let header = request
+            .headers
+            .get("x-lumen-metadata")
+            .expect("x-lumen-metadata");
+        serde_json::from_str(header.to_str().unwrap()).unwrap()
+    }
+
+    /// Log lines written while a [`capture_logs`] guard is held.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    /// Capture this thread's logs (the `#[tokio::test]` runtime runs on it).
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let logs = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_enriches_with_the_message_account_key() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct-a", Some(lumen_target(&lumen, "k-a", "fg-A")));
+        lab.set_ai("acct-b", Some(lumen_target(&lumen, "k-b", "fg-B")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+        let forwarder = w
+            .spawn_ai_usage_forwarder()
+            .expect("hosted calls are tracked");
+
+        index_all(
+            &w,
+            vec![
+                ai_page("https://a.test/1", Some("acct-a")),
+                ai_page("https://a.test/2", Some("acct-b")),
+            ],
+        )
+        .await;
+
+        let requests = lumen.received_requests().await.unwrap();
+        let keys: Vec<String> = requests.iter().map(bearer).collect();
+        assert_eq!(keys, vec!["Bearer fg-A", "Bearer fg-B"]);
+        for request in &requests {
+            assert_eq!(request.url.path(), "/v1/chat/completions");
+            let meta = lumen_metadata(request);
+            assert_eq!(meta["product"], "scrapix");
+            assert_eq!(meta["feature"], "ai_summary");
+            assert_eq!(meta["job_id"], "job-1");
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert_eq!(body["model"], "lab-default-model");
+        }
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true, true], "{events:?}");
+        // Hosted calls feed the same `AiUsage` events as the env client.
+        let usage: Vec<(Option<String>, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CrawlEvent::AiUsage {
+                    account_id,
+                    feature,
+                    ..
+                } => Some((account_id.clone(), feature.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            usage,
+            vec![
+                (Some("acct-a".to_string()), "ai_summary".to_string()),
+                (Some("acct-b".to_string()), "ai_summary".to_string()),
+            ]
+        );
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_without_account_skips_ai() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        // A key exists for some account: never used for an unattributed page.
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        index_all(&w, vec![ai_page("https://a.test/1", None)]).await;
+
+        assert!(lumen.received_requests().await.unwrap().is_empty());
+        assert!(lab.ai_queries().is_empty());
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains("no account"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_worker_uses_env_ai() {
+        let ms = meilisearch(task_accepted()).await;
+        let env_ai = lumen_answering("A short summary.").await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(standalone_worker_with_env_ai(&bus, &ms, &env_ai));
+
+        index_all(&w, vec![ai_page("https://a.test/1", None)]).await;
+
+        let requests = env_ai.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(bearer(&requests[0]), "Bearer env-key");
+        // Not a Lumen target: no metadata header.
+        assert!(requests[0].headers.get("x-lumen-metadata").is_none());
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+    }
+
+    /// A standalone worker with the env provider (AI_PROVIDER + its key)
+    /// pointed at `env_ai`.
+    fn standalone_worker_with_env_ai(
+        bus: &ChannelBus,
+        ms: &MockServer,
+        env_ai: &MockServer,
+    ) -> ContentWorker {
+        let mut w = build_worker(bus, ms, &[]);
+        let client = AiClient::new(scrapix_ai::AiClientConfig {
+            api_key: "env-key".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", env_ai.uri())),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        w.ai_service = Some(Arc::new(
+            AiService::minimal(Arc::new(client)).with_summarization(),
+        ));
+        w
+    }
+
+    #[tokio::test]
+    async fn standalone_worker_never_spends_env_ai_on_a_hosted_page() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let env_ai = lumen_answering("A short summary.").await;
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(standalone_worker_with_env_ai(&bus, &ms, &env_ai));
+
+        // An account on the page: it comes from a hosted engine, and this
+        // worker was left on the default standalone mode.
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert!(env_ai.received_requests().await.unwrap().is_empty());
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::JobWarning { message, .. } if message == WARN_AI_UNAVAILABLE
+            )),
+            "{events:?}"
+        );
+        let logs = logs.text();
+        assert!(
+            logs.contains("ERROR") && logs.contains("SCRAPIX_MODE=hosted"),
+            "{logs}"
+        );
+    }
+
+    struct FakeVision;
+    #[async_trait::async_trait]
+    impl scrapix_ocr::OcrBackend for FakeVision {
+        fn name(&self) -> &str {
+            "fake-vision"
+        }
+        async fn recognize(&self, _: &[u8], _: &str) -> Result<String, scrapix_ocr::OcrError> {
+            Ok("Invoice number 4821".to_string())
+        }
+        fn uses_ai(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_worker_skips_ai_ocr_on_a_hosted_page() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let mut w = build_worker(&bus, &ms, &[]);
+        w.ocr = Some(Arc::new(OcrEngine::new(
+            Arc::new(FakeRaster),
+            Arc::new(FakeVision),
+            Arc::new(scrapix_ocr::MemoryOcrCache::new(10)),
+            Arc::new(scrapix_ocr::MemoryOcrBudget::new(0)),
+            scrapix_ocr::OcrSettings::default(),
+        )));
+        let w = started(w);
+        let mut msg = doc_page(
+            "https://a.test/mixed.pdf",
+            "application/pdf",
+            &fixture("mixed.pdf"),
+            pdf_on(scrapix_core::OcrMode::Auto),
+        );
+
+        // No account (a standalone engine's page): the env-backed engine
+        // runs as configured.
+        msg.account_id = None;
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 1);
+        assert!(doc.markdown.unwrap().contains("Invoice number 4821"));
+
+        // An account: skipped, the scanned page stays flagged.
+        msg.account_id = Some("acct".into());
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+        assert_eq!(ocr_pages, 0);
+        assert!(!doc.markdown.unwrap().contains("Invoice number 4821"));
+        assert_eq!(doc.metadata.unwrap()["needs_ocr"], "true");
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_without_team_ai_skips_ai() {
+        let ms = meilisearch(task_accepted()).await;
+        let lab = FakeLab::start().await; // no `/ai` target: 404
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CrawlEvent::JobWarning { message, .. } if message == WARN_AI_NO_TEAM_AI
+        )));
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_with_the_lab_down_still_indexes() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        lab.set_down(true);
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert!(lumen.received_requests().await.unwrap().is_empty());
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CrawlEvent::JobWarning { message, .. } if message == WARN_AI_UNAVAILABLE
+        )));
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_replaces_a_refused_key_once() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer fg-1"))
+            .respond_with(gateway_error(401, "LM-4004", "key refused"))
+            .mount(&lumen)
+            .await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("authorization", "Bearer fg-2"))
+            .respond_with(completion("A short summary."))
+            .mount(&lumen)
+            .await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        lab.rotate_ai("acct", lumen_target(&lumen, "k-2", "fg-2"));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert_eq!(lab.ai_queries(), vec![None, Some("k-1".to_string())]);
+        let keys: Vec<String> = lumen
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(bearer)
+            .collect();
+        assert_eq!(keys, vec!["Bearer fg-1", "Bearer fg-2"]);
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_over_budget_indexes_without_ai() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(gateway_error(402, "LM-4001", "team budget exceeded"))
+            .mount(&lumen)
+            .await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        // Not retried, not re-resolved.
+        assert_eq!(lumen.received_requests().await.unwrap().len(), 1);
+        assert_eq!(lab.ai_queries(), vec![None]);
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![false], "{events:?}");
+        // Scrapix's insufficient-credits wording, not Lumen's raw code.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::JobWarning { message, .. }
+                    if message.contains(scrapix_ai::AI_BUDGET_EXCEEDED_MESSAGE)
+                        && !message.contains("LM-4001")
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_worker_ocr_uses_the_team_key_and_vision_model() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("Invoice number 4821").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let mut w = hosted_worker(&bus, &ms, &lab);
+        // A local engine (no env AI client) that takes a request's client.
+        w.ocr = Some(Arc::new(
+            OcrEngine::new(
+                Arc::new(FakeRaster),
+                Arc::new(FakeOcr),
+                Arc::new(scrapix_ocr::MemoryOcrCache::new(10)),
+                Arc::new(scrapix_ocr::MemoryOcrBudget::new(0)),
+                scrapix_ocr::OcrSettings::default(),
+            )
+            .with_request_vision(true),
+        ));
+        let w = started(w);
+        let msg = doc_page(
+            "https://a.test/scan.pdf",
+            "application/pdf",
+            &fixture("scanned.pdf"),
+            pdf_on(scrapix_core::OcrMode::Auto),
+        );
+
+        let (doc, ocr_pages) = indexed_doc(w.process_page(&msg).await);
+
+        assert_eq!(ocr_pages, 1);
+        assert!(doc.markdown.unwrap().contains("Invoice number 4821"));
+        let requests = lumen.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(bearer(&requests[0]), "Bearer fg-1");
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["model"], "lab-vision-model");
+        let meta = lumen_metadata(&requests[0]);
+        assert_eq!(meta["feature"], "ocr");
+        assert_eq!(meta["job_id"], "job-1");
+    }
+
+    /// A standalone worker given the API's Lab settings (a shared secret
+    /// bundle) starts, warns, and keeps using its env provider: no Lab call.
+    #[tokio::test]
+    async fn standalone_worker_ignores_lab_settings() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let env_ai = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&env_ai, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let mut w = build_worker(
+            &bus,
+            &ms,
+            &[
+                "--lab-url",
+                &lab.url,
+                "--lab-instance-id",
+                INSTANCE_ID,
+                "--lab-instance-secret",
+                SECRET,
+            ],
+        );
+        assert!(w.hosted_ai.is_none());
+        let client = AiClient::new(scrapix_ai::AiClientConfig {
+            api_key: "env-key".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", env_ai.uri())),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        w.ai_service = Some(Arc::new(
+            AiService::minimal(Arc::new(client)).with_summarization(),
+        ));
+        let w = started(w);
+
+        index_all(&w, vec![ai_page("https://a.test/1", None)]).await;
+
+        assert!(lab.ai_queries().is_empty());
+        let requests = env_ai.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(bearer(&requests[0]), "Bearer env-key");
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains("ignored in standalone mode"),
+            "{logs}"
+        );
+    }
+
+    /// A bundle that only sets the deprecated LAB_EVENTS_URL (the API still
+    /// accepts it): the worker derives the Lab base from it, as the API does.
+    #[tokio::test]
+    async fn hosted_worker_falls_back_to_lab_events_url() {
+        let (logs, _guard) = capture_logs();
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = lumen_answering("A short summary.").await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct", Some(lumen_target(&lumen, "k-1", "fg-1")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let events_url = format!("{}/internal/events", lab.url);
+        let w = started(build_worker(
+            &bus,
+            &ms,
+            &[
+                "--mode",
+                "hosted",
+                "--lab-events-url",
+                &events_url,
+                "--lab-instance-id",
+                INSTANCE_ID,
+                "--lab-instance-secret",
+                SECRET,
+            ],
+        ));
+
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct"))]).await;
+
+        assert_eq!(lab.ai_queries(), vec![None]);
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        assert_eq!(ai_enriched(&events), vec![true], "{events:?}");
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains("LAB_EVENTS_URL is deprecated"),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn hosted_mode_needs_the_lab_settings() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["scrapix-worker-content"];
+            argv.extend_from_slice(extra);
+            hosted_lab(&Args::parse_from(argv)).map(|lab| lab.is_some())
+        };
+        let lab = [
+            "--lab-url",
+            "http://lab.test",
+            "--lab-instance-id",
+            INSTANCE_ID,
+            "--lab-instance-secret",
+            SECRET,
+        ];
+        assert!(!parse(&[]).unwrap(), "standalone by default");
+        let mut hosted = vec!["--mode", "hosted"];
+        hosted.extend_from_slice(&lab);
+        assert!(parse(&hosted).unwrap());
+        // Hosted with any Lab setting missing: refuse to start.
+        for missing in ["--lab-url", "--lab-instance-id", "--lab-instance-secret"] {
+            let i = hosted.iter().position(|a| *a == missing).unwrap();
+            let mut partial = hosted.clone();
+            partial.drain(i..i + 2);
+            let err = parse(&partial).unwrap_err().to_string();
+            assert!(err.contains("SCRAPIX_MODE=hosted requires"), "{err}");
+        }
+        // Standalone ignores the Lab settings (shared env bundles): it
+        // starts, with no Lab.
+        assert!(!parse(&lab).unwrap());
+        assert!(!parse(&["--lab-url", "http://lab.test"]).unwrap());
+        assert!(parse(&["--mode", "cloud"]).is_err());
     }
 }

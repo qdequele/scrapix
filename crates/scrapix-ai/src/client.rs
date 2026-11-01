@@ -48,6 +48,33 @@ pub enum AiClientError {
     Config(String),
 }
 
+impl AiClientError {
+    /// The API error body of a provider call, when the provider answered
+    /// with one.
+    fn api_error(&self) -> Option<&async_openai::error::ApiError> {
+        match self {
+            AiClientError::OpenAI(async_openai::error::OpenAIError::ApiError(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The Lumen gateway code (one of [`crate::gateway_codes`]) of an error
+    /// the gateway answered with, if this is one. An `LM-` code Scrapix does
+    /// not know is not one: that error stays an ordinary API error.
+    pub fn gateway_code(&self) -> Option<&str> {
+        self.api_error()?
+            .code
+            .as_deref()
+            .filter(|code| crate::gateway_codes::is_known(code))
+    }
+
+    /// The gateway's own message for a [`gateway_code`](Self::gateway_code) error.
+    pub fn gateway_message(&self) -> Option<&str> {
+        self.gateway_code()?;
+        self.api_error().map(|e| e.message.as_str())
+    }
+}
+
 /// Configuration for the AI client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiClientConfig {
@@ -81,6 +108,11 @@ pub struct AiClientConfig {
     /// Request timeout (ms)
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// Send the `x-lumen-metadata` header (OpenAI provider only): set when
+    /// `base_url` is a Lumen gateway.
+    #[serde(default)]
+    pub lumen_metadata: bool,
 }
 
 fn default_provider() -> String {
@@ -110,6 +142,7 @@ impl Default for AiClientConfig {
             max_retries: default_max_retries(),
             retry_delay_ms: default_retry_delay_ms(),
             timeout_ms: default_timeout_ms(),
+            lumen_metadata: false,
         }
     }
 }
@@ -184,12 +217,15 @@ tokio::task_local! {
 /// Receiver end of the AI usage tracking channel.
 pub type AiUsageReceiver = tokio::sync::mpsc::UnboundedReceiver<AiUsageEvent>;
 
+/// Sending end of the AI usage tracking channel.
+pub type AiUsageSender = tokio::sync::mpsc::UnboundedSender<AiUsageEvent>;
+
 /// AI client wrapper with rate limiting and retries
 pub struct AiClient {
     provider: Box<dyn LlmProvider>,
     config: AiClientConfig,
     semaphore: Arc<Semaphore>,
-    usage_tx: Option<tokio::sync::mpsc::UnboundedSender<AiUsageEvent>>,
+    usage_tx: Option<AiUsageSender>,
 }
 
 impl AiClient {
@@ -200,10 +236,10 @@ impl AiClient {
         }
 
         let provider: Box<dyn LlmProvider> = match config.provider.as_str() {
-            "openai" => Box::new(OpenAiProvider::new(
-                &config.api_key,
-                config.base_url.as_deref(),
-            )),
+            "openai" => Box::new(
+                OpenAiProvider::new(&config.api_key, config.base_url.as_deref())
+                    .with_lumen_metadata(config.lumen_metadata),
+            ),
             "anthropic" => Box::new(AnthropicProvider::new(&config.api_key)),
             "gemini" => Box::new(GeminiProvider::new(&config.api_key)),
             "mistral" => Box::new(MistralProvider::new(&config.api_key)),
@@ -234,6 +270,13 @@ impl AiClient {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.usage_tx = Some(tx);
         Ok((client, rx))
+    }
+
+    /// Emit an `AiUsageEvent` on `tx` for every successful LLM call (for
+    /// several clients feeding one receiver).
+    pub fn with_usage_sender(mut self, tx: AiUsageSender) -> Self {
+        self.usage_tx = Some(tx);
+        self
     }
 
     /// Create a client from environment variables.
@@ -466,6 +509,11 @@ impl AiClient {
 
     /// Check if an error is retryable
     fn is_retryable(error: &AiClientError) -> bool {
+        // A known gateway refusal (budget, key, model, request) is final:
+        // asking again gets the same answer.
+        if error.gateway_code().is_some() {
+            return false;
+        }
         matches!(
             error,
             AiClientError::RateLimited { .. }
@@ -586,5 +634,206 @@ mod tests {
         assert!(count > 0);
         let count = AiClient::count_tokens("Hello world", "mistral-3").unwrap();
         assert!(count > 0);
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn client(server: &MockServer) -> AiClient {
+        AiClient::new(AiClientConfig {
+            api_key: "test-key".to_string(),
+            provider: "openai".to_string(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            max_retries: 3,
+            retry_delay_ms: 1,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn user_message() -> Vec<Message> {
+        vec![Message {
+            role: MessageRole::User,
+            content: "hi".to_string(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_usage_sender_gets_one_event_per_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client(&server).with_usage_sender(tx);
+
+        client
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.total_tokens, 5);
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn lumen_error(code: &str) -> serde_json::Value {
+        json!({"error": {"code": code, "message": "refused by lumen", "type": "lumen_error"}})
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_are_not_retried() {
+        for (status, code) in [
+            (402, crate::gateway_codes::BUDGET_EXCEEDED),
+            (401, crate::gateway_codes::KEY_REFUSED),
+            (404, crate::gateway_codes::UNKNOWN_MODEL),
+            (400, crate::gateway_codes::INVALID_REQUEST),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(lumen_error(code)))
+                .mount(&server)
+                .await;
+
+            let err = client(&server)
+                .chat(user_message(), "gpt-4o-mini", None, None)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.gateway_code(), Some(code), "status {status}");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "{code} must not be retried"
+            );
+        }
+    }
+
+    /// Only the four known codes are final: an unknown `LM-` code is an
+    /// ordinary API error, retried as any other.
+    #[tokio::test]
+    async fn unknown_gateway_codes_are_retried_like_other_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(lumen_error("LM-9999")))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.gateway_code(), None);
+        assert_eq!(err.gateway_message(), None);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_gateway_code_on_a_503_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(lumen_error("LM-5003")))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let response = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "ok");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn non_gateway_api_errors_have_no_gateway_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": {"code": "invalid_api_key", "message": "no", "type": "x"}}),
+            ))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.gateway_code(), None);
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_still_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let response = client(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "ok");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

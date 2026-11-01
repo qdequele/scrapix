@@ -64,9 +64,11 @@ To get their text, turn on OCR.
 
 ## OCR
 
-OCR is **opt-in** and **off by default**: it is slow and billed per
-recognized page on hosted (the Lab prices it — see **Billing & Usage** in
-the Platform docs).
+OCR is **opt-in** and **off by default**: it is slow. On hosted, vision OCR
+runs on your team's AI gateway, which bills the tokens to the team: Scrapix
+reports the recognized pages (`pages_ocr`) but charges no credits for them. A
+team without AI gets no OCR: the request succeeds with an "OCR skipped"
+warning and scanned pages stay flagged.
 
 | Mode | Behavior |
 |------|----------|
@@ -163,7 +165,7 @@ shell-out), and it is what pdf-inspector itself renders with.
 | Cache keyed by page-image hash | 30 days | `OCR_CACHE_TTL_DAYS`; shared across instances via `OCR_REDIS_URL` (falls back to `REDIS_URL`), otherwise in-process (`OCR_CACHE_CAPACITY`) |
 
 Pages beyond the cap or the budget are reported as `pages_capped` and stay
-flagged. **Cache hits are not billed**: re-crawling or re-uploading the same
+flagged. **Cache hits make no gateway call**: re-crawling or re-uploading the same
 document never pays twice for the same page.
 
 ## Crawling documents

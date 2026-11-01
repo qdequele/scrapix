@@ -55,9 +55,35 @@ pub mod summary;
 
 // Re-export main types from client
 pub use client::{
-    AiClient, AiClientConfig, AiUsageContext, AiUsageEvent, AiUsageReceiver, ChatResponse,
-    AI_USAGE_CONTEXT,
+    AiClient, AiClientConfig, AiClientError, AiUsageContext, AiUsageEvent, AiUsageReceiver,
+    AiUsageSender, ChatResponse, AI_USAGE_CONTEXT,
 };
+
+/// Error codes of the Lumen AI gateway (the `code` of its
+/// `{"error":{"code","message","type"}}` bodies).
+pub mod gateway_codes {
+    /// 402: the team's budget is used up.
+    pub const BUDGET_EXCEEDED: &str = "LM-4001";
+    /// 401: the gateway refused the API key (revoked or rotated).
+    pub const KEY_REFUSED: &str = "LM-4004";
+    /// 404: the requested model is not served.
+    pub const UNKNOWN_MODEL: &str = "LM-2001";
+    /// 400: the request itself is invalid.
+    pub const INVALID_REQUEST: &str = "LM-1001";
+
+    /// One of the codes above: the gateway's final answer. Any other `LM-`
+    /// code is handled as an ordinary AI error.
+    pub fn is_known(code: &str) -> bool {
+        [BUDGET_EXCEEDED, KEY_REFUSED, UNKNOWN_MODEL, INVALID_REQUEST].contains(&code)
+    }
+}
+
+/// What Scrapix says when the team's AI budget is used up
+/// ([`gateway_codes::BUDGET_EXCEEDED`]): the insufficient-credits refusal,
+/// with no balance in it (the team's Scrapix balance is usually still
+/// positive; its AI budget is what ran out).
+pub const AI_BUDGET_EXCEEDED_MESSAGE: &str =
+    "Insufficient credits: the team's AI budget is used up, top up to continue";
 
 pub use providers::ImageInput;
 
@@ -75,6 +101,35 @@ pub use summary::{
 
 use scrapix_core::{Result, ScrapixError};
 use std::sync::Arc;
+
+/// The gateway code (see [`gateway_codes`]) of an AI error, when the AI
+/// gateway refused the call.
+pub fn ai_gateway_code(err: &ScrapixError) -> Option<&str> {
+    match err {
+        ScrapixError::AiGateway { code, .. } => Some(code),
+        _ => None,
+    }
+}
+
+/// Convert an AI failure: a gateway refusal keeps its code
+/// ([`ScrapixError::AiGateway`]), anything else is [`ScrapixError::Ai`].
+fn ai_error<E: std::error::Error + 'static>(err: E) -> ScrapixError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+    while let Some(e) = source {
+        if let Some(client_err) = e.downcast_ref::<AiClientError>() {
+            if let (Some(code), Some(message)) =
+                (client_err.gateway_code(), client_err.gateway_message())
+            {
+                return ScrapixError::AiGateway {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                };
+            }
+        }
+        source = e.source();
+    }
+    ScrapixError::Ai(err.to_string())
+}
 
 /// Unified AI service providing all AI capabilities
 ///
@@ -153,7 +208,7 @@ impl AiService {
         extractor
             .extract_with_prompt(content, prompt)
             .await
-            .map_err(|e| ScrapixError::Ai(e.to_string()))
+            .map_err(ai_error)
     }
 
     /// Extract structured data using a schema
@@ -170,7 +225,7 @@ impl AiService {
         extractor
             .extract_with_schema(content, schema)
             .await
-            .map_err(|e| ScrapixError::Ai(e.to_string()))
+            .map_err(ai_error)
     }
 
     /// Summarize content
@@ -180,10 +235,7 @@ impl AiService {
             .as_ref()
             .ok_or_else(|| ScrapixError::Ai("Summarization not enabled".to_string()))?;
 
-        summarizer
-            .summarize(content)
-            .await
-            .map_err(|e| ScrapixError::Ai(e.to_string()))
+        summarizer.summarize(content).await.map_err(ai_error)
     }
 
     /// Generate a TL;DR
@@ -193,10 +245,7 @@ impl AiService {
             .as_ref()
             .ok_or_else(|| ScrapixError::Ai("Summarization not enabled".to_string()))?;
 
-        summarizer
-            .tldr(content)
-            .await
-            .map_err(|e| ScrapixError::Ai(e.to_string()))
+        summarizer.tldr(content).await.map_err(ai_error)
     }
 
     /// Generate a headline
@@ -209,7 +258,7 @@ impl AiService {
         summarizer
             .generate_headline(content)
             .await
-            .map_err(|e| ScrapixError::Ai(e.to_string()))
+            .map_err(ai_error)
     }
 }
 
@@ -225,6 +274,86 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_become_ai_gateway() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "LM-4001",
+                    "message": "budget exceeded",
+                    "type": "lumen_error"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            AiClient::new(AiClientConfig {
+                api_key: "test-key".to_string(),
+                provider: "openai".to_string(),
+                base_url: Some(format!("{}/v1", server.uri())),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let err = AiService::new(client)
+            .extract("some page", "extract the title")
+            .await
+            .unwrap_err();
+
+        assert_eq!(ai_gateway_code(&err), Some(gateway_codes::BUDGET_EXCEEDED));
+        match err {
+            ScrapixError::AiGateway { code, message } => {
+                assert_eq!(code, "LM-4001");
+                assert!(message.contains("budget exceeded"), "{message}");
+            }
+            other => panic!("expected AiGateway, got {other:?}"),
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_gateway_codes_are_plain_ai_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {"code": "LM-9999", "message": "something new", "type": "lumen_error"}
+            })))
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            AiClient::new(AiClientConfig {
+                api_key: "test-key".to_string(),
+                provider: "openai".to_string(),
+                base_url: Some(format!("{}/v1", server.uri())),
+                max_retries: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let err = AiService::new(client)
+            .extract("some page", "extract the title")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ScrapixError::Ai(_)), "{err:?}");
+    }
+
+    #[test]
+    fn ai_gateway_code_ignores_other_errors() {
+        assert_eq!(ai_gateway_code(&ScrapixError::Ai("x".into())), None);
     }
 
     #[test]

@@ -23,6 +23,11 @@ pub trait OcrBackend: Send + Sync {
     /// Recognize `image` (`media_type` `image/png` for rendered PDF pages)
     /// and return its content as Markdown (or plain text).
     async fn recognize(&self, image: &[u8], media_type: &str) -> Result<String, OcrError>;
+
+    /// Whether recognition calls an AI provider (and so costs AI usage).
+    fn uses_ai(&self) -> bool {
+        false
+    }
 }
 
 const VISION_SYSTEM_PROMPT: &str = "You are an OCR engine. Transcribe the document page in the \
@@ -69,6 +74,10 @@ impl VisionLlmOcr {
 impl OcrBackend for VisionLlmOcr {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn uses_ai(&self) -> bool {
+        true
     }
 
     async fn recognize(&self, image: &[u8], media_type: &str) -> Result<String, OcrError> {

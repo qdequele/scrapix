@@ -30,7 +30,10 @@ vendored `openapi.json`, the Lab's drift check fails until it re-vendors it.
   (`/internal/*`: credential introspection, accounts, Meilisearch targets)
   that the engine calls with its `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET`.
   Owned by `meilisearch/lab` (`contracts/lab-internal.openapi.json`); never
-  edit the vendored copy by hand.
+  edit the vendored copy by hand. The engine also calls
+  `GET /internal/accounts/{id}/ai` (the team's Lumen target for hosted AI);
+  the vendored copy gains it with `check-drift.sh --fix` once the Lab merges
+  that endpoint.
 - `vendor/lab/lab-events.schema.json`: the events contract (spec: Lab
   platform contract v2 §4) every engine reports against at
   `POST {LAB_URL}/internal/events`: `usage.recorded` carries raw `units`

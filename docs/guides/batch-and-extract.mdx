@@ -129,10 +129,12 @@ How it works:
    combines the partial results.
 
 Extract needs an AI provider on the server (see [AI enrichment](/guides/ai-enrichment));
-without one, `POST /extract` returns `503`.
+without one (hosted: a team without AI), `POST /extract` returns `503`. Pass `model`
+to pick the model (hosted: the Lab's default for your team when absent).
 
-**Usage.** Each page fetched is billed like a `/scrape`, each glob like a `/map`,
-and each AI call separately (prices are the Lab's, hosted only). A large extraction
+**Usage.** Each page fetched is billed like a `/scrape` and each glob like a `/map`
+(prices are the Lab's, hosted only). The AI calls are not charged in Scrapix credits:
+on hosted the team's AI gateway bills the tokens to the team. A large extraction
 makes one AI call per page plus one merge call, so keep URL lists focused.
 
 ## Reading Results

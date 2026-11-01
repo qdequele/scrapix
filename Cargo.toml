@@ -13,6 +13,7 @@ members = [
     "crates/scrapix-auth",
     "crates/scrapix-lifecycle",
     "crates/scrapix-ocr",
+    "crates/scrapix-lab",
 
     "bins/scrapix-api",
     "bins/scrapix-worker-crawler",
@@ -103,6 +104,8 @@ fantoccini = "0.21"
 
 # AI/ML
 async-openai = "0.28"
+backoff = "0.4"
+secrecy = "0.10"
 tiktoken-rs = "0.6"
 
 # Telemetry

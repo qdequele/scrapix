@@ -294,7 +294,13 @@ that names a Lab-owned table, reads included).
   `docs/configuration/environment-variables.mdx`), the Meilisearch target comes
   from `GET /internal/accounts/{id}/meilisearch` (a hosted tenant without one
   cannot crawl; `MEILISEARCH_URL` is ignored in hosted mode, never a
-  fallback), and the balance and plan `limits` (`concurrent_jobs`,
+  fallback), the account's AI gateway target from
+  `GET /internal/accounts/{id}/ai[?rejected_key_id=]` (a Lumen `base_url`,
+  a `lab-scrapix` key, the team's default and vision models; 404 = no AI for
+  the account; cached for the answer's `cache_ttl`; **every hosted LLM call**
+  goes through it, so hosted needs no `AI_PROVIDER` or provider key, and a key
+  Lumen refuses (`LM-4004`) is re-resolved once with `rejected_key_id` and the
+  call retried once), and the balance and plan `limits` (`concurrent_jobs`,
   `rate_limit_rpm`, `max_depth`, `js_rendering`) from introspect /
   `GET /internal/accounts/{id}`. The engine enforces concurrent jobs,
   `max_depth` (a hosted crawl without one gets the plan's) and JS rendering
@@ -364,6 +370,7 @@ The project is organized as a Cargo workspace with two main directories:
 - `scrapix-parser` - HTML parsing (scraper), content extraction, markdown conversion, language detection
 - `scrapix-extractor` - Feature extraction: metadata, JSON-LD/microdata schemas, custom CSS selectors, block splitting
 - `scrapix-ai` - AI enrichment via OpenAI: extraction, summarization, embeddings
+- `scrapix-lab` - The engine's client for the Lab's internal API (`LabClient`) and the per-key Lumen AI services (`HostedAiClients`, one-retry on a refused key), shared by `scrapix-api` and `scrapix-worker-content`
 - `scrapix-storage` - Storage backends: Meilisearch, RocksDB, Redis/DragonflyDB, S3/MinIO, ClickHouse
 - `scrapix-queue` - Kafka/Redpanda message queue producer and consumer
 - `scrapix-telemetry` - Prometheus metrics, distributed tracing, structured logging
@@ -425,8 +432,11 @@ never deletes a document whose page returned `304` in this job.
   `validation_error`; AI (`/scrape` `ai`, `/parse`, batch, crawl
   `features.ai_*`) without an AI provider → 503 `service_unavailable`;
   `crawler_type: browser` with `crawl_browser_available == false` → 503
-  `render_js_unavailable`. The AI surcharge is billed only for AI work that
-  produced a result.
+  `render_js_unavailable`. Hosted AI work (a team without AI → 503
+  `service_unavailable`, `AI is not available for this account`) is not
+  charged by Scrapix: the team's Lumen bills the tokens. `/extract` and
+  `/scrape` `ai` take an optional `model` (hosted: the Lab's default model
+  when absent).
 - Error code → status (`ApiError::into_response`): `quota_exceeded` 429,
   `fetch_error` 502, `render_js_unavailable` 503, `forbidden` 403, `timeout`
   504, `analytics_unavailable` 404 (`/analytics/v0/*` without ClickHouse).
@@ -514,7 +524,7 @@ rename without updating the scrape config there. Current metrics:
 `scrapix_consumer_uncommitted{topic}`, `scrapix_lab_events_pending`,
 `scrapix_lab_events_delivered_total{outcome}` (`accepted`|`rejected`|`failed`|`dropped`),
 `scrapix_lab_requests_total{endpoint,outcome}` (the engine's calls to the Lab's
-`/internal/*` API; endpoint `instances_me`|`introspect`|`account`|`meilisearch`.
+`/internal/*` API; endpoint `instances_me`|`introspect`|`account`|`meilisearch`|`ai`.
 The boot check was `endpoint="ping"` before contract v2: dashboards filtering
 on it go empty).
 
@@ -608,7 +618,12 @@ pre-check. **Transition release:** every `usage.recorded` also carries
 `usage_units` counters), which the Lab debits as authoritative for product
 scrapix; delete the module and the field next release (units, including
 `feature_pages`, are unaffected). `provider_cost_micro_usd` is 0: the engine knows token counts, not
-provider prices.
+provider prices. **AI is not charged by Scrapix**: hosted LLM calls (`/scrape`
+`ai`, `/extract`, `/parse`, crawl AI, vision OCR) go through the team's Lumen
+gateway, which bills the tokens to the team, so the AI terms of
+`legacy_credits` (summary, extraction, `pages_ai`, OCR pages) are 0 and
+`/extract` emits no usage event; pages, maps and searches are unchanged. The
+units still report `ai_summary`, `ai_extraction`, `pages_ai` and `pages_ocr`.
 
 ### ClickHouse Analytics Queries
 
@@ -635,7 +650,7 @@ GROUP BY date ORDER BY date;
 
 | Variable | Description |
 |----------|-------------|
-| `SCRAPIX_MODE` | API: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start |
+| `SCRAPIX_MODE` | API and content worker: `standalone` (default) or `hosted`. Validated at startup; an unrecognized value refuses to start. A hosted content worker resolves each team's AI key from the Lab (crawl AI and vision OCR), so it needs `LAB_*` too; a standalone one ignores `LAB_*` (warned) and uses the env AI provider, except for pages carrying an account (a hosted engine's): it skips their AI and AI OCR rather than spend the env key on a tenant |
 | `SCRAPIX_ADMIN_KEY` | API, standalone only: the operator key guarding every protected route (`Authorization: Bearer` or `X-API-Key`; `?token=` on WebSocket routes). Required unless `SCRAPIX_AUTH=disabled`; must be ≥16 chars after trimming |
 | `SCRAPIX_AUTH` | API, standalone only: `disabled` turns off all authentication (local dev only, logs a loud warning; refused in hosted mode and together with `SCRAPIX_ADMIN_KEY`) |
 | `DATABASE_URL` | API: the engine's **own** job-history store in both modes; default `sqlite://./data/scrapix.db` (image default `sqlite:///data/scrapix.db`), or a dedicated `postgres://`/`postgresql://` URL the engine migrates itself (refuses a database that already has the Rails schema, so it can never be the Lab's). Hosted production should point it at a dedicated Postgres database (e.g. `scrapix_engine`). |
@@ -649,16 +664,16 @@ GROUP BY date ORDER BY date;
 | `CLICKHOUSE_USER` | ClickHouse username |
 | `CLICKHOUSE_PASSWORD` | ClickHouse password |
 | `RUST_LOG` | Log level (info, debug, trace) |
-| `OPENAI_API_KEY` | For AI enrichment features |
+| `AI_PROVIDER` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | Standalone only: the env AI provider (`AI_PROVIDER` default `anthropic`). Hosted needs none (AI goes through the team's Lumen key from the Lab) |
 | `JOB_STALL_TIMEOUT_SECS` | API: seconds without progress before a job is finalized `FailStalled` (default `1800`) |
 | `JOB_COMPLETION_GRACE_MS` | API: grace period after exact accounting says a job is done, before finalizing (default `3000`) |
 | `MAX_PENDING_ACKS` | API: max event acks held awaiting the accounting flush before the consumer blocks (default `50000`) |
 | `ALLOW_PRIVATE_IPS` | API: allow webhook deliveries to private/loopback/link-local addresses (default `false`, SSRF opt-out, tests only); same-named flag also exists on the crawler worker for its own fetches |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | API: max webhook deliveries in flight at once across all jobs/hooks (default `64`) |
 | `CRAWL_BROWSER_AVAILABLE` | API: whether the crawlers can render pages; unset = unknown (browser crawls accepted), `false` = `POST /crawl` refuses `crawler_type: browser`. `scrapix all` sets it from `BROWSER_RENDER` |
-| `LAB_URL` | API, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone |
+| `LAB_URL` | API and content worker, hosted only, required: the Lab's base URL (`http://`/`https://`, no path, e.g. `http://127.0.0.1:8091`). Events go to `{LAB_URL}/internal/events`, everything else to `{LAB_URL}/internal/*`. Ignored in standalone (the worker warns) |
 | `LAB_EVENTS_URL` | **Deprecated** fallback for `LAB_URL` (the old `…/internal/events` URL; the base is derived from it, with a warning). Do not set it |
-| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API, hosted only, required; refused in standalone. Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` once; rotate with `lab:hosted_engine:rotate ID=`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
+| `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API and content worker (the API's values), hosted only, required; the standalone API refuses them (a standalone worker ignores them, warned). Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` once; rotate with `lab:hosted_engine:rotate ID=`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
 | `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars; generated first and passed to the Lab at mint time as `CREDENTIAL=`, stored per engine), inbound only: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron). Never sent to the Lab |
 | `LAB_EVENTS_SECRET` | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET` |
 | `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |

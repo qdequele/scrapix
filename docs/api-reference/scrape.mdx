@@ -251,12 +251,14 @@ A selector definition supports:
 
 ### AI Enrichment
 
-Requires an AI provider on the server (`AI_PROVIDER` and its API key, e.g.
-`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). Without one, a request asking for
-`ai.summary` or `ai.extract` is refused with `503 service_unavailable` before
-anything is fetched or billed. The AI surcharge is billed only for the AI work
-that produced a result: if the provider fails, the response carries a
-`warning` and only the scrape itself is billed.
+Requires an AI provider on the server. Standalone: `AI_PROVIDER` and its API
+key (e.g. `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). Hosted: the team's AI
+gateway, which needs no configuration; a team without AI is refused. Without
+a provider, a request asking for `ai.summary` or `ai.extract` is refused with
+`503 service_unavailable` before anything is fetched or billed. Hosted Scrapix
+charges nothing for AI (the gateway bills the tokens to the team); if the
+provider fails, the response carries a `warning` and the scrape itself is
+still returned.
 
 ```json
 {
@@ -288,6 +290,7 @@ that produced a result: if the provider fails, the response carries a
 | `ai.summary` | boolean | Generate a TL;DR summary |
 | `ai.extract.prompt` | string | Natural language extraction prompt |
 | `ai.extract.schema` | array | Structured field definitions for typed extraction |
+| `ai.model` | string | Model to summarize and extract with, e.g. `gpt-4o-mini`. Hosted: a model from the team's AI gateway, the Lab's default model when absent. Standalone: a model of the server's `AI_PROVIDER`, the provider's default when absent |
 
 ### Documents (PDF, Word, Excel, PowerPoint, ...)
 
@@ -318,7 +321,10 @@ The response adds a `document` object (`format`, `content_type`, `parser`,
 `backend`, `pages_processed`, `pages_cached`, `pages_skipped`,
 `pages_capped`, `pages_failed`, `pages`). `html`, `rawhtml`, `schema` and
 `blocks` do not apply to documents. OCR pages are reported as a separate `ocr`
-usage event on top of the scrape (hosted only; the Lab prices them). See [Documents & OCR](/guides/documents).
+usage event on top of the scrape (hosted only), not charged: hosted vision OCR
+runs on the team's AI gateway. When the team has no AI (or the Lab cannot be
+reached), OCR is skipped: the request still returns `200`, with a `warning`
+(and `ocr.warning`) starting "OCR skipped", and scanned pages stay flagged. See [Documents & OCR](/guides/documents).
 
 ### Response
 

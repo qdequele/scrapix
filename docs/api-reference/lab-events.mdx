@@ -22,7 +22,7 @@ Until meilisearch/lab#17 (contract v2) merges, CI pins the check to that PR's
 commit with `LAB_REF`.
 
 <Note>
-Hosted mode only. A **standalone** engine emits no lab events and refuses
+Hosted mode only. A **standalone** engine emits no lab events and its API refuses
 `LAB_INSTANCE_ID`/`LAB_INSTANCE_SECRET`.
 </Note>
 
@@ -69,14 +69,20 @@ and stores the `units` without pricing them. `credits` (and
 
 | `data` field | Type | Description |
 |--------------|------|-------------|
-| `operation` | string | `scrape`, `map`, `search`, `parse`, `ocr`, `extract` or `crawl`. |
+| `operation` | string | `scrape`, `map`, `search`, `parse`, `ocr` or `crawl` (the schema still allows `extract`, which the engine no longer emits: see below). |
 | `credits` | integer ≥ 0 | Deprecated, transition release only: the pre-v2 price of this usage, debited as-is by the Lab (see below). |
 | `units` | object of integer ≥ 0 | Raw units (`pages_http`, `pages_browser`, `requests`, `documents`, `feature_pages`) plus informational counters (`ai_summary`, `ai_extraction`, `urls_found`, `results`, `pages_ai`, `pages_ocr`). The Lab stores them all; a future `pricing.yml` prices them. |
 | `provider_cost_micro_usd` | integer ≥ 0 | Upstream provider money the engine paid, in micro-USD. Always `0` for Scrapix: the engine only knows the token counts its AI and OCR providers report, not what the provider charged. |
 | `description` | string | Text shown on the ledger row. |
-| `job_id` | string, optional | Present for job-scoped usage (a `crawl`, or an `extract` job). |
+| `job_id` | string, optional | Present for job-scoped usage (a `crawl`). |
 
-Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction, feature_pages}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction, feature_pages}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `extract` `{documents: 1}` per AI call (globs also emit a `map`; fetched pages are `scrape` events); `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr, feature_pages}` once per terminal job.
+Per operation: `scrape` `{pages_http | pages_browser: 1, ai_summary, ai_extraction, feature_pages}` (a document URL fetched by `/scrape` also reports `documents: 1`); `map` `{requests: 1, urls_found}`; `search` `{requests: 1, results}`; `parse` `{documents: 1, ai_summary, ai_extraction, feature_pages}` (a `/parse` upload); `ocr` `{documents: <recognized pages>, pages_ocr}`; `crawl` `{pages_http, pages_browser, pages_ai, pages_ocr, feature_pages}` once per terminal job.
+
+`/extract` reports no usage event of its own: globs emit a `map` and fetched
+pages `scrape` events, and the AI calls run on the team's Lumen gateway, which
+bills the tokens to the team. Likewise no Scrapix price applies to AI: the AI
+and OCR counters (`ai_summary`, `ai_extraction`, `pages_ai`, `pages_ocr`) are
+informational units, and the `ocr` event carries `credits: 0`.
 
 `feature_pages` is the per-feature surcharge as a unit, so a future
 `pricing.yml` can price it: for `scrape` and `parse`, the number of feature
@@ -89,11 +95,10 @@ for `crawl`, `(pages_http + pages_browser) × <enabled non-AI features>`
 
 | Operation | `credits` |
 |-----------|-----------|
-| `scrape` (incl. a document URL), `parse` | `max(feature formats + 5 × AI summary delivered + 5 × AI extraction delivered, 1)` |
-| `ocr` | `5 ×` recognized pages |
+| `scrape` (incl. a document URL), `parse` | `max(feature formats, 1)` (AI summary and extraction add `0`: the team's gateway bills them) |
+| `ocr` | `0` (vision OCR is metered by the team's gateway) |
 | `map`, `search` | `2` |
-| `extract` | `5` per AI call (glob maps and fetched pages are billed as `map` and `scrape`) |
-| `crawl` | `pages_http × (1 + F) + pages_browser × (2 + F) + pages_ai × A + 5 × pages_ocr`, with `F` the enabled non-AI features and `A` 5 per enabled AI feature (extraction, summary) |
+| `crawl` | `pages_http × (1 + F) + pages_browser × (2 + F)`, with `F` the enabled non-AI features (AI features and OCR pages add `0`) |
 
 A crawl is reported **once**, when the job reaches a terminal state, from what
 was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,
@@ -124,7 +129,7 @@ to the account owner if they opted in to job emails.
 
 | Event | `id` |
 |-------|------|
-| Request usage (`scrape`, `map`, `search`, `parse`, `ocr`, `extract`) | UUIDv7, generated per event |
+| Request usage (`scrape`, `map`, `search`, `parse`, `ocr`) | UUIDv7, generated per event |
 | Crawl final usage | UUIDv5(`6f1c3a2e-6b1d-4f6e-9a57-0c3b2a9e5d41`, `"job:{job_id}:final"`) |
 | Job lifecycle (`job.completed` / `job.failed`) | UUIDv5(same namespace, `"job:{job_id}:lifecycle"`) |
 
@@ -219,6 +224,7 @@ drifts from the Lab's `main`.
 | `POST /internal/auth/introspect` | Resolves a client credential (API key, OAuth token, session JWT) to an account, tier, role, effective credit balance and plan `limits`, RFC 7662 style. The engine caches the answer for the Lab's `cache_ttl` (default 30 s, at most 300 s) and keeps serving a stale answer for up to 5 minutes if the Lab is down, except answers with `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the Lab is down gets `503` with `Retry-After: 5`. |
 | `GET /internal/accounts/{id}` | Tier, spendable balance and plan `limits` of an account (balance pre-check). |
 | `GET /internal/accounts/{account_id}/meilisearch` | The account's Meilisearch target with the decrypted key. The engine caches it for 60 s. A hosted tenant without a target cannot crawl: the engine never falls back to the operator's `MEILISEARCH_URL`. |
+| `GET /internal/accounts/{account_id}/ai[?rejected_key_id=<id>]` | The account's AI gateway target: Lumen `base_url`, a `lab-scrapix` `api_key` and its `key_id`, the team's `default_model` and `vision_model` (OCR), and a `cache_ttl`. Every hosted LLM call (the API's `/scrape`, `/extract`, `/parse` and the content workers' crawl AI and OCR) goes through it, and the team's Lumen bills the tokens. The engine caches the answer for `cache_ttl` (stale for up to 5 minutes if the Lab is down); a `404` means "no AI for this account" (cached 5 s: the AI request is refused with `503`, crawl pages are indexed without enrichment); a `5xx` is treated like an unreachable Lab (`503` with `Retry-After: 5` when nothing is cached). When Lumen refuses the key (`LM-4004`) the engine asks again once with `rejected_key_id` (never served from cache) and retries the call once. |
 
 Introspect and account answers carry `limits`
 (`concurrent_jobs`, `rate_limit_rpm`, `max_depth`, `js_rendering`), which the
@@ -253,15 +259,15 @@ The engine exposes the outbox state at `GET /metrics`:
 |--------|-------------|
 | `scrapix_lab_events_pending` | Undelivered events in the outbox. Should hover near zero; a growing value means the Lab is unreachable or rejecting events. |
 | `scrapix_lab_events_delivered_total{outcome}` | Events by delivery outcome: `accepted`, `rejected` (the Lab answered but did not take them), `failed` (unreachable or unreadable response) or `dropped` (never acknowledged for 24 h). |
-| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint (`instances_me`, `introspect`, `account`, `meilisearch`) and outcome. `instances_me` replaced `ping`: dashboards filtering on `endpoint="ping"` go empty. |
+| `scrapix_lab_requests_total{endpoint,outcome}` | The engine's calls to the Lab's internal API, by endpoint (`instances_me`, `introspect`, `account`, `meilisearch`, `ai`) and outcome. `instances_me` replaced `ping`: dashboards filtering on `endpoint="ping"` go empty. |
 
 ## Configuration
 
 | Variable | Where | Description |
 |----------|-------|-------------|
-| `LAB_URL` | engine | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
-| `LAB_INSTANCE_ID` | engine | The uuid the Lab minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused in standalone mode. |
-| `LAB_INSTANCE_SECRET` | engine | The 64 hex characters minted with the id: Bearer token on `/internal/*`, HMAC key on event batches. Rotate with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays valid for 10 minutes). Refused in standalone mode. |
+| `LAB_URL` | engine, content worker | The Lab's base URL (`http://` or `https://`, no path). Events go to `{LAB_URL}/internal/events`. |
+| `LAB_INSTANCE_ID` | engine, content worker | The uuid the Lab minted for this deployment (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` once). Sent as `X-Lab-Instance-Id`. Refused by a standalone API (a standalone content worker ignores it, with a warning). |
+| `LAB_INSTANCE_SECRET` | engine, content worker | The 64 hex characters minted with the id: Bearer token on `/internal/*`, HMAC key on event batches. Rotate with `bin/rails lab:hosted_engine:rotate ID=<LAB_INSTANCE_ID>` (the old one stays valid for 10 minutes). Refused by a standalone API. |
 | `LAB_SERVICE_TOKEN` | engine | Inbound only: the Bearer token the Lab presents when it calls the engine (saved-config cron), at least 32 characters. Generated first and passed to the Lab at mint time as `CREDENTIAL=` (the Lab stores it per engine). |
 | `LAB_EVENTS_URL` | engine | Deprecated fallback for `LAB_URL` (the old `…/internal/events` URL). |
 | `LAB_EVENTS_SECRET` | engine | Deprecated, ignored (warned at boot): batches are signed with `LAB_INSTANCE_SECRET`. |

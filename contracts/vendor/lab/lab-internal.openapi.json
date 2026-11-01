@@ -154,6 +154,100 @@
         }
       }
     },
+    "/internal/accounts/{account_id}/ai": {
+      "get": {
+        "operationId": "getAccountAi",
+        "summary": "The hosted Scrapix engine's LLM target: the team's Gateway and its key",
+        "description": "Only the hosted Scrapix engine may call it (any other product gets 403 `{\"error\":\"forbidden\"}`). `base_url` is the team's hosted Gateway (Lumen) OpenAI-compatible base (`<engine url>/v1`); `api_key` is the team's `lab-scrapix` virtual key, minted on first use and kept by the Lab; `key_id` names it. `default_model` and `vision_model` are the models to ask for. `cache_ttl` is the seconds the answer may be cached. When the Gateway refuses the key, call again with `rejected_key_id` set to the `key_id` it refused: the Lab replaces the stored key only if it is still that one, so a stale id gets the current key back. 404 `{\"error\":\"not_found\"}` when the account id is not a UUID, the team has no built-in Gateway or it has no hosted engine. 502 `{\"error\":\"gateway_unavailable\",\"message\":...}` when the Gateway could not mint the key.",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "rejected_key_id",
+            "in": "query",
+            "required": false,
+            "description": "The `key_id` the Gateway refused; the Lab mints a new key when it still stores that one.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The Gateway target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiTarget"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Not the hosted Scrapix engine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "const": "forbidden"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No Gateway for this account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFound"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The Gateway could not mint the key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error",
+                    "message"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "const": "gateway_unavailable"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/internal/instances/me": {
       "get": {
         "operationId": "getSelf",
@@ -373,6 +467,7 @@
         "properties": {
           "kind": {
             "type": "string",
+            "description": "`bearer` is the value of `Authorization: Bearer`: an `sk_live_`/`sk_test_` credential resolves as that API key (principal `api_key`), anything else as an OAuth access token.",
             "enum": [
               "api_key",
               "bearer",
@@ -554,6 +649,41 @@
           }
         }
       },
+      "AiTarget": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "api_key",
+          "key_id",
+          "default_model",
+          "vision_model",
+          "cache_ttl"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "description": "OpenAI-compatible base of the team's hosted Gateway, ending in /v1"
+          },
+          "api_key": {
+            "type": "string",
+            "description": "The team's lab-scrapix virtual key (fg-...)"
+          },
+          "key_id": {
+            "type": "string",
+            "description": "The Gateway's id for that key; send it back as rejected_key_id when the Gateway refuses the key"
+          },
+          "default_model": {
+            "type": "string"
+          },
+          "vision_model": {
+            "type": "string"
+          },
+          "cache_ttl": {
+            "type": "integer",
+            "description": "Seconds the answer may be cached"
+          }
+        }
+      },
       "NotFound": {
         "type": "object",
         "required": [
@@ -568,7 +698,7 @@
       },
       "PlanLimits": {
         "type": "object",
-        "description": "Per-plan limits an engine enforces for the account's tier (contract v2 section 5)",
+        "description": "Limits an engine enforces for the account (contract v2 section 5). Pricing is usage-based, so every account gets the same limits whatever its tier",
         "required": [
           "concurrent_jobs",
           "rate_limit_rpm",
