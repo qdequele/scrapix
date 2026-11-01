@@ -33,8 +33,7 @@ curl http://localhost:8080/metrics
 
 Every worker (`scrapix-worker-crawler`, `scrapix-worker-content`,
 `scrapix-frontier-service`) exposes the same `GET /metrics` (and `GET
-/health`) on its `WAKE_PORT` (default `8081`) — the same bare-TCP listener
-Fly's proxy connects to for autostart:
+/health`) on its `WAKE_PORT` (default `8081`), a bare-TCP listener:
 
 ```bash
 curl http://localhost:8081/metrics
@@ -109,7 +108,7 @@ scrape_configs:
     metrics_path: /metrics
 ```
 
-In a multi-machine deployment (Fly, Kubernetes), each worker machine listens
+In a multi-machine deployment (e.g. Kubernetes), each worker machine listens
 on the same `WAKE_PORT` (8081 by default), so scrape targets need one entry
 per machine/pod, not per logical service.
 

@@ -503,8 +503,7 @@ The engine (`scrapix-api`) exposes unauthenticated Prometheus text-format
 metrics at `GET /metrics` on its normal HTTP port (8080). Every worker
 (`scrapix-worker-crawler`, `scrapix-worker-content`,
 `scrapix-frontier-service`) exposes the same `/metrics` and a `GET /health`
-on its `WAKE_PORT` (default `8081`) — the same bare-TCP listener Fly's proxy
-uses to autostart a suspended machine. Metric names are a contract with
+on its `WAKE_PORT` (default `8081`), a bare-TCP listener. Metric names are a contract with
 `qdq-server/monitoring` (see `crates/scrapix-core/src/metrics.rs`): don't
 rename without updating the scrape config there. Current metrics:
 `scrapix_crawler_fetches_total{outcome}`,
@@ -666,7 +665,7 @@ GROUP BY date ORDER BY date;
 | `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |
 | `JOB_RETENTION_HOURS` | Frontier: how long a finished/cancelled job's state stays queryable after release (default `168`) |
-| `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` and triggering Fly autostart (default `8081`) |
+| `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` (default `8081`) |
 | `DOCUMENT_MAX_SIZE_MB` | API: max document size for `/scrape` of a document and `/parse` uploads (default `50`) |
 | `OCR_BACKEND` | API + content workers: `auto` (vision if an AI provider is set, else tesseract), `vision`, `tesseract`, `off` |
 | `PDFIUM_LIB_PATH` | API + content workers: PDFium library used to rasterize pages for OCR (`/opt/pdfium/lib` in the images) |

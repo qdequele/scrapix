@@ -1,21 +1,21 @@
-//! Shared process-lifecycle helpers for Scrapix services on Fly.io.
+//! Shared process-lifecycle helpers for Scrapix services.
 //!
 //! Three primitives, composed per service:
 //! - [`install_signal_handlers`] — flips a shutdown flag on `SIGTERM` or Ctrl-C.
-//!   Fly sends SIGTERM before SIGKILL; without a handler, in-flight Kafka
-//!   messages lose their offset commit and get reprocessed.
+//!   Orchestrators send SIGTERM before SIGKILL; without a handler, in-flight
+//!   Kafka messages lose their offset commit and get reprocessed.
 //! - [`spawn_wake_listener`] — tiny HTTP responder on a configurable port.
-//!   Fly's proxy uses an incoming TCP connection on a declared port to
-//!   auto-start a suspended machine, so accepting the connection at all is
-//!   what matters for that; on top of it, it serves `GET /metrics`
-//!   (Prometheus text format, from the shared [`scrapix_core::metrics`]
-//!   registry) and `GET /health` (`ok`) unauthenticated. Any other request,
+//!   A platform that auto-starts a suspended machine on an incoming TCP
+//!   connection only needs the connection accepted; on top of it, it serves
+//!   `GET /metrics` (Prometheus text format, from the shared
+//!   [`scrapix_core::metrics`] registry) and `GET /health` (`ok`)
+//!   unauthenticated. Any other request,
 //!   or a non-HTTP connection, still gets accepted (and so still counts as
 //!   a wake) and is closed with a generic `200 OK`.
 //! - [`spawn_idle_watchdog`] — watches a monotonically-increasing counter
 //!   (typically `messages_processed`); flips the shutdown flag if it doesn't
 //!   advance for `idle_minutes`. Lets Kafka-consumer workers exit cleanly
-//!   when idle so Fly can suspend them to zero cost.
+//!   when idle so the platform can suspend them to zero cost.
 //! - [`spawn_shutdown_deadline`] with [`shutdown_timeout_from_env`]: bounds
 //!   the whole graceful shutdown (`SHUTDOWN_TIMEOUT_SECS`, default 90 s), so
 //!   a worker always exits before its orchestrator's SIGKILL (ECS sends it
@@ -34,8 +34,8 @@ use tracing::{debug, error, info, warn};
 
 /// Generic response for anything that isn't a recognized `GET /metrics` or
 /// `GET /health` request: a non-HTTP connection, a HEAD/POST, an unknown
-/// path, or a request line we failed to read within the timeout. Fly's
-/// autostart only cares that the connection was accepted, so this is a
+/// path, or a request line we failed to read within the timeout. A wake
+/// only cares that the connection was accepted, so this is a
 /// harmless catch-all rather than an error.
 const GENERIC_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
@@ -45,7 +45,7 @@ const HEALTH_RESPONSE: &[u8] =
 
 /// How long to wait for a request line before giving up and sending the
 /// generic response. Keeps a slow/garbage client from tying up a task
-/// forever; legitimate `curl`/Fly-proxy requests arrive well within this.
+/// forever; legitimate `curl`/Prometheus requests arrive well within this.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Install SIGTERM + Ctrl-C handlers that flip `shutdown` to `true` on the
@@ -73,9 +73,9 @@ pub fn install_signal_handlers(shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
 }
 
 /// Spawn a bare-bones TCP listener that accepts connections on `port` and
-/// responds `200 OK` to any payload. Exists solely so Fly.io's proxy sees
-/// the port open and will autostart the machine on incoming connections
-/// (e.g. from the API's worker-wake fan-out).
+/// responds `200 OK` to any payload, so a connection to the port (e.g. from
+/// the API's worker-wake fan-out) can wake a suspended machine, and serves
+/// `GET /metrics` and `GET /health`.
 ///
 /// Exits when `shutdown` flips to `true`.
 pub fn spawn_wake_listener(port: u16, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -84,7 +84,7 @@ pub fn spawn_wake_listener(port: u16, shutdown: Arc<AtomicBool>) -> JoinHandle<(
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
             Err(e) => {
-                warn!(port, error = %e, "Wake listener failed to bind; Fly autostart will not work for this machine");
+                warn!(port, error = %e, "Wake listener failed to bind; /metrics, /health and wake pings will not work for this machine");
                 return;
             }
         };
@@ -464,7 +464,7 @@ mod wake_listener_tests {
 
     #[tokio::test]
     async fn connection_with_no_data_still_counts_as_a_wake() {
-        // Fly's proxy just needs the TCP connection accepted; a client that
+        // A wake just needs the TCP connection accepted; a client that
         // connects and disconnects without sending anything must not hang
         // the server or panic it.
         let (addr, shutdown) = spawn_test_server().await;

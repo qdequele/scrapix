@@ -1,6 +1,6 @@
 [package]
 name = "scrapix-lifecycle"
-description = "Shared process-lifecycle helpers: signal handlers, Fly.io wake listener, idle watchdog"
+description = "Shared process-lifecycle helpers: signal handlers, wake listener, idle watchdog"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
