@@ -19,7 +19,7 @@ script) runs from a `meilisearch/lab` checkout, not from this repo.
 
 ## Pre-deploy checklist
 
-- [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Fly, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
+- [ ] **Set `SCRAPIX_MODE=hosted`** on every hosted API (qdq-server env file, Heroku, k8s) and restart, **before** deploying an engine that includes standalone mode. The old binary ignores the variable; the new one refuses to start without it (it would otherwise start in standalone mode and ask for `SCRAPIX_ADMIN_KEY`).
 - [ ] **Local dev: refresh an existing `.env`.** `just dev` in this repo now runs the engine **standalone** (`.env.example` sets `SCRAPIX_MODE=standalone` and a dev `SCRAPIX_ADMIN_KEY`); an `.env` copied from the old hosted dev setup still points `DATABASE_URL` at the Rails database and sets `SCRAPIX_MODE=hosted`. Re-copy `.env.example`, or use its commented "Hosted against a local Lab" block with the Lab running from a `meilisearch/lab` checkout.
 - [ ] **Set `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` and `LAB_SERVICE_TOKEN`** on every hosted API (generate `LAB_SERVICE_TOKEN` first, then mint the instance id and secret on the Lab with `bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>`; see section A) — the hosted engine refuses to start without them, and refuses a Lab that predates contract v2 (no `GET /internal/instances/me`), so deploy the Lab first. `LAB_EVENTS_SECRET` is ignored now (warned at boot): remove it. Dashboards filtering `scrapix_lab_requests_total` on `endpoint="ping"` must switch to `endpoint="instances_me"`, and `scrapix_lab_events_delivered_total` gains `outcome="dropped"` (events never acknowledged for 24 h). If production still runs an engine from before the Lab split, do **not** do the two rollouts below one after the other: follow "Lab split phase 1" as a single ordered rollout (it carries the boundary steps it needs). (`JWT_SECRET` is Rails-only now: the engine ignores it. `LAB_EVENTS_URL` is the deprecated pre-split spelling of `LAB_URL`.)
 - [ ] **Drain the v1 outbox before the contract-v2 engine starts.** Rows the old engine wrote to its `lab_events` outbox keep the v1 payload (`credits`, non-integer `units`), which the v2 schema rejects: the v2 binary would send them under its new instance identity and the Lab would skip them or price them at 0. Stop the old engine only once its outbox is drained (or let it keep running with its v1 Lab credentials until it is):
@@ -162,7 +162,7 @@ with steps 3 to 6 of "Lab split phase 1", not by pointing it at the Rails
 Follow the normal service order in "4. Deploy order" below (content workers,
 crawlers, frontier, then API), with `LAB_URL`, `LAB_EVENTS_SECRET` and
 `LAB_SERVICE_TOKEN` set on the API, and with no jobs running (step 0). Also
-update every hosted deploy config you use (Fly secrets, Heroku config vars,
+update every hosted deploy config you use (Heroku config vars,
 the Kubernetes `scrapix-secrets` / `scrapix-config`) — they are listed in
 `deploy/`.
 
@@ -575,7 +575,7 @@ monitoring dashboard:
 - `scrapix-api`: `GET /metrics` on its HTTP port (8080).
 - Each crawler/content-worker/frontier process: `GET /metrics` on its own
   `WAKE_PORT` — on `hackersearch`, the ports from the table in step 3
-  (`localhost:9101`, `9102`, `9103`); on Fly, one target per machine
+  (`localhost:9101`, `9102`, `9103`); on Kubernetes, one target per pod
   (`WAKE_PORT` 8081 there, where nothing else binds it).
 
 Import the metric names from `crates/scrapix-core/src/metrics.rs`:
@@ -661,4 +661,3 @@ After all services are deployed:
 - Rollout order and the reasoning for it: `docs/superpowers/specs/2026-09-26-crawl-engine-fixes.md`
 - Politeness/job-lifecycle/webhook/metrics behavior: `CLAUDE.md` → "Crawl
   Pipeline Behavior"
-- Fly-specific politeness/wake/scaling notes: `deploy/fly/README.md`

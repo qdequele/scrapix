@@ -178,7 +178,7 @@ pub struct Args {
 
     /// On graceful shutdown, how long the dispatcher may take to finish its
     /// in-flight send and put every popped-but-unsent URL back (ms). Keep it
-    /// below the platform's kill timeout (Fly `kill_timeout` is 30s).
+    /// below the platform's kill timeout (the time between SIGTERM and SIGKILL).
     #[arg(long, env = "DISPATCH_SHUTDOWN_GRACE_MS", default_value = "10000")]
     pub dispatch_shutdown_grace_ms: u64,
 

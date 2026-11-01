@@ -67,7 +67,6 @@
         "deployment/overview",
         "deployment/docker-compose",
         "deployment/kubernetes",
-        "deployment/fly-io",
         "deployment/railway",
         "deployment/render",
         "deployment/google-cloud-run",

@@ -1901,7 +1901,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Hard stop SHUTDOWN_TIMEOUT_SECS after shutdown starts (before ECS's SIGKILL).
     spawn_shutdown_deadline(worker.shutdown.clone(), shutdown_timeout_from_env());
 
-    // Wake listener for Fly.io autostart.
+    // Wake listener on WAKE_PORT: /metrics, /health and the API's wake pings.
     let wake_handle = spawn_wake_listener(wake_port_from_env(), worker.shutdown.clone());
 
     // Idle watchdog: exit cleanly after IDLE_EXIT_MINUTES of no processed pages.

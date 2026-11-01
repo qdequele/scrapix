@@ -4244,8 +4244,8 @@ fn extract_links_from_html(html: &str, base_url: &str) -> Vec<String> {
 }
 
 /// Fire-and-forget TCP connect to each host in `WORKER_WAKE_HOSTS` (comma-separated
-/// `host:port` pairs). On Fly.io, connecting to `scrapix-worker-crawler.internal:8081`
-/// triggers the proxy to auto-start the machine from a suspended state. No-op when
+/// `host:port` pairs), each a worker's `WAKE_PORT`. On a platform that auto-starts
+/// suspended machines on an incoming connection, this wakes the workers. No-op when
 /// the env var is unset (local dev, tests).
 fn fan_out_worker_wakes() {
     let hosts = match std::env::var("WORKER_WAKE_HOSTS") {

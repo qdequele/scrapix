@@ -1065,13 +1065,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Hard stop SHUTDOWN_TIMEOUT_SECS after shutdown starts (before ECS's SIGKILL).
     spawn_shutdown_deadline(worker.shutdown.clone(), shutdown_timeout_from_env());
 
-    // Bare-TCP wake listener on WAKE_PORT (default 8081) so Fly.io's proxy can
-    // autostart this machine from a suspended state when the API fans out
-    // wake requests on POST /crawl.
+    // Bare-TCP wake listener on WAKE_PORT (default 8081): serves /metrics and
+    // /health, and accepts the API's wake pings on POST /crawl.
     let wake_handle = spawn_wake_listener(wake_port_from_env(), worker.shutdown.clone());
 
     // Idle watchdog: if no URLs processed for IDLE_EXIT_MINUTES (default 10),
-    // exit cleanly so Fly can suspend this machine to zero cost.
+    // exit cleanly so the platform can suspend this machine to zero cost.
     let idle_metrics = worker.metrics.clone();
     let idle_handle = spawn_idle_watchdog(
         move || idle_metrics.urls_processed.load(Ordering::Relaxed),

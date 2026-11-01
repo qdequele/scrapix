@@ -56,6 +56,7 @@ The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, s
 | `ALLOW_PRIVATE_IPS` | `false` | Allow webhook deliveries to reach private/loopback addresses (SSRF opt-out; same policy as the crawler's own `ALLOW_PRIVATE_IPS`, off by default, tests only). Link-local and cloud metadata addresses (169.254.0.0/16, fe80::/10, fd00:ec2::254) stay refused even when set |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Maximum webhook deliveries in flight at once, across all jobs and hooks |
 | `CRAWL_BROWSER_AVAILABLE` | unset | Whether the crawler workers can render pages in a browser. Unset: unknown, `crawler_type: "browser"` crawls are accepted. `false`: `POST /crawl` refuses them (`503 render_js_unavailable`). Reported as `crawl_browser_available` by `GET /health/services`. `scrapix all` sets it from `BROWSER_RENDER` |
+| `WORKER_WAKE_HOSTS` | unset | Comma-separated `host:port` list (each a worker's `WAKE_PORT`) the API opens a fire-and-forget TCP connection to on `POST /crawl`, to wake workers on a platform that suspends idle machines. Unset: no wake pings |
 
 ## Message Queue
 
@@ -120,7 +121,7 @@ modes.
 | `FRONTIER_KEY_PREFIX` | `scrapix:frontier` | Redis key prefix for the frontier store (only relevant with `REDIS_URL` set) |
 | `JOB_RETENTION_HOURS` | `168` | How long a finished/cancelled job's counters and state stay queryable after its queue and seen set are released |
 | `INSTANCE_ID` | random per start | Instance identifier. **Set a stable value per frontier instance in production**: it names the instance's job-control consumer group, so a random id loses controls published while the instance was down and leaks one consumer group per restart (a warning is logged when unset) |
-| `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight send and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (Fly `kill_timeout` is 30 s) |
+| `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight send and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (the time between SIGTERM and SIGKILL) |
 | `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health`. On a single box give each service its own port (8081 is also the Lab's Rails port; a failed bind only logs a warning) |
 | `SHUTDOWN_TIMEOUT_SECS` | `90` | Most a graceful shutdown (SIGTERM, Ctrl-C or idle exit) may take before the process exits anyway. The Kafka consumer stops taking new messages, waits up to this minus 15 s for in-flight ones, commits only the finished ones (the rest are redelivered) and flushes its producer. Keep it below the platform's kill timeout (ECS `stopTimeout`, at most 120 s on Fargate) |
 
@@ -157,7 +158,8 @@ modes.
 | `WORKER_ID` | random per start | Worker identifier. **Set a stable value per worker instance in production** (same reason as the frontier's `INSTANCE_ID`: it names the job-control consumer group; a warning is logged when unset). Applies to content workers too |
 | `REDIS_URL` | — | Optional; when set, enables incremental-crawl header lookups shared across crawler instances (without it, incremental crawling uses in-message headers only) |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow fetching hosts that resolve to private/loopback/CGNAT/multicast/unspecified addresses (SSRF opt-out). Tests and self-hosted private-network crawls only, never enable in production. Raw-IP URLs stay refused regardless, and so do hosts resolving to link-local or cloud metadata addresses (169.254.0.0/16, which holds the EC2 metadata and ECS task credentials endpoints, fe80::/10, fd00:ec2::254). The same rules apply to the browser renderer, which also blocks link-local IP literals on every page it renders |
-| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` (Prometheus text) and `GET /health`, and used by Fly's proxy to autostart a suspended machine |
+| `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` (Prometheus text) and `GET /health` |
+| `IDLE_EXIT_MINUTES` | `10` | Minutes without a processed message after which the worker shuts down gracefully. `0` disables the watchdog; set it to `0` (or run under a supervisor that restarts on exit) for always-on workers. Applies to content workers too |
 | `SHUTDOWN_TIMEOUT_SECS` | `90` | Most a graceful shutdown (SIGTERM, Ctrl-C or idle exit) may take before the process exits anyway. The Kafka consumer stops taking new messages, waits up to this minus 15 s for in-flight ones, commits only the finished ones (the rest are redelivered) and flushes its producer. Applies to content workers too. Keep it below the platform's kill timeout (ECS `stopTimeout`, at most 120 s on Fargate) |
 
 ### DNS Cache
@@ -276,7 +278,6 @@ There is no separate `METRICS_PORT`. The engine (`scrapix-api`) serves
 `GET /metrics` (Prometheus text format, unauthenticated) on its normal HTTP
 port (`PORT`, default `8080`). Every worker (`scrapix-worker-crawler`,
 `scrapix-worker-content`, `scrapix-frontier-service`) serves the same
-`GET /metrics` and `GET /health` on its `WAKE_PORT` (default `8081`) — the
-same bare-TCP listener Fly's proxy connects to for autostart. Metric names
-are a contract with `qdq-server/monitoring`; see `crates/scrapix-core/src/metrics.rs`.
+`GET /metrics` and `GET /health` on its `WAKE_PORT` (default `8081`), a
+bare-TCP listener. Metric names are a contract with `qdq-server/monitoring`; see `crates/scrapix-core/src/metrics.rs`.
 </Note>
