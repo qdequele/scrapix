@@ -290,7 +290,7 @@ still returned.
 | `ai.summary` | boolean | Generate a TL;DR summary |
 | `ai.extract.prompt` | string | Natural language extraction prompt |
 | `ai.extract.schema` | array | Structured field definitions for typed extraction |
-| `ai.model` | string | Model to summarize and extract with, e.g. `gpt-4o-mini`. Hosted: a model from the team's AI gateway, the Lab's default model when absent. Standalone: a model of the server's `AI_PROVIDER`, the provider's default when absent |
+| `ai.model` | string | Model to summarize and extract with, e.g. `openai/gpt-4o-mini`. Hosted: a model id from the team's AI gateway, as `provider/model`, the Lab's default model when absent. Standalone: a model of the server's `AI_PROVIDER`, the provider's default when absent |
 
 ### Documents (PDF, Word, Excel, PowerPoint, ...)
 

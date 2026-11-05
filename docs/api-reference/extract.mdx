@@ -42,7 +42,7 @@ Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET 
 | `urls` | string[] | **required** | URLs and URL globs, 50 URLs max in total after glob resolution |
 | `prompt` | string | — | What to extract, in natural language. Required when there is no `schema` |
 | `schema` | object \| array | — | A JSON Schema object, or a list of fields `[{ "name", "description", "field_type", "required" }]` (the `/scrape` `ai.extract.schema` form) |
-| `model` | string | — | Model to extract with, e.g. `gpt-4o-mini`. Hosted: a model from the team's AI gateway, the Lab's default model when absent. Standalone: a model of the server's provider, the provider's default when absent |
+| `model` | string | — | Model to extract with, e.g. `openai/gpt-4o-mini`. Hosted: a model id from the team's AI gateway, as `provider/model`, the Lab's default model when absent. Standalone: a model of the server's provider, the provider's default when absent |
 | `render_js` | boolean | `false` | Render JavaScript when fetching pages (requires Chrome/Chromium) |
 | `only_main_content` | boolean | `true` | Only use each page's main content |
 | `timeout_ms` | integer | `30000` | Per-page fetch timeout |

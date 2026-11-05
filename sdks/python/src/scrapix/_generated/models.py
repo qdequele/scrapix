@@ -1904,7 +1904,7 @@ class AiOptions(BaseModel):
         populate_by_name=True,
     )
     extract: Optional[AiExtractOptions] = None
-    model: Optional[str] = Field(None, examples=["gpt-4o-mini"])
+    model: Optional[str] = Field(None, examples=["openai/gpt-4o-mini"])
     """
     Model to summarize and extract with, from the team's Gateway; the default model when absent
     """
@@ -2502,7 +2502,7 @@ class ExtractRequest(BaseModel):
     """
     Custom request headers for the page fetches
     """
-    model: Optional[str] = Field(None, examples=["gpt-4o-mini"])
+    model: Optional[str] = Field(None, examples=["openai/gpt-4o-mini"])
     """
     Model to extract with, from the team's Gateway; the default model when absent
     """

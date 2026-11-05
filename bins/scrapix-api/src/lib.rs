@@ -2989,7 +2989,7 @@ struct AiOptions {
 
     /// Model to summarize and extract with, from the team's Gateway; the default model when absent
     #[serde(default)]
-    #[schema(example = "gpt-4o-mini")]
+    #[schema(example = "openai/gpt-4o-mini")]
     model: Option<String>,
 }
 

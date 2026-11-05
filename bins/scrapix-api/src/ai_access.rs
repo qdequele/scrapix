@@ -143,8 +143,8 @@ mod tests {
             base_url: format!("{}/v1/", lumen.uri()),
             api_key: api_key.into(),
             key_id: key_id.into(),
-            default_model: "gpt-4o-mini".into(),
-            vision_model: "gpt-4o".into(),
+            default_model: "openai/gpt-4o-mini".into(),
+            vision_model: "openai/gpt-4o".into(),
         }
     }
 
@@ -153,7 +153,7 @@ mod tests {
             "id": "chatcmpl-1",
             "object": "chat.completion",
             "created": 1,
-            "model": "gpt-4o-mini",
+            "model": "openai/gpt-4o-mini",
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": "{\"title\": \"Hello\"}"},
@@ -267,7 +267,7 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&first.service, &again.service));
         assert_eq!(first.key_id.as_deref(), Some("k-1"));
-        assert_eq!(first.vision_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(first.vision_model.as_deref(), Some("openai/gpt-4o"));
 
         // The Lab rotates the key: a new service, with the new key.
         let rotated = resolve_ai(&state, Some(&ctx()), Some("k-1"))
@@ -301,7 +301,7 @@ mod tests {
         );
         assert!(requests[0].headers.get("x-lumen-metadata").is_some());
         let body: serde_json::Value = requests[0].body_json().unwrap();
-        assert_eq!(body["model"], "gpt-4o-mini");
+        assert_eq!(body["model"], "openai/gpt-4o-mini");
     }
 
     #[tokio::test]
@@ -329,7 +329,7 @@ mod tests {
         // Same channel as the env client: drained into ClickHouse `ai_usage_events`.
         let event = usage.try_recv().unwrap();
         assert_eq!(event.provider, "openai");
-        assert_eq!(event.model, "gpt-4o-mini");
+        assert_eq!(event.model, "openai/gpt-4o-mini");
         assert_eq!(event.total_tokens, 15);
         assert_eq!(event.context, Some(attribution));
         assert!(usage.try_recv().is_err());

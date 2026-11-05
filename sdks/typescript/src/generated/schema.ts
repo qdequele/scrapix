@@ -1608,7 +1608,7 @@ export interface components {
             extract?: null | components["schemas"]["AiExtractOptions"];
             /**
              * @description Model to summarize and extract with, from the team's Gateway; the default model when absent
-             * @example gpt-4o-mini
+             * @example openai/gpt-4o-mini
              */
             model?: string | null;
             /** @description Generate a TL;DR summary */
@@ -1998,7 +1998,7 @@ export interface components {
             };
             /**
              * @description Model to extract with, from the team's Gateway; the default model when absent
-             * @example gpt-4o-mini
+             * @example openai/gpt-4o-mini
              */
             model?: string | null;
             /** @description Only use each page's main content (default true) */
