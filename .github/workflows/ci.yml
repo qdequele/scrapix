@@ -12,6 +12,8 @@ on:
       - 'sdks/**'
       - 'contracts/**'
       - 'justfile'
+      - 'CHANGELOG.md'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   # Every commit on main gets check runs, with no paths filter: the box that
   # hosts the Lab deploys a main commit only once Format, Clippy and Tests are
@@ -20,6 +22,9 @@ on:
   push:
     branches: [main]
   workflow_call:
+  # prepare-release.yml dispatches CI on the release branch: a PR opened with
+  # GITHUB_TOKEN gets no pull_request run of its own.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,6 +35,16 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  # The release invariant: Cargo.toml, Cargo.lock and the contract versions
+  # (contracts/openapi.json, contracts/openapi.engine.json,
+  # bins/scrapix-api/src/openapi.rs) agree. Fails in seconds and names the file.
+  version-sync:
+    name: Version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/prepare-release.sh --check
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

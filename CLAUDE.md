@@ -22,6 +22,53 @@ cargo clippy
 
 All three must pass with no errors before committing.
 
+## Versioning, releases and deployment
+
+One version, kept in sync by `scripts/prepare-release.sh` and enforced by
+CI's `Version sync` job: `[workspace.package] version` in `Cargo.toml`, the
+workspace crates in `Cargo.lock`, the contract versions (`info.version` in
+`contracts/openapi.json` and `contracts/openapi.engine.json`,
+`info(version = ...)` in `bins/scrapix-api/src/openapi.rs`), and the newest
+`CHANGELOG.md` section. The SDKs in `sdks/` version and tag on their own
+(`sdk-*-vX.Y.Z`, `sdk-publish.yml`).
+
+- **Every PR**: add its entries under `## [Unreleased]` in `CHANGELOG.md`, in
+  the same PR. Leave every version alone: only the release script writes
+  them.
+- **Release**: run the "Prepare release" workflow (bump `auto`, or
+  `patch`/`minor`/`major`/`X.Y.Z`), then merge the `chore(release): vX.Y.Z`
+  PR it opens. The merge tags `vX.Y.Z`, pushes the role images
+  `ghcr.io/qdequele/<scrapix-api|scrapix-frontier-service|scrapix-worker-crawler|scrapix-worker-content>:vX.Y.Z`
+  (linux/amd64), publishes the GitHub release from the CHANGELOG and sends
+  `scrapix-released` to the Lab. Tags come only from that merge: never push
+  or move one by hand.
+- **Contract change** (`contracts/openapi.json`, which the Lab vendors and
+  builds its MCP tools from): merge and release it here, then the Lab's
+  Contracts sync PR re-vendors it (or re-vendor in the Lab in the same
+  cross-repo task, same branch name, linked PRs). The Lab ships code that
+  uses it after. Lab-owned contracts (`contracts/vendor/lab/`) go the other
+  way: the Lab changes them first, backward compatible, then
+  `contracts/check-drift.sh --fix` here.
+- **Deploy**: production (the Lab's hosted Scrapix on hackersearch) is not
+  the release. qdq-server's `qdq-autodeploy` builds every `main` commit whose
+  `Format`, `Clippy` and `Tests` checks are green (`20-build-engine.sh`), so
+  merging to `main` deploys. Renaming one of those jobs stalls the
+  autodeploy until `ENGINE_REQUIRED_CHECKS` in qdq-server follows. In a tick
+  the Lab deploys before the engine, so Rails migrations land first. The
+  engine `pg_dump`s `scrapix_engine`, then applies
+  `bins/scrapix-api/migrations/postgres` at startup, forward-only; a failed
+  verify restores the binary, and the dump when migrations changed.
+- **Before merging a change that needs config**: a new env var or secret
+  goes on the box first: `/etc/scrapix/scrapix-engine.env` (engine only) or
+  `/etc/scrapix/scrapix.env` (shared with Rails), via qdq-server `scrapix/`. Moving a route between the engine and Rails means
+  changing the console's `SAAS_PREFIXES` and Caddy's `@saas` list
+  (qdq-server `scrapix/scrapix-console.service`,
+  `scrapix/scrapix-caddy-site.template`) and the Lab's copies in the same
+  rollout. Keep migrations additive: a failed deploy restores the dump and
+  loses the writes made meanwhile.
+- **PR description**: a "Deploy notes" section listing env and config
+  changes, migrations and the rollout order, or "none".
+
 ## Project Overview
 
 Scrapix is a high-performance, distributed web crawler and search indexer built in Rust. It's designed for internet-scale crawling with three main use cases: global internet indexing, targeted site crawling, and real-time information retrieval.
