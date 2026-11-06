@@ -998,8 +998,9 @@ class PdfConfig(BaseModel):
     Opt-in configuration for PDF scraping.
 
     When `enabled = true`, PDFs are fetched (with base64-encoded transport
-    through the content worker), parsed for text + metadata, and indexed into
-    the same Meilisearch index. All other fields default to conservative values.
+    through the content worker), parsed into layout-aware Markdown (tables,
+    multi-column reading order) + metadata, and indexed into the same
+    Meilisearch index. All other fields default to conservative values.
     """
 
     model_config = ConfigDict(
@@ -1012,8 +1013,14 @@ class PdfConfig(BaseModel):
     """
     extract_links: Optional[bool] = None
     """
-    Reserved flag for extracting URLs embedded inside PDF text.
-    Currently a no-op; will be wired up in a follow-up issue.
+    Follow hyperlinks found inside PDFs (link annotations): the crawler
+    publishes them to the frontier like links found in HTML, subject to
+    the job's usual domain/pattern/depth rules.
+    """
+    max_pages: Optional[int] = Field(None, ge=0)
+    """
+    Parse at most this many pages of each PDF (the first N). `None`
+    parses every page.
     """
     max_size_mb: Optional[int] = Field(None, ge=0)
     """
@@ -1843,12 +1850,55 @@ class ParserOptions(BaseModel):
     are flagged in `document.pages_needing_ocr`, not recognized), `auto`
     (OCR only the pages that need it) or `force` (OCR every page, for
     PDFs whose broken font encodings extract as garbage). OCR pages are
-    billed at a higher per-page rate.
+    counted, not charged (hosted vision OCR runs on the team's AI
+    gateway).
     """
     ocr_max_pages: Optional[int] = Field(None, ge=0)
     """
     Per-document OCR page cap. Can only lower the server cap
     (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50).
+    """
+
+
+class DocumentsConfig(BaseModel):
+    """
+    Opt-in configuration for office/other document scraping (DOCX, XLSX,
+    PPTX, legacy DOC/XLS/PPT, ODT/ODS/ODP, RTF, EPUB, CSV).
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    enabled: bool
+    """
+    Whether office/other document scraping is enabled.
+    """
+    max_size_mb: Optional[int] = Field(None, ge=0)
+    """
+    Maximum document size in megabytes. Larger documents are rejected
+    before being buffered. When `None`, the global fetcher
+    `max_body_size` applies.
+    """
+
+
+class OcrConfig(BaseModel):
+    """
+    Per-job OCR configuration.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    max_pages: Optional[int] = Field(None, ge=0)
+    """
+    Per-document OCR page cap. Can only lower the server-wide cap
+    (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50), never raise it.
+    """
+    mode: Optional[OcrMode] = None
+    """
+    `off` (default), `auto` or `force`.
     """
 
 
@@ -2031,8 +2081,10 @@ class FeaturesConfig(BaseModel):
     ai_summary: Optional[FeatureToggle] = None
     block_split: Optional[FeatureToggle] = None
     custom_selectors: Optional[CustomSelectorsConfig] = None
+    documents: Optional[DocumentsConfig] = None
     markdown: Optional[FeatureToggle] = None
     metadata: Optional[FeatureToggle] = None
+    ocr: Optional[OcrConfig] = None
     pdf: Optional[PdfConfig] = None
     schema_: Optional[SchemaFeatureConfig] = Field(None, alias="schema")
 
@@ -2575,7 +2627,7 @@ class ScrapeRequest(BaseModel):
     """
     formats: Optional[list[ScrapeFormat]] = None
     """
-    Formats to return (default: all)
+    Formats to return (default: markdown, content, metadata)
     """
     headers: Optional[dict[str, str]] = None
     """

@@ -34,7 +34,7 @@ Scrape a single URL and return extracted content in the requested formats.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | **required** | URL to scrape |
-| `formats` | string[] | all | Output formats to include (see below) |
+| `formats` | string[] | `markdown`, `content`, `metadata` | Output formats to include (see below) |
 | `only_main_content` | boolean | `true` | Use readability algorithm to extract main content only |
 | `include_links` | boolean | `false` | Include discovered links in response |
 | `timeout_ms` | integer | `30000` | Request timeout in milliseconds |

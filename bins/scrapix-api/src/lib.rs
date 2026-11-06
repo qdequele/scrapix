@@ -2835,7 +2835,7 @@ struct ScrapeRequest {
     /// URL to scrape
     url: String,
 
-    /// Formats to return (default: all)
+    /// Formats to return (default: markdown, content, metadata)
     #[serde(default)]
     formats: Vec<ScrapeFormat>,
 
