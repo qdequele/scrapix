@@ -2229,7 +2229,7 @@
               "null"
             ],
             "description": "Model to summarize and extract with, from the team's Gateway; the default model when absent",
-            "example": "gpt-4o-mini"
+            "example": "openai/gpt-4o-mini"
           },
           "summary": {
             "type": "boolean",
@@ -3174,7 +3174,7 @@
               "null"
             ],
             "description": "Model to extract with, from the team's Gateway; the default model when absent",
-            "example": "gpt-4o-mini"
+            "example": "openai/gpt-4o-mini"
           },
           "only_main_content": {
             "type": "boolean",

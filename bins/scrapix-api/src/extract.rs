@@ -96,7 +96,7 @@ pub(crate) struct ExtractRequest {
     pub schema: Option<Value>,
     /// Model to extract with, from the team's Gateway; the default model when absent
     #[serde(default)]
-    #[schema(example = "gpt-4o-mini")]
+    #[schema(example = "openai/gpt-4o-mini")]
     pub model: Option<String>,
     /// Render JavaScript when fetching pages (requires Chrome/Chromium)
     #[serde(default)]
@@ -1402,7 +1402,7 @@ mod tests {
         let created = start_extract(
             &state,
             &hosted_ctx(),
-            with_model(request(urls), "claude-haiku-4-5"),
+            with_model(request(urls), "anthropic/claude-haiku-4-5"),
         )
         .await
         .unwrap();
@@ -1410,9 +1410,9 @@ mod tests {
         assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
         let bodies = chat_bodies(&lumen).await;
         assert_eq!(bodies.len(), 1);
-        assert_eq!(bodies[0]["model"], "claude-haiku-4-5");
+        assert_eq!(bodies[0]["model"], "anthropic/claude-haiku-4-5");
         // The job's config shows the requested model.
-        assert_eq!(job.config.unwrap()["model"], "claude-haiku-4-5");
+        assert_eq!(job.config.unwrap()["model"], "anthropic/claude-haiku-4-5");
     }
 
     #[tokio::test]

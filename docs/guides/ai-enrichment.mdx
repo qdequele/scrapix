@@ -161,11 +161,11 @@ curl -X POST http://localhost:8080/scrape \
 ```json
 {
   "url": "https://blog.example.com/long-article",
-  "ai": { "summary": true, "model": "gpt-4o-mini" }
+  "ai": { "summary": true, "model": "openai/gpt-4o-mini" }
 }
 ```
 
-When absent, the hosted engine uses the Lab's default model for your team and a standalone engine the provider's default. A `model` must be one your team's gateway serves (hosted) or one the server's `AI_PROVIDER` serves (standalone); an unknown model fails with the gateway's error. Crawls use the Lab's default model in hosted mode and the server provider's default model in standalone (a per-crawl model is not supported).
+When absent, the hosted engine uses the Lab's default model for your team and a standalone engine the provider's default. A `model` must be one your team's gateway serves, by its full `provider/model` id such as `openai/gpt-4o-mini` (hosted) or one the server's `AI_PROVIDER` serves (standalone); an unknown model fails with the gateway's error. Crawls use the Lab's default model in hosted mode and the server provider's default model in standalone (a per-crawl model is not supported).
 
 ## Extract: One Result From Many Pages
 
@@ -290,4 +290,4 @@ curl "http://localhost:8080/analytics/v0/pipes/ai_usage.json?hours=24"
 - Token costs scale with page content length (hosted: billed by the gateway to your team, not in Scrapix credits)
 - Use `include_pages` / `exclude_pages` patterns to limit processing to valuable content
 - Set `AI_CONCURRENCY` to control parallel AI requests (default: 5)
-- The `gpt-4o-mini` model is recommended for cost-effective bulk processing
+- `gpt-4o-mini` (`openai/gpt-4o-mini` on the hosted gateway) is recommended for cost-effective bulk processing
