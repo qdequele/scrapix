@@ -31,4 +31,17 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   re-vendors `contracts/openapi.json` for this.
 - `benches/Cargo.toml` takes the workspace version.
 
+### Fixed
+
+- `contracts/openapi.json` catches up with the engine: `features.documents`
+  (`DocumentsConfig`) and `features.ocr` (`OcrConfig`), `pdf.max_pages`, and
+  `pdf.extract_links`, which follows links inside PDFs (the spec still called it
+  a no-op). The Lab re-vendors it, so its MCP crawl tools gain these options.
+- `POST /scrape` with no `formats` returns `markdown`, `content` and `metadata`;
+  the spec (both contracts) and the API reference said "all".
+- The crawl docs no longer mark `index_uid` and `meilisearch` as required: the
+  index name is derived from the first start URL, and behind the Meilisearch Lab
+  a crawl without `meilisearch` writes to the team's default instance. They
+  document `index_strategy` instead of the legacy `replace_index`.
+
 [Unreleased]: https://github.com/qdequele/scrapix/compare/v0.5.0...HEAD

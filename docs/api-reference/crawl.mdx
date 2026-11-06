@@ -43,14 +43,14 @@ Create an asynchronous crawl job. Returns immediately with a job ID that you can
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `start_urls` | string[] | Yes | Seed URLs to begin crawling from |
-| `index_uid` | string | Yes | Meilisearch index to write documents to |
+| `index_uid` | string | No | Meilisearch index to write documents to. Defaults to a name derived from the first start URL (`https://docs.example.com/guides` → `docs-example-com-guides`) |
 | `source` | string | No | Source identifier for multi-tenant indexing (defaults to domain) |
 | `max_depth` | integer | No | Maximum link depth from seed URLs |
 | `max_pages` | integer | No | Maximum number of pages to crawl |
 | `crawler_type` | string | No | `"http"` (default) or `"browser"` for JS rendering |
 | `allowed_domains` | string[] | No | Restrict crawling to these domains (auto-inferred from start_urls if omitted) |
-| `replace_index` | boolean | No | Atomically swap the index on completion |
-| `meilisearch` | object | Yes | Meilisearch connection settings |
+| `index_strategy` | string | No | `"update"` (default) adds and updates documents; `"replace"` builds a temporary index and swaps it in on completion. The legacy `replace_index: true` still means `"replace"` |
+| `meilisearch` | object | No | Meilisearch connection settings. Behind the Meilisearch Lab, omit it to write to the team's default instance, or send only `url` to pick another registered instance (the Lab supplies its key) |
 
 See [Crawl Configs](/configuration/crawl-configs) for the complete schema with all options.
 

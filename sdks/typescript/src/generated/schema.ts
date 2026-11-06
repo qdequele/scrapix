@@ -2084,8 +2084,10 @@ export interface components {
             ai_summary?: null | components["schemas"]["FeatureToggle"];
             block_split?: null | components["schemas"]["FeatureToggle"];
             custom_selectors?: null | components["schemas"]["CustomSelectorsConfig"];
+            documents?: null | components["schemas"]["DocumentsConfig"];
             markdown?: null | components["schemas"]["FeatureToggle"];
             metadata?: null | components["schemas"]["FeatureToggle"];
+            ocr?: null | components["schemas"]["OcrConfig"];
             pdf?: null | components["schemas"]["PdfConfig"];
             schema?: null | components["schemas"]["SchemaFeatureConfig"];
         };
@@ -2331,17 +2333,25 @@ export interface components {
          * @description Opt-in configuration for PDF scraping.
          *
          *     When `enabled = true`, PDFs are fetched (with base64-encoded transport
-         *     through the content worker), parsed for text + metadata, and indexed into
-         *     the same Meilisearch index. All other fields default to conservative values.
+         *     through the content worker), parsed into layout-aware Markdown (tables,
+         *     multi-column reading order) + metadata, and indexed into the same
+         *     Meilisearch index. All other fields default to conservative values.
          */
         PdfConfig: {
             /** @description Whether PDF scraping is enabled. */
             enabled: boolean;
             /**
-             * @description Reserved flag for extracting URLs embedded inside PDF text.
-             *     Currently a no-op; will be wired up in a follow-up issue.
+             * @description Follow hyperlinks found inside PDFs (link annotations): the crawler
+             *     publishes them to the frontier like links found in HTML, subject to
+             *     the job's usual domain/pattern/depth rules.
              */
             extract_links?: boolean;
+            /**
+             * Format: int32
+             * @description Parse at most this many pages of each PDF (the first N). `None`
+             *     parses every page.
+             */
+            max_pages?: number | null;
             /**
              * Format: int64
              * @description Maximum PDF size in megabytes. PDFs larger than this are rejected.
@@ -2474,7 +2484,7 @@ export interface components {
             extract?: {
                 [key: string]: components["schemas"]["ScrapeSelector"];
             };
-            /** @description Formats to return (default: all) */
+            /** @description Formats to return (default: markdown, content, metadata) */
             formats?: components["schemas"]["ScrapeFormat"][];
             /** @description Custom headers to send with the request */
             headers?: {
@@ -2888,7 +2898,8 @@ export interface components {
              *     are flagged in `document.pages_needing_ocr`, not recognized), `auto`
              *     (OCR only the pages that need it) or `force` (OCR every page, for
              *     PDFs whose broken font encodings extract as garbage). OCR pages are
-             *     billed at a higher per-page rate.
+             *     counted, not charged (hosted vision OCR runs on the team's AI
+             *     gateway).
              */
             ocr?: components["schemas"]["OcrMode"];
             /**
@@ -2903,6 +2914,32 @@ export interface components {
          *     `custom_selectors` accepts plus a full selector definition.
          */
         ScrapeSelector: string | string[] | components["schemas"]["SelectorDefinition"];
+        /**
+         * @description Opt-in configuration for office/other document scraping (DOCX, XLSX,
+         *     PPTX, legacy DOC/XLS/PPT, ODT/ODS/ODP, RTF, EPUB, CSV).
+         */
+        DocumentsConfig: {
+            /** @description Whether office/other document scraping is enabled. */
+            enabled: boolean;
+            /**
+             * Format: int64
+             * @description Maximum document size in megabytes. Larger documents are rejected
+             *     before being buffered. When `None`, the global fetcher
+             *     `max_body_size` applies.
+             */
+            max_size_mb?: number | null;
+        };
+        /** @description Per-job OCR configuration. */
+        OcrConfig: {
+            /**
+             * Format: int32
+             * @description Per-document OCR page cap. Can only lower the server-wide cap
+             *     (`OCR_MAX_PAGES_PER_DOCUMENT`, default 50), never raise it.
+             */
+            max_pages?: number | null;
+            /** @description `off` (default), `auto` or `force`. */
+            mode?: components["schemas"]["OcrMode"];
+        };
     };
     responses: never;
     parameters: never;

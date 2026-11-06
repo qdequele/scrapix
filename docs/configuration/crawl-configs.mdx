@@ -29,13 +29,13 @@ The simplest crawl config only needs `start_urls` and `index_uid`:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `start_urls` | `string[]` | **required** | Seed URLs to begin crawling |
-| `index_uid` | `string` | **required** | Meilisearch index name |
+| `index_uid` | `string` | derived from the first start URL | Meilisearch index name (`https://docs.example.com/guides` → `docs-example-com-guides`) |
 | `source` | `string` | — | Source identifier for multi-tenant indexing (defaults to domain) |
 | `crawler_type` | `"http"` or `"browser"` | `"http"` | HTTP-only or headless browser |
 | `max_depth` | `integer` | — | Maximum link depth from start URLs |
 | `max_pages` | `integer` | — | Maximum pages to crawl |
 | `allowed_domains` | `string[]` | `[]` | Strict domain whitelist |
-| `replace_index` | `boolean` | `false` | Atomically swap index on completion |
+| `index_strategy` | `"update"` or `"replace"` | `"update"` | `replace` builds a temporary index and swaps it in on completion (the legacy `replace_index: true` means the same) |
 | `headers` | `object` | `{}` | Custom HTTP headers |
 | `user_agents` | `string[]` | `[]` | User-Agent rotation list |
 

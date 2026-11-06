@@ -4862,7 +4862,7 @@
             "items": {
               "$ref": "#/components/schemas/ScrapeFormat"
             },
-            "description": "Formats to return (default: all)"
+            "description": "Formats to return (default: markdown, content, metadata)"
           },
           "headers": {
             "type": "object",

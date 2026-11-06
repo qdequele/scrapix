@@ -5319,6 +5319,17 @@
               }
             ]
           },
+          "documents": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DocumentsConfig",
+                "description": "Office/other document scraping (opt-in): Word, PowerPoint, Excel,\nOpenDocument, RTF, EPUB and CSV responses are converted to Markdown\nand indexed alongside HTML pages. Disabled by default."
+              }
+            ]
+          },
           "markdown": {
             "oneOf": [
               {
@@ -5341,6 +5352,17 @@
               }
             ]
           },
+          "ocr": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OcrConfig",
+                "description": "OCR for scanned / image-only PDF pages (opt-in, `off` by default:\nOCR is slow and billed at a higher per-page rate)."
+              }
+            ]
+          },
           "pdf": {
             "oneOf": [
               {
@@ -5348,7 +5370,7 @@
               },
               {
                 "$ref": "#/components/schemas/PdfConfig",
-                "description": "PDF scraping (opt-in). When enabled, the crawler fetches\n`application/pdf` responses, extracts text + metadata, and indexes\nthem alongside HTML pages. Disabled by default."
+                "description": "PDF scraping (opt-in). When enabled, the crawler fetches\n`application/pdf` responses, extracts layout-aware Markdown +\nmetadata, and indexes them alongside HTML pages. Disabled by default."
               }
             ]
           },
@@ -6108,7 +6130,7 @@
       },
       "PdfConfig": {
         "type": "object",
-        "description": "Opt-in configuration for PDF scraping.\n\nWhen `enabled = true`, PDFs are fetched (with base64-encoded transport\nthrough the content worker), parsed for text + metadata, and indexed into\nthe same Meilisearch index. All other fields default to conservative values.",
+        "description": "Opt-in configuration for PDF scraping.\n\nWhen `enabled = true`, PDFs are fetched (with base64-encoded transport\nthrough the content worker), parsed into layout-aware Markdown (tables,\nmulti-column reading order) + metadata, and indexed into the same\nMeilisearch index. All other fields default to conservative values.",
         "required": [
           "enabled"
         ],
@@ -6119,7 +6141,16 @@
           },
           "extract_links": {
             "type": "boolean",
-            "description": "Reserved flag for extracting URLs embedded inside PDF text.\nCurrently a no-op; will be wired up in a follow-up issue."
+            "description": "Follow hyperlinks found inside PDFs (link annotations): the crawler\npublishes them to the frontier like links found in HTML, subject to\nthe job's usual domain/pattern/depth rules."
+          },
+          "max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Parse at most this many pages of each PDF (the first N). `None`\nparses every page.",
+            "minimum": 0
           },
           "max_size_mb": {
             "type": [
@@ -6457,7 +6488,7 @@
             "items": {
               "$ref": "#/components/schemas/ScrapeFormat"
             },
-            "description": "Formats to return (default: all)"
+            "description": "Formats to return (default: markdown, content, metadata)"
           },
           "headers": {
             "type": "object",
@@ -7732,7 +7763,7 @@
           },
           "ocr": {
             "$ref": "#/components/schemas/OcrMode",
-            "description": "OCR for scanned / image-only pages: `off` (default \u2014 scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\nbilled at a higher per-page rate."
+            "description": "OCR for scanned / image-only pages: `off` (default \u2014 scanned pages\nare flagged in `document.pages_needing_ocr`, not recognized), `auto`\n(OCR only the pages that need it) or `force` (OCR every page, for\nPDFs whose broken font encodings extract as garbage). OCR pages are\ncounted, not charged (hosted vision OCR runs on the team's AI\ngateway)."
           },
           "ocr_max_pages": {
             "type": [
@@ -7764,6 +7795,47 @@
           }
         ],
         "description": "One `/scrape` `extract` field, in any of the shapes crawl's\n`custom_selectors` accepts plus a full selector definition."
+      },
+      "DocumentsConfig": {
+        "type": "object",
+        "description": "Opt-in configuration for office/other document scraping (DOCX, XLSX,\nPPTX, legacy DOC/XLS/PPT, ODT/ODS/ODP, RTF, EPUB, CSV).",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether office/other document scraping is enabled."
+          },
+          "max_size_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Maximum document size in megabytes. Larger documents are rejected\nbefore being buffered. When `None`, the global fetcher\n`max_body_size` applies.",
+            "minimum": 0
+          }
+        }
+      },
+      "OcrConfig": {
+        "type": "object",
+        "description": "Per-job OCR configuration.",
+        "properties": {
+          "max_pages": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Per-document OCR page cap. Can only lower the server-wide cap\n(`OCR_MAX_PAGES_PER_DOCUMENT`, default 50), never raise it.",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/OcrMode",
+            "description": "`off` (default), `auto` or `force`."
+          }
+        }
       }
     },
     "securitySchemes": {
