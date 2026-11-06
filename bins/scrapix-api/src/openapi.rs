@@ -16,7 +16,7 @@ use utoipa::OpenApi;
 #[openapi(
     info(
         title = "Scrapix API",
-        version = "0.1.0",
+        version = "0.3.0",
         description = "High-performance web crawler and search indexer API. Scrape pages, map websites, run distributed crawls, and search indexed content.",
         contact(name = "Meilisearch", url = "https://scrapix.meilisearch.com"),
         license(name = "MIT")
