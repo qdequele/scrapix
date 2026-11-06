@@ -293,6 +293,9 @@ cmd_prepare() {
         inside && !done && /^    "version": / { sub(/"version": *"[^"]*"/, "\"version\": \"" ver "\""); done = 1 }
         { print }
       ' "$f" >"$tmp/$(basename "$f")"
+      # awk ends every line with a newline: keep a file that had none at EOF
+      # byte-identical apart from the version (the Lab vendors a byte copy).
+      if [ -n "$(tail -c 1 "$f")" ]; then perl -pi -e 'chomp if eof' "$tmp/$(basename "$f")"; fi
     done
     awk -v ver="$target" '
       /^    info\(/ { inside = 1; print; next }
