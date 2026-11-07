@@ -37,7 +37,7 @@ Scrape a single URL and return extracted content in the requested formats.
 | `formats` | string[] | `markdown`, `content`, `metadata` | Output formats to include (see below) |
 | `only_main_content` | boolean | `true` | Use readability algorithm to extract main content only |
 | `include_links` | boolean | `false` | Include discovered links in response |
-| `timeout_ms` | integer | `30000` | Request timeout in milliseconds |
+| `timeout_ms` | integer | `30000` | Time allowed to load the page, in milliseconds, browser rendering included. Page `actions` get their own 30 s budget on top. Past it the request fails with `timeout` |
 | `headers` | object | `{}` | Custom HTTP headers to send |
 | `exclude_selectors` | string[] | `[]` | CSS selectors to remove before extraction |
 | `include_selectors` | string[] | `[]` | CSS selectors to keep (extract only from these) |

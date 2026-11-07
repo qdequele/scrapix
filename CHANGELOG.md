@@ -33,6 +33,42 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **Browser crawls indexed almost nothing.** The renderer took the content
+  type and status of whatever request CDP reported for the navigation, which
+  was often one of the page's subresources (`text/css`, `font/woff2`), so the
+  content worker skipped the page as "unsupported content type". A
+  `crawler_type: browser` crawl of quotes.toscrape.com crawled 4 pages and
+  indexed 0. Only the document's own response counts now, and without one
+  the page's `document.contentType` is used.
+- **URL patterns that mix `**` and `*`.** After a `**`, a `*` was compared
+  literally, so `**/page/*`, `**/login*`, `**/*.pdf` and `**?lang=*` (the
+  last two from the docs) never matched: an `index_only` of `**/page/*`
+  indexed nothing and an `exclude` of `**/login*` excluded nothing. Patterns
+  are now matched as globs over the whole URL (`**` crosses `/`, `*` does
+  not). A trailing `*` still matches like `**`. A pattern that ends in a
+  literal must now end the URL: `https://a.com/*/feed` no longer takes
+  `https://a.com/news/feeds`. This applies to `include`, `exclude`,
+  `index_only`, the features' `include_pages` / `exclude_pages` and
+  `/extract` globs.
+- **`/scrape` custom `headers` with a browser.** With `render_js`, `mobile`,
+  `actions` or a screenshot, the headers were not sent; they are now, minus
+  the same hop-by-hop headers the HTTP path blocks. `/batch/scrape` and
+  `/extract` follow.
+- **`/scrape` `timeout_ms` with a browser.** It only bounded the HTTP fetch; a
+  rendered page could take as long as it liked. It now bounds the render too
+  (`timeout`, 504), with `actions` keeping their 30 s budget on top, and the
+  page is still closed.
+- **Crawl `markdown` was plain text.** The content worker converted
+  readability's text output, so `markdown` repeated `content`. It is now
+  built from the page's main content HTML, with headings, links, lists and
+  tables, like `/scrape`.
+- **Crawled titles** collapse whitespace (`Poetry | Books to Scrape`, was
+  `Poetry | \n     Books to Scrape`).
+- **Why a crawled page was not indexed.** The content worker's
+  `document_skipped` and `document_failed` events are now kept in the job's
+  event history (`GET /job/{id}/events/history`) as `page_skipped` (with the
+  reason) and `page_failed`.
+
 - The spec types a selector's `default` (`/scrape` and `/batch/scrape`
   `extract`) and `schema.json_ld` as any JSON value instead of an object, so
   clients that validate against it (the Lab's MCP tools) accept
