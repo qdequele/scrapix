@@ -717,6 +717,92 @@ mod tests {
         assert_eq!((started, crawled, failed, completed), (1, 90, 10, 1));
     }
 
+    fn scrape_request(body: Value) -> ScrapeRequest {
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// `timeout_ms` bounds the default fetch too, not only the one-off
+    /// fetcher built for custom headers or cookies.
+    #[tokio::test]
+    async fn scrape_timeout_ms_bounds_the_default_fetch() {
+        let server = serve(Duration::from_secs(3)).await;
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state(&bus);
+        let request = scrape_request(serde_json::json!({
+            "url": format!("{}/ok/1", base(&server)), "timeout_ms": 200
+        }));
+        let started = std::time::Instant::now();
+        let err = perform_scrape(&state, &None, &request).await.err().unwrap();
+        assert_eq!(err.code, "timeout", "{}", err.error);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// `include_selectors` shape the content only: the page's metadata still
+    /// comes from its `<head>`.
+    #[tokio::test]
+    async fn include_selectors_keep_the_page_metadata() {
+        let server = serve(Duration::ZERO).await;
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state(&bus);
+        let request = scrape_request(serde_json::json!({
+            "url": format!("{}/ok/4", base(&server)),
+            "formats": ["metadata", "markdown"],
+            "include_selectors": ["p"]
+        }));
+        let response =
+            serde_json::to_value(perform_scrape(&state, &None, &request).await.unwrap()).unwrap();
+        assert_eq!(response["metadata"]["title"], "Page 4");
+        let markdown = response["markdown"].as_str().unwrap();
+        assert!(markdown.contains("Body of page 4"), "{markdown}");
+        assert!(!markdown.contains("# Page 4"), "{markdown}");
+    }
+
+    /// AI enrichment reads the page's text even when neither `markdown` nor
+    /// `content` is among the requested formats.
+    #[tokio::test]
+    async fn ai_summary_runs_without_a_text_format() {
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "c1", "object": "chat.completion", "created": 1, "model": "mock",
+                "choices": [{ "index": 0, "finish_reason": "stop",
+                              "message": { "role": "assistant", "content": "A short page." } }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })))
+            .mount(&llm)
+            .await;
+        let client = scrapix_ai::AiClient::new(scrapix_ai::AiClientConfig {
+            api_key: "test".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", llm.uri())),
+            max_retries: 1,
+            retry_delay_ms: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        let service = Arc::new(scrapix_ai::AiService::new(Arc::new(client)));
+
+        let server = serve(Duration::ZERO).await;
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = crate::results::test_support::test_state_with_ai(&bus, Some(service));
+        let request = scrape_request(serde_json::json!({
+            "url": format!("{}/ok/2", base(&server)),
+            "formats": ["links"],
+            "ai": { "summary": true }
+        }));
+        let response =
+            serde_json::to_value(perform_scrape(&state, &None, &request).await.unwrap()).unwrap();
+        assert_eq!(response["ai"]["summary"], "A short page.", "{response}");
+        assert!(response.get("warning").is_none(), "{response}");
+        assert!(
+            response.get("markdown").is_none(),
+            "markdown was not requested"
+        );
+        let calls = llm.received_requests().await.unwrap();
+        assert!(String::from_utf8_lossy(&calls[0].body).contains("Body of page 2"));
+    }
+
     #[tokio::test]
     async fn cancel_stops_remaining_urls_and_keeps_results() {
         let server = serve(Duration::from_millis(100)).await;

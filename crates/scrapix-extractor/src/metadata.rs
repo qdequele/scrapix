@@ -156,11 +156,21 @@ impl MetadataExtractor {
     /// Extract meta tags
     fn extract_meta_tags(&self, document: &Html, metadata: &mut ExtractedMetadata) {
         for element in document.select(&self.meta_selector) {
+            // An `itemprop` meta inside an `itemscope` describes that
+            // microdata item (one quote's keywords, one product's price),
+            // not the page: only page-level ones count.
+            let itemprop = element.value().attr("itemprop").filter(|_| {
+                !element.ancestors().any(|node| {
+                    node.value()
+                        .as_element()
+                        .is_some_and(|e| e.attr("itemscope").is_some())
+                })
+            });
             let name = element
                 .value()
                 .attr("name")
                 .or_else(|| element.value().attr("property"))
-                .or_else(|| element.value().attr("itemprop"));
+                .or(itemprop);
 
             let content = element.value().attr("content");
 
@@ -423,6 +433,28 @@ mod tests {
         assert_eq!(metadata.author, Some("John Doe".to_string()));
         assert_eq!(metadata.robots, Some("index, follow".to_string()));
         assert_eq!(metadata.keywords, vec!["test", "page", "example"]);
+    }
+
+    /// quotes.toscrape.com: each quote is a microdata item with its own
+    /// `<meta itemprop="keywords">`; none of them is the page's.
+    #[test]
+    fn microdata_item_metas_are_not_page_metadata() {
+        let html = r#"
+            <html><head><title>Quotes</title></head><body>
+              <div itemscope itemtype="http://schema.org/CreativeWork">
+                <meta class="keywords" itemprop="keywords" content="change,world">
+              </div>
+              <div itemscope itemtype="http://schema.org/CreativeWork">
+                <meta itemprop="keywords" content="humor,simile">
+              </div>
+            </body></html>
+        "#;
+        let metadata = MetadataExtractor::new().extract(html).unwrap();
+        assert!(metadata.keywords.is_empty(), "{:?}", metadata.keywords);
+
+        let page_level = r#"<html><head><meta itemprop="keywords" content="a, b"></head></html>"#;
+        let metadata = MetadataExtractor::new().extract(page_level).unwrap();
+        assert_eq!(metadata.keywords, vec!["a", "b"]);
     }
 
     #[test]

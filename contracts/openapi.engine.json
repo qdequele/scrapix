@@ -3318,7 +3318,6 @@
             "description": "Individual schema items by type"
           },
           "json_ld": {
-            "type": "object",
             "description": "All JSON-LD data found (may be array or object)"
           },
           "json_ld_count": {
@@ -5214,7 +5213,6 @@
                 "description": "Attribute name (for Attribute mode)"
               },
               "default": {
-                "type": "object",
                 "description": "Default value if no match found"
               },
               "fields": {

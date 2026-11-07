@@ -57,3 +57,44 @@ fn openapi_snapshot_is_up_to_date() {
          cargo test -p scrapix-api --test openapi_snapshot and review the diff."
     );
 }
+
+/// Fields that hold arbitrary JSON (a selector's `default`, JSON-LD that is
+/// an object or an array) accept any value in both specs: a `type` there
+/// makes clients that validate against the spec (the Lab's MCP tools)
+/// refuse values the engine accepts, such as `"default": "none"`.
+#[test]
+fn arbitrary_json_fields_accept_any_value() {
+    let engine: serde_json::Value = serde_json::from_str(
+        &scrapix_api::openapi::ScrapixApi::openapi()
+            .to_json()
+            .expect("OpenAPI spec serializes to JSON"),
+    )
+    .expect("engine spec is JSON");
+    let platform: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/openapi.json"),
+        )
+        .expect("read contracts/openapi.json"),
+    )
+    .expect("contracts/openapi.json is JSON");
+
+    for (name, spec) in [("engine", &engine), ("contracts/openapi.json", &platform)] {
+        let schemas = &spec["components"]["schemas"];
+        for (field, schema) in [
+            (
+                "SelectorDefinition.default",
+                &schemas["SelectorDefinition"]["allOf"][1]["properties"]["default"],
+            ),
+            (
+                "ExtractedSchema.json_ld",
+                &schemas["ExtractedSchema"]["properties"]["json_ld"],
+            ),
+        ] {
+            assert!(schema.is_object(), "{name}: {field} is missing");
+            assert!(
+                schema.get("type").is_none(),
+                "{name}: {field} must accept any JSON value, got {schema}"
+            );
+        }
+    }
+}

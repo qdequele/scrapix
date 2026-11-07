@@ -290,13 +290,15 @@ pub(crate) fn glob_base(pattern: &str) -> Result<url::Url, String> {
 }
 
 /// Whether a discovered URL belongs to the glob: same host, matching, a
-/// page, and not the glob's base itself (`/blog/*` means pages under
-/// `/blog/`).
+/// page, and not a directory glob's base itself (`/blog/*` means pages
+/// under `/blog/`; `/learn*` includes `/learn`).
 pub(crate) fn glob_accepts(url: &str, pattern: &str, host: &str) -> bool {
     let prefix = &pattern[..pattern.find('*').unwrap_or(pattern.len())];
+    let is_directory_base =
+        prefix.ends_with('/') && url.trim_end_matches('/') == prefix.trim_end_matches('/');
     url::Url::parse(url).is_ok_and(|u| u.host_str() == Some(host))
-        && url.trim_end_matches('/') != prefix.trim_end_matches('/')
-        && matches_glob(url, pattern)
+        && !is_directory_base
+        && (matches_glob(url, pattern) || matches_glob(url.trim_end_matches('/'), pattern))
         && !is_non_page_url(url)
 }
 
@@ -1127,6 +1129,21 @@ mod tests {
         ));
         assert!(is_glob(p));
         assert!(!is_glob("https://example.com/blog/"));
+
+        // Without a slash before `*`, the prefix itself is a page.
+        let learn = "https://example.com/learn*";
+        for url in [
+            "https://example.com/learn",
+            "https://example.com/learn/",
+            "https://example.com/learn/get-started",
+        ] {
+            assert!(glob_accepts(url, learn, "example.com"), "{url}");
+        }
+        assert!(!glob_accepts(
+            "https://example.com/about",
+            learn,
+            "example.com"
+        ));
     }
 
     #[test]

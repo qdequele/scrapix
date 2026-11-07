@@ -2050,7 +2050,7 @@ class ExtractedSchema(BaseModel):
     """
     Individual schema items by type
     """
-    json_ld: Optional[dict[str, Any]] = None
+    json_ld: Optional[Any] = None
     """
     All JSON-LD data found (may be array or object)
     """
@@ -2190,7 +2190,7 @@ class SelectorDefinition3(BaseModel):
     """
     Attribute name (for Attribute mode)
     """
-    default: Optional[dict[str, Any]] = None
+    default: Optional[Any] = None
     """
     Default value if no match found
     """

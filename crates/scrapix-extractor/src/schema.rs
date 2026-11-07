@@ -43,7 +43,7 @@ pub struct SchemaConfig {
 pub struct ExtractedSchema {
     /// All JSON-LD data found (may be array or object)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub json_ld: Option<Value>,
 
     /// Individual schema items by type
@@ -72,6 +72,18 @@ pub struct SchemaItem {
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub data: Value,
+}
+
+impl SchemaItem {
+    /// An item of `schema_type` with `data`, minus its own `@type`: the
+    /// item's `@type` is `schema_type` (one entry of an array `@type`), and
+    /// keeping both would serialize the key twice.
+    pub fn new(schema_type: String, mut data: Value) -> Self {
+        if let Value::Object(map) = &mut data {
+            map.remove("@type");
+        }
+        Self { schema_type, data }
+    }
 }
 
 /// Schema extractor
@@ -218,7 +230,7 @@ impl SchemaExtractor {
                             self.convert_dates_in_value(&mut data);
                         }
 
-                        result.items.push(SchemaItem { schema_type, data });
+                        result.items.push(SchemaItem::new(schema_type, data));
                     }
                 }
             }
@@ -323,10 +335,9 @@ impl SchemaExtractor {
                 // Extract properties
                 let data = self.extract_microdata_properties(&element);
 
-                result.microdata.push(SchemaItem {
-                    schema_type: schema_type.clone(),
-                    data,
-                });
+                result
+                    .microdata
+                    .push(SchemaItem::new(schema_type.clone(), data));
                 result.microdata_count += 1;
             }
         }
@@ -489,6 +500,18 @@ mod tests {
         if let Value::Object(obj) = &result.items[0].data {
             assert_eq!(obj.get("headline").unwrap(), "Test Article");
         }
+
+        // `@type` appears once in the serialized item (it used to be written
+        // twice: the item's own and the flattened data's).
+        let json = serde_json::to_string(&result.items[0]).unwrap();
+        assert_eq!(
+            json.matches("\"@type\"").count(),
+            2,
+            "item + author: {json}"
+        );
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["@type"], "Article");
+        assert_eq!(value["author"]["@type"], "Person");
     }
 
     #[test]
