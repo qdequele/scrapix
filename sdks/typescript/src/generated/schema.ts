@@ -2056,7 +2056,7 @@ export interface components {
             /** @description Individual schema items by type */
             items?: components["schemas"]["SchemaItem"][];
             /** @description All JSON-LD data found (may be array or object) */
-            json_ld?: Record<string, never>;
+            json_ld?: unknown;
             /** @description Number of JSON-LD scripts found */
             json_ld_count: number;
             /** @description Microdata items */
@@ -2593,7 +2593,7 @@ export interface components {
             /** @description Attribute name (for Attribute mode) */
             attribute?: string | null;
             /** @description Default value if no match found */
-            default?: Record<string, never>;
+            default?: unknown;
             /** @description For ListOfObjects mode: field definitions */
             fields?: {
                 [key: string]: components["schemas"]["FieldDefinition"];

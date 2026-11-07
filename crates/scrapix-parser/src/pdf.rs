@@ -229,7 +229,15 @@ pub fn title_from_url(url: &str) -> Option<String> {
     let last = parsed.path_segments()?.rfind(|s| !s.is_empty())?;
     let last = percent_decode(last);
     let title = match last.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && (1..=5).contains(&ext.len()) => stem,
+        // An extension has a letter: `1706.03762` (an arXiv id) or
+        // `v1.2` keep their dot.
+        Some((stem, ext))
+            if !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+        {
+            stem
+        }
         _ => last.as_str(),
     };
     let title = title.replace(['-', '_'], " ");
@@ -307,6 +315,18 @@ mod tests {
         assert_eq!(
             title_from_url("https://example.com/files/report"),
             Some("report".to_string())
+        );
+    }
+
+    #[test]
+    fn test_title_from_url_keeps_numeric_dots() {
+        assert_eq!(
+            title_from_url("https://arxiv.org/pdf/1706.03762"),
+            Some("1706.03762".to_string())
+        );
+        assert_eq!(
+            title_from_url("https://arxiv.org/pdf/1706.03762v7.pdf"),
+            Some("1706.03762v7".to_string())
         );
     }
 

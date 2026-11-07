@@ -56,7 +56,7 @@ Scrape a single URL and return extracted content in the requested formats.
 |--------|-------------|
 | `markdown` | Cleaned content converted to Markdown |
 | `html` | Cleaned HTML (nav, footer, ads removed) |
-| `raw_html` | Original unmodified HTML |
+| `rawhtml` | Original unmodified HTML (returned as `raw_html`) |
 | `content` | Plain text extracted via readability |
 | `links` | All links found on the page |
 | `metadata` | Title, description, Open Graph, Twitter cards |
@@ -246,6 +246,7 @@ A selector definition supports:
 |-------|------|---------|-------------|
 | `selector` / `selectors` | string / string[] | **required** (one of them) | CSS selector, or selectors tried in order |
 | `mode` | string or object | `"text"` | `"text"`, `"html"`, `"outer_html"`, `"list"`, `"first"`, `"count"`, `"list_of_objects"` or `{"attribute": "<name>"}` |
+| `attribute` | string | none | With `text`, `first` or `list`: read this attribute instead of the text (`{"mode": "list", "attribute": "src"}`) |
 | `default` | any | `null` | Value when nothing matches |
 | `transform` | array | `[]` | Transforms applied to the value (`"trim"`, `"lowercase"`, ...) |
 
@@ -359,10 +360,12 @@ reached), OCR is skipped: the request still returns `200`, with a `warning`
   },
   "blocks": [
     {
+      "index": 0,
       "heading": "Introduction",
-      "level": 2,
-      "content": "The intro paragraph...",
-      "anchor": "introduction"
+      "heading_level": 2,
+      "h2": "Introduction",
+      "anchor": "introduction",
+      "content": "The intro paragraph..."
     }
   ],
   "extract": {
@@ -437,9 +440,9 @@ More request shapes (self-hosted engine on `localhost:8080`):
         "url": "https://shop.example.com/product/123",
         "formats": ["metadata"],
         "extract": {
-          "name": {"selector": "h1.product-title", "type": "text"},
-          "price": {"selector": ".price-current", "type": "text"},
-          "images": {"selector": ".gallery img", "type": "list", "attribute": "src"}
+          "name": "h1.product-title",
+          "price": {"selector": ".price-current", "transform": ["trim"]},
+          "images": {"selector": ".gallery img", "mode": "list", "attribute": "src"}
         }
       }'
     ```

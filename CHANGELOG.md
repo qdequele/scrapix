@@ -33,6 +33,31 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- The spec types a selector's `default` (`/scrape` and `/batch/scrape`
+  `extract`) and `schema.json_ld` as any JSON value instead of an object, so
+  clients that validate against it (the Lab's MCP tools) accept
+  `"default": "none"` or a number, as the engine always did. The SDKs follow:
+  `unknown` in TypeScript (was `Record<string, never>`), `Any` in Python.
+- `/scrape` and `/batch/scrape` `ai.summary` / `ai.extract` run whatever the
+  requested `formats`: without `markdown` or `content` they used to do
+  nothing and return "could not be generated".
+- `/scrape` `timeout_ms` bounds the default fetch (`timeout` error, 504). It
+  only applied with custom `headers` or `cookies`.
+- `metadata` comes from the whole page even with `include_selectors` (the
+  title was `null` when they dropped `<head>`), and ignores the `itemprop`
+  metas of microdata items: `keywords` was the last quote's tags on
+  quotes.toscrape.com.
+- A document's fallback title keeps a dot followed by digits:
+  `arxiv.org/pdf/1706.03762` is titled `1706.03762`, not `1706`.
+- `schema` items carry `@type` once (it was serialized twice).
+- An `extract` selector's `attribute` field is read by the `text`, `first`
+  and `list` modes (`{"mode": "list", "attribute": "src"}`), as documented;
+  it was ignored.
+- `/extract` globs without a slash before `*` (`/learn*`) include their
+  prefix page (`/learn`).
+- Docs: the request format is `rawhtml` (the response field `raw_html`),
+  `blocks` items show their real fields, and the `extract` examples use
+  `mode`, not `type`.
 - `contracts/openapi.json` catches up with the engine: `features.documents`
   (`DocumentsConfig`) and `features.ocr` (`OcrConfig`), `pdf.max_pages`, and
   `pdf.extract_links`, which follows links inside PDFs (the spec still called it

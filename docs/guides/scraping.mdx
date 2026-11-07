@@ -45,7 +45,7 @@ Request only the formats you need to reduce response size:
 |--------|----------|
 | `markdown` | LLM input, clean readable content |
 | `html` | Cleaned HTML (ads, nav, footer removed) |
-| `raw_html` | Original unmodified HTML for custom parsing |
+| `rawhtml` | Original unmodified HTML for custom parsing (returned as `raw_html`) |
 | `content` | Plain text (readability algorithm) |
 | `links` | Link discovery, sitemap building |
 | `metadata` | SEO analysis, title/description extraction |
@@ -84,28 +84,21 @@ Extract specific data from a page using CSS selectors:
   "url": "https://shop.example.com/product/123",
   "formats": ["metadata"],
   "extract": {
-    "name": {
-      "selector": "h1.product-title",
-      "type": "text"
-    },
+    "name": "h1.product-title",
     "price": {
       "selector": ".price-current",
-      "type": "text"
+      "transform": ["trim"]
     },
     "images": {
       "selector": ".gallery img",
-      "type": "list",
+      "mode": "list",
       "attribute": "src"
     },
     "rating": {
       "selector": "[data-rating]",
-      "type": "text",
-      "attribute": "data-rating"
+      "mode": { "attribute": "data-rating" }
     },
-    "in_stock": {
-      "selector": ".availability",
-      "type": "text"
-    }
+    "in_stock": ".availability"
   }
 }
 ```
@@ -172,22 +165,19 @@ Response:
 {
   "blocks": [
     {
+      "index": 0,
       "heading": "Introduction",
-      "level": 2,
-      "content": "This guide covers...",
-      "anchor": "introduction"
+      "heading_level": 2,
+      "h2": "Introduction",
+      "anchor": "introduction",
+      "content": "This guide covers..."
     },
     {
+      "index": 1,
       "heading": "Installation",
-      "level": 2,
-      "content": "Run the following command...",
-      "anchor": "installation"
-    },
-    {
-      "heading": "Configuration",
-      "level": 2,
-      "content": "Edit your config file...",
-      "anchor": "configuration"
+      "heading_level": 2,
+      "h2": "Installation",
+      "content": "Run the following command..."
     }
   ]
 }

@@ -43,7 +43,7 @@ pub struct SchemaConfig {
 pub struct ExtractedSchema {
     /// All JSON-LD data found (may be array or object)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub json_ld: Option<Value>,
 
     /// Individual schema items by type
@@ -62,7 +62,7 @@ pub struct ExtractedSchema {
 }
 
 /// A single schema.org item
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct SchemaItem {
     /// Schema type (e.g., "Article", "Product", "Organization")
     #[serde(rename = "@type")]
@@ -72,6 +72,31 @@ pub struct SchemaItem {
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub data: Value,
+}
+
+impl SchemaItem {
+    /// An item of `schema_type` (one entry when the source `@type` is an
+    /// array). `data` stays the source object, `@type` included: the crawler
+    /// indexes it as is.
+    pub fn new(schema_type: String, data: Value) -> Self {
+        Self { schema_type, data }
+    }
+}
+
+/// `@type` (the item's `schema_type`) then `data`'s other keys: a derived
+/// `#[serde(flatten)]` wrote `@type` twice, once from each.
+impl Serialize for SchemaItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("@type", &self.schema_type)?;
+        if let Value::Object(data) = &self.data {
+            for (key, value) in data.iter().filter(|(key, _)| *key != "@type") {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Schema extractor
@@ -218,7 +243,7 @@ impl SchemaExtractor {
                             self.convert_dates_in_value(&mut data);
                         }
 
-                        result.items.push(SchemaItem { schema_type, data });
+                        result.items.push(SchemaItem::new(schema_type, data));
                     }
                 }
             }
@@ -323,10 +348,9 @@ impl SchemaExtractor {
                 // Extract properties
                 let data = self.extract_microdata_properties(&element);
 
-                result.microdata.push(SchemaItem {
-                    schema_type: schema_type.clone(),
-                    data,
-                });
+                result
+                    .microdata
+                    .push(SchemaItem::new(schema_type.clone(), data));
                 result.microdata_count += 1;
             }
         }
@@ -488,7 +512,21 @@ mod tests {
 
         if let Value::Object(obj) = &result.items[0].data {
             assert_eq!(obj.get("headline").unwrap(), "Test Article");
+            // The crawler indexes `data`: it keeps the source `@type`.
+            assert_eq!(obj.get("@type").unwrap(), "Article");
         }
+
+        // `@type` appears once in the serialized item (it used to be written
+        // twice: the item's own and the flattened data's).
+        let json = serde_json::to_string(&result.items[0]).unwrap();
+        assert_eq!(
+            json.matches("\"@type\"").count(),
+            2,
+            "item + author: {json}"
+        );
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["@type"], "Article");
+        assert_eq!(value["author"]["@type"], "Person");
     }
 
     #[test]

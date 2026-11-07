@@ -60,7 +60,7 @@ pub struct SelectorDefinition {
 
     /// Default value if no match found
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     pub default: Option<Value>,
 
     /// Transform the extracted value (trim, lowercase, etc.)
@@ -323,12 +323,22 @@ impl SelectorExtractor {
                 continue;
             }
 
+            // `attribute` (outside the `{"attribute": ...}` mode) makes the
+            // text modes read that attribute: `{"mode": "list", "attribute":
+            // "src"}` is every image's `src`.
+            let read = |el: &scraper::ElementRef| -> Value {
+                match &definition.attribute {
+                    Some(attr) => el
+                        .value()
+                        .attr(attr)
+                        .map_or(Value::Null, |v| Value::String(v.to_string())),
+                    None => Value::String(el.text().collect::<String>()),
+                }
+            };
+
             // Extract based on mode
             let value = match &definition.mode {
-                ExtractionMode::Text => {
-                    let text = elements[0].text().collect::<String>();
-                    Value::String(text)
-                }
+                ExtractionMode::Text => read(&elements[0]),
                 ExtractionMode::Html => {
                     let html = elements[0].inner_html();
                     Value::String(html)
@@ -344,17 +354,8 @@ impl SelectorExtractor {
                         Value::Null
                     }
                 }
-                ExtractionMode::First => {
-                    let text = elements[0].text().collect::<String>();
-                    Value::String(text)
-                }
-                ExtractionMode::List => {
-                    let values: Vec<Value> = elements
-                        .iter()
-                        .map(|el| Value::String(el.text().collect::<String>()))
-                        .collect();
-                    Value::Array(values)
-                }
+                ExtractionMode::First => read(&elements[0]),
+                ExtractionMode::List => Value::Array(elements.iter().map(read).collect()),
                 ExtractionMode::ListOfObjects => {
                     let objects: Vec<Value> = elements
                         .iter()
@@ -764,6 +765,32 @@ mod tests {
         let result = extractor.extract(html).unwrap();
 
         assert_eq!(result.values.get("subtitle").unwrap(), "No subtitle");
+    }
+
+    /// The documented `{"mode": "list", "attribute": "src"}` (and `text`
+    /// with `attribute`) read the attribute instead of the text.
+    #[test]
+    fn attribute_field_applies_to_text_and_list_modes() {
+        let html = r#"<div class="gallery"><img src="/a.jpg"><img src="/b.jpg"></div>
+                      <span data-rating="4.5">★★★★</span>"#;
+        let definition: SelectorDefinition = serde_json::from_value(serde_json::json!({
+            "selector": ".gallery img", "mode": "list", "attribute": "src"
+        }))
+        .unwrap();
+        let rating: SelectorDefinition = serde_json::from_value(serde_json::json!({
+            "selector": "[data-rating]", "attribute": "data-rating"
+        }))
+        .unwrap();
+        let mut extractor = SelectorExtractor::new();
+        extractor.add("images", definition);
+        extractor.add("rating", rating);
+
+        let result = extractor.extract(html).unwrap();
+        assert_eq!(
+            result.values["images"],
+            serde_json::json!(["/a.jpg", "/b.jpg"])
+        );
+        assert_eq!(result.values["rating"], "4.5");
     }
 
     #[test]

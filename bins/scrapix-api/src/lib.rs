@@ -3713,11 +3713,25 @@ pub(crate) async fn perform_scrape(
     } else if request.headers.is_empty() && request.cookies.is_empty() {
         // Use the shared fetcher (connection pooling, DNS cache, retries).
         // It has no cookie store, so nothing carries over between requests.
-        state
-            .fetcher
-            .fetch_with_options(&crawl_url, document_fetch_options())
-            .await
-            .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
+        // Its own timeout is the server's, so the request's `timeout_ms`
+        // bounds the whole fetch here.
+        tokio::time::timeout(
+            Duration::from_millis(request.timeout_ms),
+            state
+                .fetcher
+                .fetch_with_options(&crawl_url, document_fetch_options()),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                format!(
+                    "Fetching the URL took longer than {} ms",
+                    request.timeout_ms
+                ),
+                "timeout",
+            )
+        })?
+        .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     } else {
         // Build a one-off fetcher with custom headers and/or cookies
         let robots_config = RobotsConfig {
@@ -3890,20 +3904,11 @@ pub(crate) async fn perform_scrape(
     };
 
     // (c) Run extractor for metadata, schema, blocks, and custom selectors
-    let needs_extraction = formats.contains(&ScrapeFormat::Metadata)
-        || formats.contains(&ScrapeFormat::Schema)
-        || formats.contains(&ScrapeFormat::Blocks)
-        || !request.extract.is_empty();
+    let needs_extraction = formats.contains(&ScrapeFormat::Blocks) || !request.extract.is_empty();
 
     let extraction_result = if needs_extraction {
         let mut extractor = Extractor::new();
 
-        if formats.contains(&ScrapeFormat::Metadata) {
-            extractor = extractor.with_metadata();
-        }
-        if formats.contains(&ScrapeFormat::Schema) {
-            extractor = extractor.with_schema();
-        }
         if formats.contains(&ScrapeFormat::Blocks) {
             extractor = extractor.with_blocks();
         }
@@ -3923,13 +3928,30 @@ pub(crate) async fn perform_scrape(
         None
     };
 
+    // Metadata and schema.org data describe the whole page (its <head>,
+    // its JSON-LD scripts), so they come from the original HTML: the
+    // include/exclude selectors only shape the content.
+    let page_extraction =
+        if formats.contains(&ScrapeFormat::Metadata) || formats.contains(&ScrapeFormat::Schema) {
+            let mut extractor = Extractor::new();
+            if formats.contains(&ScrapeFormat::Metadata) {
+                extractor = extractor.with_metadata();
+            }
+            if formats.contains(&ScrapeFormat::Schema) {
+                extractor = extractor.with_schema();
+            }
+            extractor.extract(&original_html).ok()
+        } else {
+            None
+        };
+
     // Pull out extraction results
-    let metadata = extraction_result
+    let metadata = page_extraction
         .as_ref()
         .and_then(|r| r.metadata.clone())
         .map(ScrapeMetadata::from);
 
-    let schema = extraction_result.as_ref().and_then(|r| r.schema.clone());
+    let schema = page_extraction.as_ref().and_then(|r| r.schema.clone());
 
     let blocks = extraction_result
         .as_ref()
@@ -3991,8 +4013,24 @@ pub(crate) async fn perform_scrape(
         .and_then(|text| detect_language_info(text))
         .map(|info| info.code);
 
-    // (e) AI enrichment (optional)
-    let ai_text = content.as_deref().or(markdown.as_deref()).unwrap_or("");
+    // (e) AI enrichment (optional). It reads the page's text whatever the
+    // requested formats: without `content` or `markdown`, the main content
+    // is converted for the AI only.
+    let ai_only_text = match (&request.ai, &content, &markdown) {
+        (Some(options), None, None) if options.wants_summary() || options.wants_extraction() => {
+            Some(if request.only_main_content {
+                html_to_main_content_markdown(&processed_html)
+            } else {
+                html_to_markdown(&processed_html)
+            })
+        }
+        _ => None,
+    };
+    let ai_text = content
+        .as_deref()
+        .or(markdown.as_deref())
+        .or(ai_only_text.as_deref())
+        .unwrap_or("");
     let ai_run = match (request.ai.as_ref(), ai.as_ref()) {
         (Some(options), Some(ai)) => {
             let usage = AiUsageContext {
