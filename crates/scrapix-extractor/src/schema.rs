@@ -62,7 +62,7 @@ pub struct ExtractedSchema {
 }
 
 /// A single schema.org item
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct SchemaItem {
     /// Schema type (e.g., "Article", "Product", "Organization")
     #[serde(rename = "@type")]
@@ -75,14 +75,27 @@ pub struct SchemaItem {
 }
 
 impl SchemaItem {
-    /// An item of `schema_type` with `data`, minus its own `@type`: the
-    /// item's `@type` is `schema_type` (one entry of an array `@type`), and
-    /// keeping both would serialize the key twice.
-    pub fn new(schema_type: String, mut data: Value) -> Self {
-        if let Value::Object(map) = &mut data {
-            map.remove("@type");
-        }
+    /// An item of `schema_type` (one entry when the source `@type` is an
+    /// array). `data` stays the source object, `@type` included: the crawler
+    /// indexes it as is.
+    pub fn new(schema_type: String, data: Value) -> Self {
         Self { schema_type, data }
+    }
+}
+
+/// `@type` (the item's `schema_type`) then `data`'s other keys: a derived
+/// `#[serde(flatten)]` wrote `@type` twice, once from each.
+impl Serialize for SchemaItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("@type", &self.schema_type)?;
+        if let Value::Object(data) = &self.data {
+            for (key, value) in data.iter().filter(|(key, _)| *key != "@type") {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
     }
 }
 
@@ -499,6 +512,8 @@ mod tests {
 
         if let Value::Object(obj) = &result.items[0].data {
             assert_eq!(obj.get("headline").unwrap(), "Test Article");
+            // The crawler indexes `data`: it keeps the source `@type`.
+            assert_eq!(obj.get("@type").unwrap(), "Article");
         }
 
         // `@type` appears once in the serialized item (it used to be written

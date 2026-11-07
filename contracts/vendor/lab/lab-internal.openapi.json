@@ -157,8 +157,8 @@
     "/internal/accounts/{account_id}/ai": {
       "get": {
         "operationId": "getAccountAi",
-        "summary": "The hosted Scrapix engine's LLM target: the team's Gateway and its key",
-        "description": "Only the hosted Scrapix engine may call it (any other product gets 403 `{\"error\":\"forbidden\"}`). `base_url` is the team's hosted Gateway (Lumen) OpenAI-compatible base (`<engine url>/v1`); `api_key` is the team's `lab-scrapix` virtual key, minted on first use and kept by the Lab; `key_id` names it. `default_model` and `vision_model` are the models to ask for. `cache_ttl` is the seconds the answer may be cached. When the Gateway refuses the key, call again with `rejected_key_id` set to the `key_id` it refused: the Lab replaces the stored key only if it is still that one, so a stale id gets the current key back. 404 `{\"error\":\"not_found\"}` when the account id is not a UUID, the team has no built-in Gateway or it has no hosted engine. 502 `{\"error\":\"gateway_unavailable\",\"message\":...}` when the Gateway could not mint the key.",
+        "summary": "A hosted engine's LLM target: the team's Gateway and the engine's key",
+        "description": "Only the hosted Scrapix and Pipelines engines may call it (any other product gets 403 `{\"error\":\"forbidden\"}`). `base_url` is the team's hosted Gateway (Lumen) OpenAI-compatible base (`<engine url>/v1`); `api_key` is the team's virtual key for the calling engine (`lab-scrapix` for Scrapix, `lab-pipelines` for Pipelines), minted on first use and kept by the Lab; `key_id` names it. `default_model` and `vision_model` are the models to ask for; Pipelines also gets `decision_model`, the model its `jev_enricher` asks for. `cache_ttl` is the seconds the answer may be cached. When the Gateway refuses the key, call again with `rejected_key_id` set to the `key_id` it refused: the Lab replaces the stored key only if it is still that one, so a stale id gets the current key back. 404 `{\"error\":\"not_found\"}` when the account id is not a UUID, the team has no built-in Gateway or it has no hosted engine. 502 `{\"error\":\"gateway_unavailable\",\"message\":...}` when the Gateway could not mint the key.",
         "parameters": [
           {
             "name": "account_id",
@@ -194,7 +194,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "description": "Not the hosted Scrapix engine",
+            "description": "The caller is not a hosted Scrapix or Pipelines engine",
             "content": {
               "application/json": {
                 "schema": {
@@ -666,7 +666,7 @@
           },
           "api_key": {
             "type": "string",
-            "description": "The team's lab-scrapix virtual key (fg-...)"
+            "description": "The calling engine's virtual key on the team's Gateway (fg-...): lab-scrapix or lab-pipelines"
           },
           "key_id": {
             "type": "string",
@@ -677,6 +677,10 @@
           },
           "vision_model": {
             "type": "string"
+          },
+          "decision_model": {
+            "type": "string",
+            "description": "Pipelines only: the model `jev_enricher` asks for"
           },
           "cache_ttl": {
             "type": "integer",
