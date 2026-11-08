@@ -78,7 +78,18 @@ Control which URLs get crawled and indexed:
 | `index_only` | Crawl all links but only index pages matching these globs |
 | `allowed_domains` | Restrict to specific domains (auto-inferred from start_urls) |
 
-Glob patterns use `**` for path wildcards and `*` for single-segment wildcards.
+Patterns are matched against the whole URL. `**` matches anything, `/`
+included; `*` matches anything inside one path segment (no `/`); every other
+character, `?` and `.` included, is literal. A `*` at the very end matches
+like `**`, so `**/page/*` also takes `/page/2/` and `/page/2/comments`.
+
+| Pattern | Matches | Does not match |
+|---------|---------|----------------|
+| `https://docs.example.com/**` | every page of the site | `https://blog.example.com/` |
+| `**/blog/**` | `https://a.com/blog/post`, `https://a.com/en/blog/post` | `https://a.com/blogs/post` |
+| `**/*.pdf` | `https://a.com/files/report.pdf` | `https://a.com/report.pdf.html` |
+| `**/login*` | `https://a.com/login`, `https://a.com/login?next=/` | `https://a.com/account/signin` |
+| `https://a.com/*/feed` | `https://a.com/news/feed` | `https://a.com/news/2024/feed` |
 
 ## Domain Restrictions
 

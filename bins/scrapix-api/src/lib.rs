@@ -2541,6 +2541,24 @@ fn crawl_event_to_page_event(job_id: &str, event: &CrawlEvent) -> Option<ClickHo
             timestamp: now,
             ..Default::default()
         }),
+        // The content worker's verdicts: without them a page that was
+        // crawled but never indexed leaves no trace of why.
+        CrawlEvent::DocumentSkipped { url, reason, .. } => Some(ClickHousePageEvent {
+            job_id: job_id.to_string(),
+            event_type: "page_skipped".to_string(),
+            url: url.clone(),
+            reason: reason.clone(),
+            timestamp: now,
+            ..Default::default()
+        }),
+        CrawlEvent::DocumentFailed { url, error, .. } => Some(ClickHousePageEvent {
+            job_id: job_id.to_string(),
+            event_type: "page_failed".to_string(),
+            url: url.clone(),
+            error: error.clone(),
+            timestamp: now,
+            ..Default::default()
+        }),
         CrawlEvent::RateLimited {
             domain, wait_ms, ..
         } => Some(ClickHousePageEvent {
@@ -3565,6 +3583,38 @@ async fn record_search_usage(
         .await;
 }
 
+/// Hop-by-hop and routing headers a scrape request may not set: they would
+/// let a caller smuggle requests or reach a proxy.
+const BLOCKED_SCRAPE_HEADERS: &[&str] = &[
+    "host",
+    "transfer-encoding",
+    "content-length",
+    "connection",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+];
+
+/// A scrape request's `headers` minus [`BLOCKED_SCRAPE_HEADERS`], for both
+/// the HTTP fetch and the browser.
+fn forwardable_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(key, _)| {
+            let blocked = BLOCKED_SCRAPE_HEADERS.contains(&key.to_lowercase().as_str());
+            if blocked {
+                warn!(header = %key, "Blocked sensitive header in scrape request");
+            }
+            !blocked
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
 /// The full /scrape pipeline for one URL: balance and plan pre-check, fetch
 /// (HTTP or browser), extraction, AI enrichment, analytics and usage report.
 ///
@@ -3679,12 +3729,30 @@ pub(crate) async fn perform_scrape(
             // by the site) and storage never reach another request on the
             // shared browser.
             isolate: true,
+            extra_headers: forwardable_headers(&request.headers),
+            // `timeout_ms` bounds loading the page; actions keep their own
+            // budget on top of it.
+            timeout: Some(
+                Duration::from_millis(request.timeout_ms)
+                    + if request.actions.is_empty() {
+                        Duration::ZERO
+                    } else {
+                        scrapix_crawler::ACTIONS_BUDGET
+                    },
+            ),
             ..Default::default()
         };
         let mut rendered = renderer
             .render_page(&request.url, &page_options)
             .await
             .map_err(|e| match e {
+                scrapix_core::ScrapixError::Timeout(_) => ApiError::new(
+                    format!(
+                        "Fetching the URL took longer than {} ms",
+                        request.timeout_ms
+                    ),
+                    "timeout",
+                ),
                 scrapix_core::ScrapixError::Action {
                     index,
                     action,
@@ -3756,25 +3824,8 @@ pub(crate) async fn perform_scrape(
             builder = builder.cookie(cookie.to_set_cookie_string(), parsed_url.clone());
         }
 
-        // Add custom headers (block sensitive headers to prevent injection attacks)
-        const BLOCKED_HEADERS: &[&str] = &[
-            "host",
-            "transfer-encoding",
-            "content-length",
-            "connection",
-            "upgrade",
-            "proxy-authorization",
-            "proxy-connection",
-            "te",
-            "trailer",
-        ];
-        for (key, value) in &request.headers {
-            let key_lower = key.to_lowercase();
-            if BLOCKED_HEADERS.contains(&key_lower.as_str()) {
-                warn!(header = %key, "Blocked sensitive header in scrape request");
-                continue;
-            }
-            builder = builder.header(key, value);
+        for (key, value) in forwardable_headers(&request.headers) {
+            builder = builder.header(&key, &value);
         }
 
         let fetcher = builder.build(robots_cache).map_err(|e| {
@@ -7902,25 +7953,54 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_blocked_headers() {
-        let blocked: &[&str] = &[
-            "host",
-            "transfer-encoding",
-            "connection",
-            "upgrade",
-            "proxy-authorization",
-            "proxy-connection",
-            "te",
-            "trailer",
-        ];
+    fn content_worker_verdicts_are_kept_in_event_history() {
+        let skipped = CrawlEvent::DocumentSkipped {
+            job_id: "j".into(),
+            url: "https://a.test/x".into(),
+            url_message_id: "m".into(),
+            reason: "no content".into(),
+            timestamp: 1,
+        };
+        let row = crawl_event_to_page_event("j", &skipped).expect("a history row");
+        assert_eq!(row.event_type, "page_skipped");
+        assert_eq!(row.url, "https://a.test/x");
+        assert_eq!(row.reason, "no content");
 
-        // Verify the canonical list of headers that must be blocked
-        for header in blocked {
-            assert!(
-                header.to_lowercase() == *header,
-                "Blocked headers should be lowercase for case-insensitive comparison"
-            );
-        }
+        let failed = CrawlEvent::DocumentFailed {
+            job_id: "j".into(),
+            url: "https://a.test/y".into(),
+            url_message_id: "m".into(),
+            error: "Parse error".into(),
+            timestamp: 1,
+        };
+        let row = crawl_event_to_page_event("j", &failed).expect("a history row");
+        assert_eq!(row.event_type, "page_failed");
+        assert_eq!(row.error, "Parse error");
+    }
+
+    #[test]
+    fn test_blocked_headers() {
+        let headers: HashMap<String, String> = [
+            ("Host", "evil.test"),
+            ("Transfer-Encoding", "chunked"),
+            ("connection", "close"),
+            ("Proxy-Authorization", "Basic x"),
+            ("X-Tenant", "t1"),
+            ("Authorization", "Bearer tok"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(
+            forwardable_headers(&headers),
+            vec![
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+                ("X-Tenant".to_string(), "t1".to_string()),
+            ]
+        );
+        assert!(BLOCKED_SCRAPE_HEADERS
+            .iter()
+            .all(|h| h.to_lowercase() == *h));
     }
 
     // ========================================================================

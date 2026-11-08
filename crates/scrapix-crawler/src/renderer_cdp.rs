@@ -124,6 +124,28 @@ pub struct PageOptions {
     /// cache), disposed afterwards, so nothing this render sets or receives
     /// is visible to any other render on the shared browser.
     pub isolate: bool,
+    /// Bound the whole render, from waiting for a browser slot to capturing
+    /// the page (actions and screenshot included). On expiry the render
+    /// fails with [`ScrapixError::Timeout`]; the page and its context are
+    /// still closed. `None` leaves only the renderer's own timeouts.
+    pub timeout: Option<Duration>,
+}
+
+/// Whether a request is the page's own document, not one of its
+/// subresources.
+pub(crate) fn is_main_document(request: &chromiumoxide::handler::http::HttpRequest) -> bool {
+    request.is_navigation_request || request.resource_type.as_deref() == Some("Document")
+}
+
+/// The document's MIME type as the page sees it (`document.contentType`),
+/// for when CDP gave no main-document response.
+async fn document_content_type(page: &Page) -> Option<String> {
+    page.evaluate("document.contentType")
+        .await
+        .ok()?
+        .into_value::<String>()
+        .ok()
+        .filter(|ct| !ct.is_empty())
 }
 
 /// HTTP status of the main document as reported by CDP (`Network.Response.status`),
@@ -747,12 +769,23 @@ impl CdpRenderer {
         };
         check_render_target(url, self.config.allow_private_ips, robots).await?;
 
+        let deadline = req.timeout.map(|t| tokio::time::Instant::now() + t);
+        let timed_out = || {
+            ScrapixError::Timeout(format!(
+                "rendering took longer than {} ms",
+                req.timeout.unwrap_or_default().as_millis()
+            ))
+        };
+
         // Acquire semaphore
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| CdpError::PoolExhausted)?;
+        let acquire = self.semaphore.acquire();
+        let permit = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+                .await
+                .map_err(|_| timed_out())?,
+            None => acquire.await,
+        };
+        let _permit = permit.map_err(|_| CdpError::PoolExhausted)?;
 
         let start = Instant::now();
 
@@ -786,9 +819,13 @@ impl CdpRenderer {
         // Always close the page (and stop its request guard, and dispose its
         // context), including on error paths.
         let mut guard = None;
-        let result = self
-            .render_on_page(&page, url, req, start, &mut guard)
-            .await;
+        let render = self.render_on_page(&page, url, req, start, &mut guard);
+        let result = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, render)
+                .await
+                .unwrap_or_else(|_| Err(timed_out())),
+            None => render.await,
+        };
         let _ = page.close().await;
         if let Some(guard) = guard {
             guard.abort();
@@ -938,7 +975,14 @@ impl CdpRenderer {
             .map_err(|e| CdpError::NavigationFailed(format!("Failed to get content: {}", e)))?;
 
         // Status, headers and content type of the main document response.
-        let response = navigation.as_ref().and_then(|r| r.response.as_ref());
+        // The request chromiumoxide reports for the navigation can be one of
+        // the page's subresources (a stylesheet, a font): taking its
+        // `text/css` made the content worker skip every page of a browser
+        // crawl as "unsupported content type". Only the document counts.
+        let response = navigation
+            .as_deref()
+            .filter(|r| is_main_document(r))
+            .and_then(|r| r.response.as_ref());
         let status = match document_status(response.map(|r| r.status)) {
             Some(status) => status,
             None => {
@@ -957,6 +1001,7 @@ impl CdpRenderer {
                     .map(|r| r.mime_type.clone())
                     .filter(|m| !m.is_empty())
             })
+            .or(document_content_type(page).await)
             .or_else(|| Some("text/html".to_string()));
 
         // Collect console logs and errors

@@ -10,7 +10,7 @@ use url::Url;
 use scrapix_core::{Document, RawPage, Result, ScrapixError};
 
 use crate::language::detect_language;
-use crate::markdown::html_to_markdown;
+use crate::markdown::html_to_main_content_markdown;
 use crate::readability::{extract_content_from_dom, ReadabilityConfig};
 
 /// HTML parser configuration
@@ -104,9 +104,11 @@ impl HtmlParser {
         if self.config.extract_content {
             let content = extract_content_from_dom(&html, &ReadabilityConfig::default());
             if content.len() >= self.config.min_content_length {
-                // Convert to markdown if enabled
+                // Markdown comes from the page's HTML (main content only, as
+                // `/scrape` does by default): readability's output is plain
+                // text, so converting it gave the text back with escapes.
                 if self.config.convert_to_markdown {
-                    doc.markdown = Some(html_to_markdown(&content));
+                    doc.markdown = Some(html_to_main_content_markdown(&page.html));
                 }
 
                 // Readability output is already plain text, just normalize whitespace
@@ -137,10 +139,9 @@ impl HtmlParser {
     fn extract_title(&self, html: &Html) -> Option<String> {
         // Try <title> tag first
         if let Some(title_el) = html.select(&self.title_selector).next() {
-            let title = title_el.text().collect::<String>();
-            let title = title.trim();
+            let title = collapse_whitespace(&title_el.text().collect::<String>());
             if !title.is_empty() {
-                return Some(title.to_string());
+                return Some(title);
             }
         }
 
@@ -148,9 +149,9 @@ impl HtmlParser {
         for meta in html.select(&self.meta_selector) {
             if meta.value().attr("property") == Some("og:title") {
                 if let Some(content) = meta.value().attr("content") {
-                    let content = content.trim();
+                    let content = collapse_whitespace(content);
                     if !content.is_empty() {
-                        return Some(content.to_string());
+                        return Some(content);
                     }
                 }
             }
@@ -158,10 +159,9 @@ impl HtmlParser {
 
         // Try h1
         if let Some(h1) = html.select(&self.h1_selector).next() {
-            let text = h1.text().collect::<String>();
-            let text = text.trim();
+            let text = collapse_whitespace(&h1.text().collect::<String>());
             if !text.is_empty() {
-                return Some(text.to_string());
+                return Some(text);
             }
         }
 
@@ -316,6 +316,11 @@ impl HtmlParser {
 
 /// Clean extracted text content (normalize whitespace only, no HTML parsing).
 /// Readability output is already plain text, so re-parsing as HTML is wasteful.
+/// `text` with each run of whitespace (newlines, indentation) as one space.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clean_extracted_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -404,6 +409,48 @@ mod tests {
         let html = Html::parse_document("<html><head><title>Test Title</title></head></html>");
 
         assert_eq!(parser.extract_title(&html), Some("Test Title".to_string()));
+    }
+
+    #[test]
+    fn title_whitespace_is_collapsed() {
+        let parser = HtmlParser::with_defaults();
+        let html = Html::parse_document(
+            "<html><head><title>Poetry |\n     Books to Scrape - Sandbox\n</title></head></html>",
+        );
+        assert_eq!(
+            parser.extract_title(&html),
+            Some("Poetry | Books to Scrape - Sandbox".to_string())
+        );
+    }
+
+    #[test]
+    fn crawl_markdown_keeps_the_page_structure() {
+        let parser = HtmlParser::with_defaults();
+        let html = r#"<html><head><title>Guide</title></head><body>
+            <nav><a href="/">Home</a></nav>
+            <main><article>
+              <h1>Install the engine</h1>
+              <p>Run the <strong>installer</strong> and read the
+                 <a href="https://a.test/docs">docs</a> for the details you need.</p>
+              <ul><li>First step to follow</li><li>Second step to follow</li></ul>
+              <p>Another paragraph with enough text to be the main content here.</p>
+            </article></main>
+            <footer>Copyright</footer></body></html>"#;
+        let doc = parser
+            .parse(&make_page("https://a.test/guide", html))
+            .unwrap();
+        let md = doc.markdown.unwrap();
+        assert!(md.contains("Install the engine\n==="), "{md}");
+        assert!(md.contains("**installer**"), "{md}");
+        assert!(md.contains("[docs](https://a.test/docs)"), "{md}");
+        assert!(md.contains("First step to follow"), "{md}");
+        assert!(
+            md.lines().any(|l| l.trim_start().starts_with(['*', '-'])),
+            "{md}"
+        );
+        assert!(!md.contains("Copyright"), "{md}");
+        // `content` stays plain text.
+        assert!(!doc.content.unwrap().contains("**"));
     }
 
     #[test]

@@ -4,42 +4,79 @@
 //! and per-feature `include_pages` / `exclude_pages` (content worker) all use
 //! these functions so a pattern means the same thing everywhere.
 
-/// Simple glob-style pattern matching.
+/// Glob-style URL matching, anchored at both ends.
 ///
-/// A single `*` matches any characters except `/`; `**` matches any
-/// characters including `/`. A pattern without `*` must match exactly.
+/// `**` matches any characters, `/` included; `*` matches any characters
+/// except `/`; everything else (`?` included) is literal. A pattern without
+/// `*` must match exactly.
+///
+/// A `*` that ends the pattern matches like `**`: `https://a.test/docs/*`
+/// takes `https://a.test/docs/1/2` and `**/page/*` takes `/page/2/`. This
+/// keeps the crawler's long-standing meaning of a trailing `*`.
 pub fn matches_glob(url: &str, pattern: &str) -> bool {
-    if pattern.contains("**") {
-        // Handle ** as "match anything"
-        let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            return url.starts_with(parts[0]) && (parts[1].is_empty() || url.ends_with(parts[1]));
-        }
-    }
+    let tokens = tokenize(pattern);
+    let url = url.as_bytes();
 
-    if pattern.contains('*') {
-        // Handle * as "match anything except /"
-        let parts: Vec<&str> = pattern.split('*').collect();
-        let mut pos = 0;
-        for part in parts {
-            if part.is_empty() {
-                continue;
-            }
-            if let Some(found) = url[pos..].find(part) {
-                // Check no / between pos and found
-                if url[pos..pos + found].contains('/') && !pattern.contains("**") {
-                    return false;
+    // `reach[j]`: the tokens seen so far can match `url[..j]`.
+    let mut reach = vec![false; url.len() + 1];
+    reach[0] = true;
+    for token in &tokens {
+        let mut next = vec![false; url.len() + 1];
+        match *token {
+            Token::Byte(b) => {
+                for j in 0..url.len() {
+                    next[j + 1] = reach[j] && url[j] == b;
                 }
-                pos = pos + found + part.len();
-            } else {
-                return false;
+            }
+            Token::Any => {
+                let mut seen = false;
+                for j in 0..=url.len() {
+                    seen |= reach[j];
+                    next[j] = seen;
+                }
+            }
+            Token::AnyInSegment => {
+                for j in 0..=url.len() {
+                    next[j] = reach[j] || (j > 0 && next[j - 1] && url[j - 1] != b'/');
+                }
             }
         }
-        true
-    } else {
-        // Exact match
-        url == pattern
+        if !next.contains(&true) {
+            return false;
+        }
+        reach = next;
     }
+    reach[url.len()]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Token {
+    Byte(u8),
+    /// `**`, or a trailing `*`.
+    Any,
+    /// `*`: anything but `/`.
+    AnyInSegment,
+}
+
+fn tokenize(pattern: &str) -> Vec<Token> {
+    let bytes = pattern.as_bytes();
+    let mut tokens = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'*' {
+            let run = bytes[i..].iter().take_while(|&&b| b == b'*').count();
+            i += run;
+            tokens.push(if run >= 2 || i == bytes.len() {
+                Token::Any
+            } else {
+                Token::AnyInSegment
+            });
+        } else {
+            tokens.push(Token::Byte(bytes[i]));
+            i += 1;
+        }
+    }
+    tokens
 }
 
 /// Include/exclude filter: exclude patterns win over include patterns, and
@@ -71,6 +108,63 @@ mod tests {
         ));
         assert!(matches_glob("https://a.test/x", "https://a.test/x"));
         assert!(!matches_glob("https://a.test/y", "https://a.test/x"));
+    }
+
+    #[test]
+    fn double_star_mixed_with_single_star() {
+        // `**` then a `*`: the `*` is a wildcard, not a literal.
+        assert!(matches_glob("https://q.test/page/2/", "**/page/*"));
+        assert!(matches_glob("https://q.test/tag/love/page/1/", "**/page/*"));
+        assert!(!matches_glob("https://q.test/author/x", "**/page/*"));
+        assert!(matches_glob("https://q.test/login", "**/login*"));
+        assert!(matches_glob("https://q.test/login?next=/", "**/login*"));
+        assert!(matches_glob("https://a.test/files/report.pdf", "**/*.pdf"));
+        assert!(!matches_glob(
+            "https://a.test/files/report.pdf.html",
+            "**/*.pdf"
+        ));
+        assert!(matches_glob("https://a.test/w?lang=fr", "**?lang=*"));
+        assert!(!matches_glob("https://a.test/w?language", "**?lang=*"));
+        assert!(matches_glob(
+            "https://a.test/docs/v2/x/api",
+            "https://a.test/docs/**/api"
+        ));
+        assert!(matches_glob("https://a.test/x/blog/y/z", "**/blog/**"));
+    }
+
+    #[test]
+    fn literal_parts_are_anchored() {
+        // A pattern ending in a literal must end the URL.
+        assert!(!matches_glob("https://a.test/a/xyz", "https://a.test/*/x"));
+        assert!(!matches_glob(
+            "https://a.test/docs/1/2",
+            "https://a.test/docs/**/1"
+        ));
+        // `?` and `.` are literal.
+        assert!(!matches_glob("https://a.test/aXb", "https://a.test/a?b"));
+        assert!(!matches_glob("https://aXtest/", "https://a.test/"));
+        // Non-ASCII URLs.
+        assert!(matches_glob("https://a.test/café/1", "https://a.test/*/1"));
+    }
+
+    #[test]
+    fn trailing_star_keeps_its_crawler_meaning() {
+        assert!(matches_glob(
+            "https://a.test/docs/1/2",
+            "https://a.test/docs/*"
+        ));
+        assert!(matches_glob(
+            "https://a.test/learn",
+            "https://a.test/learn*"
+        ));
+        assert!(matches_glob(
+            "https://a.test/learn/x",
+            "https://a.test/learn*"
+        ));
+        assert!(!matches_glob(
+            "https://b.test/learn",
+            "https://a.test/learn*"
+        ));
     }
 
     #[test]

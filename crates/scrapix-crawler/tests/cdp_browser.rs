@@ -391,7 +391,9 @@ impl Respond for EchoPage {
 </script></head><body>
 <div class="desktop">DESKTOP LAYOUT</div><div class="mobile">MOBILE LAYOUT</div>
 <pre id="cookie">{cookie}</pre><pre id="ua">{ua}</pre><pre id="chmobile">{chm}</pre>
+<pre id="xtest">{xtest}</pre>
 </body></html>"#,
+            xtest = h("x-test"),
             cookie = h("cookie"),
             ua = h("user-agent"),
             chm = h("sec-ch-ua-mobile"),
@@ -552,5 +554,97 @@ async fn cookies_are_sent_and_isolated() {
     };
     let result = r.render_page(&url, &second).await.unwrap();
     assert_eq!(pre(&result.html, "cookie"), "", "no cookie leaks");
+    r.close().await;
+}
+
+/// `extra_headers` reach the server on the browser path.
+#[tokio::test]
+async fn extra_headers_are_sent() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    let url = serve_echo(&server).await;
+    let opts = PageOptions {
+        extra_headers: vec![("X-Test".into(), "lab-recheck".into())],
+        isolate: true,
+        ..Default::default()
+    };
+    let result = r.render_page(&url, &opts).await.unwrap();
+    assert_eq!(pre(&result.html, "xtest"), "lab-recheck");
+    r.close().await;
+}
+
+/// `timeout` bounds the render: a slow page fails with `Timeout` instead of
+/// waiting for it, and the renderer stays usable.
+#[tokio::test]
+async fn timeout_bounds_the_render() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<html><body>late</body></html>", "text/html")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/slow", server.uri().replace("127.0.0.1", "localhost"));
+    let opts = PageOptions {
+        isolate: true,
+        timeout: Some(Duration::from_millis(800)),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let err = r.render_page(&url, &opts).await.unwrap_err();
+    assert!(matches!(err, ScrapixError::Timeout(_)), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let fast = serve(&server, "/fast", "<html><body>ok</body></html>").await;
+    let result = r.render_page(&fast, &opts).await.unwrap();
+    assert!(result.html.contains("ok"));
+    r.close().await;
+}
+
+/// A page that loads a stylesheet and a font is still reported as
+/// `text/html` with its own status: a subresource's response once stood in
+/// for the document's, and browser crawls skipped every page as
+/// "unsupported content type text/css".
+#[tokio::test]
+async fn subresources_do_not_replace_the_document_response() {
+    let Some(r) = renderer().await else { return };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/style.css"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "@font-face { font-family: F; src: url(/font.woff2) format('woff2'); } body { font-family: F; }",
+            "text/css; charset=utf-8",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/font.woff2"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0u8; 64], "font/woff2"))
+        .mount(&server)
+        .await;
+    let url = serve(
+        &server,
+        "/styled",
+        r#"<html><head><link rel="stylesheet" href="/style.css"></head>
+        <body><h1>Styled page</h1><p>Text in a web font.</p></body></html>"#,
+    )
+    .await;
+
+    // The crawler's options: shared context, no request guard.
+    for _ in 0..3 {
+        let result = r.render_page(&url, &PageOptions::default()).await.unwrap();
+        let ct = result.content_type.clone().unwrap_or_default();
+        assert!(ct.starts_with("text/html"), "content type: {ct}");
+        assert_eq!(result.status, 200);
+        assert!(result.html.contains("Styled page"));
+    }
     r.close().await;
 }
