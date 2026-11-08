@@ -91,7 +91,7 @@ pub use extractor::{
 };
 pub use fetcher::{
     parse_retry_after, ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig,
-    HttpFetcher, HttpFetcherBuilder, RetryConfig,
+    HttpFetcher, HttpFetcherBuilder, RetryConfig, HEAD_ONLY_MAX_BYTES,
 };
 pub use proxy::{ProxyConfig, ProxyPool, RotationStrategy};
 pub use robots::{

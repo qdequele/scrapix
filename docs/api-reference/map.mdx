@@ -20,8 +20,8 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
   "depth": 0,
   "search": "guide",
   "sitemap": true,
-  "fetch_titles": true,
-  "fetch_descriptions": true
+  "get_title": true,
+  "get_description": true
 }
 ```
 
@@ -30,37 +30,38 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | **required** | Base URL to discover URLs from |
-| `limit` | integer | `5000` | Maximum number of URLs to return |
-| `depth` | integer | `0` | Link-following depth (`0` = sitemap only, no crawling) |
-| `search` | string | — | Filter URLs containing this substring |
+| `limit` | integer | `5000` | Maximum number of URLs to return (at most `10000`) |
+| `depth` | integer | `0` | Link-following depth (`0` = sitemap only, no crawling; at most `5`) |
+| `search` | string | — | Keep URLs whose URL, title or description contains this text |
 | `sitemap` | boolean | `true` | Whether to discover and parse sitemaps |
-| `fetch_titles` | boolean | `false` | Fetch page titles for each discovered URL |
-| `fetch_descriptions` | boolean | `false` | Fetch meta descriptions for each discovered URL |
+| `render_js` | boolean | `false` | Render pages in the browser before reading them (plans with JS rendering) |
+| `get_title` | boolean | `true` | Fetch each page's `<title>` |
+| `get_description` | boolean | `true` | Fetch each page's meta description |
+| `get_lastmod` | boolean | `true` | Include `lastmod` from the sitemap |
+| `get_priority` | boolean | `true` | Include `priority` from the sitemap |
+| `get_changefreq` | boolean | `true` | Include `changefreq` from the sitemap |
 
 ### Response
 
 ```json
 {
-  "urls": [
+  "success": true,
+  "links": [
     {
       "url": "https://docs.example.com/getting-started",
       "title": "Getting Started",
       "description": "Learn how to set up and configure the product",
-      "last_modified": "2024-01-10T00:00:00Z",
+      "lastmod": "2024-01-10T00:00:00+00:00",
       "changefreq": "weekly",
       "priority": 0.8
     },
     {
       "url": "https://docs.example.com/api-reference",
-      "title": "API Reference",
-      "description": null,
-      "last_modified": null,
-      "changefreq": null,
-      "priority": null
+      "title": "API Reference"
     }
   ],
   "total": 247,
-  "source": "sitemap"
+  "duration_ms": 3120
 }
 ```
 
@@ -68,15 +69,35 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `urls` | array | List of discovered URL objects |
-| `urls[].url` | string | The discovered URL |
-| `urls[].title` | string | Page title (only if `fetch_titles` is `true`) |
-| `urls[].description` | string | Meta description (only if `fetch_descriptions` is `true`) |
-| `urls[].last_modified` | string | Last modification date from sitemap |
-| `urls[].changefreq` | string | Change frequency from sitemap |
-| `urls[].priority` | float | Priority from sitemap (0.0 - 1.0) |
-| `total` | integer | Total number of URLs returned |
-| `source` | string | How URLs were discovered (`sitemap`, `crawl`, or `mixed`) |
+| `links` | array | Discovered URLs |
+| `links[].url` | string | The discovered URL |
+| `links[].title` | string | Page title (with `get_title`, when the page answered in time) |
+| `links[].description` | string | Meta description (with `get_description`, when the page answered in time) |
+| `links[].lastmod` | string | Last modification date from the sitemap |
+| `links[].changefreq` | string | Change frequency from the sitemap |
+| `links[].priority` | float | Priority from the sitemap (0.0 - 1.0) |
+| `total` | integer | Number of URLs returned |
+| `duration_ms` | integer | Time the map took |
+
+Fields without a value are omitted.
+
+### How a map runs
+
+1. **Sitemaps.** `robots.txt` is read for `Sitemap:` lines (else
+   `/sitemap.xml`). Sitemaps and the children of a sitemap index are fetched
+   8 at a time, and reading stops once about twice `limit` URLs are found.
+2. **Pages.** A page is fetched once at most: for its title and description,
+   for its links (pages above `depth`), or both. When its links are not
+   followed, only its `<head>` is kept and parsed. Pages start as soon as a
+   slot is free; there is no wait between depth levels.
+3. **Concurrency.** Fetches start at 32 at once and grow to 100 while the
+   site keeps up. A `429`, a `503` or a timeout halves it (not below 4).
+   Browser renders (`render_js`) run 50 at once.
+4. **Time limits.** A page fetched only for its title and description has
+   8 seconds and is not retried: a slow page goes without its title. A page
+   whose links are followed has 30 seconds, one retry included (30 seconds
+   too with `render_js`). The whole map, sitemaps included, stops after 60
+   seconds and returns what it found by then.
 
 ### Use Cases
 
@@ -88,18 +109,16 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
 ### Example
 
 ```bash
-# Discover all URLs from sitemaps
+# URLs from sitemaps only: no page is fetched
 curl -X POST http://localhost:8080/map \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://docs.example.com"}'
+  -d '{"url": "https://docs.example.com", "get_title": false, "get_description": false}'
 
-# Discover with metadata
+# With titles and descriptions (the default)
 curl -X POST http://localhost:8080/map \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://docs.example.com",
-    "fetch_titles": true,
-    "fetch_descriptions": true,
     "limit": 100
   }'
 
@@ -108,11 +127,10 @@ curl -X POST http://localhost:8080/map \
   -H "Content-Type: application/json" \
   -d '{
     "url": "https://docs.example.com",
-    "search": "guide",
-    "fetch_titles": true
+    "search": "guide"
   }'
 ```
 
 <Tip>
-  Set `depth: 0` (the default) to only use sitemaps — this is fast and doesn't make HTTP requests to individual pages (unless `fetch_titles` or `fetch_descriptions` is enabled). Increase `depth` to discover URLs not listed in sitemaps.
+  With `depth: 0` (the default) and `get_title` and `get_description` set to `false`, a map reads only sitemaps and fetches no page: the fastest map. Titles and descriptions cost one fetch per URL. Increase `depth` to discover URLs not listed in sitemaps.
 </Tip>
