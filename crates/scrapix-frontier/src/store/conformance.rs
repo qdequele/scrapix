@@ -25,6 +25,28 @@ pub async fn admits_then_dedups(s: &dyn FrontierStore) {
     assert_eq!((c.received, c.admitted), (2, 1));
 }
 
+/// `http://` and `https://` of one page are one page: the second is a
+/// duplicate whichever scheme comes first.
+pub async fn http_and_https_are_one_page(s: &dyn FrontierStore) {
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+    let https = CrawlUrl::seed("https://a.test/login");
+    let http = CrawlUrl::seed("http://a.test/login");
+    assert_eq!(
+        s.admit("j", &https, 100).await.unwrap(),
+        Admission::Admitted
+    );
+    assert_eq!(
+        s.admit("j", &http, 100).await.unwrap(),
+        Admission::Duplicate
+    );
+    let other = CrawlUrl::seed("http://a.test/logout");
+    assert_eq!(
+        s.admit("j", &other, 100).await.unwrap(),
+        Admission::Admitted
+    );
+}
+
 pub async fn max_pages_counts_each_url_once(s: &dyn FrontierStore) {
     s.ensure_job("j", "{}", Some(2), None).await.unwrap();
     s.set_state("j", JobRunState::Running).await.unwrap();
@@ -345,6 +367,7 @@ where
     Fut: Future<Output = Arc<dyn FrontierStore>>,
 {
     admits_then_dedups(&*make().await).await;
+    http_and_https_are_one_page(&*make().await).await;
     max_pages_counts_each_url_once(&*make().await).await;
     full_queue_rejects_before_marking_seen(&*make().await).await;
     priority_then_fifo(&*make().await).await;

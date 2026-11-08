@@ -13,6 +13,10 @@
 /// A `*` that ends the pattern matches like `**`: `https://a.test/docs/*`
 /// takes `https://a.test/docs/1/2` and `**/page/*` takes `/page/2/`. This
 /// keeps the crawler's long-standing meaning of a trailing `*`.
+///
+/// A `*` that starts the pattern matches like `**` too: `*/blog/*` takes
+/// `https://a.test/blog/post`. Every URL starts with `scheme://host`, so a
+/// leading `*` that stopped at a `/` could never match one.
 pub fn matches_glob(url: &str, pattern: &str) -> bool {
     let tokens = tokenize(pattern);
     let url = url.as_bytes();
@@ -65,8 +69,9 @@ fn tokenize(pattern: &str) -> Vec<Token> {
     while i < bytes.len() {
         if bytes[i] == b'*' {
             let run = bytes[i..].iter().take_while(|&&b| b == b'*').count();
+            let leading = i == 0;
             i += run;
-            tokens.push(if run >= 2 || i == bytes.len() {
+            tokens.push(if run >= 2 || leading || i == bytes.len() {
                 Token::Any
             } else {
                 Token::AnyInSegment
@@ -108,6 +113,36 @@ mod tests {
         ));
         assert!(matches_glob("https://a.test/x", "https://a.test/x"));
         assert!(!matches_glob("https://a.test/y", "https://a.test/x"));
+    }
+
+    #[test]
+    fn leading_star_spans_scheme_and_host() {
+        // The "Meilisearch Blog" saved config: include `*/blog/*`, exclude
+        // `*/blog/tag/*`. A leading `*` that stopped at `/` matched no URL,
+        // so the crawl never went past its start page.
+        let inc = vec!["*/blog/*".to_string()];
+        let exc = vec!["*/blog/tag/*".to_string()];
+        let post = "https://www.meilisearch.com/blog/rag-vs-mcp";
+        assert!(matches_glob(post, "*/blog/*"));
+        assert!(matches_include_exclude(post, &inc, &exc));
+        assert!(matches_include_exclude(
+            "https://www.meilisearch.com/blog/page/2",
+            &inc,
+            &exc
+        ));
+        assert!(!matches_include_exclude(
+            "https://www.meilisearch.com/blog/tag/ai",
+            &inc,
+            &exc
+        ));
+        assert!(!matches_include_exclude(
+            "https://www.meilisearch.com/docs/learn",
+            &inc,
+            &exc
+        ));
+        // A `*` that is not leading still stops at `/`.
+        assert!(!matches_glob("https://a.test/a/b/x", "https://a.test/*/x"));
+        assert!(matches_glob("https://a.test/x.pdf", "*.pdf"));
     }
 
     #[test]

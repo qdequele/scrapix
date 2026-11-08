@@ -251,10 +251,25 @@ impl UrlExtractor {
         }
 
         // Resolve relative URLs
-        let resolved = match base_url.join(href) {
+        let mut resolved = match base_url.join(href) {
             Ok(url) => url,
             Err(_) => return None,
         };
+
+        // An `http://` link to the page's own host from an `https://` page
+        // is the same page: keep the crawl on `https` rather than indexing
+        // both schemes.
+        if resolved.scheme() == "http"
+            && base_url.scheme() == "https"
+            && resolved
+                .host_str()
+                .is_some_and(|h| h.eq_ignore_ascii_case(base_domain))
+        {
+            let _ = resolved.set_scheme("https");
+            if resolved.port() == Some(80) {
+                let _ = resolved.set_port(None);
+            }
+        }
 
         // Normalize the URL
         let normalized = self.normalize_url(&resolved)?;
@@ -713,6 +728,39 @@ mod tests {
             "https://example.com/blog/page",
             "https://example.com/docs/**"
         ));
+    }
+
+    #[test]
+    fn same_host_http_links_on_an_https_page_stay_https() {
+        let extractor = UrlExtractor::with_defaults();
+        let page = make_page(
+            "https://quotes.toscrape.com/",
+            r#"<a href="http://quotes.toscrape.com/login">a</a>
+               <a href="http://quotes.toscrape.com:80/tag/love/">b</a>
+               <a href="/login">dup</a>
+               <a href="http://other.test/x">ext</a>"#,
+        );
+        let urls = extractor.extract_urls(&page);
+        assert_eq!(
+            urls,
+            vec![
+                "https://quotes.toscrape.com/login".to_string(),
+                "https://quotes.toscrape.com/tag/love".to_string(),
+            ]
+        );
+
+        // An http page keeps its links as they are.
+        let page = make_page(
+            "http://a.test/",
+            r#"<a href="/x">x</a><a href="https://a.test/y">y</a>"#,
+        );
+        assert_eq!(
+            extractor.extract_urls(&page),
+            vec![
+                "http://a.test/x".to_string(),
+                "https://a.test/y".to_string()
+            ]
+        );
     }
 
     #[test]

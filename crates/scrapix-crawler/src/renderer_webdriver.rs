@@ -755,7 +755,7 @@ impl WebDriverRenderer {
 
         Ok(RawPage {
             url: url.url.clone(),
-            final_url: result.final_url,
+            final_url: scrapix_core::crawl_scope::keep_https(&url.url, &result.final_url),
             status: 200,             // WebDriver doesn't expose HTTP status
             headers: HashMap::new(), // WebDriver doesn't expose headers
             html: result.html,

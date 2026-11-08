@@ -462,7 +462,11 @@ pages** is marked `Failed` rather than `Completed`. A job that stops making
 progress for `JOB_STALL_TIMEOUT_SECS` (default `1800`) is finalized as
 `FailStalled`; **stalled jobs are billed** for the pages they did crawl.
 `Replace`-strategy stale-document cleanup only runs after true completion, and
-never deletes a document whose page returned `304` in this job.
+never deletes a document whose page returned `304` in this job. It is scoped
+to the crawl (`crates/scrapix-core/src/crawl_scope.rs`): it deletes
+`_crawl_scope = <id of the start URLs> AND _crawl_job_id != <job>`, plus
+documents without `_crawl_scope` (pre-scope) whose `url` lies under a start
+URL, so crawls sharing an index never delete each other's documents.
 
 - `DELETE /job/{id}` cancels a pending, running or paused job: it stops the
   frontier and every worker for that job and bills the pages crawled so far.

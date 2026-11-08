@@ -1170,7 +1170,7 @@ impl CdpRenderer {
     pub fn raw_page(url: &CrawlUrl, result: RenderResult) -> RawPage {
         RawPage {
             url: url.url.clone(),
-            final_url: result.final_url,
+            final_url: scrapix_core::crawl_scope::keep_https(&url.url, &result.final_url),
             status: result.status,
             headers: result.headers,
             html: result.html,
