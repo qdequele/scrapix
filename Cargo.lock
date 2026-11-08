@@ -5525,6 +5525,7 @@ dependencies = [
  "backoff",
  "base64 0.22.1",
  "chrono",
+ "parking_lot",
  "reqwest 0.12.28",
  "scrapix-core",
  "secrecy",

@@ -68,6 +68,7 @@ impl AnthropicProvider {
             completion_tokens: resp.usage.output_tokens,
             total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
             finish_reason: resp.stop_reason,
+            cost_micro_usd: None,
         })
     }
 }

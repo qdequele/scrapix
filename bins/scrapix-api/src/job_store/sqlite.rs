@@ -38,6 +38,18 @@ fn json_text(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".into())
 }
 
+/// The AI usage kept in the row's `accounting` snapshot (see the Postgres
+/// store's `stored_ai_usage`); empty when there is none.
+fn stored_ai_usage(row: &SqliteRow) -> scrapix_core::AiUsage {
+    row.try_get::<Option<String>, _>("accounting")
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|acc| acc.get("ai_usage").cloned())
+        .and_then(|usage| serde_json::from_value(usage).ok())
+        .unwrap_or_default()
+}
+
 fn row_to_job(row: &SqliteRow) -> JobState {
     let job_id: String = row.get("job_id");
     let start_urls: String = row.get("start_urls");
@@ -67,6 +79,7 @@ fn row_to_job(row: &SqliteRow) -> JobState {
         swap_meilisearch_url: row.get("swap_meilisearch_url"),
         swap_meilisearch_api_key: row.get("swap_meilisearch_api_key"),
         warnings: Vec::new(),
+        ai_usage: stored_ai_usage(row),
         // Webhook auth secrets are never persisted; a job recovered from
         // SQLite after a restart has no real webhooks to deliver to.
         webhooks: Vec::new(),

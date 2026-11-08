@@ -381,11 +381,19 @@ reached), OCR is skipped: the request still returns `200`, with a `warning`
     }
   },
   "status_code": 200,
-  "scrape_duration_ms": 523
+  "scrape_duration_ms": 523,
+  "ai_usage": {
+    "calls": 2,
+    "prompt_tokens": 1840,
+    "completion_tokens": 212,
+    "cost_micro_usd": 410
+  }
 }
 ```
 
 Fields are only present if the corresponding format was requested. A `warning` field appears when requested AI work could not be generated (not billed).
+
+`ai_usage` appears when the request made LLM calls (AI summary, extraction, vision OCR): how many, their tokens, and `cost_micro_usd`, the provider cost the hosted AI gateway reported for them, in micro-USD. That cost is billed by the gateway (the Lab adds its markup), not in the scrape's credits. With a provider's own API (standalone), the tokens are counted but the cost is `0`.
 
 ### Examples
 

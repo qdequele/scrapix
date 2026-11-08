@@ -426,6 +426,12 @@ pub struct JobState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_meilisearch_api_key: Option<String>,
 
+    /// The job's LLM calls (AI enrichment, OCR, extraction) and the cost
+    /// the hosted AI gateway reported for them. Billed by the gateway, not
+    /// in the job's credits. Kept in the `accounting` snapshot (crawls).
+    #[serde(default, skip_serializing_if = "crate::AiUsage::is_empty")]
+    pub ai_usage: crate::AiUsage,
+
     /// Job-level warnings raised by workers (`JobWarning` events), deduped,
     /// in arrival order. In-memory only (not persisted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -473,6 +479,7 @@ impl JobState {
             swap_meilisearch_url: None,
             swap_meilisearch_api_key: None,
             warnings: Vec::new(),
+            ai_usage: Default::default(),
             webhooks: Vec::new(),
         }
     }

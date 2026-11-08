@@ -596,6 +596,7 @@ pub(crate) async fn document_response(
         ocr: ocr_report.as_ref().map(OcrInfo::from),
         status_code: job.status_code,
         scrape_duration_ms: duration_ms,
+        ai_usage: Default::default(),
     })
 }
 
@@ -742,7 +743,7 @@ pub(crate) async fn parse_upload(
         (!title.is_empty()).then_some(title)
     });
 
-    let response = document_response(
+    let response = crate::with_ai_usage(document_response(
         &state,
         &account_ctx,
         DocumentJob {
@@ -760,7 +761,7 @@ pub(crate) async fn parse_upload(
             js_rendered: false,
         },
         start_time,
-    )
+    ))
     .await?;
     Ok(Json(response))
 }

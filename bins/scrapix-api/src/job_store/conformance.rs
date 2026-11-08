@@ -102,6 +102,18 @@ pub(super) async fn accounting_and_active_recovery(s: Arc<dyn JobStore>) {
     assert!(acc
         .iter()
         .any(|(id, v)| id == "ac-run" && v == &json!({"dispatched": 3})));
+    assert!(s.get_job("ac-run", None).await.unwrap().ai_usage.is_empty());
+
+    // The AI usage in the snapshot reads back on the job (GET /jobs/{id}
+    // after a restart).
+    let usage =
+        json!({"calls": 2, "prompt_tokens": 9, "completion_tokens": 4, "cost_micro_usd": 70});
+    s.flush_job_accounting(&[("ac-done".into(), json!({"ai_usage": usage}))])
+        .await
+        .unwrap();
+    let got = s.get_job("ac-done", None).await.unwrap();
+    assert_eq!(got.ai_usage.calls, 2);
+    assert_eq!(got.ai_usage.cost_micro_usd, 70);
 }
 
 pub(super) async fn list_newest_first_and_account_filter(s: Arc<dyn JobStore>) {

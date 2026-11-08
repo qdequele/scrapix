@@ -36,8 +36,8 @@ use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use scrapix_ai::{
-    gateway_codes, AiClient, AiService, AiUsageContext, ExtractionConfig, ExtractionSchema,
-    FieldDefinition, AI_USAGE_CONTEXT, DEFAULT_EXTRACTION_MODEL,
+    gateway_codes, AiClient, AiService, AiUsageContext, AiUsageTally, ExtractionConfig,
+    ExtractionSchema, FieldDefinition, AI_USAGE_CONTEXT, AI_USAGE_TALLY, DEFAULT_EXTRACTION_MODEL,
 };
 use scrapix_core::config::WebhookConfig;
 use scrapix_core::url_glob::matches_glob;
@@ -158,6 +158,11 @@ pub(crate) struct ExtractStatusResponse {
     /// Why the job failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The extraction's LLM calls and the provider cost the hosted AI
+    /// gateway reported for them, in micro-USD (billed by the gateway, not
+    /// in the job's credits). Omitted when no AI call was made.
+    #[serde(skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
+    pub ai_usage: scrapix_core::AiUsage,
 }
 
 /// What is stored as the extract job's summary (results store, seq 0).
@@ -169,6 +174,9 @@ struct ExtractSummary {
     sources: Vec<ExtractSource>,
     #[serde(default)]
     warnings: Vec<String>,
+    /// The run's LLM calls and their gateway cost (written by `save`).
+    #[serde(default, skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
+    ai_usage: scrapix_core::AiUsage,
 }
 
 // ============================================================================
@@ -546,8 +554,12 @@ pub(crate) async fn start_extract(
         instruction,
         ai,
         model,
+        ai_tally: AiUsageTally::new(),
     };
-    tokio::spawn(async move { runner.run(inputs).await });
+    // Every LLM call of the run (page fetches' AI formats, the extraction)
+    // is tallied for the job's `ai_usage`.
+    let tally = runner.ai_tally.clone();
+    tokio::spawn(AI_USAGE_TALLY.scope(tally, async move { runner.run(inputs).await }));
 
     Ok(CreateExtractResponse {
         job_id: job.job_id,
@@ -584,6 +596,7 @@ pub(crate) async fn get_extract(
         data: summary.data,
         sources: summary.sources,
         warning: (!summary.warnings.is_empty()).then(|| summary.warnings.join("; ")),
+        ai_usage: summary.ai_usage,
         error: job.error_message,
     }))
 }
@@ -601,6 +614,8 @@ struct ExtractRunner {
     ai: ResolvedAi,
     /// The requested model; the service's extraction model when `None`.
     model: Option<String>,
+    /// The run's LLM calls (the run is scoped in `AI_USAGE_TALLY`).
+    ai_tally: Arc<AiUsageTally>,
 }
 
 /// Why an AI call produced nothing.
@@ -628,13 +643,31 @@ struct FetchedPage {
 }
 
 impl ExtractRunner {
+    /// Store the summary, with the AI usage so far, and show that usage on
+    /// the job (`GET /jobs/{id}`, kept in the job row's `accounting`).
     async fn save(&self, summary: &ExtractSummary) {
-        results::store_summary(
-            &self.state,
-            &self.job_id,
-            serde_json::to_value(summary).unwrap_or_default(),
-        )
-        .await;
+        let ai_usage = self.ai_tally.totals();
+        let mut value = serde_json::to_value(summary).unwrap_or_default();
+        if !ai_usage.is_empty() {
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "ai_usage".to_string(),
+                    serde_json::to_value(ai_usage).unwrap_or_default(),
+                );
+            }
+            self.state
+                .update_job(&self.job_id, |j| j.ai_usage = ai_usage);
+            if let Some(store) = &self.state.job_store {
+                let entry = (
+                    self.job_id.clone(),
+                    serde_json::json!({ "ai_usage": ai_usage }),
+                );
+                if let Err(e) = store.flush_job_accounting(&[entry]).await {
+                    warn!(job_id = %self.job_id, error = %e, "Failed to store the extract's AI usage");
+                }
+            }
+        }
+        results::store_summary(&self.state, &self.job_id, value).await;
     }
 
     async fn fail(&self, summary: &ExtractSummary, error: &str) {
@@ -1288,6 +1321,65 @@ mod tests {
         assert!(state.list_jobs(10, 0).is_empty(), "no job is created");
     }
 
+    /// The extraction's LLM calls and the cost the gateway reported for them
+    /// land on the summary, `GET /extract/{id}` and the job.
+    #[tokio::test]
+    async fn the_gateway_cost_of_the_extraction_is_reported() {
+        let site = site(false).await;
+        let llm = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "mock",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": r#"{"prices": [1]}"# },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                    }))
+                    .insert_header("x-lumen-cost-micro-usd", "420"),
+            )
+            .mount(&llm)
+            .await;
+        let client = AiClient::new(AiClientConfig {
+            api_key: "test".into(),
+            provider: "openai".into(),
+            base_url: Some(format!("{}/v1", llm.uri())),
+            lumen_metadata: true,
+            max_retries: 1,
+            retry_delay_ms: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state_with_ai(&bus, Some(Arc::new(AiService::new(Arc::new(client)))));
+        let urls = vec![format!("{}/blog/alpha", base(&site))];
+
+        let created = start_extract(&state, &None, request(urls)).await.unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        let expected = scrapix_core::AiUsage {
+            calls: 1,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cost_micro_usd: 420,
+        };
+        assert_eq!(job.ai_usage, expected);
+        assert_eq!(summary(&state, &created.job_id).await.ai_usage, expected);
+        let status = crate::JobStatusResponse::from(job);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["ai_usage"],
+            serde_json::json!({"calls": 1, "prompt_tokens": 10, "completion_tokens": 5, "cost_micro_usd": 420})
+        );
+    }
+
     #[tokio::test]
     async fn single_pass_over_combined_pages_with_a_failed_source() {
         let site = site(false).await;
@@ -1310,6 +1402,9 @@ mod tests {
         assert_eq!(s.sources.len(), 3);
         assert_eq!(s.sources[2].success, Some(false));
         assert!(s.warnings.iter().any(|w| w.contains("1 of 3 pages")));
+        // A provider's own API reports tokens but no cost.
+        assert_eq!(s.ai_usage.calls, 1);
+        assert_eq!(s.ai_usage.cost_micro_usd, 0);
 
         // One AI call, over both pages' content, following the schema.
         let calls = llm.received_requests().await.unwrap();
@@ -1648,6 +1743,7 @@ mod tests {
                 key_id: None,
             },
             model: None,
+            ai_tally: AiUsageTally::new(),
         };
         runner
             .charge(

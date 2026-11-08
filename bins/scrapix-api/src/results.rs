@@ -1002,6 +1002,28 @@ pub(crate) mod test_support {
         .await
     }
 
+    /// Lumen answering every chat call with `reply`, reporting `cost`
+    /// micro-USD per call in `x-lumen-cost-micro-usd`.
+    pub(crate) async fn lumen_answering_at_cost(reply: &str, cost: u64) -> wiremock::MockServer {
+        lumen_responding(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "mock",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": reply },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                }))
+                .insert_header("x-lumen-cost-micro-usd", cost.to_string()),
+        )
+        .await
+    }
+
     /// Lumen refusing every chat call with `status` and a gateway `code`.
     pub(crate) async fn lumen_refusing(
         status: u16,

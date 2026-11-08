@@ -1913,11 +1913,17 @@ impl AppState {
                     account_id: self.diagnostics_account(job_id, event),
                 });
             }
-            CrawlEvent::DocumentIndexed { .. } if !frozen => {
+            CrawlEvent::DocumentIndexed { ai_usage, .. } if !frozen => {
                 self.update_job(job_id, |j| {
                     match accounted {
-                        Some(c) => j.pages_indexed = c.documents_indexed,
-                        None => j.pages_indexed += 1,
+                        Some(c) => {
+                            j.pages_indexed = c.documents_indexed;
+                            j.ai_usage = c.ai_usage;
+                        }
+                        None => {
+                            j.pages_indexed += 1;
+                            j.ai_usage.add(ai_usage);
+                        }
                     }
                     j.documents_sent += 1;
                 });
@@ -2218,6 +2224,8 @@ struct AccountedCounters {
     /// Pages recognized by OCR across indexed documents
     /// (`DocumentIndexed.ocr_pages`), billed at the OCR page rate.
     pages_ocr: u64,
+    /// LLM calls of the indexed documents (`DocumentIndexed.ai_usage`).
+    ai_usage: scrapix_core::AiUsage,
 }
 
 impl From<&JobAccounting> for AccountedCounters {
@@ -2230,6 +2238,7 @@ impl From<&JobAccounting> for AccountedCounters {
             pages_browser: acc.pages_browser,
             pages_ai: acc.pages_ai,
             pages_ocr: acc.pages_ocr,
+            ai_usage: acc.ai_usage,
         }
     }
 }
@@ -2777,6 +2786,12 @@ struct JobStatusResponse {
     /// there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// The job's LLM calls (AI summary, extraction, OCR) and the provider
+    /// cost the hosted AI gateway reported for them, in micro-USD. That cost
+    /// is billed by the gateway (with the Lab's markup), not in the job's
+    /// credits. Omitted when the job made no AI call.
+    #[serde(default, skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
+    ai_usage: scrapix_core::AiUsage,
 }
 
 impl From<JobState> for JobStatusResponse {
@@ -2804,6 +2819,7 @@ impl From<JobState> for JobStatusResponse {
             max_pages: job.max_pages,
             config: job.config,
             warnings: job.warnings,
+            ai_usage: job.ai_usage,
         }
     }
 }
@@ -3196,6 +3212,13 @@ struct ScrapeResponse {
 
     /// Time taken to scrape in milliseconds
     scrape_duration_ms: u64,
+
+    /// The request's LLM calls (AI summary, extraction, OCR) and the
+    /// provider cost the hosted AI gateway reported for them, in micro-USD
+    /// (billed by the gateway, not in the scrape's credits). Omitted when no
+    /// AI call was made.
+    #[serde(skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
+    ai_usage: scrapix_core::AiUsage,
 }
 
 /// Results of the /scrape `actions`
@@ -3469,9 +3492,24 @@ async fn scrape_url(
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
     check_write_permission(&account_ctx)?;
-    perform_scrape(&state, &account_ctx, &request)
+    with_ai_usage(perform_scrape(&state, &account_ctx, &request))
         .await
         .map(Json)
+}
+
+/// Run a sync scrape (`/scrape`, `/parse`) and report its LLM calls on the
+/// response's `ai_usage`. Only at the handler: a scrape made for a job
+/// (`/extract`) counts into that job's tally instead.
+pub(crate) async fn with_ai_usage<F>(scrape: F) -> Result<ScrapeResponse, ApiError>
+where
+    F: std::future::Future<Output = Result<ScrapeResponse, ApiError>>,
+{
+    let tally = scrapix_ai::AiUsageTally::new();
+    let mut response = scrapix_ai::AI_USAGE_TALLY
+        .scope(tally.clone(), scrape)
+        .await?;
+    response.ai_usage = tally.totals();
+    Ok(response)
 }
 
 impl AppState {
@@ -3899,6 +3937,7 @@ pub(crate) async fn perform_scrape(
             ocr: None,
             status_code,
             scrape_duration_ms: start_time.elapsed().as_millis() as u64,
+            ai_usage: Default::default(),
         });
     }
 
@@ -4180,6 +4219,7 @@ pub(crate) async fn perform_scrape(
         ocr: None,
         status_code,
         scrape_duration_ms,
+        ai_usage: Default::default(),
     })
 }
 
@@ -9350,6 +9390,7 @@ mod lifecycle_tests {
             url_message_id: id.into(),
             ai_enriched: false,
             ocr_pages: 0,
+            ai_usage: Default::default(),
         }
     }
 
@@ -10620,6 +10661,52 @@ mod lifecycle_tests {
         assert_eq!(d.pages_billed.load(Ordering::Relaxed), 1);
     }
 
+    /// A crawl's `ai_usage` is the sum of its indexed pages' AI calls, each
+    /// page counted once (a redelivered event adds nothing), and shows on
+    /// `GET /jobs/{id}`.
+    #[tokio::test]
+    async fn job_ai_usage_sums_its_indexed_pages() {
+        let bus = ChannelBus::new();
+        let state = test_state(&bus);
+        running_job(&state, "ai", 3);
+        let with_ai = |id: &str, cost: u64| {
+            let mut e = indexed("ai", id);
+            if let CrawlEvent::DocumentIndexed { ai_usage, .. } = &mut e {
+                *ai_usage = scrapix_core::AiUsage {
+                    calls: 1,
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                    cost_micro_usd: cost,
+                };
+            }
+            e
+        };
+        for e in [
+            crawled("ai", "m1"),
+            crawled("ai", "m2"),
+            crawled("ai", "m3"),
+            with_ai("m1", 400),
+            with_ai("m1", 400),
+            with_ai("m2", 600),
+            indexed("ai", "m3"),
+        ] {
+            state.process_event("ai", &e);
+        }
+
+        let job = state.get_job("ai").unwrap();
+        assert_eq!(
+            job.ai_usage,
+            scrapix_core::AiUsage {
+                calls: 2,
+                prompt_tokens: 200,
+                completion_tokens: 20,
+                cost_micro_usd: 1000,
+            }
+        );
+        let body = serde_json::to_value(JobStatusResponse::from(job)).unwrap();
+        assert_eq!(body["ai_usage"]["cost_micro_usd"], 1000);
+    }
+
     /// D4/R4: a completed job with a mix of plain-HTTP, browser-rendered and
     /// AI-enriched pages reports exactly the units that were delivered — not
     /// the whole job as browser pages, and no AI units for pages that were
@@ -10697,6 +10784,7 @@ mod lifecycle_tests {
                     url_message_id: id.into(),
                     ai_enriched,
                     ocr_pages: 0,
+                    ai_usage: Default::default(),
                 },
             );
         }
@@ -10800,6 +10888,7 @@ mod lifecycle_tests {
                     url_message_id: id.into(),
                     ai_enriched: false,
                     ocr_pages,
+                    ai_usage: Default::default(),
                 },
             );
         }

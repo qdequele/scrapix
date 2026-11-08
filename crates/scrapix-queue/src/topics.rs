@@ -442,6 +442,10 @@ pub enum CrawlEvent {
         /// cache hits are not counted). `0` for HTML pages.
         #[serde(default, skip_serializing_if = "is_zero_u32")]
         ocr_pages: u32,
+        /// The LLM calls made for this page (AI enrichment, OCR) and their
+        /// gateway-reported cost. Empty when no AI ran.
+        #[serde(default, skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
+        ai_usage: scrapix_core::AiUsage,
     },
     /// The content worker processed a page but indexed nothing for it
     /// (non-2xx page from an old crawler, `index_only` mismatch, no content,

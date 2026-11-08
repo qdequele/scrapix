@@ -17,10 +17,12 @@ thiserror = { workspace = true }
 
 # OpenAI client
 async-openai = { workspace = true }
-# Backoff policy handed to async-openai (its retry loop only)
-backoff = { workspace = true }
+# Backoff policy handed to async-openai, and the Lumen call's own retry loop
+backoff = { workspace = true, features = ["tokio"] }
 # `Config::api_key` returns async-openai's secrecy type
 secrecy = { workspace = true }
+
+parking_lot = { workspace = true }
 
 # HTTP client for non-OpenAI providers
 reqwest = { workspace = true }

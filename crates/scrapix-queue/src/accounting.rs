@@ -171,6 +171,8 @@ pub struct JobAccounting {
     /// OCR'd pages across indexed documents (`DocumentIndexed.ocr_pages`),
     /// billed at the OCR page rate.
     pub pages_ocr: u64,
+    /// LLM calls of the indexed documents (`DocumentIndexed.ai_usage`).
+    pub ai_usage: scrapix_core::AiUsage,
     /// `url_message_id`s of `PageCrawled` messages that spawned a
     /// first-time sitemap discovery for their `(job, domain)`
     /// (`PageCrawled.sitemap_pending`, R-18). `is_balanced` requires this
@@ -262,6 +264,7 @@ impl JobAccounting {
                 url_message_id,
                 ai_enriched,
                 ocr_pages,
+                ai_usage,
                 ..
             } => {
                 if Self::first_time(&mut self.seen_content, url_message_id) {
@@ -271,6 +274,7 @@ impl JobAccounting {
                         self.pages_ai += 1;
                     }
                     self.pages_ocr += *ocr_pages as u64;
+                    self.ai_usage.add(ai_usage);
                 }
             }
             CrawlEvent::DocumentSkipped { url_message_id, .. } => {
@@ -425,7 +429,53 @@ mod tests {
             url_message_id: id.into(),
             ai_enriched: false,
             ocr_pages: 0,
+            ai_usage: scrapix_core::AiUsage::default(),
         }
+    }
+
+    fn indexed_with_ai(id: &str, cost_micro_usd: u64) -> CrawlEvent {
+        let mut event = indexed(id);
+        if let CrawlEvent::DocumentIndexed {
+            ai_enriched,
+            ai_usage,
+            ..
+        } = &mut event
+        {
+            *ai_enriched = true;
+            *ai_usage = scrapix_core::AiUsage {
+                calls: 2,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cost_micro_usd,
+            };
+        }
+        event
+    }
+
+    /// A page's AI usage is added once, even when its event is redelivered.
+    #[test]
+    fn ai_usage_sums_per_page_and_dedupes_redeliveries() {
+        let mut a = JobAccounting::default();
+        a.apply(&indexed_with_ai("m1", 300));
+        a.apply(&indexed_with_ai("m1", 300));
+        a.apply(&indexed_with_ai("m2", 200));
+        a.apply(&indexed("m3"));
+        assert_eq!(a.pages_ai, 2);
+        assert_eq!(
+            a.ai_usage,
+            scrapix_core::AiUsage {
+                calls: 4,
+                prompt_tokens: 200,
+                completion_tokens: 40,
+                cost_micro_usd: 500,
+            }
+        );
+        // Persisted with the snapshot, and absent in old snapshots.
+        let back: JobAccounting =
+            serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!(back.ai_usage, a.ai_usage);
+        let old: JobAccounting = serde_json::from_str("{}").unwrap();
+        assert!(old.ai_usage.is_empty());
     }
 
     fn failed(id: &str) -> CrawlEvent {
