@@ -46,9 +46,9 @@ use scrapix_core::{CrawlUrl, RawPage, Result, ScrapixError};
 
 use crate::fetcher::FetchOptions;
 use crate::renderer_cdp::{
-    block_link_local_urls, check_render_final_url, check_render_target, document_content_type,
-    document_status, is_main_document, response_headers, CdpRenderer, RenderResult,
-    BROWSER_PROXY_UNSUPPORTED,
+    check_render_final_url, check_render_target, document_content_type, document_status,
+    is_main_document, response_headers, CdpRenderer, RenderResult, BROWSER_PROXY_UNSUPPORTED,
+    LINK_LOCAL_URL_PATTERNS,
 };
 use crate::robots::RobotsCache;
 
@@ -130,6 +130,58 @@ impl Method for GetPageStatus {
 
 impl Command for GetPageStatus {
     type Response = PageStatus;
+}
+
+/// `Network.setBlockedURLs` in the form Lightpanda implements: the newer
+/// CDP `urlPatterns: [{urlPattern, block}]`. chromiumoxide 0.7 only sends
+/// the older `urls` list, which Lightpanda refuses (`MissingField`), so the
+/// Chrome renderer's `block_link_local_urls` never applied here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBlockedUrlPatterns {
+    url_patterns: Vec<BlockedUrlPattern>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockedUrlPattern {
+    url_pattern: String,
+    block: bool,
+}
+
+impl SetBlockedUrlPatterns {
+    fn blocking<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            url_patterns: patterns
+                .into_iter()
+                .map(|p| BlockedUrlPattern {
+                    url_pattern: p.to_string(),
+                    block: true,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Method for SetBlockedUrlPatterns {
+    fn identifier(&self) -> MethodId {
+        "Network.setBlockedURLs".into()
+    }
+}
+
+impl Command for SetBlockedUrlPatterns {
+    type Response = serde_json::Value;
+}
+
+/// Bar `page` from [`LINK_LOCAL_URL_PATTERNS`] (link-local and cloud
+/// metadata IP literals), as the Chrome renderer does. A failure is logged,
+/// not fatal: the navigation checks still run on every render, and
+/// Lightpanda's `--block-private-networks` covers these ranges too.
+async fn block_link_local_urls(page: &Page) {
+    let params = SetBlockedUrlPatterns::blocking(LINK_LOCAL_URL_PATTERNS.iter().copied());
+    if let Err(e) = page.execute(params).await {
+        warn!(error = %e, "Could not block link-local URLs on the Lightpanda page");
+    }
 }
 
 /// One Lightpanda render: the page, plus what Chrome fallback needs.
@@ -531,6 +583,85 @@ mod tests {
             text_chars,
             min_text_chars: DEFAULT_MIN_TEXT_CHARS,
         }
+    }
+
+    #[test]
+    fn blocked_urls_use_lightpandas_url_patterns_shape() {
+        let cmd = SetBlockedUrlPatterns::blocking(["*://169.254.*", "*://[fe8*"]);
+        assert_eq!(cmd.identifier(), "Network.setBlockedURLs");
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"urlPatterns": [
+                {"urlPattern": "*://169.254.*", "block": true},
+                {"urlPattern": "*://[fe8*", "block": true}
+            ]})
+        );
+        let all = SetBlockedUrlPatterns::blocking(LINK_LOCAL_URL_PATTERNS.iter().copied());
+        assert_eq!(all.url_patterns.len(), LINK_LOCAL_URL_PATTERNS.len());
+    }
+
+    /// Against a real Lightpanda (`SCRAPIX_TEST_LIGHTPANDA`, skipped
+    /// otherwise): the server accepts the command (it refused chromiumoxide's
+    /// `urls` form) and a page's requests to a blocked URL never leave.
+    #[tokio::test]
+    async fn lightpanda_accepts_and_enforces_blocked_url_patterns() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(cdp_url) = std::env::var("SCRAPIX_TEST_LIGHTPANDA")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("SCRAPIX_TEST_LIGHTPANDA not set; skipping Lightpanda test");
+            return;
+        };
+        let server = MockServer::start().await;
+        // The same page fetches an allowed and a blocked URL: the allowed one
+        // proves fetch works, so "blocked" comes from the pattern.
+        let page_html = r#"<html><body><p id="open">pending</p><p id="out">pending</p><script>
+            const mark = (id, v) => { document.getElementById(id).textContent = v; };
+            fetch('/open-probe').then(() => mark('open', 'open-reached'), () => mark('open', 'open-failed'));
+            fetch('/blocked-probe').then(() => mark('out', 'reached'), () => mark('out', 'blocked'));
+            </script></body></html>"#;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page_html, "text/html"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/open-probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/blocked-probe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("secret"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("127.0.0.1", "localhost");
+
+        let (browser, mut handler) = Browser::connect(resolve_ws_url(&cdp_url).await.unwrap())
+            .await
+            .unwrap();
+        let handler = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let page = browser.new_page("about:blank").await.unwrap();
+        page.execute(SetBlockedUrlPatterns::blocking(["*/blocked-probe*"]))
+            .await
+            .expect("Lightpanda accepts urlPatterns");
+        page.goto(format!("{base}/page")).await.unwrap();
+        let _ = page.wait_for_navigation_response().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let html = page.content().await.unwrap();
+        assert!(
+            html.contains(">open-reached<"),
+            "unblocked fetch failed: {html}"
+        );
+        assert!(html.contains(">blocked<"), "fetch was not refused: {html}");
+        let _ = page.close().await;
+        handler.abort();
+        // `expect` counts (1 open, 0 blocked) are checked when the server drops.
     }
 
     #[test]
