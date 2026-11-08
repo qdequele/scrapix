@@ -30,9 +30,29 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   is now the crate version, `0.3.0`; it was a fixed `0.1.0`. The Lab
   re-vendors `contracts/openapi.json` for this.
 - `benches/Cargo.toml` takes the workspace version.
+- **`/map` is much faster.** Each page is fetched once at most (with
+  `depth > 0`, a page was fetched once for its title and again for its
+  links), and only its `<head>` is kept and parsed when its links are not
+  followed. Pages run from one queue instead of depth by depth, so one slow
+  page no longer holds up its level. Concurrency starts at 32, grows to 100
+  while the site keeps up and halves on `429`/`503`/timeouts (it was a fixed
+  50). A page fetched only for its title gets 8 s and no retry (it was 30 s
+  and 3 retries); a page whose links are followed keeps 30 s. On a local
+  site with 2% of pages taking 20 s, a depth-2 map went from 60 s (cut by
+  the deadline) to 20 s, and a depth-3 map found 5,000 URLs in 21 s instead
+  of 931 in 60 s. Sitemaps, and the children of a sitemap index, are fetched 8 at
+  a time (for crawls and `/extract` globs too), and `/map` stops reading
+  them at about twice its `limit` instead of 100,000 URLs.
 
 ### Fixed
 
+- **`/map` ran past its 60 s limit.** The link-following levels never
+  checked it, and fetches kept running after it. Sitemap discovery now
+  counts toward it too, and pending fetches are cancelled when it is hit.
+- **`/map` resolved relative links against the map's URL**, not the page
+  they were on: `href="intro"` on `/docs/` became `/intro`.
+- **Sitemap discovery dropped the port** of the site's URL, so it found no
+  sitemap on a site served on a non-default port.
 - **Replace crawls sharing an index deleted each other's documents.** After a
   `"index_strategy": "replace"` crawl, every document of the index not
   indexed by that job was deleted (`_crawl_job_id != <job>`). Two saved

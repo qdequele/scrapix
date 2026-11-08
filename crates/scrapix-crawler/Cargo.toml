@@ -40,7 +40,6 @@ hickory-resolver = { workspace = true }
 # Browser automation (tiered - all optional)
 # Tier 1: CDP for Chrome/Chromium (most mature)
 chromiumoxide = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
 # Tier 2: WebDriver protocol (cross-browser)
 fantoccini = { workspace = true, optional = true }
 # Future: Lightpanda integration (when stable)
@@ -53,6 +52,8 @@ dashmap = { workspace = true }
 # Base64 encoding for binary payloads (PDFs) through the Kafka
 # RawPageMessage.html string without a schema change.
 base64 = { workspace = true }
+# Concurrent sitemap fetches (and the CDP renderer's event streams).
+futures = { workspace = true }
 
 # Tracing
 tracing = { workspace = true }
@@ -64,7 +65,7 @@ wiremock = { workspace = true }
 [features]
 default = []
 # Chrome/Chromium via CDP (chromiumoxide)
-browser-cdp = ["chromiumoxide", "futures"]
+browser-cdp = ["chromiumoxide"]
 # WebDriver protocol (fantoccini) - Firefox, Safari, etc.
 browser-webdriver = ["fantoccini"]
 # All browser rendering options
