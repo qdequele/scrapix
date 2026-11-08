@@ -1,0 +1,51 @@
+# JS-heavy docs and framework sites
+https://react.dev/learn
+https://vuejs.org/guide/introduction.html
+https://svelte.dev/docs
+https://angular.dev/overview
+https://nextjs.org/docs
+https://www.meilisearch.com/docs
+https://docs.github.com/en/get-started
+https://developer.mozilla.org/en-US/docs/Web/JavaScript
+https://tailwindcss.com/docs/installation
+https://vercel.com/docs
+https://docs.stripe.com/
+https://docs.docker.com/get-started/
+https://kubernetes.io/docs/home/
+https://www.rust-lang.org/learn
+https://doc.rust-lang.org/book/
+https://go.dev/doc/
+https://www.typescriptlang.org/docs/
+https://nodejs.org/en/learn
+https://deno.com/
+https://bun.sh/docs
+# Commerce and product pages
+https://www.apple.com/iphone/
+https://www.ikea.com/us/en/
+https://www.airbnb.com/
+https://www.booking.com/
+https://www.etsy.com/
+# News
+https://www.bbc.com/news
+https://www.theguardian.com/international
+https://www.lemonde.fr/
+https://news.ycombinator.com/
+https://www.reuters.com/
+# SaaS marketing sites
+https://linear.app/
+https://www.notion.com/
+https://www.figma.com/
+https://openai.com/
+https://www.anthropic.com/
+https://supabase.com/
+https://posthog.com/
+# Apps and SPAs
+https://www.youtube.com/
+https://x.com/
+https://www.reddit.com/r/rust/
+https://github.com/lightpanda-io/browser
+https://en.wikipedia.org/wiki/Web_crawler
+https://www.npmjs.com/package/react
+https://crates.io/crates/tokio
+https://crates.io/
+https://www.producthunt.com/

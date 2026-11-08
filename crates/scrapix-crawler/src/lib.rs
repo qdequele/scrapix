@@ -16,13 +16,14 @@
 //! Enable browser rendering with feature flags:
 //!
 //! - `browser-cdp`: Chrome/Chromium via CDP (chromiumoxide)
+//! - `browser-lightpanda`: Lightpanda over CDP, for fast plain crawl renders
 //! - `browser-webdriver`: WebDriver protocol (fantoccini)
 //! - `browser-full`: All browser options
 //!
 //! ### Rendering Strategy
 //!
 //! 1. **HTTP First** (default): Fast reqwest + scraper for 80-90% of pages
-//! 2. **Lightpanda** (future): 10x faster than Chrome when stable
+//! 2. **Lightpanda** (`browser-lightpanda`): plain crawl renders, Chrome fallback
 //! 3. **Chrome/Chromium**: Fallback for complex JS sites
 //! 4. **Browserbase** (optional): Hosted infrastructure for scale
 //!
@@ -76,6 +77,9 @@ pub(crate) mod cdp_stealth;
 #[cfg(feature = "browser-cdp")]
 pub mod renderer_cdp;
 
+#[cfg(feature = "browser-lightpanda")]
+pub mod renderer_lightpanda;
+
 #[cfg(feature = "browser-webdriver")]
 pub mod renderer_webdriver;
 
@@ -114,4 +118,11 @@ pub use renderer_cdp::{
 pub use renderer_webdriver::{
     BrowserType, PageLoadStrategy, WebDriverConfig, WebDriverCookie, WebDriverError,
     WebDriverRenderResult, WebDriverRenderer, WebDriverRendererBuilder,
+};
+
+// Lightpanda renderer re-exports
+#[cfg(feature = "browser-lightpanda")]
+pub use renderer_lightpanda::{
+    should_retry_in_chrome, visible_text_chars, LightpandaConfig, LightpandaRender,
+    LightpandaRenderer, PageStatus, DEFAULT_MIN_TEXT_CHARS,
 };

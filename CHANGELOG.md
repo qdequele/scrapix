@@ -20,6 +20,19 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   its AI usage on `DocumentIndexed` (`ai_usage`), summed into the job's
   accounting snapshot. Batch scrape jobs do not report it yet.
 
+- **Lightpanda renderer for browser crawls (prototype).** With
+  `BROWSER_RENDER` and the new `LIGHTPANDA_URL` (and
+  `LIGHTPANDA_CONNECTIONS`, default `8`), the crawler worker renders plain
+  crawl pages on a running Lightpanda 1.0+ first, and re-renders in Chrome
+  when Lightpanda fails, times out, meets a bot challenge or returns a page
+  with almost no text. `/scrape` (screenshots, actions, mobile, stealth)
+  stays on Chrome. In a 46-URL benchmark at 8 pages at once, Lightpanda
+  rendered every page in 7 to 11 s against 38 to 58 s for Chrome, with
+  about a tenth of the memory, and handed 5 pages to Chrome.
+  `scrapix-crawler` gains the `browser-lightpanda` feature
+  (`LightpandaRenderer`, enabled by the worker's `browser` feature) and the
+  `lightpanda_vs_chrome` benchmark example.
+
 - **Automated releases.** `scripts/prepare-release.sh` bumps the workspace
   version in `Cargo.toml` and `Cargo.lock` and the contract versions
   (`info.version` of `contracts/openapi.json` and

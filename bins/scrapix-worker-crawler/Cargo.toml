@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-browser = ["scrapix-crawler/browser-cdp"]
+browser = ["scrapix-crawler/browser-cdp", "scrapix-crawler/browser-lightpanda"]
 
 [dependencies]
 scrapix-core = { path = "../../crates/scrapix-core" }
