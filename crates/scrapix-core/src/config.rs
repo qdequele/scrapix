@@ -687,14 +687,28 @@ pub struct CustomSelectorsConfig {
     pub exclude_pages: Vec<String>,
 }
 
-/// CSS selector definition
+/// CSS selector definition of a crawl's `custom_selectors` field. The
+/// field is the trimmed text of every matched element: a string for one
+/// match, an array of strings for several.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum SelectorDef {
-    /// Single selector
+    /// Single selector: every element it matches
     Single(String),
-    /// Multiple selectors (results combined)
+    /// Multiple selectors, results combined: every selector's matches in
+    /// list order (an element matched twice counts once). An invalid
+    /// selector is skipped.
     Multiple(Vec<String>),
+}
+
+impl SelectorDef {
+    /// The selectors, in order.
+    pub fn selectors(&self) -> &[String] {
+        match self {
+            SelectorDef::Single(s) => std::slice::from_ref(s),
+            SelectorDef::Multiple(v) => v,
+        }
+    }
 }
 
 /// AI extraction configuration
@@ -722,7 +736,8 @@ pub struct MeilisearchConfig {
     /// API key
     pub api_key: String,
 
-    /// Primary key field name
+    /// Primary key field name. Only `uid` (the default) is accepted:
+    /// crawled documents are identified by their `uid`.
     #[serde(default)]
     pub primary_key: Option<String>,
 

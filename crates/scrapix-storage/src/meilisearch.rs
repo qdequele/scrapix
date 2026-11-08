@@ -184,6 +184,11 @@ fn scoped_stale_filter(scope: &CrawlScope, job_id: &str) -> String {
     )
 }
 
+/// Filter for the documents a job wrote.
+fn job_documents_filter(job_id: &str) -> String {
+    format!("{CRAWL_JOB_ID_FIELD} = {}", filter_literal(job_id))
+}
+
 /// Filter for documents indexed before `_crawl_scope` existed (or by
 /// something else than a crawl) and not by this job; the cleanup only
 /// deletes those whose URL lies in the crawl's scope.
@@ -1191,32 +1196,54 @@ impl MeilisearchStorage {
         Ok(())
     }
 
-    /// Query the actual document count for an index directly from Meilisearch.
-    /// Returns None if the index doesn't exist or the query fails.
-    pub async fn get_actual_document_count(
+    /// The number of documents in `index_uid` written by `job_id` (its
+    /// `_crawl_job_id`), counted by Meilisearch. `None` if the index is
+    /// missing, `_crawl_job_id` is not filterable or the query fails.
+    pub async fn count_job_documents(
         meilisearch_url: &str,
         api_key: Option<&str>,
         index_uid: &str,
+        job_id: &str,
     ) -> Option<u64> {
         let client = Client::new(meilisearch_url, api_key).ok()?;
-        let stats = client.index(index_uid).get_stats().await.ok()?;
-        Some(stats.number_of_documents as u64)
+        let index = client.index(index_uid);
+        let filter = job_documents_filter(job_id);
+        let mut query = DocumentsQuery::new(&index);
+        query
+            .with_filter(&filter)
+            .with_fields([CRAWL_JOB_ID_FIELD])
+            .with_limit(1);
+        let page = index
+            .get_documents_with::<serde_json::Value>(&query)
+            .await
+            .map_err(
+                |e| warn!(index = %index_uid, error = %e, "Failed to count the job's documents"),
+            )
+            .ok()?;
+        Some(page.total as u64)
     }
 
-    /// Check for recently failed Meilisearch tasks on a given index and log them.
-    /// Returns the number of failed tasks found.
+    /// Log the failed document tasks of `index_uid` enqueued since
+    /// `since` (the job's start), so tasks of earlier jobs are not
+    /// counted. Returns how many failed (best effort: 0 when the tasks
+    /// cannot be read).
     pub async fn log_failed_tasks(
         meilisearch_url: &str,
         api_key: Option<&str>,
         index_uid: &str,
-    ) -> u32 {
+        since: time::OffsetDateTime,
+    ) -> u64 {
         let client = match Client::new(meilisearch_url, api_key) {
             Ok(c) => c,
             Err(_) => return 0,
         };
 
         let mut query = TasksSearchQuery::new(&client);
-        query.with_index_uids([index_uid]).with_statuses(["failed"]);
+        query
+            .with_index_uids([index_uid])
+            .with_statuses(["failed"])
+            .with_types(["documentAdditionOrUpdate"])
+            .with_after_enqueued_at(&since);
 
         let result = match client.get_tasks_with(&query).await {
             Ok(r) => r,
@@ -1226,7 +1253,7 @@ impl MeilisearchStorage {
             }
         };
 
-        let count = result.results.len() as u32;
+        let count = result.total;
         if count > 0 {
             error!(
                 index = %index_uid,

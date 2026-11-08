@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use scrapix_core::url_normalize::normalize_entry_url;
 use scrapix_core::{Ack, CrawlUrl, CrawlerType, RawPage, ScrapixError};
 use scrapix_crawler::{
-    ConditionalRequestHeaders, ExtractorConfig, FetchOptions, FetchResult, UrlExtractor,
+    url_allowed_any_scheme_or_www, ConditionalRequestHeaders, ExtractorConfig, FetchOptions,
+    FetchResult, UrlExtractor, MAX_STORED_LINKS,
 };
 use scrapix_queue::{
     topic_names, CrawlEvent, DlqMessage, FetchFeedback, LinksMessage, RawPageMessage, UrlMessage,
@@ -24,7 +26,19 @@ use tracing::{debug, info, warn};
 
 use crate::job_fetch::{headers_allowed_for, is_proxy_failure};
 use crate::outcome::{classify, is_retryable, Outcome};
+use crate::page_history::PageRecord;
 use crate::CrawlerWorker;
+
+/// `PageSkipped` reason of a page that answered 304 to an incremental crawl.
+pub(crate) const NOT_MODIFIED: &str = "304 Not Modified";
+
+/// Accounting fields of a `PageSkipped` event.
+#[derive(Debug, Default, Clone, Copy)]
+struct Skip {
+    links_published: u64,
+    not_modified: bool,
+    sitemap_pending: bool,
+}
 
 /// Reason used when a job needs JS rendering and this worker has no browser.
 pub(crate) const BROWSER_UNAVAILABLE: &str = "browser rendering unavailable on this worker";
@@ -142,7 +156,7 @@ impl CrawlerWorker {
 
         let published = match outcome {
             Outcome::Crawled => match result {
-                Some(Ok(FetchResult::Fetched(page))) => self.on_crawled(&msg, page, elapsed).await,
+                Some(Ok(FetchResult::Fetched(page))) => self.on_fetched(&msg, page, elapsed).await,
                 // `classify` only returns `Crawled` for `Ok(Fetched(2xx))`;
                 // never panic here (a panicking handler would lose the ack).
                 _ => {
@@ -160,6 +174,11 @@ impl CrawlerWorker {
             Outcome::Failed { reason, status } => {
                 let exhausted = result.as_ref().is_some_and(is_retryable);
                 self.on_failed(&msg, &reason, status, exhausted).await
+            }
+            Outcome::Skipped { reason } => {
+                self.metrics.record_skipped();
+                info!(url = %msg.url.url, job_id = %msg.job_id, reason, "URL skipped");
+                self.on_skipped(&msg, &reason, Skip::default()).await
             }
         };
 
@@ -376,11 +395,18 @@ impl CrawlerWorker {
         if let Some(ref last_modified) = url.last_modified {
             headers = headers.with_last_modified(last_modified);
         }
-        // No in-message headers: look up the Redis crawl history.
+        // No in-message headers: look up the page history. A record without
+        // stored links, or stored under other link filters (another job, a
+        // widened config, a record older than scope keys), is not used: a
+        // 304 would replay the wrong links. The full fetch rewrites it.
         if !headers.has_headers() {
             if let Some(ref history) = self.crawl_history {
                 match history.get(&msg.index_uid, &url.url).await {
-                    Ok(Some(record)) => {
+                    Ok(Some(record))
+                        if record.usable_for_conditional_request()
+                            && record.link_scope.as_deref()
+                                == Some(self.link_scope_key(msg).as_str()) =>
+                    {
                         if let Some(ref etag) = record.etag {
                             headers = headers.with_etag(etag);
                         }
@@ -388,7 +414,7 @@ impl CrawlerWorker {
                             headers = headers.with_last_modified(lm);
                         }
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(e) => {
                         debug!(url = %url.url, error = %e, "Failed to look up crawl history");
                     }
@@ -441,31 +467,10 @@ impl CrawlerWorker {
         // whether to wait for a matching `SitemapPublished` — and because
         // deciding is itself the (one-shot) dedup side effect, so it must
         // happen at most once per page.
-        let domain = url::Url::parse(&url.url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string));
-        let sitemap_pending = match &domain {
-            Some(domain) => self.sitemap_discovery_should_run(&msg.job_id, domain, msg),
-            None => false,
-        };
+        let sitemap_pending = self.start_sitemap_discovery(msg, &page.final_url);
 
-        // Sitemap discovery runs in the background so it never delays the
-        // first fetch (Task 7 moves it to a per-job flow). Once
-        // `sitemap_pending` is true, `maybe_discover_sitemaps` guarantees a
-        // `SitemapPublished` for `msg.message_id` on every path (disabled
-        // parser, no sitemaps, fetch error) and cannot itself fail, so
-        // accounting never waits forever for it and there's nothing for the
-        // spawned task to report back.
-        if sitemap_pending {
-            let domain = domain.expect("sitemap_pending is only true when domain is Some");
-            let worker = self.clone();
-            let parent = msg.clone();
-            tokio::spawn(async move {
-                worker.maybe_discover_sitemaps(&domain, &parent).await;
-            });
-        }
-
-        let discovered_urls = self.extract_links(msg, &page);
+        let (discovered_urls, outlinks) = self.extract_links(msg, &page);
+        let page_final_url = page.final_url.clone();
         let discovered_count = discovered_urls.len();
         self.metrics.record_discovered(discovered_count as u64);
 
@@ -496,18 +501,20 @@ impl CrawlerWorker {
         let etag = page.headers.get("etag").cloned();
         let last_modified = page.headers.get("last-modified").cloned();
 
-        // Save crawl history for future incremental crawls (Update strategy only).
+        // Save the page history for future incremental crawls (Update
+        // strategy only), with the page's in-scope links and final URL so a
+        // later 304 can still follow them.
         if msg.incremental && (etag.is_some() || last_modified.is_some()) {
             if let Some(ref history) = self.crawl_history {
-                if let Err(e) = history
-                    .save(
-                        &msg.index_uid,
-                        &url.url,
-                        etag.clone(),
-                        last_modified.clone(),
-                    )
-                    .await
-                {
+                let record = PageRecord {
+                    etag: etag.clone(),
+                    last_modified: last_modified.clone(),
+                    crawled_at: chrono::Utc::now().timestamp_millis(),
+                    final_url: Some(page_final_url),
+                    link_scope: Some(self.link_scope_key(msg)),
+                    outlinks: Some(outlinks),
+                };
+                if let Err(e) = history.save(&msg.index_uid, &url.url, &record).await {
                     debug!(url = %url.url, error = %e, "Failed to save crawl history to Redis");
                 }
             }
@@ -518,29 +525,7 @@ impl CrawlerWorker {
             .send(topic_names::PAGES_RAW, Some(&msg.job_id), &raw_page_msg)
             .await?;
 
-        for mut discovered in discovered_urls {
-            if let Some(ref graph) = self.link_graph {
-                discovered.priority += graph.get_priority_boost(&discovered.url);
-            }
-            let child = msg.child(discovered);
-            self.producer
-                .send(
-                    topic_names::URL_FRONTIER,
-                    Some(&child.partition_key()),
-                    &child,
-                )
-                .await?;
-        }
-
-        if discovered_count > 0 {
-            let event = CrawlEvent::UrlsDiscovered {
-                job_id: msg.job_id.clone(),
-                source_url: url.url.clone(),
-                count: discovered_count,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            self.publish_event(&msg.job_id, &event).await?;
-        }
+        self.publish_links(msg, discovered_urls).await?;
 
         let event = CrawlEvent::PageCrawled {
             job_id: msg.job_id.clone(),
@@ -564,8 +549,58 @@ impl CrawlerWorker {
     /// Links to documents the job parses (`features.pdf`,
     /// `features.documents`) are followed; a PDF's own hyperlinks are
     /// followed when the job sets `features.pdf.extract_links`.
-    fn extract_links(&self, msg: &UrlMessage, page: &RawPage) -> Vec<CrawlUrl> {
+    ///
+    /// Also returns the links to store in the page history: the in-scope
+    /// links (the job's domain, include/exclude and non-page filters),
+    /// whatever the depth, at most [`MAX_STORED_LINKS`].
+    fn extract_links(&self, msg: &UrlMessage, page: &RawPage) -> (Vec<CrawlUrl>, Vec<String>) {
         let depth = msg.url.depth;
+        let extractor = self.job_extractor(msg);
+
+        let content_type = page.content_type.as_deref().unwrap_or_default();
+        if !scrapix_core::content_types::is_binary_document(content_type) {
+            return extractor.extract_with_outlinks(page, depth);
+        }
+        // A binary document: its body is base64, not HTML. Only PDFs carry
+        // followable links, and only when the job asks for them.
+        if !msg.features.as_ref().is_some_and(|f| f.pdf_extract_links()) {
+            return (Vec::new(), Vec::new());
+        }
+        let Ok(bytes) = BASE64.decode(page.html.as_bytes()) else {
+            return (Vec::new(), Vec::new());
+        };
+        if scrapix_parser::detect_kind(Some(content_type), &bytes)
+            != Some(scrapix_parser::DocumentKind::Pdf)
+        {
+            return (Vec::new(), Vec::new());
+        }
+        match scrapix_parser::pdf::extract_links(&bytes, &page.final_url) {
+            Ok(links) => {
+                let discovered = extractor.extract_from_links(&page.final_url, links, depth);
+                let stored = discovered
+                    .iter()
+                    .take(MAX_STORED_LINKS)
+                    .map(|u| u.url.clone())
+                    .collect();
+                (discovered, stored)
+            }
+            Err(e) => {
+                debug!(url = %page.final_url, error = %e, "PDF link extraction failed");
+                (Vec::new(), Vec::new())
+            }
+        }
+    }
+
+    /// The link extractor for `msg`'s job: its URL patterns, `max_depth`
+    /// and document opt-ins.
+    fn job_extractor(&self, msg: &UrlMessage) -> UrlExtractor {
+        let (config, follow_pdf, follow_documents) = self.job_extractor_config(msg);
+        UrlExtractor::new(config).follow_document_links(follow_pdf, follow_documents)
+    }
+
+    /// The extractor configuration of `msg`'s job, with its PDF and office
+    /// document link opt-ins.
+    fn job_extractor_config(&self, msg: &UrlMessage) -> (ExtractorConfig, bool, bool) {
         let effective_max_depth = msg.max_depth.unwrap_or(self.extractor.config().max_depth);
         let (follow_pdf, follow_documents) = msg.features.as_ref().map_or((false, false), |f| {
             (f.is_pdf_enabled(), f.is_documents_enabled())
@@ -585,48 +620,241 @@ impl CrawlerWorker {
             config.max_depth = effective_max_depth;
             config
         };
-        let extractor =
-            UrlExtractor::new(config).follow_document_links(follow_pdf, follow_documents);
+        (config, follow_pdf, follow_documents)
+    }
 
-        let content_type = page.content_type.as_deref().unwrap_or_default();
-        if !scrapix_core::content_types::is_binary_document(content_type) {
-            return extractor.extract(page, depth);
-        }
-        // A binary document: its body is base64, not HTML. Only PDFs carry
-        // followable links, and only when the job asks for them.
-        if !msg.features.as_ref().is_some_and(|f| f.pdf_extract_links()) {
-            return Vec::new();
-        }
-        let Ok(bytes) = BASE64.decode(page.html.as_bytes()) else {
+    /// Stable key of the filters `msg`'s job applies to a page's links
+    /// (allowed domains, include/exclude patterns, external/subdomain
+    /// following, document link opt-ins, PDF link extraction), not of
+    /// `max_depth` or other per-run settings. A page's stored links are only
+    /// replayed on a 304 for a job with the same key: a job with other
+    /// filters (a widened saved config) fetches the page in full instead.
+    fn link_scope_key(&self, msg: &UrlMessage) -> String {
+        let (config, follow_pdf, follow_documents) = self.job_extractor_config(msg);
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let (include, exclude) = config
+            .patterns
+            .as_ref()
+            .map(|p| (sorted(&p.include), sorted(&p.exclude)))
+            .unwrap_or_default();
+        let pdf_links = msg.features.as_ref().is_some_and(|f| f.pdf_extract_links());
+        let canonical = format!(
+            "links-v1|include={include:?}|exclude={exclude:?}|domains={:?}|external={}|subdomains={}|data_attrs={}|pdf={follow_pdf}|documents={follow_documents}|pdf_links={pdf_links}",
+            sorted(&config.allowed_domains),
+            config.follow_external,
+            config.follow_subdomains,
+            config.extract_from_data_attrs,
+        );
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, canonical.as_bytes())
+            .simple()
+            .to_string()
+    }
+
+    /// 304 under incremental crawling: the page is unchanged and already
+    /// indexed, but its links are followed again from the page history
+    /// (filtered by this job's rules), so the crawl still reaches the pages
+    /// below it. Also starts the domain's sitemap discovery, like a crawled
+    /// page would.
+    async fn on_not_modified(self: &Arc<Self>, msg: &UrlMessage) -> scrapix_core::Result<()> {
+        self.metrics.record_not_modified();
+        let record = match self.crawl_history {
+            Some(ref history) => match history.get(&msg.index_uid, &msg.url.url).await {
+                Ok(record) => record,
+                Err(e) => {
+                    warn!(url = %msg.url.url, error = %e, "Failed to read the stored links of a 304 page");
+                    None
+                }
+            },
+            None => None,
+        };
+        let page_url = record
+            .as_ref()
+            .and_then(|r| r.final_url.clone())
+            .unwrap_or_else(|| msg.url.url.clone());
+        let links = self.stored_links(msg, record);
+        debug!(url = %msg.url.url, links = links.len(), "Page not modified (304), following its stored links");
+        let sitemap_pending = self.start_sitemap_discovery(msg, &page_url);
+        let links_published = links.len() as u64;
+        self.publish_links(msg, links).await?;
+        self.on_skipped(
+            msg,
+            NOT_MODIFIED,
+            Skip {
+                links_published,
+                not_modified: true,
+                sitemap_pending,
+            },
+        )
+        .await
+    }
+
+    /// The links to follow from a 304 page's history `record`, re-filtered by
+    /// `msg`'s job. They are judged from the page's final URL (where the
+    /// first fetch landed, possibly another host after a redirect), not from
+    /// the requested URL.
+    fn stored_links(&self, msg: &UrlMessage, record: Option<PageRecord>) -> Vec<CrawlUrl> {
+        let Some(record) = record else {
             return Vec::new();
         };
-        if scrapix_parser::detect_kind(Some(content_type), &bytes)
-            != Some(scrapix_parser::DocumentKind::Pdf)
-        {
-            return Vec::new();
-        }
-        match scrapix_parser::pdf::extract_links(&bytes, &page.final_url) {
-            Ok(links) => extractor.extract_from_links(&page.final_url, links, depth),
-            Err(e) => {
-                debug!(url = %page.final_url, error = %e, "PDF link extraction failed");
-                Vec::new()
+        let page_url = record.final_url.unwrap_or_else(|| msg.url.url.clone());
+        self.job_extractor(msg).extract_from_links(
+            &page_url,
+            record.outlinks.unwrap_or_default(),
+            msg.url.depth,
+        )
+    }
+
+    /// A fetched 2xx page: skipped when a redirect took it out of the
+    /// crawl's scope, else crawled. The final URL of an in-scope redirect is
+    /// marked seen in the frontier, so a direct link to it is not fetched a
+    /// second time.
+    async fn on_fetched(
+        self: &Arc<Self>,
+        msg: &UrlMessage,
+        page: RawPage,
+        elapsed: Duration,
+    ) -> scrapix_core::Result<()> {
+        let requested = normalize_entry_url(&msg.url.url);
+        let target = normalize_entry_url(&page.final_url);
+        if let Some(target) = target.filter(|t| Some(t) != requested.as_ref()) {
+            if let Some(reason) = self.redirect_out_of_scope(msg, &target).await {
+                self.metrics.record_skipped();
+                info!(url = %msg.url.url, final_url = %page.final_url, reason, "Redirect target skipped");
+                return self.on_skipped(msg, &reason, Skip::default()).await;
             }
+            let seen = msg.seen_only_child(target);
+            self.producer
+                .send(
+                    topic_names::URL_FRONTIER,
+                    Some(&seen.partition_key()),
+                    &seen,
+                )
+                .await?;
+        }
+        self.on_crawled(msg, page, elapsed).await
+    }
+
+    /// Why the redirect target `target` of `msg` must not be crawled, if it
+    /// must not: robots.txt disallows it (unless the job ignores robots.txt),
+    /// or, for a discovered URL (not a start URL, which may legitimately
+    /// redirect anywhere), it is outside the job's allowed domains or
+    /// include/exclude patterns. `http`/`https` and a leading `www.` count
+    /// as the same site there: a `https://example.com/docs/*` include keeps
+    /// a redirect to `https://www.example.com/docs/a`.
+    async fn redirect_out_of_scope(&self, msg: &UrlMessage, target: &str) -> Option<String> {
+        let respects_robots = !matches!(msg.job, Some(ref j) if !j.respect_robots_txt);
+        if respects_robots {
+            match self.fetcher.is_allowed(target).await {
+                Ok(false) => {
+                    return Some(format!(
+                        "Redirect target disallowed by robots.txt: {target}"
+                    ));
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    debug!(target, error = %e, "robots.txt check of a redirect target failed")
+                }
+            }
+        }
+        let discovered = msg.url.parent_url.is_some();
+        match msg.url_patterns {
+            Some(ref patterns)
+                if discovered && !url_allowed_any_scheme_or_www(patterns, target) =>
+            {
+                Some(format!(
+                    "Redirect target outside the crawl's scope: {target}"
+                ))
+            }
+            _ => None,
         }
     }
 
-    /// 304 under incremental crawling.
-    async fn on_not_modified(&self, msg: &UrlMessage) -> scrapix_core::Result<()> {
-        self.metrics.record_not_modified();
-        debug!(url = %msg.url.url, "Page not modified (304), skipping processing");
+    /// Publish `PageSkipped` for `msg`.
+    async fn on_skipped(
+        &self,
+        msg: &UrlMessage,
+        reason: &str,
+        skip: Skip,
+    ) -> scrapix_core::Result<()> {
         let event = CrawlEvent::PageSkipped {
             job_id: msg.job_id.clone(),
             url: msg.url.url.clone(),
-            reason: "304 Not Modified".to_string(),
+            reason: reason.to_string(),
             timestamp: chrono::Utc::now().timestamp_millis(),
             url_message_id: msg.message_id.clone(),
+            links_published: skip.links_published,
+            not_modified: skip.not_modified,
+            sitemap_pending: skip.sitemap_pending,
         };
-        self.publish_event(&msg.job_id, &event).await?;
+        self.publish_event(&msg.job_id, &event).await
+    }
+
+    /// Publish `links` to the frontier as children of `msg` (with the link
+    /// graph's priority boost), then `UrlsDiscovered` when there are any.
+    async fn publish_links(
+        &self,
+        msg: &UrlMessage,
+        links: Vec<CrawlUrl>,
+    ) -> scrapix_core::Result<()> {
+        let count = links.len();
+        for mut discovered in links {
+            if let Some(ref graph) = self.link_graph {
+                discovered.priority += graph.get_priority_boost(&discovered.url);
+            }
+            let child = msg.child(discovered);
+            self.producer
+                .send(
+                    topic_names::URL_FRONTIER,
+                    Some(&child.partition_key()),
+                    &child,
+                )
+                .await?;
+        }
+        if count > 0 {
+            let event = CrawlEvent::UrlsDiscovered {
+                job_id: msg.job_id.clone(),
+                source_url: msg.url.url.clone(),
+                count,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            self.publish_event(&msg.job_id, &event).await?;
+        }
         Ok(())
+    }
+
+    /// Start `(job, host)`'s one-time sitemap discovery for a page served
+    /// at `page_url`, on that page's scheme, host and port. Returns whether
+    /// this message owns it (the `sitemap_pending` its event must carry).
+    ///
+    /// Sitemap discovery runs in the background so it never delays the
+    /// fetch. Once `sitemap_pending` is true, `maybe_discover_sitemaps`
+    /// guarantees a `SitemapPublished` for `msg.message_id` on every path
+    /// (disabled parser, no sitemaps, fetch error) and cannot itself fail,
+    /// so accounting never waits forever for it.
+    fn start_sitemap_discovery(self: &Arc<Self>, msg: &UrlMessage, page_url: &str) -> bool {
+        let Some(parsed) = url::Url::parse(page_url).ok() else {
+            return false;
+        };
+        let Some(domain) = parsed.host_str().map(str::to_string) else {
+            return false;
+        };
+        let origin = parsed.origin().ascii_serialization();
+        if !self.sitemap_discovery_should_run(&msg.job_id, &domain, msg) {
+            return false;
+        }
+        let worker = self.clone();
+        let parent = msg.clone();
+        tokio::spawn(async move {
+            worker
+                .maybe_discover_sitemaps(&domain, &origin, &parent)
+                .await;
+        });
+        true
     }
 
     /// Transient failure: re-queue with `retry_count + 1` and a
@@ -762,6 +990,27 @@ mod tests {
         )
     }
 
+    /// A worker with an in-memory page history (incremental crawling).
+    async fn worker_with_history(bus: &ChannelBus) -> Arc<CrawlerWorker> {
+        let mut args = Args::parse_from(["scrapix-worker-crawler"]);
+        args.allow_private_ips = true; // wiremock listens on 127.0.0.1
+        args.respect_robots = false;
+        args.sitemap_discovery = false;
+        args.redis_url = None;
+        args.browser_render = false;
+        args.max_retries = MAX_RETRIES;
+        let mut w = CrawlerWorker::build(
+            &args,
+            "test".into(),
+            AnyConsumer::from(bus.consumer()),
+            AnyProducer::from(bus.producer()),
+        )
+        .await
+        .unwrap();
+        w.crawl_history = Some(Arc::new(crate::page_history::PageHistory::memory()));
+        Arc::new(w)
+    }
+
     async fn worker_with_sitemaps(bus: &ChannelBus) -> Arc<CrawlerWorker> {
         let mut args = Args::parse_from(["scrapix-worker-crawler"]);
         args.allow_private_ips = true; // wiremock listens on 127.0.0.1
@@ -866,6 +1115,347 @@ mod tests {
         }
     }
 
+    /// An unchanged page (304 to the conditional request built from the
+    /// page history) is not downloaded again, but its stored links are
+    /// followed, so an incremental re-crawl still reaches the pages below
+    /// it; its `PageSkipped` counts those links and marks it unchanged.
+    #[tokio::test]
+    async fn not_modified_page_still_follows_its_stored_links() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_raw(
+                        r#"<a href="/next/">n</a><a href="https://elsewhere.test/x">x</a>"#,
+                        "text/html",
+                    ),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_history(&bus).await;
+
+        // First crawl: full fetch, stores the validator, the final URL and
+        // the in-scope links only (the external link is not stored).
+        let (ack, _) = tracked_ack();
+        w.handle_message(message(url(&server, "/"), None), ack)
+            .await;
+        assert_eq!(drain::<RawPageMessage>(&t.pages).await.len(), 1);
+        let record = w
+            .crawl_history
+            .as_ref()
+            .unwrap()
+            .get("idx", &url(&server, "/"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.outlinks, Some(vec![url(&server, "/next")]));
+        assert_eq!(record.final_url, Some(url(&server, "/")));
+        drain::<UrlMessage>(&t.frontier).await;
+        drain::<CrawlEvent>(&t.events).await;
+
+        // Re-crawl: 304, no page, but the link is followed again.
+        let msg = message(url(&server, "/"), None);
+        let (ack, acked) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        let children: Vec<UrlMessage> = drain(&t.frontier).await;
+        let urls: Vec<_> = children.iter().map(|c| c.url.url.clone()).collect();
+        assert_eq!(urls, vec![url(&server, "/next")]);
+        assert_eq!(children[0].url.depth, 1);
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::PageSkipped { not_modified: true, links_published: 1, url_message_id, .. }
+                    if *url_message_id == msg.message_id
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A 304 page's stored links are judged from the page's final URL: a
+    /// first fetch that redirected to another host stored that host's
+    /// links, and they are followed (not rejected as external).
+    #[tokio::test]
+    async fn stored_links_are_judged_from_the_final_url() {
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let msg = message("https://a.test/".into(), None);
+        let record = PageRecord {
+            etag: Some("\"e\"".into()),
+            final_url: Some("https://b.test/".into()),
+            outlinks: Some(vec!["https://b.test/x".into()]),
+            ..Default::default()
+        };
+        let links: Vec<_> = w
+            .stored_links(&msg, Some(record.clone()))
+            .into_iter()
+            .map(|u| u.url)
+            .collect();
+        assert_eq!(links, vec!["https://b.test/x"]);
+        // Without a final URL (older record) the requested URL is used.
+        let old = PageRecord {
+            final_url: None,
+            ..record
+        };
+        assert!(w.stored_links(&msg, Some(old)).is_empty());
+        assert!(w.stored_links(&msg, None).is_empty());
+    }
+
+    /// Conditional headers are sent only for a record stored under the
+    /// same link filters: a widened config fetches the page in full (so its
+    /// new links are found and the record rewritten); a record without a
+    /// scope key (older) counts as a mismatch.
+    #[tokio::test]
+    async fn conditional_request_only_for_the_same_link_scope() {
+        let bus = ChannelBus::new();
+        let w = worker_with_history(&bus).await;
+        let target = "https://a.test/docs".to_string();
+        let scoped = |include: &str| {
+            UrlMessage::with_patterns(
+                CrawlUrl::seed(target.clone()),
+                "job-1",
+                "idx",
+                scrapix_core::UrlPatterns {
+                    include: vec![include.into()],
+                    allowed_domains: vec!["a.test".into()],
+                    ..Default::default()
+                },
+            )
+        };
+        let narrow = scoped("https://a.test/docs/*");
+        let wide = scoped("https://a.test/*");
+        let history = w.crawl_history.as_ref().unwrap();
+        let mut record = PageRecord {
+            etag: Some("\"v1\"".into()),
+            outlinks: Some(vec![]),
+            ..Default::default()
+        };
+        // No scope key: a mismatch.
+        history.save("idx", &target, &record).await.unwrap();
+        assert!(!w.conditional_headers(&narrow).await.has_headers());
+
+        record.link_scope = Some(w.link_scope_key(&narrow));
+        history.save("idx", &target, &record).await.unwrap();
+        assert!(w.conditional_headers(&narrow).await.has_headers());
+        // Same filters, another max_depth: still the same scope.
+        let deeper = scoped("https://a.test/docs/*").with_limits(Some(9), None);
+        assert!(w.conditional_headers(&deeper).await.has_headers());
+        // Widened include patterns: full fetch.
+        assert!(!w.conditional_headers(&wide).await.has_headers());
+    }
+
+    /// A redirect target is matched against the user's include/exclude
+    /// patterns with `http`/`https` and `www.` treated as the same site.
+    #[tokio::test]
+    async fn redirect_scope_check_ignores_scheme_and_www() {
+        let bus = ChannelBus::new();
+        let w = worker(&bus).await;
+        let patterns = scrapix_core::UrlPatterns {
+            include: vec!["https://example.com/docs/*".into()],
+            ..Default::default()
+        };
+        let msg = UrlMessage::with_patterns(
+            CrawlUrl::new("https://example.com/docs/old", 1)
+                .with_parent("https://example.com/docs"),
+            "job-1",
+            "idx",
+            patterns,
+        );
+        assert_eq!(
+            w.redirect_out_of_scope(&msg, "https://www.example.com/docs/a")
+                .await,
+            None
+        );
+        assert!(w
+            .redirect_out_of_scope(&msg, "https://www.example.com/blog/a")
+            .await
+            .is_some());
+    }
+
+    fn scoped_message(server: &MockServer, target: &str) -> UrlMessage {
+        let patterns = scrapix_core::UrlPatterns {
+            include: vec![format!("{}/*", url(server, "/docs"))],
+            ..Default::default()
+        };
+        UrlMessage::with_patterns(
+            CrawlUrl::new(url(server, target), 1).with_parent(url(server, "/docs")),
+            "job-1",
+            "idx",
+            patterns,
+        )
+    }
+
+    /// A discovered URL that redirects out of the job's include patterns is
+    /// skipped, not indexed; one that redirects inside them is crawled and
+    /// its final URL marked seen in the frontier (so a direct link to it is
+    /// not fetched again).
+    #[tokio::test]
+    async fn redirect_targets_are_scope_checked_and_marked_seen() {
+        let server = MockServer::start().await;
+        for (from, to) in [("/docs/old", "/blog/new"), ("/docs/a", "/docs/b/")] {
+            Mock::given(method("GET"))
+                .and(path(from))
+                .respond_with(ResponseTemplate::new(301).insert_header("location", to))
+                .mount(&server)
+                .await;
+        }
+        for p in ["/blog/new", "/docs/b/"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(200).set_body_raw("<p>x</p>", "text/html"))
+                .mount(&server)
+                .await;
+        }
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+
+        let out = scoped_message(&server, "/docs/old");
+        let (ack, acked) = tracked_ack();
+        w.handle_message(out.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::PageSkipped { reason, url_message_id, .. }
+                    if *url_message_id == out.message_id && reason.contains("outside the crawl's scope")
+            )),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            CrawlEvent::PageCrawled { .. } | CrawlEvent::PageFailed { .. }
+        )));
+
+        let inside = scoped_message(&server, "/docs/a");
+        let (ack, _) = tracked_ack();
+        w.handle_message(inside, ack).await;
+        assert_eq!(drain::<RawPageMessage>(&t.pages).await.len(), 1);
+        let frontier: Vec<UrlMessage> = drain(&t.frontier).await;
+        assert!(
+            frontier
+                .iter()
+                .any(|m| m.seen_only && m.url.url == url(&server, "/docs/b")),
+            "{frontier:?}"
+        );
+    }
+
+    /// robots.txt disallows and unsupported content types are skipped with
+    /// their reason, not reported as failed pages.
+    #[tokio::test]
+    async fn robots_disallowed_and_unsupported_content_are_skipped() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("User-agent: *\nDisallow: /private\n", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/llms.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("# llms", "text/plain"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_robots(&bus, true).await;
+
+        for (target, expected) in [
+            ("/private/x", crate::outcome::ROBOTS_DISALLOWED),
+            ("/llms.txt", "Unsupported content type: text/plain"),
+        ] {
+            let msg = message(url(&server, target), None);
+            let (ack, acked) = tracked_ack();
+            w.handle_message(msg.clone(), ack).await;
+            assert!(acked.load(Ordering::SeqCst));
+            let events: Vec<CrawlEvent> = drain(&t.events).await;
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    CrawlEvent::PageSkipped { reason, url_message_id, .. }
+                        if *url_message_id == msg.message_id && reason.starts_with(expected)
+                )),
+                "{target}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CrawlEvent::PageFailed { .. })),
+                "{target}: {events:?}"
+            );
+        }
+        assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
+    }
+
+    /// Sitemap discovery uses the crawled page's scheme and port, and its
+    /// entries are normalized like links (`/post/` -> `/post`).
+    #[tokio::test]
+    async fn sitemap_discovery_keeps_the_origin_and_normalizes_entries() {
+        let server = MockServer::start().await;
+        let base = url(&server, "");
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("User-agent: *\nSitemap: {base}/sitemap.xml\n"),
+                "text/plain",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sitemap.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>{base}/post/</loc></url></urlset>"#
+                ),
+                "application/xml",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>home</p>", "text/html"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_sitemaps(&bus).await;
+        let msg = message(url(&server, "/"), None);
+        let (ack, _) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+
+        let events: Vec<CrawlEvent> = wait_for_event(&t.events, Duration::from_secs(10), |e| {
+            matches!(e, CrawlEvent::SitemapPublished { url_message_id, .. } if *url_message_id == msg.message_id)
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CrawlEvent::SitemapPublished { count: 1, .. })),
+            "{events:?}"
+        );
+        let frontier: Vec<UrlMessage> = drain(&t.frontier).await;
+        let urls: Vec<_> = frontier.iter().map(|m| m.url.url.clone()).collect();
+        assert_eq!(urls, vec![format!("{base}/post")]);
+    }
+
     #[tokio::test]
     async fn success_publishes_page_links_and_event_then_acks() {
         let server = MockServer::start().await;
@@ -929,13 +1519,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // Discovery derives its target from the crawled page's *host only*
-        // (`url::Url::host_str()`, no port) and always uses `https://`, so
-        // it requests `https://{domain}:443/robots.txt` — not the wiremock
-        // server's own (HTTP, random-port) address. Nothing listens on
-        // port 443 here, so both the robots.txt and (fallback) sitemap.xml
-        // fetches fail with a connection error, not a 404, and discovery
-        // finds nothing.
+        // Discovery targets the crawled page's own origin (scheme, host and
+        // port): neither robots.txt nor sitemap.xml is mounted there, so
+        // both 404 and discovery finds nothing.
         let bus = ChannelBus::new();
         let t = topics(&bus);
         let w = worker_with_sitemaps(&bus).await;

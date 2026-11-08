@@ -217,11 +217,15 @@ have realistic values.
 
 The `extract` field maps field names to CSS selectors. Each value is one of:
 
-- a **CSS selector** (`"h1"`): the trimmed text of its first match, as in a
-  crawl's `features.custom_selectors`;
+- a **CSS selector** (`"h1"`): the trimmed text of its first match;
 - a **list of selectors** (`[".price", ".amount"]`): tried in order, the
   trimmed text of the first that matches;
-- a **selector definition** object, for other extraction modes.
+- a **selector definition** object, for other extraction modes (`"mode":
+  "list"` for every match).
+
+A crawl's `features.custom_selectors` differs: a selector there collects
+every match, and a list combines the matches of all its selectors (see
+[Crawl configs](/configuration/crawl-configs#feature-extraction)).
 
 ```json
 {

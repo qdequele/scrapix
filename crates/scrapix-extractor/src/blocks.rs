@@ -346,7 +346,7 @@ impl BlockSplitter {
             H1_SELECTOR.get_or_init(|| Selector::parse("h1").expect("valid h1 selector"));
 
         for h1 in document.select(selector) {
-            let text = h1.text().collect::<String>().trim().to_string();
+            let text = clean_heading(&h1.text().collect::<String>());
             if text.is_empty() {
                 continue;
             }
@@ -432,7 +432,7 @@ impl BlockSplitter {
                     // Check if this is any heading (H1-H6)
                     if let Some(level) = self.get_heading_level(tag_name) {
                         let child_ref = ElementRef::wrap(child).unwrap();
-                        let heading_text = child_ref.text().collect::<String>().trim().to_string();
+                        let heading_text = clean_heading(&child_ref.text().collect::<String>());
 
                         // Always track headings in hierarchy for context
                         if self.config.include_hierarchy {
@@ -599,8 +599,45 @@ impl HeadingHierarchy {
     }
 }
 
+/// Heading text without invisible characters (zero-width space/joiners,
+/// word joiner, BOM; docs sites put them in anchor links), with whitespace
+/// runs collapsed.
+fn clean_heading(text: &str) -> String {
+    let visible: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .collect();
+    visible.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headings_drop_invisible_characters() {
+        let html = "<html><body><main><h1>Guide</h1><p>Intro paragraph long enough.</p>\
+            <h2 id=\"how\"><a href=\"#how\">\u{200B}</a>How\u{2060} it\u{FEFF} works</h2>\
+            <p>Details paragraph long enough to keep.</p></main></body></html>";
+        let result = BlockSplitter::new(BlockConfig {
+            min_content_length: 0,
+            ..Default::default()
+        })
+        .split(html)
+        .unwrap();
+        let block = result
+            .blocks
+            .iter()
+            .find(|b| b.anchor.as_deref() == Some("how"))
+            .expect("the h2 block");
+        assert_eq!(block.heading.as_deref(), Some("How it works"));
+        assert_eq!(block.h2.as_deref(), Some("How it works"));
+        assert_eq!(clean_heading("\u{200C}\u{200D} a  b\n"), "a b");
+        assert_eq!(
+            clean_heading("Set\u{200B}up"),
+            "Setup",
+            "no space inside a word"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -284,7 +284,7 @@ Read by the API (`/scrape`, `/parse`) and the content workers. See
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENABLE_DEDUP` | `false` | Enable content deduplication at indexing stage |
+| `ENABLE_DEDUP` | `false` | Skip pages whose content nearly duplicates another page of the same crawl job (and index) |
 | `DEDUP_USE_SIMHASH` | `true` | Use SimHash for quick similarity checks |
 | `DEDUP_SIMHASH_THRESHOLD` | `3` | SimHash Hamming distance threshold |
 | `DEDUP_MINHASH_THRESHOLD` | `0.85` | MinHash Jaccard similarity threshold |

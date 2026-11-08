@@ -70,6 +70,11 @@ impl FrontierStore for TimeoutStore {
             .await
     }
 
+    async fn mark_seen(&self, job_id: &str, url: &str) -> Result<()> {
+        self.bounded("mark_seen", self.inner.mark_seen(job_id, url))
+            .await
+    }
+
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>> {
         self.bounded("pop_ready", self.inner.pop_ready(job_id, n, now_ms))
             .await

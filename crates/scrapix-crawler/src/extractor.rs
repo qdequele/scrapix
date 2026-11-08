@@ -9,7 +9,27 @@ use url::Url;
 #[cfg(test)]
 use scrapix_core::url_glob::matches_glob;
 use scrapix_core::url_glob::matches_include_exclude;
+use scrapix_core::url_normalize::normalize_link_url;
 use scrapix_core::{CrawlUrl, RawPage, UrlPatterns};
+
+/// Most followable links [`UrlExtractor::extract_with_outlinks`] returns
+/// for a page to store (incremental crawling keeps them per page).
+pub const MAX_STORED_LINKS: usize = 1_000;
+
+/// The URL relative links of `document` resolve against: its first `<base
+/// href>` (itself resolved against `page_url`) when that is an http(s) URL,
+/// else `page_url`.
+pub fn document_base_url(document: &Html, page_url: &Url) -> Url {
+    static BASE: std::sync::OnceLock<Selector> = std::sync::OnceLock::new();
+    let selector = BASE.get_or_init(|| Selector::parse("base[href]").expect("valid selector"));
+    document
+        .select(selector)
+        .next()
+        .and_then(|base| base.value().attr("href"))
+        .and_then(|href| page_url.join(href.trim()).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+        .unwrap_or_else(|| page_url.clone())
+}
 
 /// URL extraction configuration
 #[derive(Debug, Clone)]
@@ -82,8 +102,9 @@ impl UrlExtractor {
     }
 
     /// Filter already-resolved link targets (e.g. hyperlinks found inside a
-    /// PDF) with the same rules as HTML links: normalization, non-page
-    /// filtering, domain constraints, URL patterns and depth.
+    /// PDF, or the outlinks stored for a page that answered 304) with the
+    /// same rules as HTML links: normalization, non-page filtering, domain
+    /// constraints, URL patterns and depth.
     pub fn extract_from_links<I>(
         &self,
         final_url: &str,
@@ -96,22 +117,17 @@ impl UrlExtractor {
         if parent_depth >= self.config.max_depth {
             return vec![];
         }
-        let Ok(base_url) = Url::parse(final_url) else {
+        let Ok(page_url) = Url::parse(final_url) else {
             return vec![];
         };
-        let base_domain = base_url.host_str().unwrap_or("").to_lowercase();
+        let page_domain = page_url.host_str().unwrap_or("").to_lowercase();
         let mut seen = HashSet::new();
         links
             .into_iter()
             .filter_map(|href| {
-                self.process_href(
-                    &href,
-                    &base_url,
-                    &base_domain,
-                    final_url,
-                    parent_depth,
-                    &mut seen,
-                )
+                let (normalized, host) = self.resolve(&href, &page_url, &page_url, &page_domain)?;
+                self.accept(&normalized, &host, &page_domain, &mut seen)
+                    .then(|| self.crawl_url(normalized, final_url, parent_depth))
             })
             .collect()
     }
@@ -123,79 +139,94 @@ impl UrlExtractor {
 
     /// Extract URLs from a page
     pub fn extract(&self, page: &RawPage, parent_depth: u32) -> Vec<CrawlUrl> {
-        if parent_depth >= self.config.max_depth {
-            return vec![];
-        }
+        self.extract_with_outlinks(page, parent_depth).0
+    }
 
-        let base_url = match Url::parse(&page.final_url) {
+    /// Extract the links to follow from a page, and the page's links to
+    /// store: every link that passes the domain, URL-pattern and non-page
+    /// filters, whatever the depth, capped at [`MAX_STORED_LINKS`].
+    /// Incremental crawling stores them to follow a page's links again when
+    /// it later answers 304 Not Modified ([`Self::extract_from_links`]
+    /// re-applies the filters and the depth limit then). The links to follow
+    /// are the same ones, uncapped, and empty past `max_depth`.
+    pub fn extract_with_outlinks(
+        &self,
+        page: &RawPage,
+        parent_depth: u32,
+    ) -> (Vec<CrawlUrl>, Vec<String>) {
+        let page_url = match Url::parse(&page.final_url) {
             Ok(url) => url,
-            Err(_) => return vec![],
+            Err(_) => return (vec![], vec![]),
         };
-
-        let base_domain = base_url.host_str().unwrap_or("").to_lowercase();
+        let page_domain = page_url.host_str().unwrap_or("").to_lowercase();
+        let follow = parent_depth < self.config.max_depth;
 
         let document = Html::parse_document(&page.html);
+        let join_base = document_base_url(&document, &page_url);
         let mut seen = HashSet::new();
+        let mut outlinks = Vec::new();
         let mut urls = Vec::new();
 
         for element in document.select(&self.link_selector) {
-            if let Some(href) = element.value().attr("href") {
-                if let Some(crawl_url) = self.process_href(
-                    href,
-                    &base_url,
-                    &base_domain,
-                    &page.final_url,
-                    parent_depth,
-                    &mut seen,
-                ) {
-                    // Get anchor text
-                    let anchor_text = element
-                        .text()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .trim()
-                        .to_string();
-
-                    let crawl_url = if anchor_text.is_empty() {
-                        crawl_url
-                    } else {
-                        CrawlUrl {
-                            anchor_text: Some(anchor_text),
-                            ..crawl_url
-                        }
-                    };
-
-                    urls.push(crawl_url);
-                }
+            let Some(href) = element.value().attr("href") else {
+                continue;
+            };
+            let Some((normalized, host)) = self.resolve(href, &join_base, &page_url, &page_domain)
+            else {
+                continue;
+            };
+            if !self.accept(&normalized, &host, &page_domain, &mut seen) {
+                continue;
             }
+            if outlinks.len() < MAX_STORED_LINKS {
+                outlinks.push(normalized.clone());
+            }
+            if !follow {
+                continue;
+            }
+            let anchor_text = element
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            let mut crawl_url = self.crawl_url(normalized, &page.final_url, parent_depth);
+            if !anchor_text.is_empty() {
+                crawl_url.anchor_text = Some(anchor_text);
+            }
+            urls.push(crawl_url);
         }
 
         debug!(
             url = %page.final_url,
             extracted = urls.len(),
+            outlinks = outlinks.len(),
             "Extracted URLs"
         );
 
-        urls
+        (urls, outlinks)
     }
 
     /// Extract URLs as strings only (for implementing Parser trait)
     pub fn extract_urls(&self, page: &RawPage) -> Vec<String> {
-        let base_url = match Url::parse(&page.final_url) {
+        let page_url = match Url::parse(&page.final_url) {
             Ok(url) => url,
             Err(_) => return vec![],
         };
-
-        let base_domain = base_url.host_str().unwrap_or("").to_lowercase();
+        let page_domain = page_url.host_str().unwrap_or("").to_lowercase();
         let document = Html::parse_document(&page.html);
+        let join_base = document_base_url(&document, &page_url);
         let mut seen = HashSet::new();
         let mut urls = Vec::new();
 
         for element in document.select(&self.link_selector) {
             if let Some(href) = element.value().attr("href") {
-                if let Some(url) = self.resolve_and_filter(href, &base_url, &base_domain, &mut seen)
+                if let Some((normalized, host)) =
+                    self.resolve(href, &join_base, &page_url, &page_domain)
                 {
-                    urls.push(url);
+                    if self.accept(&normalized, &host, &page_domain, &mut seen) {
+                        urls.push(normalized);
+                    }
                 }
             }
         }
@@ -203,20 +234,9 @@ impl UrlExtractor {
         urls
     }
 
-    /// Process a single href attribute
-    fn process_href(
-        &self,
-        href: &str,
-        base_url: &Url,
-        base_domain: &str,
-        parent_url: &str,
-        parent_depth: u32,
-        seen: &mut HashSet<String>,
-    ) -> Option<CrawlUrl> {
-        let resolved = self.resolve_and_filter(href, base_url, base_domain, seen)?;
-
-        Some(CrawlUrl {
-            url: resolved,
+    fn crawl_url(&self, url: String, parent_url: &str, parent_depth: u32) -> CrawlUrl {
+        CrawlUrl {
+            url,
             depth: parent_depth + 1,
             priority: 0,
             parent_url: Some(parent_url.to_string()),
@@ -227,18 +247,20 @@ impl UrlExtractor {
             etag: None,
             last_modified: None,
             not_before_ms: None,
-        })
+        }
     }
 
-    /// Resolve a URL and apply filters
-    fn resolve_and_filter(
+    /// Resolve `href` against `join_base` (the page URL, or its `<base
+    /// href>`) and normalize it. Returns the normalized URL and its host.
+    /// `None` for an empty, `javascript:`, `mailto:`, `tel:`, `data:` or
+    /// fragment-only href, and for a non-http(s) target.
+    fn resolve(
         &self,
         href: &str,
-        base_url: &Url,
-        base_domain: &str,
-        seen: &mut HashSet<String>,
-    ) -> Option<String> {
-        // Skip empty, javascript:, mailto:, tel:, etc.
+        join_base: &Url,
+        page_url: &Url,
+        page_domain: &str,
+    ) -> Option<(String, String)> {
         let href = href.trim();
         if href.is_empty()
             || href.starts_with("javascript:")
@@ -250,20 +272,16 @@ impl UrlExtractor {
             return None;
         }
 
-        // Resolve relative URLs
-        let mut resolved = match base_url.join(href) {
-            Ok(url) => url,
-            Err(_) => return None,
-        };
+        let mut resolved = join_base.join(href).ok()?;
 
         // An `http://` link to the page's own host from an `https://` page
         // is the same page: keep the crawl on `https` rather than indexing
         // both schemes.
         if resolved.scheme() == "http"
-            && base_url.scheme() == "https"
+            && page_url.scheme() == "https"
             && resolved
                 .host_str()
-                .is_some_and(|h| h.eq_ignore_ascii_case(base_domain))
+                .is_some_and(|h| h.eq_ignore_ascii_case(page_domain))
         {
             let _ = resolved.set_scheme("https");
             if resolved.port() == Some(80) {
@@ -271,62 +289,37 @@ impl UrlExtractor {
             }
         }
 
-        // Normalize the URL
-        let normalized = self.normalize_url(&resolved)?;
-
-        // Filter non-page URLs (images, CSS, JS, fonts, and documents the
-        // job does not parse)
-        if is_non_page_url_for(&normalized, self.follow_pdf, self.follow_documents) {
-            return None;
-        }
-
-        // Check if already seen
-        if seen.contains(&normalized) {
-            return None;
-        }
-
-        // Check domain constraints
-        let url_domain = resolved.host_str()?.to_lowercase();
-        if !self.is_allowed_domain(&url_domain, base_domain) {
-            return None;
-        }
-
-        // Apply URL pattern filters
-        if let Some(ref patterns) = self.config.patterns {
-            if !matches_patterns(&normalized, patterns) {
-                return None;
-            }
-        }
-
-        seen.insert(normalized.clone());
-        Some(normalized)
+        let host = resolved.host_str()?.to_lowercase();
+        let normalized = normalize_link_url(&resolved)?;
+        Some((normalized, host))
     }
 
-    /// Normalize a URL (remove fragments, query parameters, trailing slashes, etc.)
-    fn normalize_url(&self, url: &Url) -> Option<String> {
-        // Only allow HTTP/HTTPS
-        if url.scheme() != "http" && url.scheme() != "https" {
-            return None;
+    /// Whether a resolved link is followed: not a non-page resource, not
+    /// already seen on this page, on an allowed domain and matching the URL
+    /// patterns. Records it in `seen` when accepted.
+    fn accept(
+        &self,
+        normalized: &str,
+        host: &str,
+        page_domain: &str,
+        seen: &mut HashSet<String>,
+    ) -> bool {
+        if is_non_page_url_for(normalized, self.follow_pdf, self.follow_documents) {
+            return false;
         }
-
-        let mut normalized = url.clone();
-
-        // Remove fragment
-        normalized.set_fragment(None);
-
-        // Remove query parameters — they almost never change page content
-        // and cause massive duplication (utm_*, fbclid, sort, ref, etc.)
-        normalized.set_query(None);
-
-        // Convert to string
-        let mut url_str = normalized.to_string();
-
-        // Remove trailing slash for consistency (except for root path "/")
-        if url_str.ends_with('/') && normalized.path().len() > 1 {
-            url_str.pop();
+        if seen.contains(normalized) {
+            return false;
         }
-
-        Some(url_str)
+        if !self.is_allowed_domain(host, page_domain) {
+            return false;
+        }
+        if let Some(ref patterns) = self.config.patterns {
+            if !matches_patterns(normalized, patterns) {
+                return false;
+            }
+        }
+        seen.insert(normalized.to_string());
+        true
     }
 
     /// Normalize a domain by stripping the `www.` prefix for comparison.
@@ -410,6 +403,36 @@ pub fn url_allowed(patterns: &UrlPatterns, url: &str) -> bool {
     }
 
     matches_patterns(url, patterns)
+}
+
+/// [`url_allowed`], with `http`/`https` and a leading `www.` treated as the
+/// same site: `url` is allowed when one of its spellings
+/// ([`scrapix_core::url_normalize::scheme_and_www_variants`]) matches an
+/// include pattern and none matches an exclude pattern. For judging where a
+/// redirect landed: `https://example.com/docs/*` accepts a redirect to
+/// `https://www.example.com/docs/a`, as it did before redirects were checked.
+pub fn url_allowed_any_scheme_or_www(patterns: &UrlPatterns, url: &str) -> bool {
+    if !patterns.allowed_domains.is_empty() {
+        let host_allowed = Url::parse(url).ok().and_then(|u| {
+            u.host_str()
+                .map(|h| UrlExtractor::host_in_allowed_domains(h, &patterns.allowed_domains))
+        });
+        if host_allowed != Some(true) {
+            return false;
+        }
+    }
+    let variants = scrapix_core::url_normalize::scheme_and_www_variants(url);
+    let any = |globs: &[String]| {
+        variants.iter().any(|v| {
+            globs
+                .iter()
+                .any(|p| scrapix_core::url_glob::matches_glob(v, p))
+        })
+    };
+    if any(&patterns.exclude) {
+        return false;
+    }
+    patterns.include.is_empty() || any(&patterns.include)
 }
 
 /// Check if a URL points to a non-page resource (image, PDF, CSS, JS, font, etc.)
@@ -1016,5 +1039,126 @@ mod tests {
         };
         assert!(url_allowed(&p, "https://www.a.test/x"));
         assert!(!url_allowed(&p, "https://b.test/x"));
+    }
+
+    #[test]
+    fn base_href_is_honored_for_relative_links() {
+        let extractor = UrlExtractor::with_defaults();
+        let page = make_page(
+            "https://a.test/app/deep/page",
+            r#"<html><head><base href="/app/"></head><body>
+               <a href="settings">s</a><a href="/root">r</a>
+               <a href="https://a.test/abs">a</a></body></html>"#,
+        );
+        let urls = extractor.extract_urls(&page);
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.test/app/settings",
+                "https://a.test/root",
+                "https://a.test/abs"
+            ]
+        );
+        // A non-http base is ignored.
+        let page = make_page(
+            "https://a.test/x/y",
+            r#"<base href="javascript:void(0)"><a href="z">z</a>"#,
+        );
+        assert_eq!(extractor.extract_urls(&page), vec!["https://a.test/x/z"]);
+    }
+
+    #[test]
+    fn query_strings_are_removed_from_links() {
+        let extractor = UrlExtractor::with_defaults();
+        let page = make_page(
+            "https://a.test/list",
+            r#"<a href="?page=2">2</a><a href="/w/index.php?action=edit">e</a>
+               <a href="/post/?replytocom=1#c">p</a>"#,
+        );
+        assert_eq!(
+            extractor.extract_urls(&page),
+            vec![
+                "https://a.test/list",
+                "https://a.test/w/index.php",
+                "https://a.test/post"
+            ]
+        );
+    }
+
+    #[test]
+    fn stored_links_are_filtered_capped_and_kept_past_max_depth() {
+        let extractor = UrlExtractorBuilder::new()
+            .patterns(UrlPatterns {
+                include: vec!["https://a.test/docs/*".into()],
+                ..Default::default()
+            })
+            .max_depth(1)
+            .build();
+        let page = make_page(
+            "https://a.test/docs",
+            r#"<a href="/docs/a/">a</a><a href="/blog">b</a>
+               <a href="https://other.test/x">o</a><a href="/docs/a">dup</a>
+               <a href="/docs/logo.png">img</a>"#,
+        );
+        let (links, stored) = extractor.extract_with_outlinks(&page, 0);
+        let links: Vec<_> = links.into_iter().map(|u| u.url).collect();
+        assert_eq!(links, vec!["https://a.test/docs/a"]);
+        // Only in-scope links are stored.
+        assert_eq!(stored, vec!["https://a.test/docs/a"]);
+        let replayed: Vec<_> = extractor
+            .extract_from_links("https://a.test/docs", stored, 0)
+            .into_iter()
+            .map(|u| u.url)
+            .collect();
+        assert_eq!(replayed, links);
+
+        // At max_depth nothing is followed, but the links are still stored
+        // (a later crawl may go deeper).
+        let (links, stored) = extractor.extract_with_outlinks(&page, 1);
+        assert!(links.is_empty());
+        assert_eq!(stored, vec!["https://a.test/docs/a"]);
+
+        // At most MAX_STORED_LINKS are stored.
+        let html: String = (0..MAX_STORED_LINKS + 50)
+            .map(|i| format!(r#"<a href="/docs/p{i}">p</a>"#))
+            .collect();
+        let (links, stored) =
+            extractor.extract_with_outlinks(&make_page("https://a.test/docs", &html), 0);
+        assert_eq!(stored.len(), MAX_STORED_LINKS);
+        assert_eq!(links.len(), MAX_STORED_LINKS + 50);
+    }
+
+    #[test]
+    fn redirect_targets_match_patterns_across_scheme_and_www() {
+        let p = UrlPatterns {
+            include: vec!["https://example.com/docs/*".into()],
+            exclude: vec!["https://example.com/docs/private/*".into()],
+            ..Default::default()
+        };
+        assert!(url_allowed_any_scheme_or_www(
+            &p,
+            "https://www.example.com/docs/a"
+        ));
+        assert!(url_allowed_any_scheme_or_www(
+            &p,
+            "http://example.com/docs/a"
+        ));
+        assert!(!url_allowed_any_scheme_or_www(
+            &p,
+            "https://www.example.com/blog/a"
+        ));
+        assert!(!url_allowed_any_scheme_or_www(
+            &p,
+            "https://www.example.com/docs/private/x"
+        ));
+        let d = UrlPatterns {
+            allowed_domains: vec!["example.com".into()],
+            ..Default::default()
+        };
+        assert!(url_allowed_any_scheme_or_www(
+            &d,
+            "https://www.example.com/x"
+        ));
+        assert!(!url_allowed_any_scheme_or_www(&d, "https://other.test/x"));
     }
 }

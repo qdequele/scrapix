@@ -10,7 +10,7 @@ use url::Url;
 use scrapix_core::{Document, RawPage, Result, ScrapixError};
 
 use crate::language::detect_language;
-use crate::markdown::html_to_main_content_markdown;
+use crate::markdown::html_to_markdown_for_page;
 use crate::readability::{extract_content_from_dom, ReadabilityConfig};
 
 /// HTML parser configuration
@@ -108,7 +108,8 @@ impl HtmlParser {
                 // `/scrape` does by default): readability's output is plain
                 // text, so converting it gave the text back with escapes.
                 if self.config.convert_to_markdown {
-                    doc.markdown = Some(html_to_main_content_markdown(&page.html));
+                    doc.markdown =
+                        Some(html_to_markdown_for_page(&page.html, &page.final_url, true));
                 }
 
                 // Readability output is already plain text, just normalize whitespace

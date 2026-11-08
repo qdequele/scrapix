@@ -895,10 +895,29 @@ impl FrontierService {
         Ok(())
     }
 
-    async fn handle_input(&self, msg: UrlMessage, ack: Ack) {
+    async fn handle_input(&self, mut msg: UrlMessage, ack: Ack) {
         self.metrics
             .messages_consumed
             .fetch_add(1, Ordering::Relaxed);
+
+        // One spelling per page, whatever published it (start URLs, sitemap
+        // entries, links, retries): the dedup set and the fetched URL both
+        // use the normalized form (fragment and trailing `/` removed; a query
+        // is kept: links arrive without one, start URLs and sitemap entries
+        // name that exact page).
+        match scrapix_core::url_normalize::normalize_entry_url(&msg.url.url) {
+            Some(normalized) => msg.url.url = normalized,
+            None => {
+                debug!(url = %msg.url.url, job_id = %msg.job_id, "Dropping a non-http(s) URL");
+                ack.ack();
+                return;
+            }
+        }
+
+        if msg.seen_only {
+            self.handle_seen_only(&msg, ack).await;
+            return;
+        }
         self.metrics.urls_received.fetch_add(1, Ordering::Relaxed);
 
         let Some(url) = self.boost(msg.url.clone()) else {
@@ -967,6 +986,19 @@ impl FrontierService {
             }
             backoff = (backoff * 2).min(ADMIT_BACKOFF_MAX);
         }
+    }
+
+    /// Record a [`UrlMessage::seen_only`] URL (the final URL of a redirect a
+    /// crawler followed) in the job's seen set. Best effort: the message is
+    /// acked even if the store fails, since losing it only costs a second
+    /// fetch of that page.
+    async fn handle_seen_only(&self, msg: &UrlMessage, ack: Ack) {
+        if let Err(e) = self.store.mark_seen(&msg.job_id, &msg.url.url).await {
+            warn!(url = %msg.url.url, job_id = %msg.job_id, error = %e, "Failed to mark a redirect target as seen");
+        } else {
+            debug!(url = %msg.url.url, job_id = %msg.job_id, "Marked a redirect target as seen");
+        }
+        ack.ack();
     }
 
     /// Sleep for `d`, waking early on shutdown. Returns true if shutting down.
@@ -1998,6 +2030,9 @@ mod tests {
             }
             self.inner.admit(job_id, url, queue_cap).await
         }
+        async fn mark_seen(&self, job_id: &str, url: &str) -> scrapix_core::Result<()> {
+            self.inner.mark_seen(job_id, url).await
+        }
         async fn pop_ready(
             &self,
             job_id: &str,
@@ -2201,6 +2236,38 @@ mod tests {
         let urls: std::collections::HashSet<_> =
             dispatched.iter().map(|m| m.url.url.clone()).collect();
         assert_eq!(urls.len(), 3, "each URL dispatched once");
+    }
+
+    #[tokio::test]
+    async fn spellings_of_one_page_and_redirect_targets_are_dispatched_once() {
+        let h = Harness::start().await;
+        let seed = seed_message("job-norm", None);
+        h.publish(&seed).await;
+        // A sitemap entry with a trailing slash and a link without it.
+        let sitemap = seed.child(CrawlUrl::seed("https://example.com/post/"));
+        let link = seed.child(CrawlUrl::new("https://example.com/post#c", 1));
+        // The crawler followed /old -> /landing: /landing is already fetched.
+        let seen = seed.seen_only_child("https://example.com/landing/");
+        let landing = seed.child(CrawlUrl::new("https://example.com/landing", 1));
+        // A sitemap entry with a query names that exact page: kept.
+        let paged = seed.child(CrawlUrl::seed("https://example.com/list/?page=2#x"));
+        h.publish(&sitemap).await;
+        h.publish(&link).await;
+        h.publish(&seen).await;
+        h.publish(&landing).await;
+        h.publish(&paged).await;
+
+        let dispatched = h.collect_dispatched(Duration::from_secs(2)).await;
+        h.stop();
+        let mut urls: Vec<_> = dispatched.iter().map(|m| m.url.url.clone()).collect();
+        urls.sort();
+        let mut expected = vec![
+            scrapix_core::url_normalize::normalize_entry_url(&seed.url.url).unwrap(),
+            "https://example.com/list?page=2".to_string(),
+            "https://example.com/post".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(urls, expected);
     }
 
     #[tokio::test]
@@ -3221,6 +3288,9 @@ mod tests {
                 _: usize,
             ) -> scrapix_core::Result<Admission> {
                 std::future::pending().await
+            }
+            async fn mark_seen(&self, j: &str, u: &str) -> scrapix_core::Result<()> {
+                self.0.mark_seen(j, u).await
             }
             async fn pop_ready(
                 &self,

@@ -27,7 +27,7 @@ mod features;
 
 pub use features::feature_applies;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -48,9 +48,7 @@ use scrapix_ai::{
 };
 use scrapix_core::content_types;
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage, ScrapixError};
-use scrapix_extractor::{
-    BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor, SelectorExtractor,
-};
+use scrapix_extractor::{BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor};
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
 use scrapix_lab::{log_lab_error, HostedAiClients, LabClient};
 use scrapix_ocr::{OcrEngine, OcrReport, OcrRequest};
@@ -500,6 +498,62 @@ struct StorageKey {
     batch_size: usize,
 }
 
+/// Jobs whose near-duplicate fingerprints a worker keeps at once; past
+/// it, the least recently started job's are dropped.
+const MAX_DEDUP_JOBS: usize = 64;
+
+/// Near-duplicate detectors, one per job, so fingerprints never outlive
+/// the crawl that recorded them. A finished or cancelled job's detector is
+/// dropped the next time a job starts on this worker.
+struct JobDedup {
+    config: NearDuplicateConfig,
+    jobs: parking_lot::Mutex<JobDetectors>,
+}
+
+/// `(job_id -> detector, job ids oldest first)`
+type JobDetectors = (
+    HashMap<String, Arc<NearDuplicateDetector>>,
+    VecDeque<String>,
+);
+
+impl JobDedup {
+    fn new(config: NearDuplicateConfig) -> Self {
+        Self {
+            config,
+            jobs: parking_lot::Mutex::new((HashMap::new(), VecDeque::new())),
+        }
+    }
+
+    fn for_job(&self, job_id: &str, finished: &CancelledJobs) -> Arc<NearDuplicateDetector> {
+        let mut guard = self.jobs.lock();
+        let (detectors, order) = &mut *guard;
+        if let Some(detector) = detectors.get(job_id) {
+            return detector.clone();
+        }
+        order.retain(|id| {
+            let keep = !finished.contains(id);
+            if !keep {
+                detectors.remove(id);
+            }
+            keep
+        });
+        while order.len() >= MAX_DEDUP_JOBS {
+            if let Some(oldest) = order.pop_front() {
+                detectors.remove(&oldest);
+            }
+        }
+        let detector = Arc::new(NearDuplicateDetector::new(self.config.clone()));
+        detectors.insert(job_id.to_string(), detector.clone());
+        order.push_back(job_id.to_string());
+        detector
+    }
+
+    #[cfg(test)]
+    fn jobs(&self) -> usize {
+        self.jobs.lock().0.len()
+    }
+}
+
 /// Schema extractor cache key: `(sorted only_types, convert_dates)`.
 type SchemaKey = (Vec<String>, bool);
 
@@ -532,7 +586,8 @@ struct ContentWorker {
     ocr: Option<Arc<OcrEngine>>,
     ai_config: AiConfig,
     ai_usage_rx: parking_lot::Mutex<Option<scrapix_ai::AiUsageReceiver>>,
-    dedup_detector: Option<Arc<NearDuplicateDetector>>,
+    /// Near-duplicate detection (`ENABLE_DEDUP`), one detector per job.
+    dedup_detector: Option<JobDedup>,
     block_splitter: Option<BlockSplitter>,
     /// Schema extractors for jobs with `schema.only_types` / `convert_dates`,
     /// keyed by those options.
@@ -731,9 +786,9 @@ impl ContentWorker {
                 simhash_threshold = args.dedup_simhash_threshold,
                 minhash_threshold = args.dedup_minhash_threshold,
                 max_fingerprints = args.dedup_max_fingerprints,
-                "Near-duplicate detection enabled (scoped per index)"
+                "Near-duplicate detection enabled (scoped per job and index)"
             );
-            Some(Arc::new(NearDuplicateDetector::new(config)))
+            Some(JobDedup::new(config))
         } else {
             None
         };
@@ -1279,6 +1334,7 @@ impl ContentWorker {
                     ai_enriched,
                     ocr_pages,
                     ai_usage,
+                    documents: docs.len() as u64,
                 },
                 docs: docs.len() as u64,
                 ack,
@@ -1375,7 +1431,7 @@ impl ContentWorker {
             .as_ref()
             .map(|j| j.index_only.as_slice())
             .unwrap_or_default();
-        if !features::index_only_allows(index_only, &msg.url) {
+        if !features::index_only_allows(index_only, indexed_url(msg)) {
             self.metrics.record_skipped();
             return PageOutcome::Skipped("index_only".to_string());
         }
@@ -1417,7 +1473,7 @@ impl ContentWorker {
             Err(e) => return PageOutcome::Failed(format!("Parse error: {}", e)),
         };
 
-        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        let features = features::page_features(&self.resolve_features(msg), indexed_url(msg));
         self.stamp(&mut document, msg);
         Self::filter_document(&mut document, &features);
         if features.schema_enabled() {
@@ -1470,10 +1526,11 @@ impl ContentWorker {
                     info!(url = %msg.url, block_count = extracted.count, "Split page into content blocks");
                     self.metrics
                         .record_success(page_size, extracted.count as u64);
+                    let mut used_ids = HashSet::new();
                     let docs = extracted
                         .blocks
                         .iter()
-                        .map(|block| Self::create_block_document(&document, block))
+                        .map(|block| Self::create_block_document(&document, block, &mut used_ids))
                         .collect();
                     return PageOutcome::Index {
                         docs,
@@ -1515,7 +1572,7 @@ impl ContentWorker {
             return PageOutcome::Skipped(reason);
         }
 
-        let features = features::page_features(&self.resolve_features(msg), &msg.url);
+        let features = features::page_features(&self.resolve_features(msg), indexed_url(msg));
         self.stamp(&mut document, msg);
         Self::filter_document(&mut document, &features);
 
@@ -1635,7 +1692,7 @@ impl ContentWorker {
             }
         }
 
-        let features = features::page_features(&job_features, &msg.url);
+        let features = features::page_features(&job_features, indexed_url(msg));
         self.stamp(&mut document, msg);
         let descriptor = document.metadata.clone();
         Self::filter_document(&mut document, &features);
@@ -1688,10 +1745,15 @@ impl ContentWorker {
         );
     }
 
-    /// Near-duplicate check, scoped to the page's Meilisearch index (R9).
+    /// Near-duplicate check, scoped to the page's job and Meilisearch
+    /// index (R9): a page is never skipped as a copy of a page an earlier
+    /// crawl saw (the original may be gone, e.g. moved to the new URL).
     /// Returns the skip reason for a duplicate.
     fn near_duplicate(&self, document: &Document, msg: &RawPageMessage) -> Option<String> {
-        let detector = self.dedup_detector.as_ref()?;
+        let detector = self
+            .dedup_detector
+            .as_ref()?
+            .for_job(&msg.job_id, &self.cancelled);
         let content = document
             .content
             .as_ref()
@@ -1717,20 +1779,39 @@ impl ContentWorker {
         )
     }
 
-    /// Create a document from a content block
-    fn create_block_document(parent_doc: &Document, block: &ContentBlock) -> Document {
-        // Build URL with anchor if available
-        let block_url = if let Some(ref anchor) = block.anchor {
-            format!("{}#{}", parent_doc.url, anchor)
-        } else {
-            format!("{}#block-{}", parent_doc.url, block.index)
+    /// Create a document from a content block. `used_ids` holds the id
+    /// keys of the page's blocks so far: a block whose heading id repeats
+    /// one (duplicate `id` attributes) gets a distinct uid instead of
+    /// overwriting the earlier block.
+    fn create_block_document(
+        parent_doc: &Document,
+        block: &ContentBlock,
+        used_ids: &mut HashSet<String>,
+    ) -> Document {
+        // Build URL with anchor if available (an empty `id` is no anchor)
+        let anchor = block
+            .anchor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty());
+        let block_url = match anchor {
+            Some(anchor) => format!("{}#{}", parent_doc.url, anchor),
+            None => format!("{}#block-{}", parent_doc.url, block.index),
         };
+        // The first block with a given URL keeps the uid it always had.
+        let mut id_key = block_url.clone();
+        let mut n = block.index;
+        while !used_ids.insert(id_key.clone()) {
+            id_key = format!("{block_url}~{n}");
+            n += 1;
+        }
 
         // Build title from heading hierarchy
-        let block_title = if let Some(ref heading) = block.heading {
+        let heading = block.heading.as_deref().filter(|h| !h.is_empty());
+        let block_title = if let Some(heading) = heading {
             match &parent_doc.title {
                 Some(page_title) => Some(format!("{} - {}", page_title, heading)),
-                None => Some(heading.clone()),
+                None => Some(heading.to_string()),
             }
         } else {
             parent_doc.title.clone()
@@ -1744,7 +1825,7 @@ impl ContentWorker {
             .collect();
 
         Document {
-            uid: Document::uid_from_url(&block_url),
+            uid: Document::uid_from_url(&id_key),
             url: parent_doc.url.clone(),
             block_url: Some(block_url),
             domain: parent_doc.domain.clone(),
@@ -1769,10 +1850,11 @@ impl ContentWorker {
             h4: block.h4.clone(),
             h5: block.h5.clone(),
             h6: block.h6.clone(),
-            anchor: block.anchor.clone(),
-            // Fields not used for blocks
-            schema: None,
-            custom: None,
+            anchor: anchor.map(str::to_string),
+            // Page-level extractions apply to every block of the page
+            schema: parent_doc.schema.clone(),
+            custom: parent_doc.custom.clone(),
+            // Not computed for blocks (AI enrichment is skipped)
             ai_summary: None,
             ai_extraction: None,
             _crawl_job_id: parent_doc._crawl_job_id.clone(),
@@ -2092,24 +2174,26 @@ impl ContentWorker {
         if !config.enabled || config.selectors.is_empty() {
             return None;
         }
-
-        let simple: HashMap<String, String> = config
+        let dom = scrapix_extractor::scraper::Html::parse_document(html);
+        let values: HashMap<String, serde_json::Value> = config
             .selectors
             .iter()
-            .map(|(field, def)| {
-                let selector = match def {
-                    scrapix_core::SelectorDef::Single(s) => s.clone(),
-                    scrapix_core::SelectorDef::Multiple(v) => v.join(", "),
-                };
-                (field.clone(), selector)
+            .filter_map(|(field, def)| {
+                scrapix_extractor::combined_matches(&dom, def.selectors())
+                    .map(|value| (field.clone(), value))
             })
             .collect();
+        (!values.is_empty()).then_some(values)
+    }
+}
 
-        let extractor = SelectorExtractor::from_simple(simple);
-        match extractor.extract(html) {
-            Ok(extracted) if !extracted.values.is_empty() => Some(extracted.values),
-            _ => None,
-        }
+/// The URL a page is indexed under (its final URL after redirects): what
+/// `index_only` and the per-feature page filters match.
+fn indexed_url(msg: &RawPageMessage) -> &str {
+    if msg.final_url.is_empty() {
+        &msg.url
+    } else {
+        &msg.final_url
     }
 }
 
@@ -2966,6 +3050,164 @@ mod tests {
         assert_eq!(sent, 4, "2 + 1 rejected + 1 accepted");
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert_eq!(indexed_count(&events), 1, "{events:?}");
+        let documents: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                CrawlEvent::DocumentIndexed { documents, .. } => Some(*documents),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(documents, vec![3], "the page wrote one document per block");
+    }
+
+    /// Block documents keep the page's `custom` and `schema`, have unique
+    /// uids even with duplicate or empty heading ids, and clean titles.
+    #[tokio::test]
+    async fn block_documents_carry_page_fields_and_unique_ids() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let para = "<p>A paragraph long enough to be kept as its own block by the \
+                    splitter, well over fifty characters.</p>";
+        let html = format!(
+            "<html><head><title>Docs</title><script type=\"application/ld+json\">\
+             {{\"@type\":\"Article\",\"headline\":\"H\"}}</script></head><body><main>\
+             <ul class=\"crumbs\"><li>Home</li><li>Books</li><li>Mystery</li></ul>\
+             <h2 id=\"dup\">One</h2>{para}<h2 id=\"dup\">Two</h2>{para}\
+             <h2 id=\"\">{zw}How it works</h2>{para}<h2>Four</h2>{para}\
+             </main></body></html>",
+            zw = '\u{200B}'
+        );
+        let mut msg = page("https://a.test/docs", 200, None);
+        msg.html = html;
+        let on = || {
+            Some(FeatureToggle {
+                enabled: true,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            })
+        };
+        msg.features = Some(FeaturesConfig {
+            block_split: on(),
+            schema: Some(scrapix_core::SchemaFeatureConfig {
+                enabled: true,
+                only_types: vec![],
+                convert_dates: false,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            custom_selectors: Some(scrapix_core::CustomSelectorsConfig {
+                enabled: true,
+                selectors: HashMap::from([(
+                    "crumbs".to_string(),
+                    scrapix_core::SelectorDef::Single(".crumbs li".to_string()),
+                )]),
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            ..Default::default()
+        });
+        let PageOutcome::Index { docs, .. } = w.process_page(&msg).await else {
+            panic!("page must be indexed");
+        };
+        assert!(docs.len() >= 4, "{docs:?}");
+        let uids: HashSet<&String> = docs.iter().map(|d| &d.uid).collect();
+        assert_eq!(uids.len(), docs.len(), "block uids must be unique");
+        for doc in &docs {
+            assert_eq!(
+                doc.custom.as_ref().unwrap()["crumbs"],
+                serde_json::json!(["Home", "Books", "Mystery"])
+            );
+            assert_eq!(doc.schema.as_ref().unwrap()["headline"], "H");
+        }
+        let how = docs
+            .iter()
+            .find(|d| d.h2.as_deref() == Some("How it works"))
+            .expect("the zero-width heading block");
+        assert_eq!(how.title.as_deref(), Some("Docs - How it works"));
+        assert!(how.anchor.is_none(), "an empty id is no anchor");
+        let dup: Vec<&Document> = docs
+            .iter()
+            .filter(|d| d.anchor.as_deref() == Some("dup"))
+            .collect();
+        assert_eq!(dup.len(), 2);
+        assert_eq!(
+            dup[0].uid,
+            Document::uid_from_url("https://a.test/docs#dup"),
+            "the first block keeps its stable uid"
+        );
+    }
+
+    /// `index_only` and per-feature page filters match the URL the page is
+    /// indexed under (after redirects), not the requested one.
+    #[tokio::test]
+    async fn page_filters_match_the_final_url() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+        let job = JobSpec {
+            index_only: vec!["https://a.test/docs/**".into()],
+            ..Default::default()
+        };
+        let mut moved_out = page("https://a.test/docs/old", 200, Some(job.clone()));
+        moved_out.final_url = "https://a.test/blog/new".into();
+        assert!(matches!(
+            w.process_page(&moved_out).await,
+            PageOutcome::Skipped(reason) if reason == "index_only"
+        ));
+
+        let mut moved_in = page("https://a.test/blog/old", 200, Some(job));
+        moved_in.final_url = "https://a.test/docs/new".into();
+        moved_in.features = Some(FeaturesConfig {
+            markdown: Some(FeatureToggle {
+                enabled: true,
+                include_pages: vec!["https://a.test/docs/**".into()],
+                exclude_pages: vec![],
+            }),
+            ..Default::default()
+        });
+        let (doc, _) = indexed_doc(w.process_page(&moved_in).await);
+        assert_eq!(doc.url, "https://a.test/docs/new");
+        assert!(doc.markdown.is_some(), "markdown's include_pages match");
+    }
+
+    /// Near-duplicate memory is per job: a page moved to a new URL is not a
+    /// copy of the URL an earlier crawl saw, and a finished job's
+    /// fingerprints are dropped.
+    #[tokio::test]
+    async fn near_duplicates_are_scoped_per_job() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = build_worker(&bus, &ms, &["--enable-dedup"]);
+        let in_job = |url: &str, job: &str| {
+            let mut m = page(url, 200, None);
+            m.job_id = job.into();
+            m
+        };
+        assert!(matches!(
+            w.process_page(&in_job("https://a.test/old", "job-a")).await,
+            PageOutcome::Index { .. }
+        ));
+        w.cancelled.insert("job-a");
+        assert!(
+            matches!(
+                w.process_page(&in_job("https://a.test/new", "job-b")).await,
+                PageOutcome::Index { .. }
+            ),
+            "not a copy of the previous crawl's page"
+        );
+        assert!(
+            matches!(
+                w.process_page(&in_job("https://a.test/copy", "job-b")).await,
+                PageOutcome::Skipped(reason) if reason.starts_with("Near-duplicate of")
+            ),
+            "copies within one job are still skipped"
+        );
+        assert_eq!(
+            w.dedup_detector.as_ref().unwrap().jobs(),
+            1,
+            "the finished job's detector is dropped"
+        );
     }
 
     /// R5: a page of a cancelled (or finished) job is acked and never

@@ -351,6 +351,28 @@ pub async fn requeue_after_release_drops_the_urls(s: &dyn FrontierStore) {
     assert_eq!(c.dropped, 1, "and the URL counted as dropped");
 }
 
+/// A URL marked seen (the final URL of a followed redirect) is a duplicate
+/// for a later `admit`, without being queued or counted; marking is a no-op
+/// for an unknown, finished or released job.
+pub async fn mark_seen_makes_later_admit_a_duplicate(s: &dyn FrontierStore) {
+    s.mark_seen("nope", "https://a.test/x").await.unwrap();
+    s.ensure_job("j", "{}", None, None).await.unwrap();
+    s.set_state("j", JobRunState::Running).await.unwrap();
+    s.mark_seen("j", "https://a.test/landing").await.unwrap();
+    assert_eq!(s.counters("j").await.unwrap(), JobCounters::default());
+    assert_eq!(s.queued("j").await.unwrap(), 0);
+    assert_eq!(
+        s.admit("j", &CrawlUrl::seed("http://a.test/landing"), 100)
+            .await
+            .unwrap(),
+        Admission::Duplicate
+    );
+    s.set_state("j", JobRunState::Finished).await.unwrap();
+    s.release("j", Duration::from_secs(60)).await.unwrap();
+    s.mark_seen("j", "https://a.test/after").await.unwrap();
+    assert_eq!(s.state("j").await.unwrap(), Some(JobRunState::Finished));
+}
+
 pub async fn lease_is_exclusive(s: &dyn FrontierStore) {
     let ttl = std::time::Duration::from_secs(5);
     assert!(s.try_lease("j", "a", ttl).await.unwrap());
@@ -382,6 +404,7 @@ where
     retries_bypass_dedup_and_budget(&*make().await).await;
     cancelled_job_admits_nothing_and_release_frees(&*make().await).await;
     requeue_after_release_drops_the_urls(&*make().await).await;
+    mark_seen_makes_later_admit_a_duplicate(&*make().await).await;
     lease_is_exclusive(&*make().await).await;
 }
 

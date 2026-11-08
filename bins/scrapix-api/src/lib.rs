@@ -896,8 +896,8 @@ impl AppState {
             Finalize::Wait => false,
             // Don't fail a job that crawled pages in the meantime (or
             // complete one that turned out to have none).
-            Finalize::Complete => acc.is_balanced() && acc.pages_crawled_ok > 0,
-            Finalize::FailNoPages => acc.is_balanced() && acc.pages_crawled_ok == 0,
+            Finalize::Complete => acc.is_balanced() && acc.has_pages(),
+            Finalize::FailNoPages => acc.is_balanced() && !acc.has_pages(),
             Finalize::FailStalled => {
                 !acc.is_balanced()
                     && self
@@ -1915,7 +1915,11 @@ impl AppState {
                     account_id: self.diagnostics_account(job_id, event),
                 });
             }
-            CrawlEvent::DocumentIndexed { ai_usage, .. } if !frozen => {
+            CrawlEvent::DocumentIndexed {
+                ai_usage,
+                documents,
+                ..
+            } if !frozen => {
                 self.update_job(job_id, |j| {
                     match accounted {
                         Some(c) => {
@@ -1927,7 +1931,8 @@ impl AppState {
                             j.ai_usage.add(ai_usage);
                         }
                     }
-                    j.documents_sent += 1;
+                    // Documents written, one per block with block_split.
+                    j.documents_sent += (*documents).max(1);
                 });
                 self.crawl.dirty_jobs.write().insert(job_id.to_string());
             }
@@ -2288,8 +2293,8 @@ fn crawl_event_to_ai_usage(
 }
 
 /// Replace-strategy post-crawl cleanup, run only on true completion (R5):
-/// delete stale documents from previous crawls and return the verified
-/// Meilisearch document count. Non-Replace jobs return `documents_indexed`
+/// delete stale documents from previous crawls and return the pages
+/// indexed, checked against this job's documents in Meilisearch. Non-Replace jobs return `documents_indexed`
 /// unchanged. `Err` carries the job failure message.
 async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, String> {
     let Some(ref replace_url) = job.swap_meilisearch_url else {
@@ -2318,10 +2323,15 @@ async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, 
 
     // Check for failed indexing tasks before cleanup — these indicate that
     // fire-and-forget document submissions were rejected by Meilisearch.
+    let since = job
+        .started_at
+        .map(|t| offset_datetime_from_millis(t.timestamp_millis()))
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     let failed_tasks = scrapix_storage::meilisearch::MeilisearchStorage::log_failed_tasks(
         replace_url,
         ms_key,
         index_uid,
+        since,
     )
     .await;
     if failed_tasks > 0 {
@@ -2358,32 +2368,36 @@ async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, 
         "Stale document cleanup completed successfully"
     );
 
-    // Query the actual document count from Meilisearch rather than trusting
-    // the accounted counter (documents submitted to the batch buffer, not
-    // confirmed Meilisearch task results).
-    Ok(
-        match scrapix_storage::meilisearch::MeilisearchStorage::get_actual_document_count(
-            replace_url,
-            ms_key,
-            index_uid,
-        )
-        .await
-        {
-            Some(actual_count) => {
-                if actual_count != documents_indexed {
-                    warn!(
-                        job_id = %job_id,
-                        index = %index_uid,
-                        reported = documents_indexed,
-                        actual = actual_count,
-                        "Document count mismatch: reported count differs from actual Meilisearch count. Meilisearch indexing tasks may have failed silently."
-                    );
-                }
-                actual_count
-            }
-            None => documents_indexed,
-        },
+    // The accounted count is pages Meilisearch accepted (enqueued); a
+    // task can still fail afterwards. Lower it to the documents this job
+    // actually has in the index, never to the whole index (other crawls
+    // can share it). With block_split a page has several documents, so the
+    // job's document count only caps the page count.
+    let job_documents = scrapix_storage::meilisearch::MeilisearchStorage::count_job_documents(
+        replace_url,
+        ms_key,
+        index_uid,
+        job_id,
     )
+    .await;
+    Ok(verified_pages_indexed(documents_indexed, job_documents))
+}
+
+/// Pages indexed by a Replace job: the accounted count, lowered to the
+/// job's own document count in Meilisearch when that is smaller (tasks
+/// that failed after being accepted).
+fn verified_pages_indexed(accounted: u64, job_documents: Option<u64>) -> u64 {
+    match job_documents {
+        Some(n) if n < accounted => {
+            warn!(
+                reported = accounted,
+                in_index = n,
+                "Fewer documents in Meilisearch than pages reported indexed: indexing tasks failed"
+            );
+            n
+        }
+        _ => accounted,
+    }
 }
 
 /// Extract domain from URL
@@ -2763,7 +2777,10 @@ struct JobStatusResponse {
     status: String,
     index_uid: String,
     pages_crawled: u64,
+    /// Pages whose documents Meilisearch accepted
     pages_indexed: u64,
+    /// Meilisearch documents written: one per page, or one per block with
+    /// `features.block_split`
     documents_sent: u64,
     errors: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4059,21 +4076,33 @@ pub(crate) async fn perform_scrape(
         .map(|c| c.values);
 
     // (d) Run parser functions on processed HTML
+    // Markdown links point at absolute URLs, resolved against the page's
+    // `<base href>` (read from the original HTML: preprocessing may drop
+    // `<head>`) or its final URL.
+    let page_base = scrapix_parser::document_base_url(&original_html, &final_url);
     let markdown = if formats.contains(&ScrapeFormat::Markdown) {
-        if request.only_main_content {
-            Some(html_to_main_content_markdown(&processed_html))
+        let md = if request.only_main_content {
+            html_to_main_content_markdown(&processed_html)
         } else {
-            Some(html_to_markdown(&processed_html))
-        }
+            html_to_markdown(&processed_html)
+        };
+        Some(match &page_base {
+            Some(base) => scrapix_parser::absolutize_markdown_links(&md, base),
+            None => md,
+        })
     } else {
         None
     };
 
+    // `content` is plain text in both modes (it was the page's markdown
+    // when `only_main_content` was false).
     let content = if formats.contains(&ScrapeFormat::Content) {
         if request.only_main_content {
             Some(extract_content(&processed_html))
         } else {
-            Some(html_to_markdown(&processed_html))
+            Some(scrapix_parser::markdown_to_text(&html_to_markdown(
+                &processed_html,
+            )))
         }
     } else {
         None
@@ -4564,6 +4593,12 @@ pub(crate) fn validate_crawl_config(config: &mut CrawlConfig) -> Result<(), ApiE
     }
     check_index_uid(&config.index_uid)
         .map_err(|msg| ApiError::new(format!("index_uid: {msg}"), "validation_error"))?;
+    check_primary_key(config.meilisearch.primary_key.as_deref()).map_err(|msg| {
+        ApiError::new(
+            format!("meilisearch.primary_key: {msg}"),
+            "validation_error",
+        )
+    })?;
     if let Some(ref proxy) = config.proxy {
         validate_proxy_config(proxy)
             .map_err(|msg| ApiError::new(format!("proxy: {msg}"), "validation_error"))?;
@@ -4594,6 +4629,20 @@ pub(crate) fn check_http_url(url: &str) -> Result<(), String> {
 }
 
 /// A Meilisearch index uid: 1 to 511 ASCII letters, digits, `-` or `_`.
+/// Crawled documents carry their id in `uid` (a UUID derived from the URL)
+/// and no other field fit to be a Meilisearch primary key: any other value
+/// would have every document refused by Meilisearch after the crawl
+/// reported it indexed.
+fn check_primary_key(primary_key: Option<&str>) -> Result<(), String> {
+    match primary_key {
+        None | Some("") | Some("uid") => Ok(()),
+        Some(other) => Err(format!(
+            "must be \"uid\" (got \"{other}\"): crawled documents are identified by their \
+             `uid` field. Omit it, or crawl into an index whose primary key is `uid`"
+        )),
+    }
+}
+
 pub(crate) fn check_index_uid(uid: &str) -> Result<(), String> {
     let valid = (1..=511).contains(&uid.len())
         && uid
@@ -4919,31 +4968,13 @@ pub(crate) async fn do_create_crawl(
         "Using domain whitelist for crawl"
     );
 
-    // Auto-generate include patterns from start_urls path prefixes when none specified.
-    // e.g. start_url "https://example.com/docs" -> include pattern "https://example.com/docs/*"
-    // This prevents crawling the entire site when only a subdirectory was intended.
-    // NOTE: these are full-URL glob patterns (`scheme://host/path/*`). Task B4 unifies the
-    // sitemap-discovered-URL filter and this include-pattern filter onto one matcher that
-    // understands full-URL patterns, so no change is needed here beyond this note.
+    // Auto-generate include patterns from start_urls sections when none specified.
+    // e.g. start_url "https://example.com/docs" -> "http(s)://(www.)example.com/docs/*"
+    // This prevents crawling the entire site when only a subdirectory was intended,
+    // and survives a start URL that redirects to https or to/from `www.` (see
+    // `scrapix_core::url_normalize::auto_include_patterns`).
     let include_patterns = if config.url_patterns.include.is_empty() {
-        let mut patterns: Vec<String> = config
-            .start_urls
-            .iter()
-            .filter_map(|u| url::Url::parse(u).ok())
-            .filter(|u| u.path() != "/" && u.path() != "")
-            .map(|u| {
-                let base = format!(
-                    "{}://{}{}",
-                    u.scheme(),
-                    u.host_str().unwrap_or(""),
-                    u.path().trim_end_matches('/')
-                );
-                format!("{}/*", base)
-            })
-            .collect();
-        patterns.sort();
-        patterns.dedup();
-
+        let patterns = scrapix_core::url_normalize::auto_include_patterns(&config.start_urls);
         if !patterns.is_empty() {
             info!(
                 job_id = %job_id,
@@ -4951,7 +4982,6 @@ pub(crate) async fn do_create_crawl(
                 "Auto-generated include patterns from start_urls path prefixes"
             );
         }
-
         patterns
     } else {
         config.url_patterns.include.clone()
@@ -5227,9 +5257,9 @@ enum MapFetchOutcome {
     Failed,
 }
 
-/// Links of an HTML document, relative ones resolved against `page_url`
-/// (where the document was served). Only http(s) links on `domain` are
-/// kept, without their fragment.
+/// Links of an HTML document, relative ones resolved against its `<base
+/// href>` or else `page_url` (where the document was served). Only http(s)
+/// links on `domain` are kept, without their fragment.
 fn extract_page_links(
     html: &str,
     page_url: &url::Url,
@@ -5242,12 +5272,13 @@ fn extract_page_links(
     let link_selector =
         LINK_SELECTOR.get_or_init(|| scraper::Selector::parse("a[href]").expect("valid selector"));
 
+    let base = scrapix_crawler::document_base_url(&document, page_url);
     let mut links = Vec::new();
     for element in document.select(link_selector) {
         let Some(href) = element.value().attr("href") else {
             continue;
         };
-        let Ok(mut resolved) = page_url.join(href) else {
+        let Ok(mut resolved) = base.join(href) else {
             continue;
         };
         if !matches!(resolved.scheme(), "http" | "https")
@@ -7858,6 +7889,20 @@ mod tests {
     }
 
     #[test]
+    fn map_links_resolve_against_base_href() {
+        let page = url::Url::parse("https://a.test/app/deep/page").unwrap();
+        let html = r#"<head><base href="/app/"></head><a href="settings">S</a>"#;
+        let links = extract_page_links(html, &page, "a.test");
+        assert_eq!(
+            links,
+            vec![(
+                "https://a.test/app/settings".to_string(),
+                Some("S".to_string())
+            )]
+        );
+    }
+
+    #[test]
     fn finished_jobs_report_no_eta() {
         let mut job = JobState::new("j", "idx");
         job.start();
@@ -8329,6 +8374,44 @@ mod tests {
             }));
             assert!(validate_crawl_config(&mut cfg).is_ok(), "{good}");
         }
+    }
+
+    #[test]
+    fn validate_accepts_only_the_uid_primary_key() {
+        for bad in ["id", "url", "parent_document_id"] {
+            let mut cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test"], "index_uid": "a",
+                "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k", "primary_key": bad}
+            }));
+            let err = validate_crawl_config(&mut cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"));
+            assert_eq!(err.code, "validation_error");
+            assert!(
+                err.error.starts_with("meilisearch.primary_key: "),
+                "{}",
+                err.error
+            );
+        }
+        for good in [serde_json::json!("uid"), serde_json::json!(null)] {
+            let mut cfg = crawl_config(serde_json::json!({
+                "start_urls": ["https://a.test"], "index_uid": "a",
+                "meilisearch": {"url": "http://127.0.0.1:7700", "api_key": "k", "primary_key": good}
+            }));
+            assert!(validate_crawl_config(&mut cfg).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn verified_pages_indexed_never_counts_other_crawls() {
+        // Another crawl shares the index: its documents are not counted.
+        assert_eq!(verified_pages_indexed(1, Some(1)), 1);
+        // block_split: more documents than pages, the page count stands.
+        assert_eq!(verified_pages_indexed(14, Some(241)), 14);
+        // Tasks failed after being accepted: fewer documents landed.
+        assert_eq!(verified_pages_indexed(20, Some(12)), 12);
+        // The count could not be read: keep the accounted pages.
+        assert_eq!(verified_pages_indexed(20, None), 20);
     }
 
     #[test]
@@ -9420,6 +9503,7 @@ mod lifecycle_tests {
             ai_enriched: false,
             ocr_pages: 0,
             ai_usage: Default::default(),
+            documents: 1,
         }
     }
 
@@ -10814,6 +10898,7 @@ mod lifecycle_tests {
                     ai_enriched,
                     ocr_pages: 0,
                     ai_usage: Default::default(),
+                    documents: 1,
                 },
             );
         }
@@ -10918,6 +11003,7 @@ mod lifecycle_tests {
                     ai_enriched: false,
                     ocr_pages,
                     ai_usage: Default::default(),
+                    documents: 1,
                 },
             );
         }

@@ -176,3 +176,44 @@ async fn already_filterable_and_nothing_unscoped_in_scope() {
         "the blog page of another crawl is kept"
     );
 }
+
+/// A Replace job counts its own documents (`_crawl_job_id`), not the
+/// whole index another crawl shares.
+#[tokio::test]
+async fn job_document_count_filters_on_the_job() {
+    let ms = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/indexes/{INDEX}/documents/fetch")))
+        .respond_with(|req: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["filter"], format!("_crawl_job_id = \"{JOB}\""));
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{"_crawl_job_id": JOB}], "limit": 1, "offset": 0, "total": 7}))
+        })
+        .mount(&ms)
+        .await;
+    let n = MeilisearchStorage::count_job_documents(&ms.uri(), None, INDEX, JOB).await;
+    assert_eq!(n, Some(7));
+}
+
+/// Failed tasks of earlier jobs on the index are not reported: only
+/// document tasks enqueued since the job started.
+#[tokio::test]
+async fn failed_tasks_are_scoped_to_the_job_start() {
+    let ms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(|req: &Request| {
+            let query = req.url.query().unwrap_or_default().to_string();
+            assert!(query.contains("afterEnqueuedAt="), "{query}");
+            assert!(query.contains("types=documentAdditionOrUpdate"), "{query}");
+            assert!(query.contains("statuses=failed"), "{query}");
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [], "total": 3, "limit": 20, "from": null, "next": null}))
+        })
+        .mount(&ms)
+        .await;
+    let since = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+    let failed = MeilisearchStorage::log_failed_tasks(&ms.uri(), None, INDEX, since).await;
+    assert_eq!(failed, 3, "the total, not one page of results");
+}

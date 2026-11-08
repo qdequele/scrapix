@@ -58,7 +58,7 @@ Control which URLs are crawled and indexed:
 |-------|-------------|
 | `include` | Glob patterns — only crawl matching URLs |
 | `exclude` | Glob patterns — skip matching URLs |
-| `index_only` | Crawl all, but only index matches |
+| `index_only` | Crawl all, but only index matches (matched against the page's final URL, after redirects) |
 | `allowed_domains` | Domain whitelist (alternative to top-level) |
 
 Patterns are globs over the whole URL: `**` matches anything, `/` included;
@@ -209,6 +209,22 @@ Toggle individual extraction features:
 }
 ```
 
+`custom_selectors` writes each field under `custom.<field>`:
+
+- a **CSS selector** (`".product-price"`) collects the trimmed text of every
+  element it matches: a string when one element matches, an array of strings
+  when several do (`".breadcrumb li"` gives `["Home", "Books", "Mystery"]`);
+- a **list of selectors** (`[".tag", ".category"]`) combines the matches of
+  every selector, in list order then page order (an element matched twice
+  counts once), with the same string-or-array rule;
+- an element without text (such as `<meta>`) gives its `content` attribute;
+  empty values are dropped, and a field nothing matches is left out;
+- an invalid selector is skipped (the field keeps the other selectors'
+  matches).
+
+With `block_split`, `custom` and `schema` are copied onto every block
+document of the page.
+
 #### Documents (PDF, office formats) and OCR
 
 ```json
@@ -237,7 +253,8 @@ of being skipped as non-page resources. OCR pages are counted, not charged in
 Scrapix credits (hosted vision OCR runs on the team's AI gateway).
 See [Documents & OCR](/guides/documents).
 
-Each feature supports page-level filtering:
+Each feature supports page-level filtering (patterns match the page's final
+URL, after redirects, the one it is indexed under):
 
 ```json
 {
@@ -277,6 +294,11 @@ Configure the destination index:
   }
 }
 ```
+
+`primary_key` can only be `uid` (the default): every crawled document is
+identified by its `uid`, a UUID derived from its URL. Any other value is
+refused with a `400 validation_error`. To crawl into an existing index, its
+primary key must be `uid`.
 
 Which instance is used:
 

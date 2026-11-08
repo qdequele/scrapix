@@ -89,8 +89,8 @@ pub use blocks::{BlockConfig, BlockError, BlockSplitter, ContentBlock, Extracted
 pub use metadata::{ExtractedMetadata, FeedLink, MetadataError, MetadataExtractor};
 pub use schema::{ExtractedSchema, SchemaConfig, SchemaError, SchemaExtractor, SchemaItem};
 pub use selectors::{
-    ExtractedSelectors, ExtractionMode, FieldDefinition, SelectorDefinition, SelectorError,
-    SelectorExtractor, SelectorInput, Transform,
+    combined_matches, ExtractedSelectors, ExtractionMode, FieldDefinition, SelectorDefinition,
+    SelectorError, SelectorExtractor, SelectorInput, Transform,
 };
 
 use scraper::Html;

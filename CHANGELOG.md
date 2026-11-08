@@ -69,6 +69,90 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **Re-crawling an index failed on sites that send `ETag` or
+  `Last-Modified`.** On an `update` crawl, an unchanged page answered `304`
+  and its links were never followed: a second crawl of books.toscrape.com
+  failed with "No page could be crawled (0 failures)", and on other sites
+  changed pages below an unchanged one were never reached. The crawl history
+  now keeps each page's links, and a `304` page publishes them again; a
+  crawl whose pages are all unchanged completes. The first re-crawl after
+  this release fetches pages in full once, to store their links, and so
+  does the first re-crawl after a config's link filters (include/exclude,
+  `allowed_domains`) change, so widened patterns find their new pages.
+- **A start URL that redirected crawled one page.** The include pattern
+  generated from a start URL with a path used it as typed, so after
+  `https://meilisearch.com/docs` redirected to `www.`, every link was
+  filtered out. The generated patterns accept `http`/`https` and the host
+  with or without `www.`, and drop a trailing page name (`/index.html`). A
+  root start URL listed next to start URLs with a path now crawls its host;
+  its links were all filtered out.
+- **One page was crawled twice under two spellings.** Start URLs and sitemap
+  entries skipped the normalization links get, so `/post/` from a sitemap
+  and `/post` from a link were two pages, each counted against `max_pages`
+  and billed. A redirect target is also recorded as seen, so a page reached
+  by a redirect and by a link is fetched once. A page known only from a
+  sitemap, listed with a trailing `/` on a server that answers both forms
+  without redirecting, is now indexed under the form without it: on an
+  `update` crawl the old copy stays until a `replace` crawl.
+- **Redirects bypassed the crawl's scope.** A link that redirected to
+  another host, outside the include/exclude patterns or to a path
+  robots.txt disallows was fetched and indexed. It is now skipped with the
+  reason (start URLs may still redirect anywhere).
+- **`<base href>` was ignored** when resolving links, in crawls and in
+  `/map`.
+- **Sitemap discovery in crawls forced `https` and dropped the port**, so
+  http-only sites and sites on a non-default port got no sitemap. (`/map`
+  was fixed earlier.)
+- **Pages blocked by robots.txt and unsupported content types were
+  failures.** They are now skipped pages with the reason (`page_skipped`),
+  not `errors`, so the console no longer lists them under failed pages.
+
+- **`block_split` dropped `custom` and `schema`.** Custom selectors and
+  JSON-LD were extracted onto the page, but only the block documents were
+  indexed, and they carried neither: a crawl of the Meilisearch docs with
+  `schema` on indexed 241 blocks and no `schema`. Every block now carries
+  them, like `metadata`. Block documents also get unique ids when a page
+  repeats a heading `id` (the later block overwrote the earlier one) or has
+  an empty one.
+- **`custom_selectors` kept only the first match.** `".breadcrumb li"` gave
+  `"Home"` and dropped the rest, and a list of selectors was run as one CSS
+  selector (`".a, .b"`), so it gave the first match in page order. A
+  selector now returns every match (a string for one, an array for
+  several), a list combines the matches of all its selectors in list order,
+  an invalid selector in a list is skipped instead of failing the field, and
+  an element without text (`<meta>`) gives its `content` attribute. A field
+  that matches several elements is now an array where it was a string:
+  update anything that sorts on it or expects a string.
+- **A `replace` crawl reported the whole index's document count as its
+  own.** After its cleanup, `pages_indexed` was overwritten with the index's
+  `numberOfDocuments`, documents of other crawls sharing the index included
+  (a 1-page blog crawl reported 20). It keeps the job's own count and only
+  lowers it when Meilisearch holds fewer of the job's documents. The "index
+  may be incomplete" warning only counts document tasks that failed since
+  the job started (it counted every failure the index ever had).
+- **`meilisearch.primary_key` other than `uid` emptied the index.** Crawled
+  documents only carry `uid`, so Meilisearch refused every batch after the
+  job had reported the pages indexed. Any other value is now a `400`.
+- **`documents_sent` counted pages.** With `block_split` it was 14 for 241
+  documents written. It now counts documents, as documented; the
+  `page_indexed` webhook and the `DocumentIndexed` event carry `documents`
+  (events from older workers count 1).
+- **`index_only` and the features' `include_pages` / `exclude_pages` matched
+  the URL before redirects**, not the URL the page is indexed under.
+- **Block titles carried zero-width characters** (`… - ​How it works`
+  on Mintlify sites). Headings drop U+200B–U+200D, U+2060 and U+FEFF.
+- **With `ENABLE_DEDUP`, near-duplicates were remembered across jobs**, so a
+  page that moved to a new URL was skipped as a copy of its old one (and a
+  `replace` crawl then deleted the old one). Detection is now per job.
+- **Crawled `content` was not plain text.** Headings, list items and code
+  kept markdown markers (`# Herman Melville - Moby-Dick`). `/scrape`'s
+  `content` with `only_main_content: false` was the page's markdown; it is
+  plain text too.
+- **Markdown links stayed relative.** Crawled and scraped `markdown` had
+  `[Login](/login)`; links and images now resolve against the page's
+  `<base href>` or URL. A link without an `href` (`<a class="tag">`) is kept
+  as its text instead of `[change]()`.
+
 - **The link-local URL block now applies on Lightpanda.** Lightpanda 1.0
   only accepts the newer `Network.setBlockedURLs` form (`urlPatterns`), so
   the block (169.254.0.0/16, fe80::/10, the cloud metadata endpoints) failed

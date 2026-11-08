@@ -186,6 +186,19 @@ impl FrontierStore for MemoryFrontierStore {
         Ok(decision)
     }
 
+    async fn mark_seen(&self, job_id: &str, url: &str) -> Result<()> {
+        let mut jobs = self.jobs.lock();
+        evict_expired(&mut jobs);
+        if let Some(entry) = jobs.get_mut(job_id) {
+            let live = entry.release_deadline.is_none()
+                && matches!(entry.state, JobRunState::Running | JobRunState::Paused);
+            if live {
+                entry.seen.insert(hash_url(url));
+            }
+        }
+        Ok(())
+    }
+
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>> {
         let mut jobs = self.jobs.lock();
         evict_expired(&mut jobs);

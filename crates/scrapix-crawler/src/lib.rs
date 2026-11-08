@@ -86,12 +86,14 @@ pub mod renderer_webdriver;
 // Re-exports for convenience
 pub use dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
 pub use extractor::{
-    is_non_page_url, is_non_page_url_for, is_non_page_url_with_pdf, url_allowed, ExtractorConfig,
-    UrlExtractor, UrlExtractorBuilder,
+    document_base_url, is_non_page_url, is_non_page_url_for, is_non_page_url_with_pdf, url_allowed,
+    url_allowed_any_scheme_or_www, ExtractorConfig, UrlExtractor, UrlExtractorBuilder,
+    MAX_STORED_LINKS,
 };
 pub use fetcher::{
-    parse_retry_after, ConditionalRequestHeaders, FetchOptions, FetchResult, FetcherConfig,
-    HttpFetcher, HttpFetcherBuilder, RetryConfig, HEAD_ONLY_MAX_BYTES,
+    is_unsupported_content_type, parse_retry_after, ConditionalRequestHeaders, FetchOptions,
+    FetchResult, FetcherConfig, HttpFetcher, HttpFetcherBuilder, RetryConfig, HEAD_ONLY_MAX_BYTES,
+    UNSUPPORTED_CONTENT_TYPE,
 };
 pub use proxy::{ProxyConfig, ProxyPool, RotationStrategy};
 pub use robots::{

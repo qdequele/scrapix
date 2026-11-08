@@ -299,13 +299,14 @@ fn extract_text_recursive(
                 parts.push(text.to_string());
             }
         }
+        // Plain text: no markdown markers (`#`, `- `, fences). The output
+        // is the documents' `content`, documented as plain text; `markdown`
+        // is built from the HTML separately.
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let text = filtered_text(element, skip_tags);
             let text = text.trim();
             if !text.is_empty() {
-                let level = tag_name.chars().last().unwrap();
-                let prefix = "#".repeat(level.to_digit(10).unwrap() as usize);
-                parts.push(format!("{} {}", prefix, text));
+                parts.push(text.to_string());
             }
         }
         "ul" | "ol" => {
@@ -313,14 +314,14 @@ fn extract_text_recursive(
                 let text = filtered_text(&li, skip_tags);
                 let text = text.trim();
                 if !text.is_empty() {
-                    parts.push(format!("- {}", text));
+                    parts.push(text.to_string());
                 }
             }
         }
         "pre" | "code" => {
             let text = filtered_text(element, skip_tags);
             if !text.trim().is_empty() {
-                parts.push(format!("```\n{}\n```", text.trim()));
+                parts.push(text.trim().to_string());
             }
         }
         _ => {
@@ -462,6 +463,20 @@ fn is_garbage_content(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_is_plain_text_without_markdown_markers() {
+        // httpbin.org/html: an <h1> and paragraphs, no main container.
+        let html = r#"<html><body><h1>Herman Melville - Moby-Dick</h1>
+            <div><p>Availing himself of the mild, summer-cool weather that now reigned in these latitudes.</p></div>
+            <ul><li>First item of the list</li></ul><pre><code>let x = 1;</code></pre></body></html>"#;
+        let text = extract_content(html);
+        assert!(text.contains("Herman Melville - Moby-Dick"), "{text}");
+        assert!(!text.contains("# "), "{text}");
+        assert!(!text.contains("- First"), "{text}");
+        assert!(!text.contains("```"), "{text}");
+        assert!(text.contains("let x = 1;"), "{text}");
+    }
 
     #[test]
     fn test_extract_article() {

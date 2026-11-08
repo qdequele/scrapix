@@ -65,6 +65,152 @@ pub fn html_to_markdown_with_config(html: &str, config: &MarkdownConfig) -> Stri
     clean_markdown(&stripped)
 }
 
+/// Convert HTML to Markdown whose links and images point at absolute URLs.
+///
+/// Relative targets (`/login`, `intro`, `../img.png`) resolve against the
+/// page's `<base href>` when it has one, else against `page_url`. With
+/// `only_main_content`, nav/header/footer/aside are dropped as in
+/// [`html_to_main_content_markdown`].
+pub fn html_to_markdown_for_page(html: &str, page_url: &str, only_main_content: bool) -> String {
+    let markdown = if only_main_content {
+        html_to_main_content_markdown(html)
+    } else {
+        html_to_markdown(html)
+    };
+    match document_base_url(html, page_url) {
+        Some(base) => absolutize_markdown_links(&markdown, &base),
+        None => markdown,
+    }
+}
+
+/// The URL a page's relative links resolve against: its `<base href>`
+/// (itself resolved against `page_url`) when present, else `page_url`.
+/// `None` when `page_url` is not an absolute URL.
+pub fn document_base_url(html: &str, page_url: &str) -> Option<url::Url> {
+    static BASE_RE: OnceLock<Regex> = OnceLock::new();
+    let base_re = BASE_RE.get_or_init(|| {
+        Regex::new(r#"(?is)<base\s[^>]*?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap()
+    });
+    static HEAD_END_RE: OnceLock<Regex> = OnceLock::new();
+    let head_end_re = HEAD_END_RE.get_or_init(|| Regex::new(r"(?i)</head|<body").unwrap());
+
+    let page = url::Url::parse(page_url).ok()?;
+    // Only a <base> in the head counts: look before `</head>` / `<body>`
+    // (any case), else in the first 16 KiB, cut on a char boundary.
+    let head_end = match head_end_re.find(html) {
+        Some(m) => m.start(),
+        None => {
+            let mut end = html.len().min(16 * 1024);
+            while !html.is_char_boundary(end) {
+                end -= 1;
+            }
+            end
+        }
+    };
+    let base = base_re.captures(&html[..head_end]).and_then(|c| {
+        c.get(1)
+            .or_else(|| c.get(2))
+            .or_else(|| c.get(3))
+            .map(|m| m.as_str().trim().to_string())
+    });
+    let resolved = base
+        .filter(|href| !href.is_empty())
+        .and_then(|href| page.join(&href).ok())
+        // A `javascript:` or other non-web base is ignored.
+        .filter(|u| matches!(u.scheme(), "http" | "https"));
+    Some(resolved.unwrap_or(page))
+}
+
+/// Rewrite the targets of markdown links and images to absolute URLs.
+///
+/// - `[text](/path)` → `[text](https://host/path)`, resolved against `base`;
+/// - a link with no target, `[text]()` (from an `<a>` with no `href`), is
+///   replaced by its text;
+/// - an image with no target, `![alt]()`, is removed;
+/// - absolute (`https:`, `mailto:`, `data:` …) and fragment-only (`#id`)
+///   targets are kept as they are. A link wrapping an image
+///   (`[![alt](src)](href)`) has both rewritten. Fenced code blocks (```` ``` ````
+///   and `~~~`) and inline code spans are left untouched.
+pub fn absolutize_markdown_links(markdown: &str, base: &url::Url) -> String {
+    let mut out = String::with_capacity(markdown.len() + 64);
+    let mut fence: Option<&str> = None;
+    for (i, line) in markdown.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        let marker = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m));
+        match (fence, marker) {
+            (None, Some(m)) => {
+                fence = Some(m);
+                out.push_str(line);
+                continue;
+            }
+            (Some(open), Some(m)) if open == m => {
+                fence = None;
+                out.push_str(line);
+                continue;
+            }
+            _ => {}
+        }
+        if fence.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        // Rewrite outside inline code spans only: odd segments of a
+        // backtick split are code.
+        for (j, segment) in line.split('`').enumerate() {
+            if j > 0 {
+                out.push('`');
+            }
+            if j % 2 == 0 {
+                out.push_str(&rewrite_links(segment, base));
+            } else {
+                out.push_str(segment);
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite the links and images of one line of markdown (no code in it).
+fn rewrite_links(line: &str, base: &url::Url) -> String {
+    static LINK_RE: OnceLock<Regex> = OnceLock::new();
+    // (!?) image marker, [text] (which may hold an image), (target "title")
+    let link_re = LINK_RE.get_or_init(|| {
+        Regex::new(
+            r#"(!?)\[((?:!\[[^\]]*\]\([^)]*\)|[^\]])*)\]\(\s*([^)\s]*)((?:\s+"[^"]*")?)\s*\)"#,
+        )
+        .unwrap()
+    });
+    link_re
+        .replace_all(line, |caps: &regex::Captures| {
+            let is_image = !caps[1].is_empty();
+            // The text of a link may be an image: rewrite it too.
+            let text = if is_image {
+                caps[2].to_string()
+            } else {
+                rewrite_links(&caps[2], base)
+            };
+            let target = &caps[3];
+            let title = &caps[4];
+            if target.is_empty() {
+                return if is_image { String::new() } else { text };
+            }
+            // `//cdn/x.png` is relative to the scheme: `join` handles it.
+            let is_absolute = target.starts_with('#') || url::Url::parse(target).is_ok();
+            let resolved = if is_absolute {
+                target.to_string()
+            } else {
+                base.join(target)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| target.to_string())
+            };
+            format!("{}[{}]({}{})", &caps[1], text, resolved, title)
+        })
+        .into_owned()
+}
+
 /// Strip script, style, noscript, svg, and head tags (and their content) from HTML.
 fn strip_non_content_tags(html: &str) -> String {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -392,6 +538,93 @@ mod tests {
 
         assert!(md.contains("[Real link]"));
         assert!(!md.contains("[]("));
+    }
+
+    #[test]
+    fn links_resolve_against_the_page_url() {
+        let html = r##"<h1><a href="/">Quotes</a></h1>
+            <p><a href="/login">Login</a> <a href="intro">Intro</a>
+            <a href="https://other.example/x">Other</a> <a href="#top">Top</a>
+            <img src="img/a.png" alt="A"></p>"##;
+        let md = html_to_markdown_for_page(html, "https://quotes.example/docs/page/", false);
+        assert!(md.contains("[Quotes](https://quotes.example/)"), "{md}");
+        assert!(md.contains("[Login](https://quotes.example/login)"), "{md}");
+        assert!(
+            md.contains("[Intro](https://quotes.example/docs/page/intro)"),
+            "{md}"
+        );
+        assert!(md.contains("[Other](https://other.example/x)"), "{md}");
+        assert!(md.contains("[Top](#top)"), "{md}");
+        assert!(
+            md.contains("![A](https://quotes.example/docs/page/img/a.png)"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn links_honour_base_href() {
+        let html = r#"<html><head><base href="/app/"></head>
+            <body><p><a href="settings">Settings</a></p></body></html>"#;
+        let md = html_to_markdown_for_page(html, "https://x.example/app/users/1", false);
+        assert!(
+            md.contains("[Settings](https://x.example/app/settings)"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn anchors_without_href_become_plain_text() {
+        // quotes.toscrape.com/js renders its tags as `<a class='tag'>t</a>`.
+        let html = r#"<div>Tags: <a class="tag">change</a> <a class="tag">world</a></div>"#;
+        let md = html_to_markdown_for_page(html, "https://quotes.example/js/", false);
+        assert!(!md.contains("]()"), "{md}");
+        assert!(md.contains("change") && md.contains("world"), "{md}");
+    }
+
+    #[test]
+    fn code_blocks_keep_their_link_syntax() {
+        let base = url::Url::parse("https://x.example/").unwrap();
+        let md = "```\n[a](/b)\n```\n[c](/d)\n~~~\n[e](/f)\n~~~\nsee `[g](/h)` and [i](/j)";
+        let out = absolutize_markdown_links(md, &base);
+        assert_eq!(
+            out,
+            "```\n[a](/b)\n```\n[c](https://x.example/d)\n~~~\n[e](/f)\n~~~\n\
+             see `[g](/h)` and [i](https://x.example/j)"
+        );
+    }
+
+    #[test]
+    fn a_link_wrapping_an_image_has_both_rewritten() {
+        let base = url::Url::parse("https://x.example/docs/").unwrap();
+        let out = absolutize_markdown_links("[![Logo](logo.png)](/home)", &base);
+        assert_eq!(
+            out,
+            "[![Logo](https://x.example/docs/logo.png)](https://x.example/home)"
+        );
+    }
+
+    #[test]
+    fn base_url_lookup_is_safe_on_uppercase_tags_and_multibyte_text() {
+        // No lowercase </head> or <body>, > 16 KiB, a multi-byte char
+        // straddling byte 16384: this used to panic on the slice.
+        let mut html = String::from("<HTML><HEAD><TITLE>t</TITLE></HEAD><BODY>");
+        while html.len() < 16 * 1024 - 1 {
+            html.push('a');
+        }
+        html.push_str("日本語のテキスト</BODY></HTML>");
+        let base = document_base_url(&html, "https://x.example/a/b").unwrap();
+        assert_eq!(base.as_str(), "https://x.example/a/b");
+
+        let upper = r#"<HTML><HEAD><BASE HREF="/app/"></HEAD><BODY><a href="s">S</a></BODY>"#;
+        let base = document_base_url(upper, "https://x.example/app/users/1").unwrap();
+        assert_eq!(base.as_str(), "https://x.example/app/");
+    }
+
+    #[test]
+    fn non_web_base_href_is_ignored() {
+        let html = r#"<head><base href="javascript:alert(1)//"></head>"#;
+        let base = document_base_url(html, "https://x.example/p/q").unwrap();
+        assert_eq!(base.as_str(), "https://x.example/p/q");
     }
 
     #[test]

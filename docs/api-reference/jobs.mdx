@@ -53,8 +53,8 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 | `status` | string | `pending`, `running`, `completed`, `failed`, `cancelled`, or `paused` |
 | `index_uid` | string | Target Meilisearch index |
 | `pages_crawled` | integer | Number of pages successfully fetched |
-| `pages_indexed` | integer | Number of pages indexed to Meilisearch |
-| `documents_sent` | integer | Number of documents sent (may differ with block splitting) |
+| `pages_indexed` | integer | Number of pages indexed to Meilisearch. For a `replace` job, checked at completion against the job's own documents in the index |
+| `documents_sent` | integer | Number of Meilisearch documents written: one per page, or one per block with `block_split` |
 | `errors` | integer | Number of failed page fetches |
 | `started_at` | string | ISO 8601 timestamp when crawl started |
 | `completed_at` | string | ISO 8601 timestamp when crawl finished |
