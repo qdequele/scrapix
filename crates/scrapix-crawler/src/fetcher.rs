@@ -854,7 +854,9 @@ impl HttpFetcher {
 
         Ok(RawPage {
             url: crawl_url.url.clone(),
-            final_url,
+            // A same-host https -> http redirect keeps https (one page,
+            // the crawl's scheme).
+            final_url: scrapix_core::crawl_scope::keep_https(&crawl_url.url, &final_url),
             status,
             headers,
             html,

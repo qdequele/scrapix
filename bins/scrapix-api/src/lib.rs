@@ -2322,11 +2322,14 @@ async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, 
         );
     }
 
+    // Only this crawl's documents: other crawls may share the index.
+    let scope = scrapix_core::CrawlScope::from_start_urls(&job.start_urls);
     if let Err(e) = scrapix_storage::meilisearch::MeilisearchStorage::delete_stale_documents(
         replace_url,
         ms_key,
         index_uid,
         job_id,
+        &scope,
     )
     .await
     {

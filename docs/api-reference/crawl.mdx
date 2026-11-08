@@ -49,7 +49,7 @@ Create an asynchronous crawl job. Returns immediately with a job ID that you can
 | `max_pages` | integer | No | Maximum number of pages to crawl |
 | `crawler_type` | string | No | `"http"` (default) or `"browser"` for JS rendering |
 | `allowed_domains` | string[] | No | Restrict crawling to these domains (auto-inferred from start_urls if omitted) |
-| `index_strategy` | string | No | `"update"` (default) adds and updates documents; `"replace"` builds a temporary index and swaps it in on completion. The legacy `replace_index: true` still means `"replace"` |
+| `index_strategy` | string | No | `"update"` (default) adds and updates documents; `"replace"` also deletes, on completion, the documents of an earlier run of the same crawl (same `start_urls`) that were not indexed again; other crawls' documents in the index are kept. The legacy `replace_index: true` still means `"replace"` |
 | `meilisearch` | object | No | Meilisearch connection settings. Behind the Meilisearch Lab, omit it to write to the team's default instance, or send only `url` to pick another registered instance (the Lab supplies its key) |
 
 See [Crawl Configs](/configuration/crawl-configs) for the complete schema with all options.

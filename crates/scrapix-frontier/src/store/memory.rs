@@ -16,9 +16,12 @@ use super::{Admission, FrontierStore, JobCounters, JobRunState};
 /// processes, unlike `std::collections::hash_map::DefaultHasher` whose seed
 /// is randomized per process — the Redis-backed store (`redis.rs`) reuses
 /// this exact hash so both stores agree on the seen-set contents.
+///
+/// The `http:` / `https:` scheme is left out: both are one page, so a job
+/// admits it once whichever scheme it is linked with first.
 pub(super) fn hash_url(url: &str) -> u64 {
     let mut hasher = siphasher::sip::SipHasher13::new();
-    hasher.write(url.as_bytes());
+    hasher.write(scrapix_core::crawl_scope::without_http_scheme(url).as_bytes());
     hasher.finish()
 }
 

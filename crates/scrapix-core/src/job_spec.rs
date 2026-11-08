@@ -41,6 +41,10 @@ pub struct JobSpec {
     pub index_settings: Option<MeilisearchSettings>,
     #[serde(default)]
     pub keep_settings: bool,
+    /// [`crate::CrawlScope`] id of the job's start URLs, written to every
+    /// document as `_crawl_scope`. `None` on messages from an older API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crawl_scope: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -68,6 +72,7 @@ impl Default for JobSpec {
             batch_size: None,
             index_settings: None,
             keep_settings: false,
+            crawl_scope: None,
         }
     }
 }
@@ -96,6 +101,11 @@ impl JobSpec {
             batch_size: Some(c.meilisearch.batch_size).filter(|n| *n > 0),
             index_settings: c.meilisearch.settings.clone(),
             keep_settings: c.meilisearch.keep_settings,
+            crawl_scope: Some(
+                crate::CrawlScope::from_start_urls(&c.start_urls)
+                    .id()
+                    .to_string(),
+            ),
         }
     }
 }
@@ -123,6 +133,20 @@ mod tests {
         assert_eq!(spec.user_agents, vec!["MyBot/1.0".to_string()]);
         assert_eq!(spec.requests_per_second, Some(2.0));
         assert_eq!(spec.primary_key, Some("uid".to_string()));
+    }
+
+    #[test]
+    fn from_config_carries_the_crawl_scope_of_the_start_urls() {
+        let config = CrawlConfig {
+            start_urls: vec!["https://www.meilisearch.com/blog".to_string()],
+            ..default_crawl_config()
+        };
+        let spec = JobSpec::from_config(&config);
+        let scope = crate::CrawlScope::from_start_urls(&config.start_urls);
+        assert_eq!(spec.crawl_scope.as_deref(), Some(scope.id()));
+        // A message from an older API has none.
+        let old: JobSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.crawl_scope, None);
     }
 
     #[test]

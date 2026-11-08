@@ -1650,10 +1650,11 @@ impl ContentWorker {
         }
     }
 
-    /// Stamp job id (Replace strategy stale cleanup) and source
-    /// (multi-tenant indexing; falls back to the domain).
+    /// Stamp job id and crawl scope (Replace strategy stale cleanup) and
+    /// source (multi-tenant indexing; falls back to the domain).
     fn stamp(&self, document: &mut Document, msg: &RawPageMessage) {
         document._crawl_job_id = Some(msg.job_id.clone());
+        document._crawl_scope = msg.job.as_ref().and_then(|j| j.crawl_scope.clone());
         document.source = Some(
             msg.source
                 .clone()
@@ -1749,6 +1750,7 @@ impl ContentWorker {
             ai_summary: None,
             ai_extraction: None,
             _crawl_job_id: parent_doc._crawl_job_id.clone(),
+            _crawl_scope: parent_doc._crawl_scope.clone(),
         }
     }
 

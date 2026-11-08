@@ -132,7 +132,12 @@ fn keep_settings() -> scrapix_core::JobSpec {
 
 #[tokio::test]
 async fn keep_settings_skips_settings_on_existing_index() {
-    let ms = existing_index(serde_json::json!(["domain", "_crawl_job_id"])).await;
+    let ms = existing_index(serde_json::json!([
+        "domain",
+        "_crawl_job_id",
+        "_crawl_scope"
+    ]))
+    .await;
     Mock::given(method("PUT"))
         .and(path_regex(
             r"^/indexes/existing/settings/filterable-attributes$",
@@ -153,7 +158,7 @@ async fn keep_settings_skips_settings_on_existing_index() {
 }
 
 #[tokio::test]
-async fn keep_settings_still_makes_crawl_job_id_filterable() {
+async fn keep_settings_still_makes_cleanup_fields_filterable() {
     let ms = existing_index(serde_json::json!(["domain"])).await;
     Mock::given(method("PUT"))
         .and(path_regex(
@@ -179,7 +184,10 @@ async fn keep_settings_still_makes_crawl_job_id_filterable() {
         .find(|r| r.method.as_str() == "PUT")
         .expect("filterable attributes updated");
     let body: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
-    assert_eq!(body, serde_json::json!(["domain", "_crawl_job_id"]));
+    assert_eq!(
+        body,
+        serde_json::json!(["domain", "_crawl_job_id", "_crawl_scope"])
+    );
 }
 
 #[tokio::test]
@@ -320,12 +328,14 @@ async fn job_settings_are_merged_over_feature_defaults() {
         .expect("settings applied");
     let body: serde_json::Value = serde_json::from_slice(&settings.body).unwrap();
     assert_eq!(body["searchableAttributes"], serde_json::json!(["title"]));
-    // Job's filterable list replaces the defaults, but `_crawl_job_id` stays
-    // filterable: the Replace index strategy's stale-document cleanup needs it.
+    // Job's filterable list replaces the defaults, but `_crawl_job_id` and
+    // `_crawl_scope` stay filterable: the Replace index strategy's
+    // stale-document cleanup needs them.
     let filterable: Vec<String> =
         serde_json::from_value(body["filterableAttributes"].clone()).unwrap();
     assert!(filterable.contains(&"lang".to_string()));
     assert!(filterable.contains(&"_crawl_job_id".to_string()));
+    assert!(filterable.contains(&"_crawl_scope".to_string()));
     assert!(!filterable.contains(&"domain".to_string()));
     assert_eq!(body["stopWords"], serde_json::json!(["the"]));
     assert_eq!(body["pagination"]["maxTotalHits"], 10000);

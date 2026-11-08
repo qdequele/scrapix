@@ -12,6 +12,7 @@ pub mod ack;
 pub mod browser;
 pub mod config;
 pub mod content_types;
+pub mod crawl_scope;
 pub mod document;
 pub mod error;
 pub mod job_spec;
@@ -23,6 +24,7 @@ pub mod url_glob;
 
 pub use ack::Ack;
 pub use config::*;
+pub use crawl_scope::CrawlScope;
 pub use document::*;
 pub use error::*;
 pub use job_spec::JobSpec;

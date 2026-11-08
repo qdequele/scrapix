@@ -35,7 +35,7 @@ The simplest crawl config only needs `start_urls` and `index_uid`:
 | `max_depth` | `integer` | — | Maximum link depth from start URLs |
 | `max_pages` | `integer` | — | Maximum pages to crawl |
 | `allowed_domains` | `string[]` | `[]` | Strict domain whitelist |
-| `index_strategy` | `"update"` or `"replace"` | `"update"` | `replace` builds a temporary index and swaps it in on completion (the legacy `replace_index: true` means the same) |
+| `index_strategy` | `"update"` or `"replace"` | `"update"` | `replace` writes to the index, then on completion deletes the pages of a previous run of this crawl that were not crawled again (the legacy `replace_index: true` means the same). See [Replace and shared indexes](#replace-and-shared-indexes) |
 | `headers` | `object` | `{}` | Custom HTTP headers |
 | `user_agents` | `string[]` | `[]` | User-Agent rotation list |
 
@@ -60,6 +60,29 @@ Control which URLs are crawled and indexed:
 | `exclude` | Glob patterns — skip matching URLs |
 | `index_only` | Crawl all, but only index matches |
 | `allowed_domains` | Domain whitelist (alternative to top-level) |
+
+Patterns are globs over the whole URL: `**` matches anything, `/` included;
+`*` matches anything but `/`. A `*` at the start or the end of a pattern
+matches like `**`, so `*/blog/*` takes every URL with `/blog/` in it.
+
+### Replace and shared indexes
+
+With `"index_strategy": "replace"`, each document carries `_crawl_job_id` (the
+job that last indexed it) and `_crawl_scope` (an id of the crawl's
+`start_urls`, ignoring the scheme, a leading `www.` and a trailing `/`). When
+the job completes, Scrapix deletes the documents with the same
+`_crawl_scope` and another `_crawl_job_id`: pages of an earlier run that this
+run no longer found. Documents of other crawls writing to the same index
+(another scope) are left alone, so a blog crawl and a docs crawl can share an
+index. Both fields are made filterable automatically.
+
+Documents indexed before `_crawl_scope` existed have none. The cleanup
+deletes those only when their `url` lies under one of the crawl's start URLs
+(same host, same path prefix).
+
+Changing a config's `start_urls` changes its scope: the documents of the old
+scope stay in the index until you delete them (for example with
+`{"filter": "_crawl_scope = '<old scope>'"}`).
 
 ### Sitemap
 

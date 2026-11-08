@@ -33,6 +33,29 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **Replace crawls sharing an index deleted each other's documents.** After a
+  `"index_strategy": "replace"` crawl, every document of the index not
+  indexed by that job was deleted (`_crawl_job_id != <job>`). Two saved
+  configs writing to one index (a blog crawl and a docs crawl) wiped each
+  other every day. Documents now carry `_crawl_scope`, an id of the crawl's
+  `start_urls` (scheme, `www.` and a trailing `/` ignored), and the cleanup
+  only deletes `_crawl_scope = <this crawl> AND _crawl_job_id != <job>`.
+  Documents indexed before this release have no `_crawl_scope`; the cleanup
+  deletes those only when their `url` lies under one of the crawl's start
+  URLs. `_crawl_scope` is made filterable like `_crawl_job_id` (also by the
+  cleanup itself on an index that lacks it), and a failed cleanup task now
+  fails the job instead of passing silently.
+- **A `*` at the start of a URL pattern matched nothing.** A single `*`
+  does not cross `/`, and every URL starts with `scheme://host`, so
+  `*/blog/*` excluded every link and a crawl with that `include` never left
+  its start page. A leading `*` now matches like `**` (as a trailing one
+  already did).
+- **`http://` and `https://` of one page were crawled and indexed twice.**
+  The frontier now treats both schemes of a URL as one page; a redirect from
+  `https` to `http` on the same host keeps the `https` URL (some sites behind
+  a TLS proxy redirect `https://h/x` to `http://h/x/`, so every page of an
+  `https` crawl was indexed as `http`); and a same-host `http://` link on an
+  `https` page is followed as `https`.
 - **Browser crawls indexed almost nothing.** The renderer took the content
   type and status of whatever request CDP reported for the navigation, which
   was often one of the page's subresources (`text/css`, `font/woff2`), so the

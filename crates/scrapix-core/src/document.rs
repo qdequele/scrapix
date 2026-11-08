@@ -113,6 +113,13 @@ pub struct Document {
     /// after a crawl completes (delete where `_crawl_job_id != current_job_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _crawl_job_id: Option<String>,
+
+    /// Id of the crawl scope (the crawl's start URLs, see
+    /// [`crate::crawl_scope`]) that indexed this document. The Replace
+    /// cleanup only deletes documents of its own scope, so crawls sharing an
+    /// index leave each other's documents alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _crawl_scope: Option<String>,
 }
 
 impl Document {
@@ -156,6 +163,7 @@ impl Document {
             anchor: None,
             block_url: None,
             _crawl_job_id: None,
+            _crawl_scope: None,
         }
     }
 
@@ -191,6 +199,7 @@ impl Document {
             anchor: None,
             block_url: None,
             _crawl_job_id: parent._crawl_job_id.clone(),
+            _crawl_scope: parent._crawl_scope.clone(),
         }
     }
 

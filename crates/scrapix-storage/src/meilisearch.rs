@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use meilisearch_sdk::{
     client::{Client, SwapIndexes},
-    documents::DocumentDeletionQuery,
+    documents::{DocumentDeletionQuery, DocumentsQuery},
     indexes::Index,
     settings::{PaginationSetting, Settings},
     task_info::TaskInfo,
@@ -17,7 +17,8 @@ use meilisearch_sdk::{
 use tracing::{debug, error, info, instrument, warn};
 
 use scrapix_core::config::{FeaturesConfig, MeilisearchSettings};
-use scrapix_core::{Ack, Document, JobSpec, Result, ScrapixError};
+use scrapix_core::crawl_scope::{CRAWL_JOB_ID_FIELD, CRAWL_SCOPE_FIELD};
+use scrapix_core::{Ack, CrawlScope, Document, JobSpec, Result, ScrapixError};
 
 /// Meilisearch configuration
 #[derive(Debug, Clone)]
@@ -76,6 +77,7 @@ impl Default for MeilisearchConfig {
                 "language".to_string(),
                 "crawled_at".to_string(),
                 "_crawl_job_id".to_string(),
+                "_crawl_scope".to_string(),
             ],
             sortable_attributes: vec!["crawled_at".to_string()],
             displayed_attributes: None,
@@ -152,6 +154,66 @@ fn is_permanent(e: &meilisearch_sdk::errors::Error) -> bool {
         Error::InvalidRequest | Error::CantUseWithoutApiKey(_) => true,
         _ => false,
     }
+}
+
+/// `filterable` plus the fields the Replace cleanup filters on
+/// (`_crawl_job_id`, `_crawl_scope`); `None` when it already had them.
+fn with_cleanup_fields(mut filterable: Vec<String>) -> Option<Vec<String>> {
+    let mut changed = false;
+    for field in [CRAWL_JOB_ID_FIELD, CRAWL_SCOPE_FIELD] {
+        if !filterable.iter().any(|f| f == field) {
+            filterable.push(field.to_string());
+            changed = true;
+        }
+    }
+    changed.then_some(filterable)
+}
+
+/// A Meilisearch filter string literal (double-quoted, `"` and `\` escaped).
+fn filter_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Filter for the documents a Replace job deletes outright: the scope's
+/// documents that this job did not (re)index.
+fn scoped_stale_filter(scope: &CrawlScope, job_id: &str) -> String {
+    format!(
+        "{CRAWL_SCOPE_FIELD} = {} AND {CRAWL_JOB_ID_FIELD} != {}",
+        filter_literal(scope.id()),
+        filter_literal(job_id)
+    )
+}
+
+/// Filter for documents indexed before `_crawl_scope` existed (or by
+/// something else than a crawl) and not by this job; the cleanup only
+/// deletes those whose URL lies in the crawl's scope.
+fn unscoped_candidates_filter(job_id: &str) -> String {
+    format!(
+        "{CRAWL_SCOPE_FIELD} NOT EXISTS AND {CRAWL_JOB_ID_FIELD} != {}",
+        filter_literal(job_id)
+    )
+}
+
+/// Primary keys of the unscoped `docs` (fetched with the primary key and
+/// `url`) that belong to `scope`. A document without a `url` is never
+/// selected: it was not indexed by a crawl.
+fn unscoped_ids_in_scope(
+    docs: &[serde_json::Value],
+    primary_key: &str,
+    scope: &CrawlScope,
+) -> Vec<String> {
+    docs.iter()
+        .filter(|d| {
+            d.get("url")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| scope.contains(u))
+        })
+        .filter_map(|d| match d.get(primary_key)? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// JSON text with object keys sorted at every level (array order kept).
@@ -595,9 +657,9 @@ impl MeilisearchStorage {
     /// job's features with the job's `index_settings` merged over them.
     ///
     /// With `spec.keep_settings` an already existing index keeps its
-    /// settings, except that `_crawl_job_id` is added to its filterable
-    /// attributes when missing (the Replace strategy deletes stale documents
-    /// by that filter). Failures are logged and reported as `false`:
+    /// settings, except that `_crawl_job_id` and `_crawl_scope` are added to
+    /// its filterable attributes when missing (the Replace strategy deletes
+    /// stale documents by those filters). Failures are logged and reported as `false`:
     /// documents are still indexed with whatever settings the index has.
     pub async fn configure_index(
         &self,
@@ -641,7 +703,7 @@ impl MeilisearchStorage {
             }
         } else if keep_settings {
             info!(index = %index_uid, "keep_settings: leaving existing index settings untouched");
-            return self.ensure_job_id_filterable(&index).await;
+            return self.ensure_cleanup_filterable(&index).await;
         }
 
         let overrides = spec.and_then(|s| s.index_settings.as_ref());
@@ -662,30 +724,30 @@ impl MeilisearchStorage {
         }
     }
 
-    /// Add `_crawl_job_id` to an existing index's filterable attributes
-    /// when missing, leaving every other setting as is.
-    async fn ensure_job_id_filterable(&self, index: &Index) -> bool {
-        let mut filterable = match self.bounded(index.get_filterable_attributes()).await {
+    /// Add the fields the Replace cleanup filters on (`_crawl_job_id`,
+    /// `_crawl_scope`) to an existing index's filterable attributes when
+    /// missing, leaving every other setting as is.
+    async fn ensure_cleanup_filterable(&self, index: &Index) -> bool {
+        let filterable = match self.bounded(index.get_filterable_attributes()).await {
             Ok(f) => f,
             Err(e) => {
                 warn!(index = %index.uid, error = %e.message(), "Failed to read filterable attributes");
                 return false;
             }
         };
-        if filterable.iter().any(|f| f == "_crawl_job_id") {
+        let Some(filterable) = with_cleanup_fields(filterable) else {
             return true;
-        }
-        filterable.push("_crawl_job_id".to_string());
+        };
         match self
             .bounded(index.set_filterable_attributes(&filterable))
             .await
         {
             Ok(_) => {
-                info!(index = %index.uid, "keep_settings: added _crawl_job_id to filterable attributes");
+                info!(index = %index.uid, "keep_settings: made _crawl_job_id and _crawl_scope filterable");
                 true
             }
             Err(e) => {
-                warn!(index = %index.uid, error = %e.message(), "Failed to make _crawl_job_id filterable");
+                warn!(index = %index.uid, error = %e.message(), "Failed to make the cleanup fields filterable");
                 false
             }
         }
@@ -693,8 +755,9 @@ impl MeilisearchStorage {
 
     /// Settings for a job: attributes dynamically derived from the enabled
     /// features, then each field the job set in `overrides` replaces the
-    /// derived value. `_crawl_job_id` always stays filterable (the Replace
-    /// index strategy deletes stale documents by filtering on it).
+    /// derived value. `_crawl_job_id` and `_crawl_scope` always stay
+    /// filterable (the Replace index strategy deletes stale documents by
+    /// filtering on them).
     fn job_settings(
         &self,
         features: &FeaturesConfig,
@@ -776,9 +839,7 @@ impl MeilisearchStorage {
                 settings = settings.with_synonyms(v.clone());
             }
         }
-        if !filterable.iter().any(|f| f == "_crawl_job_id") {
-            filterable.push("_crawl_job_id".to_string());
-        }
+        let filterable = with_cleanup_fields(filterable.clone()).unwrap_or(filterable);
 
         settings = settings
             .with_searchable_attributes(&searchable)
@@ -930,14 +991,24 @@ impl MeilisearchStorage {
         Ok(())
     }
 
-    /// Delete all documents in an index that were NOT indexed by the given job.
-    /// Used by the Replace index strategy: after a crawl completes, this removes
-    /// stale documents from previous crawls while preserving freshly-crawled ones.
+    /// Replace index strategy: after a crawl completes, delete the documents
+    /// of this crawl's scope that the job did not (re)index, preserving
+    /// freshly crawled ones and every other crawl's documents in the same
+    /// index.
+    ///
+    /// 1. Documents carrying `_crawl_scope = scope` and another
+    ///    `_crawl_job_id` are deleted by filter.
+    /// 2. Documents without `_crawl_scope` (indexed before it existed) are
+    ///    deleted only when their `url` lies under one of the crawl's start
+    ///    URLs ([`CrawlScope::contains`]); the others are left alone.
+    ///
+    /// Both fields are made filterable first when the index lacks them.
     pub async fn delete_stale_documents(
         meilisearch_url: &str,
         api_key: Option<&str>,
         index_uid: &str,
         job_id: &str,
+        scope: &CrawlScope,
     ) -> Result<()> {
         let client = Client::new(meilisearch_url, api_key).map_err(|e| {
             ScrapixError::Storage(format!(
@@ -949,14 +1020,17 @@ impl MeilisearchStorage {
         // Wait for all pending indexing tasks to settle first
         Self::wait_for_index_idle_with_client(&client, index_uid, Duration::from_secs(300)).await?;
 
+        let mut index = client.index(index_uid);
+        Self::ensure_cleanup_filterable_with_client(&client, &index).await?;
+
         info!(
             index = %index_uid,
             job_id = %job_id,
-            "Deleting stale documents not indexed by this crawl job"
+            scope = %scope.id(),
+            "Deleting stale documents of this crawl's scope not indexed by this job"
         );
 
-        let index = client.index(index_uid);
-        let filter = format!("_crawl_job_id != '{}'", job_id);
+        let filter = scoped_stale_filter(scope, job_id);
         let mut query = DocumentDeletionQuery::new(&index);
         query.with_filter(&filter);
         let task_info = index.delete_documents_with(&query).await.map_err(|e| {
@@ -965,26 +1039,118 @@ impl MeilisearchStorage {
                 index_uid, e,
             ))
         })?;
+        Self::wait_cleanup_task(&client, task_info, index_uid).await?;
 
-        task_info
+        // Documents indexed before `_crawl_scope` existed.
+        let primary_key = match index.get_primary_key().await {
+            Ok(Some(pk)) => pk.to_string(),
+            Ok(None) => {
+                info!(index = %index_uid, "Index has no primary key yet, no unscoped documents to clean up");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(ScrapixError::Storage(format!(
+                    "Failed to read the primary key of {}: {}",
+                    index_uid, e
+                )))
+            }
+        };
+        let filter = unscoped_candidates_filter(job_id);
+        let mut ids = Vec::new();
+        let mut offset = 0usize;
+        const PAGE: usize = 1000;
+        loop {
+            let mut query = DocumentsQuery::new(&index);
+            query
+                .with_filter(&filter)
+                .with_fields([primary_key.as_str(), "url"])
+                .with_limit(PAGE)
+                .with_offset(offset);
+            let page = index
+                .get_documents_with::<serde_json::Value>(&query)
+                .await
+                .map_err(|e| {
+                    ScrapixError::Storage(format!(
+                        "Failed to list unscoped documents of {}: {}",
+                        index_uid, e
+                    ))
+                })?;
+            let n = page.results.len();
+            ids.extend(unscoped_ids_in_scope(&page.results, &primary_key, scope));
+            offset += n;
+            if n < PAGE || offset >= page.total as usize {
+                break;
+            }
+        }
+        for chunk in ids.chunks(10_000) {
+            let task_info = index.delete_documents(chunk).await.map_err(|e| {
+                ScrapixError::Storage(format!(
+                    "Failed to delete unscoped stale documents from {}: {}",
+                    index_uid, e,
+                ))
+            })?;
+            Self::wait_cleanup_task(&client, task_info, index_uid).await?;
+        }
+
+        info!(
+            index = %index_uid,
+            job_id = %job_id,
+            unscoped_deleted = ids.len(),
+            "Stale document cleanup completed"
+        );
+        Ok(())
+    }
+
+    /// Make the cleanup's filter fields filterable on `index` when missing,
+    /// and wait for the settings task.
+    async fn ensure_cleanup_filterable_with_client(client: &Client, index: &Index) -> Result<()> {
+        let filterable = index.get_filterable_attributes().await.map_err(|e| {
+            ScrapixError::Storage(format!(
+                "Failed to read filterable attributes of {}: {}",
+                index.uid, e
+            ))
+        })?;
+        let Some(filterable) = with_cleanup_fields(filterable) else {
+            return Ok(());
+        };
+        info!(index = %index.uid, "Making _crawl_job_id and _crawl_scope filterable before stale cleanup");
+        let task_info = index
+            .set_filterable_attributes(&filterable)
+            .await
+            .map_err(|e| {
+                ScrapixError::Storage(format!(
+                    "Failed to update filterable attributes of {}: {}",
+                    index.uid, e
+                ))
+            })?;
+        Self::wait_cleanup_task(client, task_info, &index.uid).await
+    }
+
+    /// Wait (up to 5 min) for a cleanup task and fail on a failed task.
+    async fn wait_cleanup_task(
+        client: &Client,
+        task_info: TaskInfo,
+        index_uid: &str,
+    ) -> Result<()> {
+        let task = task_info
             .wait_for_completion(
-                &client,
+                client,
                 Some(Duration::from_millis(200)),
                 Some(Duration::from_secs(300)),
             )
             .await
             .map_err(|e| {
                 ScrapixError::Storage(format!(
-                    "Delete stale documents task failed for {}: {}",
+                    "Stale cleanup task failed for {}: {}",
                     index_uid, e,
                 ))
             })?;
-
-        info!(
-            index = %index_uid,
-            job_id = %job_id,
-            "Stale document cleanup completed"
-        );
+        if let meilisearch_sdk::tasks::Task::Failed { content } = task {
+            return Err(ScrapixError::Storage(format!(
+                "Stale cleanup task failed for {}: {}",
+                index_uid, content.error
+            )));
+        }
         Ok(())
     }
 
