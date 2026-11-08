@@ -2,12 +2,14 @@
 
 use async_openai::{
     config::{Config, OpenAIConfig},
+    error::{ApiError, OpenAIError},
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
         ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ImageDetail, ImageUrl,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ImageDetail, ImageUrl,
     },
     Client as OpenAIClient,
 };
@@ -22,6 +24,8 @@ use crate::client::{AiClientError, AiUsageContext, AI_USAGE_CONTEXT};
 
 /// Header the Lumen gateway reads call attribution from.
 const LUMEN_METADATA_HEADER: &str = "x-lumen-metadata";
+/// Header a Lumen gateway reports a call's settled cost in (micro-USD).
+const LUMEN_COST_HEADER: &str = "x-lumen-cost-micro-usd";
 /// Longest string value in the metadata header, in bytes.
 const METADATA_VALUE_MAX_BYTES: usize = 256;
 /// Longest metadata header, in bytes.
@@ -276,7 +280,11 @@ impl OpenAiProvider {
         &self,
         request: CreateChatCompletionRequest,
     ) -> Result<ChatResponse, AiClientError> {
-        let response = self.client().chat().create(request).await?;
+        let (response, cost_micro_usd) = if self.lumen_metadata {
+            self.send_to_lumen(&request).await?
+        } else {
+            (self.client().chat().create(request).await?, None)
+        };
 
         let choice = response
             .choices
@@ -288,12 +296,86 @@ impl OpenAiProvider {
 
         Ok(ChatResponse {
             content,
-            model: response.model,
+            model: response.model.clone(),
             prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
             completion_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
             total_tokens: usage.map(|u| u.total_tokens).unwrap_or(0),
             finish_reason: choice.finish_reason.as_ref().map(|r| format!("{:?}", r)),
+            cost_micro_usd,
         })
+    }
+
+    /// The chat call to a Lumen gateway, made by hand so the response's
+    /// `x-lumen-cost-micro-usd` header can be read (async-openai drops
+    /// headers). Same headers, same retries and same errors as
+    /// async-openai's own `create`: 5xx and rate-limit 429 are retried within
+    /// [`RETRY_MAX_ELAPSED`], any other error body is an
+    /// [`OpenAIError::ApiError`].
+    async fn send_to_lumen(
+        &self,
+        request: &CreateChatCompletionRequest,
+    ) -> Result<(CreateChatCompletionResponse, Option<u64>), AiClientError> {
+        let client = self.client();
+        let config = client.config().clone();
+        let url = config.url("/chat/completions");
+        let backoff = ExponentialBackoff {
+            max_elapsed_time: Some(RETRY_MAX_ELAPSED),
+            ..Default::default()
+        };
+        let (bytes, cost) = backoff::future::retry(backoff, || async {
+            let response = self
+                .http
+                .post(&url)
+                .query(&config.query())
+                .headers(config.headers())
+                .json(request)
+                .send()
+                .await
+                .map_err(|e| backoff::Error::Permanent(OpenAIError::Reqwest(e)))?;
+            let status = response.status();
+            let cost = response
+                .headers()
+                .get(LUMEN_COST_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| backoff::Error::Permanent(OpenAIError::Reqwest(e)))?;
+            if status.is_success() {
+                return Ok((bytes, cost));
+            }
+            Err(api_error(status, &bytes))
+        })
+        .await?;
+        let response = serde_json::from_slice(&bytes).map_err(OpenAIError::JSONDeserialize)?;
+        Ok((response, cost))
+    }
+}
+
+/// An error answer as async-openai reports it: a 5xx (its body may not be
+/// JSON) and a rate-limit 429 are retried, anything else is final.
+fn api_error(status: reqwest::StatusCode, bytes: &[u8]) -> backoff::Error<OpenAIError> {
+    #[derive(serde::Deserialize)]
+    struct Wrapped {
+        error: ApiError,
+    }
+    if status.is_server_error() {
+        return backoff::Error::transient(OpenAIError::ApiError(ApiError {
+            message: String::from_utf8_lossy(bytes).into_owned(),
+            r#type: None,
+            param: None,
+            code: None,
+        }));
+    }
+    let error = match serde_json::from_slice::<Wrapped>(bytes) {
+        Ok(wrapped) => wrapped.error,
+        Err(e) => return backoff::Error::Permanent(OpenAIError::JSONDeserialize(e)),
+    };
+    if status.as_u16() == 429 && error.r#type.as_deref() != Some("insufficient_quota") {
+        backoff::Error::transient(OpenAIError::ApiError(error))
+    } else {
+        backoff::Error::Permanent(OpenAIError::ApiError(error))
     }
 }
 
@@ -357,6 +439,95 @@ mod tests {
             .to_str()
             .unwrap();
         serde_json::from_str(raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lumen_reports_the_call_cost_from_its_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(completion_body())
+                    .insert_header("x-lumen-cost-micro-usd", "1234"),
+            )
+            .mount(&server)
+            .await;
+
+        let response = provider(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.cost_micro_usd, Some(1234));
+        assert_eq!(response.content, "hello");
+        assert_eq!(response.total_tokens, 2);
+        let request = only_request(&server).await;
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer test-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn lumen_without_a_cost_header_reports_no_cost() {
+        let server = lumen_mock().await;
+        let response = provider(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+        assert_eq!(response.cost_micro_usd, None);
+    }
+
+    /// A gateway refusal keeps its code, so the key-rotation and budget
+    /// handling still see it; it is not retried.
+    #[tokio::test]
+    async fn lumen_error_bodies_stay_api_errors_with_their_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "key revoked", "type": "authentication_error", "code": "LM-4004"}
+            })))
+            .mount(&server)
+            .await;
+
+        let err = provider(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .err()
+            .expect("an error");
+
+        assert_eq!(err.gateway_code(), Some("LM-4004"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lumen_server_errors_are_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("waking up"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(completion_body())
+                    .insert_header("x-lumen-cost-micro-usd", "7"),
+            )
+            .mount(&server)
+            .await;
+
+        let response = provider(&server)
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.cost_micro_usd, Some(7));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

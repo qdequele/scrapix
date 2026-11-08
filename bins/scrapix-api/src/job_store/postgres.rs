@@ -91,11 +91,24 @@ fn row_to_job_state(row: &sqlx::postgres::PgRow) -> JobState {
         swap_meilisearch_url: row.get("swap_meilisearch_url"),
         swap_meilisearch_api_key: row.get("swap_meilisearch_api_key"),
         warnings: Vec::new(),
+        ai_usage: stored_ai_usage(row),
         // Webhook auth secrets are never persisted (redacted before the
         // `config` blob is stored); a job recovered from Postgres after a
         // restart has no real webhooks to deliver to.
         webhooks: Vec::new(),
     }
+}
+
+/// The AI usage kept in a crawl's `accounting` snapshot, or in an extract's
+/// (`{"ai_usage": ...}`); empty when there is none (or the column is absent).
+fn stored_ai_usage(row: &sqlx::postgres::PgRow) -> scrapix_core::AiUsage {
+    use sqlx::Row;
+    row.try_get::<Option<serde_json::Value>, _>("accounting")
+        .ok()
+        .flatten()
+        .and_then(|acc| acc.get("ai_usage").cloned())
+        .and_then(|usage| serde_json::from_value(usage).ok())
+        .unwrap_or_default()
 }
 
 #[async_trait::async_trait]

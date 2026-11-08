@@ -112,6 +112,7 @@ mod tests {
             url_message_id: id.into(),
             ai_enriched: false,
             ocr_pages: 0,
+            ai_usage: Default::default(),
         }
     }
 

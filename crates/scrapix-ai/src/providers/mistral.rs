@@ -165,6 +165,7 @@ impl MistralProvider {
             completion_tokens: resp.usage.completion_tokens,
             total_tokens: resp.usage.total_tokens,
             finish_reason: choice.finish_reason.clone(),
+            cost_micro_usd: None,
         })
     }
 }

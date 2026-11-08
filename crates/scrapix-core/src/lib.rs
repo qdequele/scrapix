@@ -9,6 +9,7 @@
 //! - Core traits
 
 pub mod ack;
+pub mod ai_usage;
 pub mod browser;
 pub mod config;
 pub mod content_types;
@@ -23,6 +24,7 @@ pub mod traits;
 pub mod url_glob;
 
 pub use ack::Ack;
+pub use ai_usage::AiUsage;
 pub use config::*;
 pub use crawl_scope::CrawlScope;
 pub use document::*;

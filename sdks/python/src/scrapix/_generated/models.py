@@ -803,47 +803,6 @@ class JobStatus(str, Enum):
     paused = "paused"
 
 
-class JobStatusResponse(BaseModel):
-    """
-    Job status response
-    """
-
-    model_config = ConfigDict(
-        extra="allow",
-        populate_by_name=True,
-    )
-    completed_at: Optional[str] = None
-    config: Optional[Any] = None
-    crawl_rate: float
-    documents_sent: int = Field(..., ge=0)
-    duration_seconds: Optional[int] = None
-    error_message: Optional[str] = None
-    errors: int = Field(..., ge=0)
-    eta_seconds: Optional[int] = Field(None, ge=0)
-    index_uid: str
-    job_id: str
-    job_type: JobKind
-    """
-    `crawl`, `batch_scrape` or `extract`
-    """
-    max_pages: Optional[int] = Field(None, ge=0)
-    pages_crawled: int = Field(..., ge=0)
-    pages_indexed: int = Field(..., ge=0)
-    start_urls: Optional[list[str]] = None
-    started_at: Optional[str] = None
-    status: JobStatus
-    """
-    One of `pending`, `running`, `paused`, `completed`, `failed`,
-    `cancelled`
-    """
-    warnings: Optional[list[str]] = None
-    """
-    Job-level warnings raised by workers while running the job (e.g. a
-    requested feature a worker cannot honor), deduplicated. Omitted when
-    there are none.
-    """
-
-
 class JobSummary(BaseModel):
     model_config = ConfigDict(
         extra="allow",
@@ -1902,6 +1861,32 @@ class OcrConfig(BaseModel):
     """
 
 
+class AiUsage(BaseModel):
+    """
+    Totals of a set of LLM calls (one page, one request, or a whole job).
+
+    `cost_micro_usd` is the provider cost the hosted AI gateway (Lumen)
+    settled for those calls (its `x-lumen-cost-micro-usd`), which is what it
+    bills the team. Calls whose cost the server did not report (a provider's
+    own API in standalone) add their tokens but no cost.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    calls: Optional[int] = Field(0, ge=0)
+    """
+    Successful LLM calls.
+    """
+    completion_tokens: Optional[int] = Field(0, ge=0)
+    cost_micro_usd: Optional[int] = Field(0, ge=0)
+    """
+    Provider cost reported by the gateway, in micro-USD.
+    """
+    prompt_tokens: Optional[int] = Field(0, ge=0)
+
+
 class Action3(BaseModel):
     """
     Scroll the page by `amount` viewport heights (default 1).
@@ -2014,6 +1999,12 @@ class ExtractStatusResponse(BaseModel):
         extra="allow",
         populate_by_name=True,
     )
+    ai_usage: Optional[AiUsage] = None
+    """
+    The extraction's LLM calls and the provider cost the hosted AI
+    gateway reported for them, in micro-USD (billed by the gateway, not
+    in the job's credits). Omitted when no AI call was made.
+    """
     data: Optional[dict[str, Any]] = None
     """
     The extracted data (`null` until the job completed)
@@ -2119,6 +2110,54 @@ class JobResultsResponse(BaseModel):
     total: int = Field(..., ge=0)
     """
     Number of results available so far
+    """
+
+
+class JobStatusResponse(BaseModel):
+    """
+    Job status response
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ai_usage: Optional[AiUsage] = None
+    """
+    The job's LLM calls (AI summary, extraction, OCR) and the provider
+    cost the hosted AI gateway reported for them, in micro-USD. That cost
+    is billed by the gateway (with the Lab's markup), not in the job's
+    credits. Omitted when the job made no AI call.
+    """
+    completed_at: Optional[str] = None
+    config: Optional[Any] = None
+    crawl_rate: float
+    documents_sent: int = Field(..., ge=0)
+    duration_seconds: Optional[int] = None
+    error_message: Optional[str] = None
+    errors: int = Field(..., ge=0)
+    eta_seconds: Optional[int] = Field(None, ge=0)
+    index_uid: str
+    job_id: str
+    job_type: JobKind
+    """
+    `crawl`, `batch_scrape` or `extract`
+    """
+    max_pages: Optional[int] = Field(None, ge=0)
+    pages_crawled: int = Field(..., ge=0)
+    pages_indexed: int = Field(..., ge=0)
+    start_urls: Optional[list[str]] = None
+    started_at: Optional[str] = None
+    status: JobStatus
+    """
+    One of `pending`, `running`, `paused`, `completed`, `failed`,
+    `cancelled`
+    """
+    warnings: Optional[list[str]] = None
+    """
+    Job-level warnings raised by workers while running the job (e.g. a
+    requested feature a worker cannot honor), deduplicated. Omitted when
+    there are none.
     """
 
 
@@ -2682,6 +2721,13 @@ class ScrapeResponse(BaseModel):
     )
     actions: Optional[ScrapeActionsResult] = None
     ai: Optional[AiResult] = None
+    ai_usage: Optional[AiUsage] = None
+    """
+    The request's LLM calls (AI summary, extraction, OCR) and the
+    provider cost the hosted AI gateway reported for them, in micro-USD
+    (billed by the gateway, not in the scrape's credits). Omitted when no
+    AI call was made.
+    """
     blocks: Optional[list[ContentBlock]] = None
     """
     Content blocks split by headings (if format "blocks" requested)

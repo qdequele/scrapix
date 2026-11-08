@@ -167,6 +167,9 @@ pub struct ChatResponse {
 
     /// Finish reason
     pub finish_reason: Option<String>,
+
+    /// What the call cost in micro-USD, when the gateway reported it.
+    pub cost_micro_usd: Option<u64>,
 }
 
 impl From<ProviderChatResponse> for ChatResponse {
@@ -178,6 +181,7 @@ impl From<ProviderChatResponse> for ChatResponse {
             completion_tokens: r.completion_tokens,
             total_tokens: r.total_tokens,
             finish_reason: r.finish_reason,
+            cost_micro_usd: r.cost_micro_usd,
         }
     }
 }
@@ -191,6 +195,9 @@ pub struct AiUsageEvent {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub duration_ms: u64,
+    /// What the call cost in micro-USD, as the Lumen gateway settled it
+    /// (`x-lumen-cost-micro-usd`). `None` when the server did not say.
+    pub cost_micro_usd: Option<u64>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Attribution of the call (job, account, feature, page), when the
     /// caller ran it inside [`AI_USAGE_CONTEXT`].
@@ -212,6 +219,42 @@ pub struct AiUsageContext {
 tokio::task_local! {
     /// Attribution for AI usage events emitted by calls made inside this scope.
     pub static AI_USAGE_CONTEXT: AiUsageContext;
+}
+
+tokio::task_local! {
+    /// Running totals of the LLM calls made inside this scope: a caller
+    /// that wants to know what some work used (a crawled page, a `/scrape`)
+    /// runs it in `AI_USAGE_TALLY.scope(tally.clone(), fut)` and reads
+    /// [`AiUsageTally::totals`] after.
+    pub static AI_USAGE_TALLY: Arc<AiUsageTally>;
+}
+
+/// Thread-safe running totals of LLM calls (see [`AI_USAGE_TALLY`]).
+#[derive(Debug, Default)]
+pub struct AiUsageTally {
+    totals: parking_lot::Mutex<scrapix_core::AiUsage>,
+}
+
+impl AiUsageTally {
+    /// A new, empty tally to scope work in.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Count one successful call.
+    fn record(&self, response: &ProviderChatResponse) {
+        self.totals.lock().add(&scrapix_core::AiUsage {
+            calls: 1,
+            prompt_tokens: u64::from(response.prompt_tokens),
+            completion_tokens: u64::from(response.completion_tokens),
+            cost_micro_usd: response.cost_micro_usd.unwrap_or(0),
+        });
+    }
+
+    /// The calls counted so far.
+    pub fn totals(&self) -> scrapix_core::AiUsage {
+        *self.totals.lock()
+    }
 }
 
 /// Receiver end of the AI usage tracking channel.
@@ -445,6 +488,8 @@ impl AiClient {
                         "LLM call completed"
                     );
 
+                    let _ = AI_USAGE_TALLY.try_with(|tally| tally.record(&response));
+
                     // Emit usage event if tracking is enabled
                     if let Some(ref tx) = self.usage_tx {
                         if let Err(e) = tx.send(AiUsageEvent {
@@ -454,6 +499,7 @@ impl AiClient {
                             completion_tokens: response.completion_tokens,
                             total_tokens: response.total_tokens,
                             duration_ms,
+                            cost_micro_usd: response.cost_micro_usd,
                             timestamp: chrono::Utc::now(),
                             context: AI_USAGE_CONTEXT.try_with(|c| c.clone()).ok(),
                         }) {
@@ -694,6 +740,71 @@ mod gateway_tests {
         assert_eq!(event.provider, "openai");
         assert_eq!(event.total_tokens, 5);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Calls made inside an `AI_USAGE_TALLY` scope add up; the Lumen cost
+    /// header lands in the totals and on the usage event; calls outside the
+    /// scope are not counted.
+    #[tokio::test]
+    async fn a_tally_sums_the_calls_made_in_its_scope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-4o-mini",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hello"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                    }))
+                    .insert_header("x-lumen-cost-micro-usd", "150"),
+            )
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = AiClient::new(AiClientConfig {
+            api_key: "test-key".to_string(),
+            provider: "openai".to_string(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            lumen_metadata: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_usage_sender(tx);
+
+        let tally = AiUsageTally::new();
+        AI_USAGE_TALLY
+            .scope(tally.clone(), async {
+                let (a, b) = tokio::join!(
+                    client.chat(user_message(), "gpt-4o-mini", None, None),
+                    client.chat(user_message(), "gpt-4o-mini", None, None)
+                );
+                a.unwrap();
+                b.unwrap();
+            })
+            .await;
+        client
+            .chat(user_message(), "gpt-4o-mini", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tally.totals(),
+            scrapix_core::AiUsage {
+                calls: 2,
+                prompt_tokens: 6,
+                completion_tokens: 4,
+                cost_micro_usd: 300,
+            }
+        );
+        assert_eq!(rx.try_recv().unwrap().cost_micro_usd, Some(150));
     }
 
     fn lumen_error(code: &str) -> serde_json::Value {

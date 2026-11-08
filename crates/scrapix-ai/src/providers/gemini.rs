@@ -283,6 +283,7 @@ impl GeminiProvider {
             completion_tokens: usage.candidates_token_count,
             total_tokens: usage.total_token_count,
             finish_reason: candidate.finish_reason.clone(),
+            cost_micro_usd: None,
         })
     }
 }
