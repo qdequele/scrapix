@@ -63,6 +63,43 @@ pub struct FetchOptions {
     /// check for this fetch; `None`/`Some(true)` keep the fetcher's robots
     /// cache behavior.
     pub respect_robots: Option<bool>,
+
+    /// Keep an HTML body only up to the end of its `<head>` (`</head>`).
+    /// For callers that only need the title and meta tags (`/map`): the
+    /// page is not buffered, decoded or returned past its head (the rest is
+    /// read and discarded up to 1 MiB, to keep the connection reusable).
+    /// Binary documents are unaffected. The body is never
+    /// rejected as too large in this mode; it is cut at
+    /// [`HEAD_ONLY_MAX_BYTES`] when no `</head>` shows up first.
+    pub head_only: bool,
+
+    /// Retries for this fetch, replacing `RetryConfig::max_retries`
+    /// (`Some(0)`: one attempt). `None` keeps the fetcher's setting.
+    pub max_retries: Option<u32>,
+
+    /// Timeout for each attempt of this fetch, replacing the client's.
+    /// `None` keeps the fetcher's configured timeout.
+    pub timeout: Option<Duration>,
+}
+
+/// The most a [`FetchOptions::head_only`] fetch keeps when the page has no
+/// `</head>` in its first bytes.
+pub const HEAD_ONLY_MAX_BYTES: usize = 256 * 1024;
+
+/// After a [`FetchOptions::head_only`] fetch has its head, the rest of the
+/// body is read and discarded up to this many bytes to keep the connection
+/// reusable; a longer body is cut.
+const HEAD_ONLY_DRAIN_MAX_BYTES: usize = 1024 * 1024;
+
+/// Where `</head` starts in `bytes`, searching from `from` (ASCII
+/// case-insensitive).
+fn find_head_end(bytes: &[u8], from: usize) -> Option<usize> {
+    const NEEDLE: &[u8] = b"</head";
+    bytes
+        .get(from..)?
+        .windows(NEEDLE.len())
+        .position(|w| w.eq_ignore_ascii_case(NEEDLE))
+        .map(|i| from + i)
 }
 
 impl FetchOptions {
@@ -516,7 +553,10 @@ impl HttpFetcher {
         let mut backoff = self.config.retry_config.initial_backoff;
         let mut sleep_for = backoff;
 
-        for attempt in 0..=self.config.retry_config.max_retries {
+        let max_retries = options
+            .max_retries
+            .unwrap_or(self.config.retry_config.max_retries);
+        for attempt in 0..=max_retries {
             if attempt > 0 {
                 debug!(attempt, "Retrying request after {:?}", sleep_for);
                 tokio::time::sleep(sleep_for).await;
@@ -549,7 +589,7 @@ impl HttpFetcher {
                         .retry_config
                         .retryable_status_codes
                         .contains(&status);
-                    if retryable && attempt < self.config.retry_config.max_retries {
+                    if retryable && attempt < max_retries {
                         let hinted = response
                             .headers()
                             .get(RETRY_AFTER)
@@ -664,6 +704,9 @@ impl HttpFetcher {
         options: &FetchOptions,
     ) -> Result<(Response, String)> {
         let mut request = client.get(url.as_str());
+        if let Some(timeout) = options.timeout {
+            request = request.timeout(timeout);
+        }
 
         for (name, value) in &options.extra_headers {
             match (
@@ -787,10 +830,13 @@ impl HttpFetcher {
         } else {
             self.config.max_body_size
         };
-        let effective_cap = if is_success {
-            effective_cap
-        } else {
+        let head_only = options.head_only && !is_binary;
+        let effective_cap = if !is_success {
             effective_cap.min(64 * 1024)
+        } else if head_only {
+            effective_cap.min(HEAD_ONLY_MAX_BYTES)
+        } else {
+            effective_cap
         };
 
         // Whether exceeding `effective_cap` is a hard failure (2xx — the page
@@ -798,7 +844,7 @@ impl HttpFetcher {
         // truncation point (non-2xx — the body is never indexed, it's only
         // kept for diagnostics, so R1 requires we still return `Ok` with the
         // final status rather than turning it into an `Err`).
-        let hard_cap = is_success;
+        let hard_cap = is_success && !head_only;
 
         // Reject up front when the server told us the size via Content-Length.
         // Only for 2xx — a non-2xx body is truncated below instead.
@@ -839,7 +885,34 @@ impl HttpFetcher {
                 bytes.extend_from_slice(&chunk[..remaining]);
                 break;
             }
+            let searched = bytes.len().saturating_sub(b"</head".len() - 1);
             bytes.extend_from_slice(&chunk);
+            if head_only {
+                if let Some(end) = find_head_end(&bytes, searched) {
+                    // Keep through `</head>` so a regex on the head still
+                    // sees the closing tag; drop the rest of the body.
+                    let close = bytes[end..]
+                        .iter()
+                        .position(|&b| b == b'>')
+                        .map_or(bytes.len(), |i| end + i + 1);
+                    bytes.truncate(close);
+                    break;
+                }
+            }
+        }
+        if head_only {
+            // Read the rest without keeping it, so the connection goes back
+            // to the pool: dropping a response mid-body closes an HTTP/1.1
+            // connection, and a new TLS handshake per page costs more than
+            // the bytes saved. Past `HEAD_ONLY_DRAIN_MAX_BYTES`, dropping
+            // is the cheaper of the two.
+            let mut drained = 0usize;
+            while drained <= HEAD_ONLY_DRAIN_MAX_BYTES {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => drained += chunk.len(),
+                    Ok(None) | Err(_) => break,
+                }
+            }
         }
 
         // Encode body:
@@ -1080,6 +1153,17 @@ impl Default for HttpFetcherBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_head_end_is_case_insensitive_and_honors_the_start() {
+        let html = b"<html><HEAD><title>t</title></HeAd><body></body>";
+        let at = find_head_end(html, 0).unwrap();
+        assert_eq!(&html[at..at + 7], b"</HeAd>");
+        assert_eq!(find_head_end(html, at), Some(at));
+        assert_eq!(find_head_end(html, at + 1), None);
+        assert_eq!(find_head_end(b"<head>", 0), None);
+        assert_eq!(find_head_end(b"abc", 10), None);
+    }
 
     #[test]
     fn test_fetcher_config_default() {

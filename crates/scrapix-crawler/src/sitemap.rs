@@ -31,6 +31,7 @@ use std::io::BufRead;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Client;
@@ -38,6 +39,10 @@ use tracing::{debug, instrument, warn};
 use url::Url;
 
 use scrapix_core::{Result, ScrapixError};
+
+/// Sitemaps (from robots.txt, or the children of a sitemap index) fetched
+/// at once. Results are still merged in order.
+const SITEMAP_FETCH_CONCURRENCY: usize = 8;
 
 /// Configuration for sitemap parsing
 #[derive(Debug, Clone)]
@@ -195,11 +200,10 @@ impl SitemapParser {
         // refused explicitly — `base_url` here can be user-supplied (e.g.
         // the /map endpoint's request URL).
         crate::safe_client::reject_ip_host(&parsed)?;
-        let robots_url = format!(
-            "{}://{}/robots.txt",
-            parsed.scheme(),
-            parsed.host_str().unwrap_or("")
-        );
+        // `origin()` keeps a non-default port (`host_str()` alone drops it).
+        let origin = parsed.origin().ascii_serialization();
+        let robots_url = format!("{origin}/robots.txt");
+        let default_sitemap = format!("{origin}/sitemap.xml");
 
         debug!(robots_url, "Fetching robots.txt for sitemap discovery");
 
@@ -212,11 +216,6 @@ impl SitemapParser {
 
         if !response.status().is_success() {
             // No robots.txt, try default sitemap location
-            let default_sitemap = format!(
-                "{}://{}/sitemap.xml",
-                parsed.scheme(),
-                parsed.host_str().unwrap_or("")
-            );
             return Ok(vec![default_sitemap]);
         }
 
@@ -245,11 +244,6 @@ impl SitemapParser {
 
         // If no sitemaps found in robots.txt, try default location
         if sitemaps.is_empty() {
-            let default_sitemap = format!(
-                "{}://{}/sitemap.xml",
-                parsed.scheme(),
-                parsed.host_str().unwrap_or("")
-            );
             sitemaps.push(default_sitemap);
         }
 
@@ -295,9 +289,32 @@ impl SitemapParser {
 
                     debug!(url, count = entries.len(), "Parsed sitemap index");
 
+                    // Children are fetched a few at a time but merged in
+                    // index order, so the result is the same as a
+                    // sequential walk; the ones not yet started are skipped
+                    // once `max_urls` is reached.
+                    // (Built up front as boxed futures: a `.map` closure
+                    // here trips rustc's higher-ranked `Send` check on this
+                    // recursive future.)
+                    type Child<'e> = std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = (&'e SitemapEntry, Result<Vec<SitemapUrl>>),
+                                > + Send
+                                + 'e,
+                        >,
+                    >;
+                    let pending: Vec<Child<'_>> = entries
+                        .iter()
+                        .map(|entry| {
+                            let child = self.fetch_and_parse_recursive(&entry.loc, depth + 1);
+                            Box::pin(async move { (entry, child.await) }) as Child<'_>
+                        })
+                        .collect();
+                    let mut children = stream::iter(pending).buffered(SITEMAP_FETCH_CONCURRENCY);
                     let mut all_urls = Vec::new();
-                    for entry in entries {
-                        match self.fetch_and_parse_recursive(&entry.loc, depth + 1).await {
+                    while let Some((entry, result)) = children.next().await {
+                        match result {
                             Ok(urls) => {
                                 all_urls.extend(urls);
                                 if all_urls.len() >= self.config.max_urls {
@@ -533,9 +550,24 @@ impl SitemapParser {
     pub async fn discover_all_urls(&self, base_url: &str) -> Result<Vec<SitemapUrl>> {
         let sitemaps = self.discover_from_robots(base_url).await?;
 
+        // Boxed up front, like the index children in
+        // `fetch_and_parse_recursive`, to keep the future `Send` for spawns.
+        type Fetch<'s> = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = (&'s String, Result<Vec<SitemapUrl>>)> + Send + 's,
+            >,
+        >;
+        let pending: Vec<Fetch<'_>> = sitemaps
+            .iter()
+            .map(|sitemap| {
+                let fetch = self.fetch_and_parse(sitemap);
+                Box::pin(async move { (sitemap, fetch.await) }) as Fetch<'_>
+            })
+            .collect();
+        let mut fetches = stream::iter(pending).buffered(SITEMAP_FETCH_CONCURRENCY);
         let mut all_urls = Vec::new();
-        for sitemap in sitemaps {
-            match self.fetch_and_parse(&sitemap).await {
+        while let Some((sitemap, result)) = fetches.next().await {
+            match result {
                 Ok(urls) => {
                     all_urls.extend(urls);
                     if all_urls.len() >= self.config.max_urls {

@@ -74,6 +74,8 @@ pub(crate) mod usage_units;
 pub mod webhooks;
 
 #[cfg(test)]
+mod map_tests;
+#[cfg(test)]
 mod scrape_browser_tests;
 #[cfg(test)]
 mod scrape_tests;
@@ -5168,48 +5170,55 @@ struct MapResponse {
 
 /// Result from fetching a single page during mapping
 struct MapFetchResult {
-    url: String,
     title: Option<String>,
     description: Option<String>,
-    /// Newly discovered child links (url, anchor_text)
+    /// Newly discovered child links (url, anchor_text). Empty for a
+    /// head-only fetch.
     child_links: Vec<(String, Option<String>)>,
 }
 
-/// Extract links from an HTML document, resolving relative URLs against a base.
-/// Only returns same-domain http(s) links.
-fn extract_page_links(html: &str, base_url: &url::Url) -> Vec<(String, Option<String>)> {
+/// What one `/map` page fetch came back with.
+enum MapFetchOutcome {
+    Page(MapFetchResult),
+    /// 429 or 503, or no answer in time: the site is pushing back, so
+    /// `/map` lowers its concurrency.
+    Throttled,
+    /// Any other failure (non-2xx, not HTML, robots.txt, network).
+    Failed,
+}
+
+/// Links of an HTML document, relative ones resolved against `page_url`
+/// (where the document was served). Only http(s) links on `domain` are
+/// kept, without their fragment.
+fn extract_page_links(
+    html: &str,
+    page_url: &url::Url,
+    domain: &str,
+) -> Vec<(String, Option<String>)> {
     use std::sync::OnceLock;
     static LINK_SELECTOR: OnceLock<scraper::Selector> = OnceLock::new();
 
     let document = scraper::Html::parse_document(html);
     let link_selector =
         LINK_SELECTOR.get_or_init(|| scraper::Selector::parse("a[href]").expect("valid selector"));
-    let base_domain = base_url.host_str().unwrap_or("");
 
     let mut links = Vec::new();
     for element in document.select(link_selector) {
-        if let Some(href) = element.value().attr("href") {
-            let resolved = base_url.join(href).ok();
-            if let Some(resolved_url) = resolved {
-                // Only same-domain http(s) links
-                if matches!(resolved_url.scheme(), "http" | "https")
-                    && resolved_url.host_str().unwrap_or("") == base_domain
-                {
-                    // Strip fragment
-                    let mut clean = resolved_url;
-                    clean.set_fragment(None);
-                    let url_str = clean.to_string();
-
-                    let anchor_text = element.text().collect::<String>();
-                    let anchor = if anchor_text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(anchor_text.trim().to_string())
-                    };
-                    links.push((url_str, anchor));
-                }
-            }
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Ok(mut resolved) = page_url.join(href) else {
+            continue;
+        };
+        if !matches!(resolved.scheme(), "http" | "https")
+            || resolved.host_str().unwrap_or("") != domain
+        {
+            continue;
         }
+        resolved.set_fragment(None);
+        let anchor_text = element.text().collect::<String>();
+        let anchor = (!anchor_text.trim().is_empty()).then(|| anchor_text.trim().to_string());
+        links.push((resolved.to_string(), anchor));
     }
     links
 }
@@ -5266,38 +5275,157 @@ fn head_title_and_description(html: &str) -> (Option<String>, Option<String>) {
     (title, description)
 }
 
-/// Fetch a single URL and extract title, description, and child links.
+/// Wall-clock budget of one `/map` call, sitemap discovery included. What
+/// was found by then is returned.
+const MAP_DEADLINE: Duration = Duration::from_secs(60);
+/// Per-attempt timeout of a `/map` page fetched only for its title and
+/// description over HTTP. Titles are best effort: a slow page goes without.
+const MAP_PAGE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Time a page whose links are followed gets, retry included: losing it
+/// loses everything below it, and nothing else waits on it (pages do not
+/// run in waves).
+const MAP_LINK_PAGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout of a `/map` page rendered in the browser.
+const MAP_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Concurrent HTTP page fetches of one `/map` call: it starts at
+/// `MAP_INITIAL_CONCURRENCY`, grows by one per page fetched up to
+/// `MAP_MAX_CONCURRENCY`, and halves (not below `MAP_MIN_CONCURRENCY`) when
+/// the site answers 429/503 or times out.
+const MAP_INITIAL_CONCURRENCY: usize = 32;
+const MAP_MIN_CONCURRENCY: usize = 4;
+const MAP_MAX_CONCURRENCY: usize = 100;
+/// Browser renders run at a fixed concurrency.
+const MAP_RENDER_CONCURRENCY: usize = 50;
+/// At most one halving per this interval, so a burst of failures from the
+/// fetches already in flight counts as one signal.
+const MAP_BACKOFF_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Additive-increase / multiplicative-decrease cap on a `/map` call's
+/// concurrent page fetches.
+#[derive(Debug)]
+struct MapConcurrency {
+    limit: usize,
+    min: usize,
+    max: usize,
+    last_cut: Option<std::time::Instant>,
+}
+
+impl MapConcurrency {
+    fn adaptive() -> Self {
+        Self {
+            limit: MAP_INITIAL_CONCURRENCY,
+            min: MAP_MIN_CONCURRENCY,
+            max: MAP_MAX_CONCURRENCY,
+            last_cut: None,
+        }
+    }
+
+    fn fixed(limit: usize) -> Self {
+        Self {
+            limit,
+            min: limit,
+            max: limit,
+            last_cut: None,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn on_success(&mut self) {
+        self.limit = (self.limit + 1).min(self.max);
+    }
+
+    fn on_throttle(&mut self, now: std::time::Instant) {
+        if self
+            .last_cut
+            .is_some_and(|at| now.duration_since(at) < MAP_BACKOFF_COOLDOWN)
+        {
+            return;
+        }
+        self.limit = (self.limit / 2).max(self.min);
+        self.last_cut = Some(now);
+    }
+}
+
+/// Fetch one page for `/map`: its title and description, and its links
+/// unless `head_only` (then only the `<head>` is downloaded).
+async fn map_fetch(
+    fetcher: Arc<HttpFetcher>,
+    browser: Option<Arc<CdpRenderer>>,
+    url: String,
+    domain: String,
+    head_only: bool,
+) -> MapFetchOutcome {
+    use scrapix_core::ScrapixError;
+
+    let crawl_url = CrawlUrl::seed(&url);
+    let result = if let Some(renderer) = browser {
+        match tokio::time::timeout(MAP_RENDER_TIMEOUT, renderer.fetch(&crawl_url)).await {
+            Ok(result) => result,
+            Err(_) => return MapFetchOutcome::Throttled,
+        }
+    } else {
+        // A missing title is fine; a page whose links we follow gets more
+        // time and a retry (when the first attempt fails fast, e.g. a 503),
+        // since losing it loses everything below it. `budget` bounds the
+        // attempts and the backoff together.
+        let (budget, max_retries) = if head_only {
+            (MAP_PAGE_TIMEOUT, 0)
+        } else {
+            (MAP_LINK_PAGE_TIMEOUT, 1)
+        };
+        let options = scrapix_crawler::FetchOptions {
+            head_only,
+            max_retries: Some(max_retries),
+            timeout: Some(budget),
+            ..Default::default()
+        };
+        match tokio::time::timeout(budget, fetcher.fetch_with_options(&crawl_url, options)).await {
+            Ok(result) => result,
+            Err(_) => return MapFetchOutcome::Throttled,
+        }
+    };
+    let page = match result {
+        Ok(page) if (200..300).contains(&page.status) => page,
+        Ok(page) if matches!(page.status, 429 | 503) => return MapFetchOutcome::Throttled,
+        Err(ScrapixError::Timeout(_)) => return MapFetchOutcome::Throttled,
+        _ => return MapFetchOutcome::Failed,
+    };
+
+    let (title, description) = head_title_and_description(&page.html);
+    let child_links = if head_only {
+        Vec::new()
+    } else {
+        // Relative links resolve against where the page was served.
+        let page_url = url::Url::parse(&page.final_url)
+            .or_else(|_| url::Url::parse(&url))
+            .ok();
+        page_url
+            .map(|page_url| extract_page_links(&page.html, &page_url, &domain))
+            .unwrap_or_default()
+    };
+    MapFetchOutcome::Page(MapFetchResult {
+        title,
+        description,
+        child_links,
+    })
+}
+
+/// Fetch a single URL in full and extract title, description, and child
+/// links on `base_url`'s host.
 async fn map_fetch_page(
     fetcher: Arc<HttpFetcher>,
     browser: Option<Arc<CdpRenderer>>,
     url: String,
     base_url: url::Url,
 ) -> Option<MapFetchResult> {
-    let crawl_url = CrawlUrl::seed(&url);
-    let fetch_fut = if let Some(ref renderer) = browser {
-        let renderer = renderer.clone();
-        let crawl_url = crawl_url.clone();
-        Box::pin(async move { renderer.fetch(&crawl_url).await })
-            as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-    } else {
-        let fetcher = fetcher.clone();
-        let crawl_url = crawl_url.clone();
-        Box::pin(async move { fetcher.fetch(&crawl_url).await })
-    };
-    let page = match tokio::time::timeout(Duration::from_secs(30), fetch_fut).await {
-        Ok(Ok(page)) if (200..300).contains(&page.status) => page,
-        _ => return None,
-    };
-
-    let (title, description) = head_title_and_description(&page.html);
-    let child_links = extract_page_links(&page.html, &base_url);
-
-    Some(MapFetchResult {
-        url,
-        title,
-        description,
-        child_links,
-    })
+    let domain = base_url.host_str().unwrap_or("").to_string();
+    match map_fetch(fetcher, browser, url, domain, false).await {
+        MapFetchOutcome::Page(page) => Some(page),
+        MapFetchOutcome::Throttled | MapFetchOutcome::Failed => None,
+    }
 }
 
 /// Map a website: sitemap-first discovery with optional BFS deep crawl
@@ -5368,19 +5496,13 @@ async fn map_url(
 
     info!(url = %request.url, limit, depth = max_depth, render_js = request.render_js, "Mapping website URLs");
 
-    use futures::stream::FuturesUnordered;
+    let deadline = tokio::time::Instant::now() + MAP_DEADLINE;
 
     // Track visited URLs and collected results
     let mut visited = HashSet::new();
     let mut results: Vec<MapLink> = Vec::new();
 
-    // Map from URL → sitemap metadata for enrichment
-    type SitemapMeta = (Option<String>, Option<f32>, Option<String>);
-    let mut sitemap_meta: HashMap<String, SitemapMeta> = HashMap::new();
-
-    let base_url = parsed_url.clone();
-    let base_domain = base_url.host_str().unwrap_or("").to_string();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(50));
+    let base_domain = parsed_url.host_str().unwrap_or("").to_string();
     let fetcher = state.fetcher.clone();
     let browser: Option<Arc<CdpRenderer>> = if request.render_js {
         state.browser_renderer.clone()
@@ -5388,15 +5510,20 @@ async fn map_url(
         None
     };
 
-    // Total timeout
-    let map_deadline = std::time::Instant::now() + Duration::from_secs(60);
-
-    // ── Step 1: Sitemap discovery (blocking, primary source) ──────────────
+    // ── Step 1: Sitemap discovery (primary source) ────────────────────────
 
     if request.sitemap {
-        let sitemap_parser = SitemapParser::with_defaults();
-        match sitemap_parser.discover_all_urls(&request.url).await {
-            Ok(sitemap_urls) => {
+        // Stop reading sitemaps well past `limit` (some URLs are dropped
+        // below as off-domain or not pages) instead of the parser's 100k.
+        let sitemap_parser = SitemapParser::new(scrapix_crawler::SitemapConfig {
+            max_urls: limit.saturating_mul(2).clamp(1_000, 100_000),
+            allow_private_ips: fetcher.allows_private_ips(),
+            ..Default::default()
+        });
+        match tokio::time::timeout_at(deadline, sitemap_parser.discover_all_urls(&request.url))
+            .await
+        {
+            Ok(Ok(sitemap_urls)) => {
                 debug!(count = sitemap_urls.len(), "Discovered URLs from sitemaps");
                 for su in sitemap_urls {
                     if visited.len() >= limit {
@@ -5407,48 +5534,32 @@ async fn map_url(
                         continue;
                     }
                     // Only same-domain URLs
-                    if let Ok(su_parsed) = url::Url::parse(&su.loc) {
-                        if su_parsed.host_str().unwrap_or("") != base_domain {
-                            continue;
-                        }
-                    } else {
-                        continue;
+                    match url::Url::parse(&su.loc) {
+                        Ok(su_parsed) if su_parsed.host_str().unwrap_or("") == base_domain => {}
+                        _ => continue,
                     }
                     if visited.insert(su.loc.clone()) {
-                        // Store sitemap metadata for later enrichment
-                        let lastmod = if request.get_lastmod {
-                            su.lastmod.map(|dt| dt.to_rfc3339())
-                        } else {
-                            None
-                        };
-                        let priority = if request.get_priority {
-                            su.priority
-                        } else {
-                            None
-                        };
-                        let changefreq = if request.get_changefreq {
-                            su.changefreq.map(|cf| format!("{:?}", cf).to_lowercase())
-                        } else {
-                            None
-                        };
-                        sitemap_meta.insert(
-                            su.loc.clone(),
-                            (lastmod.clone(), priority, changefreq.clone()),
-                        );
                         results.push(MapLink {
                             url: su.loc,
                             title: None,
                             description: None,
-                            lastmod,
-                            priority,
-                            changefreq,
+                            lastmod: su
+                                .lastmod
+                                .filter(|_| request.get_lastmod)
+                                .map(|dt| dt.to_rfc3339()),
+                            priority: su.priority.filter(|_| request.get_priority),
+                            changefreq: su
+                                .changefreq
+                                .filter(|_| request.get_changefreq)
+                                .map(|cf| format!("{:?}", cf).to_lowercase()),
                         });
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "Sitemap discovery failed, falling back to BFS only");
             }
+            Err(_) => warn!(url = %request.url, "Sitemap discovery hit the map deadline"),
         }
     }
 
@@ -5465,177 +5576,95 @@ async fn map_url(
         });
     }
 
-    // ── Step 2: Enrich sitemap URLs with HTML metadata (title/description) ──
+    // ── Step 2: Fetch pages (title/description, and links up to depth) ───
+    //
+    // One work queue, each URL fetched at most once: for its title and
+    // description, for its links (depth < max_depth), or both. A page
+    // whose links are not followed is read only up to `</head>`. Pages
+    // start as soon as a slot frees up, without waiting for the rest of
+    // their depth.
 
-    if needs_html_fetch && !results.is_empty() {
-        let urls_to_fetch: Vec<String> =
-            results.iter().take(limit).map(|r| r.url.clone()).collect();
+    let mut queue: VecDeque<(usize, u32)> = (0..results.len()).map(|i| (i, 0)).collect();
+    let mut tasks: tokio::task::JoinSet<(usize, u32, MapFetchOutcome)> =
+        tokio::task::JoinSet::new();
+    let mut concurrency = if browser.is_some() {
+        MapConcurrency::fixed(MAP_RENDER_CONCURRENCY)
+    } else {
+        MapConcurrency::adaptive()
+    };
 
-        debug!(
-            count = urls_to_fetch.len(),
-            "Fetching HTML metadata for sitemap URLs"
-        );
-
-        let get_title = request.get_title;
-        let get_description = request.get_description;
-
-        let mut in_flight: FuturesUnordered<_> = urls_to_fetch
-            .into_iter()
-            .map(|url| {
-                let semaphore = semaphore.clone();
-                let fetcher = fetcher.clone();
-                let browser = browser.clone();
-                let base_url = base_url.clone();
-                tokio::spawn(async move {
-                    let _permit = semaphore.acquire().await.ok()?;
-                    map_fetch_page(fetcher, browser, url, base_url).await
-                })
-            })
-            .collect();
-
-        // Build a lookup from fetch results
-        let mut meta_map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-        while let Some(task_result) = in_flight.next().await {
-            if std::time::Instant::now() > map_deadline {
-                warn!("Map metadata fetch timed out");
+    loop {
+        while tasks.len() < concurrency.limit() {
+            let Some((index, depth)) = queue.pop_front() else {
                 break;
+            };
+            // Once `limit` URLs are known, no new link would be kept.
+            let follow_links = depth < max_depth && visited.len() < limit;
+            if !follow_links && !needs_html_fetch {
+                continue;
             }
-            if let Ok(Some(fetch_result)) = task_result {
-                let title = if get_title { fetch_result.title } else { None };
-                let desc = if get_description {
-                    fetch_result.description
-                } else {
-                    None
-                };
-                meta_map.insert(fetch_result.url, (title, desc));
-            }
+            let url = results[index].url.clone();
+            let fetcher = fetcher.clone();
+            let browser = browser.clone();
+            let domain = base_domain.clone();
+            tasks.spawn(async move {
+                let outcome = map_fetch(fetcher, browser, url, domain, !follow_links).await;
+                (index, depth, outcome)
+            });
         }
 
-        // Merge metadata into results
-        for link in &mut results {
-            if let Some((title, description)) = meta_map.remove(&link.url) {
-                link.title = title;
-                link.description = description;
-            }
-        }
-    }
-
-    // ── Step 3: BFS deep crawl (only if depth > 0) ───────────────────────
-
-    if max_depth > 0 {
-        // Build frontier from all currently known URLs
-        let mut frontier: Vec<String> = results.iter().map(|r| r.url.clone()).collect();
-
-        for current_depth in 1..=max_depth {
-            if frontier.is_empty() || results.len() >= limit {
+        // Nothing in flight here means the queue is drained too.
+        let joined = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(url = %request.url, pending = queue.len() + tasks.len(), "Map deadline reached, returning what was found");
                 break;
             }
-            if std::time::Instant::now() > map_deadline {
-                warn!(url = %request.url, "Map operation timed out during BFS");
-                break;
-            }
-
-            let budget = limit.saturating_sub(results.len());
-            frontier.truncate(budget);
-
-            debug!(
-                depth = current_depth,
-                frontier_size = frontier.len(),
-                "BFS depth level"
-            );
-
-            // Fetch all frontier pages to extract child links
-            let mut in_flight: FuturesUnordered<_> = frontier
-                .drain(..)
-                .map(|url| {
-                    let semaphore = semaphore.clone();
-                    let fetcher = fetcher.clone();
-                    let browser = browser.clone();
-                    let base_url = base_url.clone();
-                    tokio::spawn(async move {
-                        let _permit = semaphore.acquire().await.ok()?;
-                        map_fetch_page(fetcher, browser, url, base_url).await
-                    })
-                })
-                .collect();
-
-            let mut next_frontier: Vec<String> = Vec::new();
-
-            while let Some(task_result) = in_flight.next().await {
-                if let Ok(Some(fetch_result)) = task_result {
-                    // Extract child links for next BFS level
-                    for (child_url, _anchor) in fetch_result.child_links {
-                        if is_non_page_url(&child_url) {
-                            continue;
-                        }
-                        if visited.len() < limit && visited.insert(child_url.clone()) {
-                            results.push(MapLink {
-                                url: child_url.clone(),
-                                title: None,
-                                description: None,
-                                lastmod: None,
-                                priority: None,
-                                changefreq: None,
-                            });
-                            next_frontier.push(child_url);
-                        }
-                    }
+        };
+        let Ok((index, depth, outcome)) = joined else {
+            continue;
+        };
+        match outcome {
+            MapFetchOutcome::Page(page) => {
+                concurrency.on_success();
+                let link = &mut results[index];
+                if request.get_title {
+                    link.title = page.title;
                 }
-
-                if results.len() >= limit {
-                    break;
+                if request.get_description {
+                    link.description = page.description;
                 }
-            }
-
-            // Enrich newly discovered URLs with HTML metadata
-            if needs_html_fetch && !next_frontier.is_empty() {
-                let get_title = request.get_title;
-                let get_description = request.get_description;
-
-                let mut enrich_flight: FuturesUnordered<_> = next_frontier
-                    .iter()
-                    .map(|url| {
-                        let semaphore = semaphore.clone();
-                        let fetcher = fetcher.clone();
-                        let browser = browser.clone();
-                        let base_url = base_url.clone();
-                        let url = url.clone();
-                        tokio::spawn(async move {
-                            let _permit = semaphore.acquire().await.ok()?;
-                            map_fetch_page(fetcher, browser, url, base_url).await
-                        })
-                    })
-                    .collect();
-
-                let mut meta_map: HashMap<String, (Option<String>, Option<String>)> =
-                    HashMap::new();
-                while let Some(task_result) = enrich_flight.next().await {
-                    if std::time::Instant::now() > map_deadline {
+                for (child_url, _anchor) in page.child_links {
+                    if visited.len() >= limit {
                         break;
                     }
-                    if let Ok(Some(fr)) = task_result {
-                        let title = if get_title { fr.title } else { None };
-                        let desc = if get_description {
-                            fr.description
-                        } else {
-                            None
-                        };
-                        meta_map.insert(fr.url, (title, desc));
+                    if is_non_page_url(&child_url) || !visited.insert(child_url.clone()) {
+                        continue;
                     }
-                }
-                for link in &mut results {
-                    if link.title.is_none() && link.description.is_none() {
-                        if let Some((title, description)) = meta_map.remove(&link.url) {
-                            link.title = title;
-                            link.description = description;
-                        }
-                    }
+                    results.push(MapLink {
+                        url: child_url,
+                        title: None,
+                        description: None,
+                        lastmod: None,
+                        priority: None,
+                        changefreq: None,
+                    });
+                    queue.push_back((results.len() - 1, depth + 1));
                 }
             }
-
-            frontier = next_frontier;
+            MapFetchOutcome::Throttled => {
+                concurrency.on_throttle(std::time::Instant::now());
+                debug!(
+                    limit = concurrency.limit(),
+                    "Map: site pushing back, lowering concurrency"
+                );
+            }
+            MapFetchOutcome::Failed => {}
         }
     }
+    // Fetches still running past the deadline are not needed anymore.
+    tasks.abort_all();
 
     let mut links = results;
 
