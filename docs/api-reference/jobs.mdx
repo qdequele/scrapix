@@ -66,6 +66,7 @@ When PostgreSQL is configured, this endpoint also returns historical jobs that h
 | `max_pages` | integer | Page limit from configuration |
 | `config` | object | Original crawl configuration |
 | `warnings` | string[] | Non-fatal notices: config fields accepted but not fully honorable per job (see [Crawl Configs](/configuration/crawl-configs)), plus any warnings raised by workers while the job ran |
+| `ai_usage` | object | The job's LLM calls (AI summary and extraction of crawled pages, vision OCR, `/extract`): `calls`, `prompt_tokens`, `completion_tokens` and `cost_micro_usd`, the provider cost the hosted AI gateway reported for them, in micro-USD. That cost is billed by the gateway (the Lab adds its markup), not in the job's credits. Omitted when the job made no AI call. Batch scrape jobs do not report it yet |
 
 ### Job Status Lifecycle
 

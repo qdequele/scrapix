@@ -9,8 +9,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::ai_access::NO_AI_MESSAGE;
 use crate::results::test_support::{
-    hosted_ai_state, hosted_ctx, lumen_answering, lumen_metadata, lumen_refusing, lumen_target,
-    test_state_with_ai_and_lab, test_state_with_lab,
+    hosted_ai_state, hosted_ctx, lumen_answering, lumen_answering_at_cost, lumen_metadata,
+    lumen_refusing, lumen_target, test_state_with_ai_and_lab, test_state_with_lab,
 };
 
 fn ctx() -> Option<AccountContext> {
@@ -281,6 +281,36 @@ async fn scrape_ai_credits_are_pages_only() {
     );
     assert_eq!(credits(&outbox), vec![1]);
     lab_events::assert_contract_valid(&outbox.events());
+}
+
+/// `/scrape` reports its LLM calls and their gateway cost; a scrape with no
+/// AI reports none.
+#[tokio::test]
+async fn scrape_reports_the_gateway_cost_of_its_ai_calls() {
+    let (_site, url) = site().await;
+    let lumen = lumen_answering_at_cost(r#"{"prices": [42]}"#, 75).await;
+    let (_lab, state, _) = hosted_ai_state(Some(lumen_target(&lumen, "fg-1"))).await;
+    let req = request(serde_json::json!({
+        "url": url, "formats": ["markdown"],
+        "ai": {"summary": true, "extract": {"prompt": "prices"}}
+    }));
+
+    let res = with_ai_usage(perform_scrape(&state, &hosted_ctx(), &req))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&res).unwrap()["ai_usage"],
+        serde_json::json!({"calls": 2, "prompt_tokens": 20, "completion_tokens": 10, "cost_micro_usd": 150})
+    );
+    let plain = request(serde_json::json!({"url": url, "formats": ["markdown"]}));
+    let res = with_ai_usage(perform_scrape(&state, &hosted_ctx(), &plain))
+        .await
+        .unwrap();
+    assert!(serde_json::to_value(&res)
+        .unwrap()
+        .get("ai_usage")
+        .is_none());
 }
 
 #[tokio::test]

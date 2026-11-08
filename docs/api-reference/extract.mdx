@@ -81,6 +81,7 @@ Extraction runs as a job: `POST /extract` returns a `job_id`, and you poll `GET 
 | `sources` | Every URL used, including those resolved from globs (`from_glob`), with whether it could be fetched (`success` is `null` until it was tried) |
 | `warning` | Non-fatal issues: pages that failed, truncated context, globs that matched nothing or more than the cap |
 | `error` | Why the job failed (no URL resolved, no page could be fetched, AI error, out of credits) |
+| `ai_usage` | The job's LLM calls so far: `calls`, `prompt_tokens`, `completion_tokens` and `cost_micro_usd`, the provider cost the hosted AI gateway reported (billed by the gateway, not in the job's credits). Omitted before the first AI call |
 
 `sources` is filled as soon as the URLs are resolved, so a running job already shows what it is working on.
 

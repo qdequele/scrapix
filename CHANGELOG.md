@@ -10,6 +10,16 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **AI usage and cost on jobs and scrapes.** `GET /jobs/{id}` (crawl and
+  extract jobs), `GET /extract/{id}`, `POST /scrape` and `POST /parse` carry
+  `ai_usage`: the LLM calls made (AI summary, extraction, vision OCR), their
+  tokens, and `cost_micro_usd`, the provider cost the hosted AI gateway
+  reported for them (Lumen's `x-lumen-cost-micro-usd`, which needs a Lumen
+  release that sends it). The gateway bills that cost, not the job's
+  credits; the Lab console shows it on the job. Each crawled page reports
+  its AI usage on `DocumentIndexed` (`ai_usage`), summed into the job's
+  accounting snapshot. Batch scrape jobs do not report it yet.
+
 - **Lightpanda renderer for browser crawls (prototype).** With
   `BROWSER_RENDER` and the new `LIGHTPANDA_URL` (and
   `LIGHTPANDA_CONNECTIONS`, default `8`), the crawler worker renders plain

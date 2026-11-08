@@ -5102,6 +5102,10 @@
           "sources"
         ],
         "properties": {
+          "ai_usage": {
+            "$ref": "#/components/schemas/AiUsage",
+            "description": "The extraction's LLM calls and the provider cost the hosted AI\ngateway reported for them, in micro-USD (billed by the gateway, not\nin the job's credits). Omitted when no AI call was made."
+          },
           "data": {
             "type": [
               "object",
@@ -5707,6 +5711,10 @@
           "crawl_rate"
         ],
         "properties": {
+          "ai_usage": {
+            "$ref": "#/components/schemas/AiUsage",
+            "description": "The job's LLM calls (AI summary, extraction, OCR) and the provider\ncost the hosted AI gateway reported for them, in micro-USD. That cost\nis billed by the gateway (with the Lab's markup), not in the job's\ncredits. Omitted when the job made no AI call."
+          },
           "completed_at": {
             "type": [
               "string",
@@ -6580,6 +6588,10 @@
                 "description": "AI enrichment results"
               }
             ]
+          },
+          "ai_usage": {
+            "$ref": "#/components/schemas/AiUsage",
+            "description": "The request's LLM calls (AI summary, extraction, OCR) and the\nprovider cost the hosted AI gateway reported for them, in micro-USD\n(billed by the gateway, not in the scrape's credits). Omitted when no\nAI call was made."
           },
           "blocks": {
             "type": [
@@ -7832,6 +7844,38 @@
           "mode": {
             "$ref": "#/components/schemas/OcrMode",
             "description": "`off` (default), `auto` or `force`."
+          }
+        }
+      },
+      "AiUsage": {
+        "type": "object",
+        "description": "Totals of a set of LLM calls (one page, one request, or a whole job).\n\n`cost_micro_usd` is the provider cost the hosted AI gateway (Lumen)\nsettled for those calls (its `x-lumen-cost-micro-usd`), which is what it\nbills the team. Calls whose cost the server did not report (a provider's\nown API in standalone) add their tokens but no cost.",
+        "properties": {
+          "calls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Successful LLM calls.",
+            "default": 0,
+            "minimum": 0
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "cost_micro_usd": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Provider cost reported by the gateway, in micro-USD.",
+            "default": 0,
+            "minimum": 0
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
           }
         }
       }

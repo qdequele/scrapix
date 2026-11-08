@@ -60,6 +60,9 @@ pub struct ChatResponse {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub finish_reason: Option<String>,
+    /// What the call cost, in micro-USD, when the server says so (a Lumen
+    /// gateway's `x-lumen-cost-micro-usd`). `None` for a provider's own API.
+    pub cost_micro_usd: Option<u64>,
 }
 
 /// Trait for LLM providers

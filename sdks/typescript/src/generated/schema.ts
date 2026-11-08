@@ -2039,6 +2039,12 @@ export interface components {
         };
         /** @description `GET /extract/{id}` response */
         ExtractStatusResponse: {
+            /**
+             * @description The extraction's LLM calls and the provider cost the hosted AI
+             *     gateway reported for them, in micro-USD (billed by the gateway, not
+             *     in the job's credits). Omitted when no AI call was made.
+             */
+            ai_usage?: components["schemas"]["AiUsage"];
             /** @description The extracted data (`null` until the job completed) */
             data?: Record<string, never> | null;
             /** @description Why the job failed */
@@ -2195,6 +2201,13 @@ export interface components {
         JobStatus: "pending" | "running" | "completed" | "failed" | "cancelled" | "paused";
         /** @description Job status response */
         JobStatusResponse: {
+            /**
+             * @description The job's LLM calls (AI summary, extraction, OCR) and the provider
+             *     cost the hosted AI gateway reported for them, in micro-USD. That cost
+             *     is billed by the gateway (with the Lab's markup), not in the job's
+             *     credits. Omitted when the job made no AI call.
+             */
+            ai_usage?: components["schemas"]["AiUsage"];
             completed_at?: string | null;
             config?: unknown;
             /** Format: double */
@@ -2522,6 +2535,13 @@ export interface components {
         ScrapeResponse: {
             actions?: null | components["schemas"]["ScrapeActionsResult"];
             ai?: null | components["schemas"]["AiResult"];
+            /**
+             * @description The request's LLM calls (AI summary, extraction, OCR) and the
+             *     provider cost the hosted AI gateway reported for them, in micro-USD
+             *     (billed by the gateway, not in the scrape's credits). Omitted when no
+             *     AI call was made.
+             */
+            ai_usage?: components["schemas"]["AiUsage"];
             /** @description Content blocks split by headings (if format "blocks" requested) */
             blocks?: components["schemas"]["ContentBlock"][] | null;
             /** @description Extracted main content text (if requested) */
@@ -2939,6 +2959,38 @@ export interface components {
             max_pages?: number | null;
             /** @description `off` (default), `auto` or `force`. */
             mode?: components["schemas"]["OcrMode"];
+        };
+        /**
+         * @description Totals of a set of LLM calls (one page, one request, or a whole job).
+         *
+         *     `cost_micro_usd` is the provider cost the hosted AI gateway (Lumen)
+         *     settled for those calls (its `x-lumen-cost-micro-usd`), which is what it
+         *     bills the team. Calls whose cost the server did not report (a provider's
+         *     own API in standalone) add their tokens but no cost.
+         */
+        AiUsage: {
+            /**
+             * Format: int64
+             * @description Successful LLM calls.
+             * @default 0
+             */
+            calls: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            completion_tokens: number;
+            /**
+             * Format: int64
+             * @description Provider cost reported by the gateway, in micro-USD.
+             * @default 0
+             */
+            cost_micro_usd: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            prompt_tokens: number;
         };
     };
     responses: never;

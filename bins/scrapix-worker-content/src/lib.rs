@@ -43,8 +43,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{
-    gateway_codes, AiClient, AiService, AiUsageContext, AiUsageEvent, AI_BUDGET_EXCEEDED_MESSAGE,
-    AI_USAGE_CONTEXT,
+    gateway_codes, AiClient, AiService, AiUsageContext, AiUsageEvent, AiUsageTally,
+    AI_BUDGET_EXCEEDED_MESSAGE, AI_USAGE_CONTEXT, AI_USAGE_TALLY,
 };
 use scrapix_core::content_types;
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage, ScrapixError};
@@ -402,6 +402,16 @@ impl NoAi {
             NoAi::Unavailable => "AI configuration unavailable",
         }
     }
+}
+
+/// What `DocumentIndexed` reports about a page, besides its documents.
+struct IndexedPage {
+    document_id: String,
+    ai_enriched: bool,
+    /// Freshly OCR'd pages (billed).
+    ocr_pages: u32,
+    /// The page's LLM calls and their gateway cost.
+    ai_usage: scrapix_core::AiUsage,
 }
 
 /// What processing a page produced.
@@ -1127,7 +1137,13 @@ impl ContentWorker {
         self.metrics
             .active_processors
             .fetch_add(1, Ordering::AcqRel);
-        let outcome = self.process_page(&msg).await;
+        // Every LLM call made for the page (AI enrichment, OCR) is tallied
+        // and reported on its `DocumentIndexed`.
+        let tally = AiUsageTally::new();
+        let outcome = AI_USAGE_TALLY
+            .scope(tally.clone(), self.process_page(&msg))
+            .await;
+        let ai_usage = tally.totals();
         match outcome {
             PageOutcome::Skipped(reason) => {
                 debug!(url = %msg.url, reason = %reason, "Page skipped");
@@ -1158,8 +1174,13 @@ impl ContentWorker {
                 ai_enriched,
                 ocr_pages,
             } => {
-                self.index_page(&msg, docs, document_id, ai_enriched, ocr_pages, ack)
-                    .await;
+                let page = IndexedPage {
+                    document_id,
+                    ai_enriched,
+                    ocr_pages,
+                    ai_usage,
+                };
+                self.index_page(&msg, docs, page, ack).await;
             }
         }
         self.metrics
@@ -1182,11 +1203,15 @@ impl ContentWorker {
         &self,
         msg: &RawPageMessage,
         docs: Vec<Document>,
-        document_id: String,
-        ai_enriched: bool,
-        ocr_pages: u32,
+        page: IndexedPage,
         ack: Ack,
     ) {
+        let IndexedPage {
+            document_id,
+            ai_enriched,
+            ocr_pages,
+            ai_usage,
+        } = page;
         // Resolve the target first: a page that cannot be indexed must not
         // be published to the documents topic or crawl history.
         let features = self.resolve_features(msg);
@@ -1253,6 +1278,7 @@ impl ContentWorker {
                     url_message_id: msg.url_message_id.clone(),
                     ai_enriched,
                     ocr_pages,
+                    ai_usage,
                 },
                 docs: docs.len() as u64,
                 ack,
@@ -2672,6 +2698,7 @@ mod tests {
             completion_tokens: 4,
             total_tokens: 7,
             duration_ms: 5,
+            cost_micro_usd: None,
             timestamp: chrono::Utc::now(),
             context: Some(AiUsageContext {
                 job_id: "job".into(),
@@ -3453,6 +3480,48 @@ mod tests {
             ]
         );
         forwarder.abort();
+    }
+
+    /// Each page's LLM calls and their Lumen-reported cost ride on its
+    /// `DocumentIndexed`, for the job's `usage.ai`.
+    #[tokio::test]
+    async fn indexed_pages_report_their_ai_calls_and_cost() {
+        let ms = meilisearch(task_accepted()).await;
+        let lumen = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(completion("A summary.").insert_header("x-lumen-cost-micro-usd", "250"))
+            .mount(&lumen)
+            .await;
+        let lab = FakeLab::start().await;
+        lab.set_ai("acct-a", Some(lumen_target(&lumen, "k-a", "fg-A")));
+        let bus = ChannelBus::new();
+        let events = events_reader(&bus);
+        let w = started(hosted_worker(&bus, &ms, &lab));
+
+        let mut plain = page("https://a.test/plain", 200, None);
+        plain.account_id = Some("acct-a".into());
+        index_all(&w, vec![ai_page("https://a.test/1", Some("acct-a")), plain]).await;
+
+        let events: Vec<CrawlEvent> = drain(&events).await;
+        let mut usage: Vec<(bool, scrapix_core::AiUsage)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CrawlEvent::DocumentIndexed {
+                    ai_enriched,
+                    ai_usage,
+                    ..
+                } => Some((*ai_enriched, *ai_usage)),
+                _ => None,
+            })
+            .collect();
+        usage.sort_by_key(|(enriched, _)| *enriched);
+        assert_eq!(usage.len(), 2, "{events:?}");
+        assert!(usage[0].1.is_empty(), "a page without AI reports none");
+        assert!(usage[1].0);
+        assert_eq!(usage[1].1.calls, 1);
+        assert_eq!(usage[1].1.cost_micro_usd, 250);
+        assert!(usage[1].1.prompt_tokens > 0);
     }
 
     #[tokio::test]
