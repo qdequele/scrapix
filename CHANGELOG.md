@@ -69,6 +69,14 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **The link-local URL block now applies on Lightpanda.** Lightpanda 1.0
+  only accepts the newer `Network.setBlockedURLs` form (`urlPatterns`), so
+  the block (169.254.0.0/16, fe80::/10, the cloud metadata endpoints) failed
+  on every Lightpanda render and logged `Could not block link-local URLs on
+  the page`. The Lightpanda renderer now sends that form. The target and
+  final-URL checks, and Lightpanda's `--block-private-networks`, were in
+  place meanwhile.
+
 - **`/map` ran past its 60 s limit.** The link-following levels never
   checked it, and fetches kept running after it. Sitemap discovery now
   counts toward it too, and pending fetches are cancelled when it is hit.
