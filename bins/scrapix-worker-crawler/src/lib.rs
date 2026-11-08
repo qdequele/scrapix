@@ -42,7 +42,7 @@ use scrapix_crawler::{
     RobotsCache, RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
 };
 #[cfg(feature = "browser")]
-use scrapix_crawler::{CdpRenderer, CdpRendererBuilder};
+use scrapix_crawler::{CdpRenderer, CdpRendererBuilder, LightpandaConfig, LightpandaRenderer};
 use scrapix_frontier::LinkGraph;
 use scrapix_queue::{
     control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
@@ -168,6 +168,18 @@ pub struct Args {
     #[arg(long, env = "BROWSER_HEADLESS", default_value = "true")]
     pub browser_headless: bool,
 
+    /// CDP endpoint of a running `lightpanda serve` (`ws://host:9222` or
+    /// `http://host:9222`). With `--browser-render`, plain crawl renders go
+    /// to Lightpanda first and Chrome takes over when it fails or the page
+    /// looks unrendered.
+    #[arg(long, env = "LIGHTPANDA_URL")]
+    pub lightpanda_url: Option<String>,
+
+    /// Pages rendered at once on Lightpanda (one CDP connection each; keep
+    /// it at or below the server's `--cdp-max-connections`)
+    #[arg(long, env = "LIGHTPANDA_CONNECTIONS", default_value = "8")]
+    pub lightpanda_connections: usize,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -201,6 +213,8 @@ struct WorkerMetrics {
     dns_cache_hits: AtomicU64,
     dns_cache_misses: AtomicU64,
     browser_renders: AtomicU64,
+    lightpanda_renders: AtomicU64,
+    lightpanda_fallbacks: AtomicU64,
     http_fetches: AtomicU64,
     sitemap_urls_discovered: AtomicU64,
     domains_with_sitemaps: AtomicU64,
@@ -265,6 +279,16 @@ impl WorkerMetrics {
         self.browser_renders.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
+    fn record_lightpanda_render(&self) {
+        self.lightpanda_renders.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_lightpanda_fallback(&self) {
+        self.lightpanda_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_http_fetch(&self) {
         self.http_fetches.fetch_add(1, Ordering::Relaxed);
     }
@@ -296,6 +320,8 @@ impl WorkerMetrics {
             dns_cache_hits: self.dns_cache_hits.load(Ordering::Relaxed),
             dns_cache_misses: self.dns_cache_misses.load(Ordering::Relaxed),
             browser_renders: self.browser_renders.load(Ordering::Relaxed),
+            lightpanda_renders: self.lightpanda_renders.load(Ordering::Relaxed),
+            lightpanda_fallbacks: self.lightpanda_fallbacks.load(Ordering::Relaxed),
             http_fetches: self.http_fetches.load(Ordering::Relaxed),
             sitemap_urls_discovered: self.sitemap_urls_discovered.load(Ordering::Relaxed),
             domains_with_sitemaps: self.domains_with_sitemaps.load(Ordering::Relaxed),
@@ -316,6 +342,8 @@ struct MetricsSnapshot {
     dns_cache_hits: u64,
     dns_cache_misses: u64,
     browser_renders: u64,
+    lightpanda_renders: u64,
+    lightpanda_fallbacks: u64,
     http_fetches: u64,
     sitemap_urls_discovered: u64,
     domains_with_sitemaps: u64,
@@ -329,6 +357,9 @@ struct CrawlerWorker {
     sitemap_parser: Option<SitemapParser>,
     #[cfg(feature = "browser")]
     browser_renderer: Option<Arc<CdpRenderer>>,
+    /// Fast renderer for plain crawl renders, Chrome as fallback.
+    #[cfg(feature = "browser")]
+    lightpanda: Option<Arc<LightpandaRenderer>>,
     #[cfg(feature = "browser")]
     browser_patterns: Vec<regex::Regex>,
     extractor: UrlExtractor,
@@ -644,6 +675,39 @@ impl CrawlerWorker {
             (None, Vec::new())
         };
 
+        // Lightpanda, when configured, takes plain crawl renders first.
+        #[cfg(feature = "browser")]
+        let lightpanda = match (args.browser_render, args.lightpanda_url.as_deref()) {
+            (true, Some(cdp_url)) => {
+                let config = LightpandaConfig {
+                    cdp_url: cdp_url.to_string(),
+                    max_connections: args.lightpanda_connections,
+                    timeout: Duration::from_secs(args.browser_timeout),
+                    allow_private_ips: args.allow_private_ips,
+                    ..LightpandaConfig::default()
+                };
+                match LightpandaRenderer::new(config, Some(fetcher_robots_cache.clone())).await {
+                    Ok(renderer) => {
+                        info!(
+                            connections = args.lightpanda_connections,
+                            chrome_fallback = browser_renderer.is_some(),
+                            "Lightpanda renderer initialized"
+                        );
+                        Some(Arc::new(renderer))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to connect to Lightpanda; browser renders use Chrome only");
+                        None
+                    }
+                }
+            }
+            (false, Some(_)) => {
+                warn!("LIGHTPANDA_URL is set but browser rendering is off (BROWSER_RENDER); ignoring it");
+                None
+            }
+            _ => None,
+        };
+
         #[cfg(not(feature = "browser"))]
         if args.browser_render {
             warn!("Browser rendering requested but 'browser' feature is not enabled. Compile with --features browser");
@@ -680,6 +744,8 @@ impl CrawlerWorker {
             sitemap_parser,
             #[cfg(feature = "browser")]
             browser_renderer,
+            #[cfg(feature = "browser")]
+            lightpanda,
             #[cfg(feature = "browser")]
             browser_patterns,
             extractor,
@@ -736,6 +802,8 @@ impl CrawlerWorker {
                     active = snapshot.active_fetches,
                     http_fetches = snapshot.http_fetches,
                     browser_renders = snapshot.browser_renders,
+                    lightpanda_renders = snapshot.lightpanda_renders,
+                    lightpanda_fallbacks = snapshot.lightpanda_fallbacks,
                     dns_hits = snapshot.dns_cache_hits,
                     dns_misses = snapshot.dns_cache_misses,
                     link_graph_pages = link_graph_pages,
@@ -1100,6 +1168,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         bytes_mb = metrics.bytes_downloaded / (1024 * 1024),
         http_fetches = metrics.http_fetches,
         browser_renders = metrics.browser_renders,
+        lightpanda_renders = metrics.lightpanda_renders,
+        lightpanda_fallbacks = metrics.lightpanda_fallbacks,
         dns_hits = metrics.dns_cache_hits,
         dns_misses = metrics.dns_cache_misses,
         "Final worker metrics"

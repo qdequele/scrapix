@@ -230,7 +230,7 @@ impl CrawlerWorker {
     fn has_browser(&self) -> bool {
         #[cfg(feature = "browser")]
         {
-            self.browser_renderer.is_some()
+            self.browser_renderer.is_some() || self.lightpanda.is_some()
         }
         #[cfg(not(feature = "browser"))]
         {
@@ -262,20 +262,15 @@ impl CrawlerWorker {
         }
 
         #[cfg(feature = "browser")]
-        if let Some(ref renderer) = self.browser_renderer {
+        if self.has_browser() {
             // A worker-level pattern match only routes to the browser when the
             // job has no proxy (the browser cannot honor it; HTTP can).
             let job_has_proxy = msg.job.as_ref().is_some_and(|j| j.proxy.is_some());
             let pattern_match =
                 !job_has_proxy && self.browser_patterns.iter().any(|p| p.is_match(&url.url));
             if requires_browser(msg) || pattern_match {
-                debug!(url = %url.url, "Using browser rendering");
-                self.metrics.record_browser_render();
                 return FetchAttempt {
-                    result: renderer
-                        .fetch_with_options(url, &options)
-                        .await
-                        .map(FetchResult::Fetched),
+                    result: self.browser_fetch(url, &options).await,
                     proxy: None,
                 };
             }
@@ -321,6 +316,49 @@ impl CrawlerWorker {
         }
 
         FetchAttempt { result, proxy }
+    }
+
+    /// Render `url` in a browser: Lightpanda first when configured, Chrome
+    /// when Lightpanda fails (except on a refusal, which is final) or the
+    /// page looks unrendered. Without Chrome, Lightpanda's answer stands.
+    #[cfg(feature = "browser")]
+    async fn browser_fetch(
+        &self,
+        url: &scrapix_core::CrawlUrl,
+        options: &scrapix_crawler::FetchOptions,
+    ) -> scrapix_core::Result<FetchResult> {
+        let chrome = self.browser_renderer.as_ref();
+        if let Some(lightpanda) = &self.lightpanda {
+            self.metrics.record_lightpanda_render();
+            match lightpanda.fetch_with_options(url, options).await {
+                Ok(render) => match render.fallback_reason() {
+                    Some(reason) if chrome.is_some() => {
+                        debug!(url = %url.url, reason, "Lightpanda render rejected; re-rendering in Chrome");
+                        self.metrics.record_lightpanda_fallback();
+                    }
+                    _ => {
+                        debug!(url = %url.url, "Rendered with Lightpanda");
+                        return Ok(FetchResult::Fetched(render.raw_page(url)));
+                    }
+                },
+                Err(e) if chrome.is_none() || !scrapix_crawler::should_retry_in_chrome(&e) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    debug!(url = %url.url, error = %e, "Lightpanda render failed; re-rendering in Chrome");
+                    self.metrics.record_lightpanda_fallback();
+                }
+            }
+        }
+        let Some(chrome) = chrome else {
+            return Err(ScrapixError::Config(BROWSER_UNAVAILABLE.to_string()));
+        };
+        debug!(url = %url.url, "Using browser rendering");
+        self.metrics.record_browser_render();
+        chrome
+            .fetch_with_options(url, options)
+            .await
+            .map(FetchResult::Fetched)
     }
 
     /// Conditional headers for incremental crawling — only when both the

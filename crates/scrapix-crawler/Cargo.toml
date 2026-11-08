@@ -43,7 +43,6 @@ chromiumoxide = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 # Tier 2: WebDriver protocol (cross-browser)
 fantoccini = { workspace = true, optional = true }
-# Future: Lightpanda integration (when stable)
 # Future: Browserbase API client
 
 # Utilities
@@ -65,7 +64,9 @@ wiremock = { workspace = true }
 default = []
 # Chrome/Chromium via CDP (chromiumoxide)
 browser-cdp = ["chromiumoxide", "futures"]
+# Lightpanda over CDP (reuses chromiumoxide and the CDP renderer's checks)
+browser-lightpanda = ["browser-cdp"]
 # WebDriver protocol (fantoccini) - Firefox, Safari, etc.
 browser-webdriver = ["fantoccini"]
 # All browser rendering options
-browser-full = ["browser-cdp", "browser-webdriver"]
+browser-full = ["browser-cdp", "browser-lightpanda", "browser-webdriver"]

@@ -201,6 +201,20 @@ modes.
 | `BROWSER_TIMEOUT` | `30` | Browser page load timeout in seconds |
 | `BROWSER_CONCURRENCY` | `5` | Concurrent browser instances |
 | `BROWSER_HEADLESS` | `true` | Run browser in headless mode |
+| `LIGHTPANDA_URL` | — | CDP endpoint of a running `lightpanda serve` (`ws://host:9222` or `http://host:9222`), Lightpanda 1.0 or later. With `BROWSER_RENDER`, plain crawl renders go to Lightpanda first; Chrome re-renders a page when Lightpanda fails, times out, meets a bot challenge or returns a page with almost no text. Refusals (SSRF, robots.txt) are final. Without a working Chrome, Lightpanda's result stands. If the worker cannot reach it at startup it logs a warning and uses Chrome only |
+| `LIGHTPANDA_CONNECTIONS` | `8` | Pages rendered at once on Lightpanda, one CDP connection each. Keep it at or below the server's `--cdp-max-connections` (default 16) |
+
+Run Lightpanda next to the worker with `--block-private-networks`: it
+resolves DNS itself, so this flag is what keeps a page's own requests
+(scripts, fetch/XHR, redirects) off private and metadata addresses. The
+worker still checks the target and the final URL of every render.
+Lightpanda skips images, stylesheets, iframes and workers by default
+(`--load-resources` turns them back on). Content inside iframes is not
+rendered unless you enable them.
+
+```bash
+lightpanda serve --host 127.0.0.1 --port 9222 --cdp-max-connections 16 --block-private-networks
+```
 
 ## Content Workers
 

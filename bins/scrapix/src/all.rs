@@ -82,6 +82,15 @@ pub struct AllArgs {
     #[arg(long, env = "BROWSER_CONCURRENCY", default_value = "5")]
     pub browser_concurrency: usize,
 
+    /// CDP endpoint of a running `lightpanda serve`: plain crawl renders go
+    /// there first, Chrome takes over when needed
+    #[arg(long, env = "LIGHTPANDA_URL")]
+    pub lightpanda_url: Option<String>,
+
+    /// Pages rendered at once on Lightpanda
+    #[arg(long, env = "LIGHTPANDA_CONNECTIONS", default_value = "8")]
+    pub lightpanda_connections: usize,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -200,6 +209,8 @@ async fn run_all_channels(args: &AllArgs, api_args: scrapix_api::Args) -> anyhow
         browser_timeout: args.browser_timeout,
         browser_concurrency: args.browser_concurrency,
         browser_headless: true,
+        lightpanda_url: args.lightpanda_url.clone(),
+        lightpanda_connections: args.lightpanda_connections,
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,
@@ -624,6 +635,8 @@ async fn run_all_kafka(
         browser_timeout: args.browser_timeout,
         browser_concurrency: args.browser_concurrency,
         browser_headless: true,
+        lightpanda_url: args.lightpanda_url.clone(),
+        lightpanda_connections: args.lightpanda_connections,
         verbose: args.verbose,
         sitemap_discovery: true,
         max_sitemap_urls: 10000,

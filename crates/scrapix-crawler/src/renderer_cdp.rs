@@ -139,7 +139,7 @@ pub(crate) fn is_main_document(request: &chromiumoxide::handler::http::HttpReque
 
 /// The document's MIME type as the page sees it (`document.contentType`),
 /// for when CDP gave no main-document response.
-async fn document_content_type(page: &Page) -> Option<String> {
+pub(crate) async fn document_content_type(page: &Page) -> Option<String> {
     page.evaluate("document.contentType")
         .await
         .ok()?
@@ -262,7 +262,7 @@ pub(crate) const LINK_LOCAL_URL_PATTERNS: &[&str] = &[
 
 /// Install [`LINK_LOCAL_URL_PATTERNS`] on `page`. A failure is logged, not
 /// fatal: the navigation checks still run on every render.
-async fn block_link_local_urls(page: &Page) {
+pub(crate) async fn block_link_local_urls(page: &Page) {
     let params = SetBlockedUrLsParams::new(
         LINK_LOCAL_URL_PATTERNS
             .iter()
