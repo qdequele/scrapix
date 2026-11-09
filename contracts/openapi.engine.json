@@ -3924,6 +3924,7 @@
           "documents_sent": {
             "type": "integer",
             "format": "int64",
+            "description": "Meilisearch documents written: one per page, or one per block with\n`features.block_split`",
             "minimum": 0
           },
           "duration_seconds": {
@@ -3978,6 +3979,7 @@
           "pages_indexed": {
             "type": "integer",
             "format": "int64",
+            "description": "Pages whose documents Meilisearch accepted",
             "minimum": 0
           },
           "start_urls": {
@@ -4198,7 +4200,7 @@
               "string",
               "null"
             ],
-            "description": "Primary key field name"
+            "description": "Primary key field name. Only `uid` (the default) is accepted:\ncrawled documents are identified by their `uid`."
           },
           "settings": {
             "oneOf": [
@@ -5228,17 +5230,17 @@
         "oneOf": [
           {
             "type": "string",
-            "description": "Single selector"
+            "description": "Single selector: every element it matches"
           },
           {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Multiple selectors (results combined)"
+            "description": "Multiple selectors, results combined: every selector's matches in\nlist order (an element matched twice counts once). An invalid\nselector is skipped."
           }
         ],
-        "description": "CSS selector definition"
+        "description": "CSS selector definition of a crawl's `custom_selectors` field. The\nfield is the trimmed text of every matched element: a string for one\nmatch, an array of strings for several."
       },
       "SelectorDefinition": {
         "allOf": [

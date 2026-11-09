@@ -576,9 +576,94 @@ impl SelectorExtractor {
     }
 }
 
+/// Every element `selectors` match in `document`, combined: each
+/// selector's matches in list order, then page order, an element matched by
+/// several selectors counted once. The value of an element is its trimmed
+/// text, or its `content` attribute when it has no text (`<meta>`); empty
+/// values are dropped. An invalid selector is skipped (logged).
+///
+/// `None` when nothing matched, a string for one value, an array of
+/// strings for several.
+pub fn combined_matches(document: &Html, selectors: &[String]) -> Option<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    for raw in selectors {
+        let selector = match Selector::parse(raw) {
+            Ok(selector) => selector,
+            Err(e) => {
+                warn!(selector = %raw, error = ?e, "Invalid CSS selector skipped");
+                continue;
+            }
+        };
+        for element in document.select(&selector) {
+            if !seen.insert(element.id()) {
+                continue;
+            }
+            let text = element.text().collect::<String>();
+            let text = text.trim();
+            let value = if text.is_empty() {
+                element.value().attr("content").map(str::trim).unwrap_or("")
+            } else {
+                text
+            };
+            if !value.is_empty() {
+                values.push(Value::String(value.to_string()));
+            }
+        }
+    }
+    match values.len() {
+        0 => None,
+        1 => values.pop(),
+        _ => Some(Value::Array(values)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn combined(html: &str, selectors: &[&str]) -> Option<Value> {
+        let selectors: Vec<String> = selectors.iter().map(|s| s.to_string()).collect();
+        combined_matches(&Html::parse_document(html), &selectors)
+    }
+
+    #[test]
+    fn combined_single_selector_returns_every_match() {
+        let html = r#"<ul class="breadcrumb"><li>Home</li><li> Books </li><li>Mystery</li></ul>"#;
+        assert_eq!(
+            combined(html, &[".breadcrumb li"]),
+            Some(serde_json::json!(["Home", "Books", "Mystery"]))
+        );
+        assert_eq!(
+            combined(html, &[".breadcrumb li:last-child"]),
+            Some(serde_json::json!("Mystery"))
+        );
+        assert_eq!(combined(html, &[".missing"]), None);
+    }
+
+    #[test]
+    fn combined_list_merges_in_list_order_once_per_element() {
+        let html = r#"<body><span class="category">Shoes</span>
+            <a class="tag">red</a><a class="tag category">sale</a></body>"#;
+        assert_eq!(
+            combined(html, &[".tag", ".category"]),
+            Some(serde_json::json!(["red", "sale", "Shoes"]))
+        );
+    }
+
+    #[test]
+    fn combined_skips_invalid_selectors_and_reads_meta_content() {
+        let html = r#"<head><meta name="author" content="Ada"></head><body><h1>T</h1></body>"#;
+        assert_eq!(
+            combined(html, &["h1[", "h1"]),
+            Some(serde_json::json!("T")),
+            "an invalid selector must not kill the field"
+        );
+        assert_eq!(
+            combined(html, &["meta[name=author]"]),
+            Some(serde_json::json!("Ada"))
+        );
+    }
 
     #[test]
     fn test_extract_text() {

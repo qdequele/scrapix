@@ -91,6 +91,18 @@ pub const HEAD_ONLY_MAX_BYTES: usize = 256 * 1024;
 /// reusable; a longer body is cut.
 const HEAD_ONLY_DRAIN_MAX_BYTES: usize = 1024 * 1024;
 
+/// Prefix of the error a fetch returns for a 2xx response whose content
+/// type the job does not crawl (e.g. `text/plain`, or a PDF without
+/// `features.pdf`).
+pub const UNSUPPORTED_CONTENT_TYPE: &str = "Unsupported content type";
+
+/// Whether `err` is a fetch refused for its content type
+/// ([`UNSUPPORTED_CONTENT_TYPE`]): a page the job does not crawl, not a
+/// failure.
+pub fn is_unsupported_content_type(err: &ScrapixError) -> bool {
+    matches!(err, ScrapixError::Crawl(msg) if msg.starts_with(UNSUPPORTED_CONTENT_TYPE))
+}
+
 /// Where `</head` starts in `bytes`, searching from `from` (ASCII
 /// case-insensitive).
 fn find_head_end(bytes: &[u8], from: usize) -> Option<usize> {
@@ -798,8 +810,7 @@ impl HttpFetcher {
                 || is_binary;
             if !accepted {
                 return Err(ScrapixError::Crawl(format!(
-                    "Unsupported content type: {}",
-                    ct
+                    "{UNSUPPORTED_CONTENT_TYPE}: {ct}"
                 )));
             }
         }

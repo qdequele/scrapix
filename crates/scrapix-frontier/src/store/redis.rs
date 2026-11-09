@@ -201,6 +201,17 @@ end
 return 1
 "#;
 
+/// `KEYS`: meta, tpl, seen. `ARGV`: url hash. Add the hash to the seen set
+/// of a live job (meta and template exist, state Running or Paused); a
+/// no-op otherwise, so a released job's seen set is never re-created.
+const MARK_SEEN_LUA: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 or redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+local state = redis.call('HGET', KEYS[1], 'state')
+if state ~= 'Running' and state ~= 'Paused' then return 0 end
+redis.call('SADD', KEYS[3], ARGV[1])
+return 1
+"#;
+
 /// `KEYS`: lease. `ARGV`: owner, ttl_ms. Acquire if free (`SET NX PX`), or
 /// renew (compare-and-`PEXPIRE`) if already held by `owner`.
 const TRY_LEASE_LUA: &str = r#"
@@ -277,6 +288,7 @@ pub struct RedisFrontierStore {
     set_state: Script,
     release: Script,
     try_lease: Script,
+    mark_seen: Script,
 }
 
 impl RedisFrontierStore {
@@ -295,6 +307,7 @@ impl RedisFrontierStore {
             set_state: Script::new(SET_STATE_LUA),
             release: Script::new(RELEASE_LUA),
             try_lease: Script::new(TRY_LEASE_LUA),
+            mark_seen: Script::new(MARK_SEEN_LUA),
         })
     }
 
@@ -380,6 +393,20 @@ impl FrontierStore for RedisFrontierStore {
             return Err(not_found(job_id));
         }
         admission_from_code(code)
+    }
+
+    async fn mark_seen(&self, job_id: &str, url: &str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: i64 = self
+            .mark_seen
+            .key(self.job_key(job_id, "meta"))
+            .key(self.job_key(job_id, "tpl"))
+            .key(self.job_key(job_id, "seen"))
+            .arg(format!("{:016x}", hash_url(url)))
+            .invoke_async(&mut conn)
+            .await
+            .map_err(storage_err)?;
+        Ok(())
     }
 
     async fn pop_ready(&self, job_id: &str, n: usize, now_ms: i64) -> Result<Vec<CrawlUrl>> {

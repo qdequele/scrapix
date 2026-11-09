@@ -7,7 +7,7 @@
 //!   period (absorbs the transient pop/requeue frontier snapshot and late
 //!   sitemap events — see the `scrapix_queue::accounting` module docs), the
 //!   job completes, or fails with "No page could be crawled" when not a
-//!   single page was crawled successfully;
+//!   single page was crawled successfully or found unchanged (304);
 //! - when no event arrived for the job for the stall timeout while it is not
 //!   balanced, the job fails as stalled.
 //!
@@ -22,7 +22,8 @@ use scrapix_queue::JobAccounting;
 pub enum Finalize {
     /// Keep waiting.
     Wait,
-    /// All work is accounted for and at least one page was crawled.
+    /// All work is accounted for and at least one page was crawled (or
+    /// found unchanged by an incremental crawl).
     Complete,
     /// All work is accounted for but no page was crawled successfully.
     FailNoPages,
@@ -49,7 +50,7 @@ pub fn finalize_decision(
         // have lasted the whole grace period.
         return match balanced_since {
             Some(since) if now.saturating_duration_since(since) >= grace => {
-                if acc.pages_crawled_ok == 0 {
+                if !acc.has_pages() {
                     Finalize::FailNoPages
                 } else {
                     Finalize::Complete
@@ -113,6 +114,7 @@ mod tests {
             ai_enriched: false,
             ocr_pages: 0,
             ai_usage: Default::default(),
+            documents: 1,
         }
     }
 
@@ -189,6 +191,36 @@ mod tests {
         assert_eq!(
             finalize_decision(&a, Some(now), now, now, GRACE, STALL),
             Finalize::Wait
+        );
+    }
+
+    #[test]
+    fn all_pages_unchanged_completes_instead_of_failing_no_pages() {
+        let now = Instant::now();
+        let mut a = JobAccounting::default();
+        a.seeds_published = 1;
+        a.apply(&progress(1, 1, 0));
+        a.apply(&CrawlEvent::PageSkipped {
+            job_id: "j".into(),
+            url: "https://example.com".into(),
+            reason: "304 Not Modified".into(),
+            timestamp: 0,
+            url_message_id: "m1".into(),
+            links_published: 0,
+            not_modified: true,
+            sitemap_pending: false,
+        });
+        assert!(a.is_balanced());
+        assert_eq!(
+            finalize_decision(
+                &a,
+                Some(now - Duration::from_secs(4)),
+                now,
+                now,
+                GRACE,
+                STALL
+            ),
+            Finalize::Complete
         );
     }
 

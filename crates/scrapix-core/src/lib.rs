@@ -22,6 +22,7 @@ pub mod redact;
 pub mod telemetry;
 pub mod traits;
 pub mod url_glob;
+pub mod url_normalize;
 
 pub use ack::Ack;
 pub use ai_usage::AiUsage;

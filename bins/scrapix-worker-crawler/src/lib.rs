@@ -22,6 +22,7 @@
 mod handler;
 pub mod job_fetch;
 pub mod outcome;
+pub mod page_history;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -48,7 +49,9 @@ use scrapix_queue::{
     control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
     CrawlEvent, ProducerBuilder, UrlMessage,
 };
-use scrapix_storage::{RedisCrawlHistory, RedisStorage};
+use scrapix_storage::RedisStorage;
+
+use crate::page_history::PageHistory;
 
 use std::collections::HashSet;
 
@@ -251,6 +254,13 @@ impl WorkerMetrics {
             .inc();
     }
 
+    fn record_skipped(&self) {
+        self.urls_processed.fetch_add(1, Ordering::Relaxed);
+        scrapix_core::metrics::crawler_fetches_total()
+            .with_label_values(&["skipped"])
+            .inc();
+    }
+
     fn record_retry(&self) {
         self.urls_processed.fetch_add(1, Ordering::Relaxed);
         self.urls_retried.fetch_add(1, Ordering::Relaxed);
@@ -377,8 +387,9 @@ struct CrawlerWorker {
     max_retries: u32,
     /// Per-job request shaping (user agents, headers, proxies, robots opt-out)
     shaper: JobFetchShaper,
-    /// Redis-backed crawl history for cross-session incremental crawling
-    crawl_history: Option<Arc<RedisCrawlHistory>>,
+    /// Per-page validators and outlinks for cross-session incremental
+    /// crawling (Redis-backed).
+    crawl_history: Option<Arc<PageHistory>>,
     /// Tracks which (job_id, domain) pairs have already had sitemap
     /// discovery run, so a second job on the same domain still gets its own
     /// sitemap seeds (Task 7: discovery used to be keyed by worker+domain
@@ -722,7 +733,7 @@ impl CrawlerWorker {
                 match RedisStorage::with_url(redis_url.as_str()).await {
                     Ok(storage) => {
                         info!(redis_url = %redis_url, "Redis crawl history enabled for incremental crawling");
-                        Some(Arc::new(RedisCrawlHistory::with_defaults(storage)))
+                        Some(Arc::new(PageHistory::redis(storage)))
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to connect to Redis for crawl history, incremental crawling will use in-message headers only");
@@ -942,10 +953,15 @@ impl CrawlerWorker {
     /// link extraction uses, and by [`is_non_page_url_for`] honoring the
     /// job's PDF/document opt-ins, so a PDF (or `.docx`, ...) sitemap entry
     /// is kept when the job enables that format.
-    async fn maybe_discover_sitemaps(&self, domain: &str, parent: &UrlMessage) -> usize {
+    async fn maybe_discover_sitemaps(
+        &self,
+        domain: &str,
+        origin: &str,
+        parent: &UrlMessage,
+    ) -> usize {
         let job_id = parent.job_id.as_str();
 
-        let discovered_count = self.run_sitemap_discovery(domain, parent).await;
+        let discovered_count = self.run_sitemap_discovery(domain, origin, parent).await;
 
         if discovered_count > 0 {
             self.metrics
@@ -958,7 +974,7 @@ impl CrawlerWorker {
             let timestamp = chrono::Utc::now().timestamp_millis();
             let event = CrawlEvent::UrlsDiscovered {
                 job_id: job_id.to_string(),
-                source_url: format!("https://{domain}/sitemap.xml"),
+                source_url: format!("{origin}/sitemap.xml"),
                 count: discovered_count,
                 timestamp,
             };
@@ -997,7 +1013,12 @@ impl CrawlerWorker {
     /// [`Self::maybe_discover_sitemaps`] can always publish
     /// `SitemapPublished` afterward without an extra branch for "did
     /// discovery even run".
-    async fn run_sitemap_discovery(&self, domain: &str, parent: &UrlMessage) -> usize {
+    async fn run_sitemap_discovery(
+        &self,
+        domain: &str,
+        origin: &str,
+        parent: &UrlMessage,
+    ) -> usize {
         let explicit_urls: &[String] = match parent.job.as_ref() {
             Some(job) => job.sitemap.urls.as_slice(),
             None => &[],
@@ -1020,9 +1041,9 @@ impl CrawlerWorker {
             }
             all_urls
         } else {
-            // Use the same full discovery as /map: fetch robots.txt, follow all sub-sitemaps
-            let base_url = format!("https://{domain}");
-            match sitemap_parser.discover_all_urls(&base_url).await {
+            // Use the same full discovery as /map: fetch robots.txt, follow
+            // all sub-sitemaps, on the page's own scheme and port.
+            match sitemap_parser.discover_all_urls(origin).await {
                 Ok(urls) => urls,
                 Err(e) => {
                     debug!(domain, error = %e, "Sitemap discovery failed");
@@ -1053,7 +1074,14 @@ impl CrawlerWorker {
                 continue;
             }
 
-            let mut crawl_url = CrawlUrl::seed(&sitemap_entry.loc);
+            // Normalized like a discovered link (fragment, trailing `/`), so
+            // the entry and a link to the same page are one frontier entry.
+            // Its query, if any, is kept: the entry names that exact page.
+            let Some(loc) = scrapix_core::url_normalize::normalize_entry_url(&sitemap_entry.loc)
+            else {
+                continue;
+            };
+            let mut crawl_url = CrawlUrl::seed(loc);
             crawl_url.parent_url = Some(format!("sitemap:{domain}"));
 
             if let Some(priority) = sitemap_entry.priority {

@@ -152,8 +152,9 @@ pub struct EventPosition {
 pub struct JobAccounting {
     /// Number of seed URLs the job was started with.
     pub seeds_published: u64,
-    /// Sum of `PageCrawled.links_published` + `SitemapPublished.count` +
-    /// `PageRetried` (1 each, since a retry re-publishes a frontier message).
+    /// Sum of `PageCrawled.links_published`, `PageSkipped.links_published`,
+    /// `SitemapPublished.count` and `PageRetried` (1 each, since a retry
+    /// re-publishes a frontier message).
     pub links_published: u64,
     /// Latest job-global `FrontierProgress` snapshot (R-17).
     pub frontier: FrontierSnapshot,
@@ -161,6 +162,9 @@ pub struct JobAccounting {
     /// `url_message_id`).
     pub crawl_outcomes: u64,
     pub pages_crawled_ok: u64,
+    /// Pages that answered 304 Not Modified to an incremental crawl
+    /// (`PageSkipped.not_modified`): unchanged and already indexed.
+    pub pages_not_modified: u64,
     pub pages_failed: u64,
     pub pages_browser: u64,
     pub bytes_downloaded: u64,
@@ -249,9 +253,22 @@ impl JobAccounting {
                     self.pages_failed += 1;
                 }
             }
-            CrawlEvent::PageSkipped { url_message_id, .. } => {
+            CrawlEvent::PageSkipped {
+                url_message_id,
+                links_published,
+                not_modified,
+                sitemap_pending,
+                ..
+            } => {
                 if Self::first_time(&mut self.seen_crawl, url_message_id) {
                     self.crawl_outcomes += 1;
+                    self.links_published += links_published;
+                    if *not_modified {
+                        self.pages_not_modified += 1;
+                    }
+                    if *sitemap_pending && !url_message_id.is_empty() {
+                        self.pending_sitemaps.insert(url_message_id.clone());
+                    }
                 }
             }
             CrawlEvent::PageRetried { url_message_id, .. } => {
@@ -345,6 +362,13 @@ impl JobAccounting {
         seen.insert(id.to_string())
     }
 
+    /// Whether the job reached pages: crawled successfully, or found
+    /// unchanged (304) by an incremental crawl. A balanced job without any
+    /// fails with "No page could be crawled".
+    pub fn has_pages(&self) -> bool {
+        self.pages_crawled_ok > 0 || self.pages_not_modified > 0
+    }
+
     /// All work derived from the job is accounted for.
     ///
     /// This alone is not sufficient to declare the job complete: see the
@@ -430,6 +454,7 @@ mod tests {
             ai_enriched: false,
             ocr_pages: 0,
             ai_usage: scrapix_core::AiUsage::default(),
+            documents: 1,
         }
     }
 
@@ -498,6 +523,9 @@ mod tests {
             reason: "duplicate".into(),
             timestamp: 0,
             url_message_id: id.into(),
+            links_published: 0,
+            not_modified: false,
+            sitemap_pending: false,
         }
     }
 
@@ -682,6 +710,41 @@ mod tests {
         assert_eq!(a.links_published, 0);
         a.apply(&skipped("m1")); // redelivered
         assert_eq!(a.crawl_outcomes, 1);
+        assert!(!a.has_pages());
+    }
+
+    /// A 304 `PageSkipped` carries the stored links it re-published and
+    /// counts as a page reached, so an all-unchanged recrawl balances on
+    /// those links and does not fail with "No page could be crawled".
+    #[test]
+    fn not_modified_skip_counts_links_and_pages() {
+        let mut a = JobAccounting {
+            seeds_published: 1,
+            ..Default::default()
+        };
+        a.apply(&progress("f1", 1, 1, 0));
+        a.apply(&CrawlEvent::PageSkipped {
+            job_id: "j".into(),
+            url: "https://example.com".into(),
+            reason: "304 Not Modified".into(),
+            timestamp: 0,
+            url_message_id: "m1".into(),
+            links_published: 2,
+            not_modified: true,
+            sitemap_pending: true,
+        });
+        assert_eq!(a.links_published, 2);
+        assert_eq!(a.pages_not_modified, 1);
+        assert!(a.has_pages());
+        // The two re-published links have not reached the frontier yet.
+        assert!(!a.is_balanced());
+        a.apply(&progress("f1", 3, 3, 0));
+        a.apply(&skipped("m2"));
+        a.apply(&skipped("m3"));
+        // Still waiting for the sitemap discovery the 304 page started.
+        assert!(!a.is_balanced());
+        a.apply(&sitemap_published("m1", 0));
+        assert!(a.is_balanced());
     }
 
     /// `SitemapPublished` is deduped by its own `url_message_id`, separate

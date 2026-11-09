@@ -29,6 +29,7 @@ scrapix-queue = { path = "../../crates/scrapix-queue" }
 scrapix-storage = { path = "../../crates/scrapix-storage" }
 
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -44,4 +45,3 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
-serde = { workspace = true }

@@ -65,8 +65,8 @@ pub use language::{
     detect_language, detect_language_info, detect_language_with_threshold, LanguageInfo,
 };
 pub use markdown::{
-    html_to_main_content_markdown, html_to_markdown, html_to_markdown_with_config,
-    markdown_to_text, MarkdownConfig,
+    absolutize_markdown_links, document_base_url, html_to_main_content_markdown, html_to_markdown,
+    html_to_markdown_for_page, html_to_markdown_with_config, markdown_to_text, MarkdownConfig,
 };
 pub use minihtml::{html_to_main_content_minihtml, html_to_minihtml};
 pub use readability::{

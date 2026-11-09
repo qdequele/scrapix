@@ -108,6 +108,7 @@
 //! Every implementation must agree on this, since it's the contract a
 //! Redis-backed store must mirror bit-for-bit:
 //!
+//! - `mark_seen` is a silent no-op: `Ok(())`.
 //! - `admit` and `set_state` return `Err` — the job must exist. A caller
 //!   that forgot `ensure_job`, or that raced past a job's `release`
 //!   retention window, has a bug; these two methods are where mutating a
@@ -210,6 +211,13 @@ pub trait FrontierStore: Send + Sync {
     /// enqueue. Increments `received` always. `Err` for an unknown job —
     /// see the module docs' missing-job section.
     async fn admit(&self, job_id: &str, url: &CrawlUrl, queue_cap: usize) -> Result<Admission>;
+
+    /// Record `url` in the job's seen set without queueing or counting it,
+    /// so a later `admit` of it is a [`Admission::Duplicate`]. Used for the
+    /// final URL of a redirect the crawler already followed. A no-op
+    /// (`Ok(())`) for an unknown or released job, and for a job that is
+    /// neither `Running` nor `Paused`.
+    async fn mark_seen(&self, job_id: &str, url: &str) -> Result<()>;
 
     /// Pop up to `n` highest-priority URLs whose `not_before_ms` has passed,
     /// promoting due delayed URLs first (see the module docs' storage

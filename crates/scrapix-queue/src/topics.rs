@@ -75,6 +75,12 @@ pub struct UrlMessage {
     /// that workers need but that are not per-URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobSpec>,
+    /// Not a URL to crawl: the frontier only records `url` as seen for the
+    /// job, without queueing it or counting it. The crawler sends this for
+    /// the final URL of a redirect it followed (that page is already
+    /// fetched), so a later link to it is a duplicate, not a second fetch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seen_only: bool,
 }
 
 fn default_true() -> bool {
@@ -99,6 +105,7 @@ impl UrlMessage {
             max_pages: None,
             incremental: true,
             job: None,
+            seen_only: false,
         }
     }
 
@@ -193,7 +200,16 @@ impl UrlMessage {
             max_pages: self.max_pages,
             incremental: self.incremental,
             job: self.job.clone(),
+            seen_only: false,
         }
+    }
+
+    /// A [`Self::seen_only`] message for `url`: the frontier records it as
+    /// seen for this job and does not crawl it.
+    pub fn seen_only_child(&self, url: impl Into<String>) -> Self {
+        let mut msg = self.child(CrawlUrl::new(url, self.url.depth));
+        msg.seen_only = true;
+        msg
     }
 
     /// Get the partition key (domain for locality)
@@ -446,6 +462,10 @@ pub enum CrawlEvent {
         /// gateway-reported cost. Empty when no AI ran.
         #[serde(default, skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
         ai_usage: scrapix_core::AiUsage,
+        /// Meilisearch documents written for this page: 1, or one per block
+        /// with `features.block_split`. `1` on events from older workers.
+        #[serde(default = "one_u64")]
+        documents: u64,
     },
     /// The content worker processed a page but indexed nothing for it
     /// (non-2xx page from an old crawler, `index_only` mismatch, no content,
@@ -558,6 +578,19 @@ pub enum CrawlEvent {
         /// skip is not tied to a frontier message)
         #[serde(default)]
         url_message_id: String,
+        /// URLs published to the frontier for this page: the stored links
+        /// of a page that answered 304 Not Modified (job work accounting).
+        #[serde(default)]
+        links_published: u64,
+        /// The page answered 304 Not Modified to an incremental crawl: it is
+        /// unchanged and already indexed, not a page that was left out.
+        #[serde(default)]
+        not_modified: bool,
+        /// Like `PageCrawled.sitemap_pending`: this skipped (304) page
+        /// started its domain's sitemap discovery, so a `SitemapPublished`
+        /// with this `url_message_id` will follow.
+        #[serde(default)]
+        sitemap_pending: bool,
     },
     /// Sitemap URLs published to the frontier for a job's domain.
     ///
@@ -929,6 +962,10 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+fn one_u64() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,10 +1326,12 @@ mod tests {
             CrawlEvent::DocumentIndexed {
                 url_message_id,
                 ai_enriched,
+                documents,
                 ..
             } => {
                 assert!(url_message_id.is_empty());
                 assert!(!ai_enriched);
+                assert_eq!(documents, 1, "an old event is one document");
             }
             other => panic!("unexpected {other:?}"),
         }

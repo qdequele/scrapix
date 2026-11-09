@@ -14,9 +14,16 @@ pub enum Outcome {
     NotModified,
     /// Retry later with retry_count + 1 (network errors, retryable status after in-fetch retries)
     Retry { reason: String, delay: Duration },
-    /// Terminal failure (4xx, robots, unsupported content, retries exhausted)
+    /// Terminal failure (4xx, SSRF refusal, body too large, retries
+    /// exhausted)
     Failed { reason: String, status: Option<u16> },
+    /// Not crawled by design, not an error: robots.txt disallows the URL, or
+    /// its content type is one the job does not crawl.
+    Skipped { reason: String },
 }
+
+/// `PageSkipped` reason of a URL robots.txt disallows.
+pub const ROBOTS_DISALLOWED: &str = "Disallowed by robots.txt";
 
 /// HTTP statuses retried by re-queueing (after the fetcher's own in-process
 /// retries were exhausted).
@@ -38,8 +45,9 @@ pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(600);
 /// - `Ok(NotModified)` → `NotModified`.
 /// - Transient errors (timeout, connection, network, retryable HTTP error,
 ///   rate limited) → `Retry`/`Failed` like 5xx.
-/// - Everything else (robots, SSRF refusal, unsupported content, body too
-///   large, invalid config/URL) → `Failed{status: None}` (terminal).
+/// - robots.txt disallow and an unsupported content type → `Skipped`.
+/// - Everything else (SSRF refusal, body too large, invalid config/URL) →
+///   `Failed{status: None}` (terminal).
 pub fn classify(
     result: &scrapix_core::Result<FetchResult>,
     retry_count: u32,
@@ -77,6 +85,14 @@ pub fn classify(
                     reason: format!("HTTP {status}"),
                     status: Some(status),
                 }
+            }
+        }
+        Err(ScrapixError::RobotsDisallowed { .. }) => Outcome::Skipped {
+            reason: ROBOTS_DISALLOWED.to_string(),
+        },
+        Err(e @ ScrapixError::Crawl(msg)) if scrapix_crawler::is_unsupported_content_type(e) => {
+            Outcome::Skipped {
+                reason: msg.clone(),
             }
         }
         Err(e) if is_transient(e) => {
@@ -196,13 +212,23 @@ mod tests {
         assert!(matches!(classify(&r, 1, 3), Outcome::Retry { .. }));
     }
     #[test]
-    fn robots_is_terminal() {
+    fn robots_and_unsupported_content_are_skipped_not_failed() {
         let r: scrapix_core::Result<FetchResult> =
             Err(ScrapixError::RobotsDisallowed { url: "u".into() });
-        assert!(matches!(
+        assert_eq!(
             classify(&r, 0, 3),
-            Outcome::Failed { status: None, .. }
+            Outcome::Skipped {
+                reason: ROBOTS_DISALLOWED.into()
+            }
+        );
+        assert!(!is_retryable(&r));
+        let r: scrapix_core::Result<FetchResult> = Err(ScrapixError::Crawl(
+            "Unsupported content type: text/plain".into(),
         ));
+        match classify(&r, 0, 3) {
+            Outcome::Skipped { reason } => assert!(reason.contains("text/plain"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     // Additional coverage beyond the brief.
@@ -241,7 +267,6 @@ mod tests {
     fn terminal_errors_are_failed_without_status() {
         for e in [
             ScrapixError::Refused("non-public".into()),
-            ScrapixError::Crawl("Unsupported content type: image/png".into()),
             ScrapixError::Crawl("Response body too large: 1 bytes (max: 0)".into()),
             ScrapixError::Config("Invalid proxy URL".into()),
         ] {
