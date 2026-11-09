@@ -856,6 +856,11 @@ pub struct FetchFeedback {
     /// None` means "robots.txt sets no Crawl-delay", not "unknown"
     #[serde(default)]
     pub robots_checked: bool,
+    /// How long the fetch took (ms), when a request was made. The frontier
+    /// adapts the domain's delay to it; `None` (old crawlers, no request)
+    /// keeps the previous behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_ms: Option<u64>,
     /// When the feedback was produced (ms since epoch)
     #[serde(default)]
     pub timestamp: i64,

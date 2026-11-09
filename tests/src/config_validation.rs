@@ -50,7 +50,9 @@ fn test_defaults_are_polite() {
     let config = minimal_config();
     // Rate limiting should be on by default
     assert!(config.rate_limit.respect_robots_txt);
-    assert!(config.rate_limit.per_domain_delay_ms >= 100);
+    // No fixed job delay: the frontier adapts each domain's delay to its
+    // response time (and backs off on errors, 429s and robots Crawl-delay).
+    assert_eq!(config.rate_limit.per_domain_delay_ms, 0);
     assert_eq!(config.rate_limit.default_crawl_delay_ms, 0);
 }
 

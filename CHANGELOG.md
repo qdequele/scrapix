@@ -48,6 +48,37 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Changed
 
+- **Single-site crawls up to about 10× faster: the per-domain delay
+  adapts to the site.** It used to be a fixed 250 ms floor
+  (`DOMAIN_DELAY_MS`), capping one site at about 4 pages/s; a job could
+  only raise it. It now starts at `DOMAIN_DELAY_MS` and, after each
+  successful fetch, moves halfway toward the fetch time divided by
+  `CONCURRENT_PER_DOMAIN` (dropping at most ×0.9 per success), down to the
+  new `MIN_DOMAIN_DELAY_MS` (default `25`). A site answering in 200 ms
+  reaches about 40 pages/s, the ceiling the 20 ms `DISPATCH_INTERVAL_MS`
+  also sets (one URL per domain per dispatch). A site that slows down gets
+  a longer delay, even above `DOMAIN_DELAY_MS`. 429s, `Retry-After`, error
+  streaks and robots.txt `Crawl-delay` still slow it down as before.
+  `CONCURRENT_PER_DOMAIN` defaults to `8` (was `4`). Set
+  `MIN_DOMAIN_DELAY_MS` to `DOMAIN_DELAY_MS` to never go below the old
+  delay. The crawler reports the fetch time in `FetchFeedback`
+  (`fetch_ms`); feedback from older crawlers keeps the old behavior.
+
+- **A job's `rate_limit.per_domain_delay_ms` defaults to `0`** (was `100`):
+  the adaptive delay applies unless the job sets one, and an explicit value
+  is still a floor. As a side effect, `rate_limit.default_crawl_delay_ms`
+  now applies to jobs that set no delay or rate, as documented; the
+  implicit `100` used to switch it off.
+
+- **The frontier sends URLs to the crawlers concurrently.** It used to
+  wait for each URL's bus send (producer linger plus broker ack) before
+  the next, capping one frontier at about 45 URLs/s across every job.
+  Politeness slots are still taken one URL at a time, but a batch's sends
+  now go out together (about 19,000 sends/s measured on a local Redpanda).
+  A graceful shutdown still sends the URLs already granted a slot and puts
+  the rest back; a failed or abandoned send puts its URL back first, then
+  frees its slot (skipped after the shutdown hard stop: the slot expires).
+
 - The OpenAPI `info.version` of `contracts/openapi.json` and
   `contracts/openapi.engine.json` (and the `/openapi.json` the engine serves)
   is now the crate version, `0.3.0`; it was a fixed `0.1.0`. The Lab

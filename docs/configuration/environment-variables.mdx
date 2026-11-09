@@ -105,29 +105,30 @@ Setting `CLICKHOUSE_URL` automatically enables the analytics API at `/analytics/
 ## Frontier Service
 
 <Note>
-Under `scrapix all` (single-process mode), `DOMAIN_DELAY_MS` and
-`CONCURRENT_PER_DOMAIN` are hardcoded (`250`ms / `4`) and not read from the
-environment. They're only tunable when the frontier runs as its own
+Under `scrapix all` (single-process mode), `DOMAIN_DELAY_MS`,
+`MIN_DOMAIN_DELAY_MS` and `CONCURRENT_PER_DOMAIN` are hardcoded (`250`ms /
+`25`ms / `8`) and not read from the environment. They're only tunable when the frontier runs as its own
 service (distributed mode) — every other variable below applies in both
 modes.
 </Note>
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches |
+| `DISPATCH_INTERVAL_MS` | `20` | Milliseconds between dispatch batches. A domain gets at most one URL per batch, so this also caps single-site speed (20 ms: about 40 pages/s) |
 | `DISPATCH_BATCH_SIZE` | `2000` | URLs per dispatch batch |
-| `DOMAIN_DELAY_MS` | `250` | Minimum delay between requests to same domain (jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it) |
+| `DOMAIN_DELAY_MS` | `250` | Starting delay between requests to the same domain. After each successful fetch it moves halfway toward the fetch time divided by `CONCURRENT_PER_DOMAIN`; rate limits and error streaks raise it ×1.5. Jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it |
+| `MIN_DOMAIN_DELAY_MS` | `25` | Lowest delay between requests to the same domain the adaptive delay may reach. Set it to `DOMAIN_DELAY_MS` for a fixed delay |
 | `BLOOM_CAPACITY` | `10000000` | **Deprecated and ignored.** Dedup now lives in the `FrontierStore` (Redis or in-memory), not a bloom filter; kept only so old env files don't fail to parse |
 | `BLOOM_FP_RATE` | `0.01` | **Deprecated and ignored** (see `BLOOM_CAPACITY`) |
 | `MAX_PENDING_PER_JOB` | `1000000` | Maximum pending URLs per job |
-| `CONCURRENT_PER_DOMAIN` | `4` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
+| `CONCURRENT_PER_DOMAIN` | `8` | Maximum concurrent requests per domain (a slot is held until the crawler reports the fetch back) |
 | `REQUEST_TIMEOUT` | `30` | Crawler request timeout (s); a politeness slot without feedback expires after 2× this |
 | `ROBOTS_DELAY_MULTIPLIER` | `1.0` | Multiplier applied to robots.txt `Crawl-delay` |
 | `REDIS_URL` | — | When set, frontier state (dedup/queue via `FrontierStore`) and per-domain politeness state are shared in Redis across instances, so more than one frontier instance can run at once |
 | `FRONTIER_KEY_PREFIX` | `scrapix:frontier` | Redis key prefix for the frontier store (only relevant with `REDIS_URL` set) |
 | `JOB_RETENTION_HOURS` | `168` | How long a finished/cancelled job's counters and state stay queryable after its queue and seen set are released |
 | `INSTANCE_ID` | random per start | Instance identifier. **Set a stable value per frontier instance in production**: it names the instance's job-control consumer group, so a random id loses controls published while the instance was down and leaks one consumer group per restart (a warning is logged when unset) |
-| `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight send and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (the time between SIGTERM and SIGKILL) |
+| `DISPATCH_SHUTDOWN_GRACE_MS` | `10000` | On graceful shutdown, how long the dispatcher may take to finish its in-flight sends and put every popped-but-unsent URL back into the store. Keep it below the platform kill timeout (the time between SIGTERM and SIGKILL) |
 | `WAKE_PORT` | `8081` | Bare-TCP port serving `GET /metrics` and `GET /health`. On a single box give each service its own port (8081 is also the Lab's Rails port; a failed bind only logs a warning) |
 | `SHUTDOWN_TIMEOUT_SECS` | `90` | Most a graceful shutdown (SIGTERM, Ctrl-C or idle exit) may take before the process exits anyway. The Kafka consumer stops taking new messages, waits up to this minus 15 s for in-flight ones, commits only the finished ones (the rest are redelivered) and flushes its producer. Keep it below the platform's kill timeout (ECS `stopTimeout`, at most 120 s on Fargate) |
 

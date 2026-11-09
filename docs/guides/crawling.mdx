@@ -131,15 +131,18 @@ Respect target sites by controlling crawl speed:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `requests_per_second` | unlimited | Global rate cap |
-| `per_domain_delay_ms` | `100` | Minimum delay between requests to the same domain |
+| `per_domain_delay_ms` | `0` | Minimum delay between requests to the same domain. `0` lets the frontier adapt the delay to the site's response time |
 | `respect_robots_txt` | `true` | Honor `robots.txt` crawl-delay and disallow rules |
 | `default_crawl_delay_ms` | `0` | Fallback `Crawl-delay` used only when robots.txt was fetched, set no `Crawl-delay` of its own, and the job set no explicit `per_domain_delay_ms`/rate — it never lowers an explicit delay |
 
 <Note>
-  The frontier also enforces its own process-wide politeness floor
-  (`DOMAIN_DELAY_MS`, default `250`ms, and `CONCURRENT_PER_DOMAIN`, default
-  `4` in-flight requests per domain) — a job's `rate_limit` can only raise
-  the effective per-domain delay above that floor, never lower it.
+  The frontier adapts each domain's delay to how fast the site answers: it
+  starts at `DOMAIN_DELAY_MS` (default `250`ms), then moves toward the
+  response time divided by `CONCURRENT_PER_DOMAIN` (default `8` in-flight
+  requests per domain), never below `MIN_DOMAIN_DELAY_MS` (default `25`ms).
+  A slower site gets a longer delay, and 429s, `Retry-After` and error
+  streaks back off. A job's `rate_limit` and robots.txt `Crawl-delay` can
+  only raise the delay, never lower it.
 </Note>
 
 ## JavaScript Rendering

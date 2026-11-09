@@ -256,7 +256,8 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub requests_per_minute: Option<u32>,
 
-    /// Minimum delay between requests to same domain (ms)
+    /// Minimum delay between requests to same domain (ms). 0 (default)
+    /// lets the frontier adapt the delay to the server's response time.
     #[serde(default = "default_domain_delay")]
     pub per_domain_delay_ms: u64,
 
@@ -273,7 +274,7 @@ pub struct RateLimitConfig {
 }
 
 fn default_domain_delay() -> u64 {
-    100
+    0
 }
 fn default_true() -> bool {
     true

@@ -21,8 +21,13 @@ The most impactful knobs for single-binary performance:
 | `DISPATCH_BATCH_SIZE` | 2000 | URLs dispatched per batch. Increase for high-throughput. |
 | `DISPATCH_INTERVAL_MS` | 20 | Lower = more frequent dispatches. |
 | `BATCH_SIZE` | 2000 | Meilisearch indexing batch size. Match to Meilisearch capacity. |
-| `DOMAIN_DELAY_MS` | 250 | Minimum per-domain delay. Lower = faster per-domain. |
-| `CONCURRENT_PER_DOMAIN` | 4 | Requests in flight per domain (held until the crawler reports back). |
+
+Under `scrapix all`, the per-domain politeness settings (`DOMAIN_DELAY_MS`,
+`MIN_DOMAIN_DELAY_MS`, `CONCURRENT_PER_DOMAIN`) are fixed at `250`ms /
+`25`ms / `8`; they are tunable only on a separate frontier service (see
+[Environment Variables](/configuration/environment-variables)). A domain
+gets at most one URL per dispatch, so `DISPATCH_INTERVAL_MS` also caps
+single-site speed (20 ms: about 40 pages/s).
 
 ### Resource Guidelines
 
@@ -48,7 +53,6 @@ With environment overrides:
 ```bash
 export DISPATCH_BATCH_SIZE=5000
 export DISPATCH_INTERVAL_MS=10
-export DOMAIN_DELAY_MS=20
 export BATCH_SIZE=500
 export BATCH_TIMEOUT_SECS=2
 ```

@@ -539,18 +539,27 @@ schema) and is removed in the cleanup release.
 
 ### Politeness
 
-Defaults: `CONCURRENT_PER_DOMAIN=4`, `DOMAIN_DELAY_MS=250`
-(`bins/scrapix-frontier-service/src/lib.rs`), down from 50 / 50: single-site
-crawls are roughly 5–12× slower unless the frontier env overrides them
-(e.g. `DOMAIN_DELAY_MS=50 CONCURRENT_PER_DOMAIN=16`; a job can only raise
-the delay, never lower it). The frontier holds a per-domain
+Defaults: `CONCURRENT_PER_DOMAIN=8`, `DOMAIN_DELAY_MS=250`,
+`MIN_DOMAIN_DELAY_MS=25` (`bins/scrapix-frontier-service/src/lib.rs`). The
+per-domain delay is adaptive (`adapt_on_success` in
+`crates/scrapix-frontier/src/politeness.rs`, mirrored in the Redis Lua
+script): it starts at `DOMAIN_DELAY_MS` and, on each success, moves halfway
+toward the crawler-reported `FetchFeedback.fetch_ms / CONCURRENT_PER_DOMAIN`
+(dropping at most ×0.9 per success), clamped to
+`[min(MIN_DOMAIN_DELAY_MS, DOMAIN_DELAY_MS), 30s]`; 429s and error streaks
+raise it ×1.5 (a job can only raise the delay, never lower it). A domain
+gets at most one URL per dispatch batch, so `DISPATCH_INTERVAL_MS` (20 ms)
+also caps one site at about 40 pages/s. The frontier holds a per-domain
 slot from dispatch until the crawler's `FetchFeedback` — topic
 `scrapix.fetch.feedback` — reports the fetch back (not at dispatch time); a
 slot without feedback expires after `2 × REQUEST_TIMEOUT` (default `30`s), so
 a lagging `scrapix.urls.processing` consumer effectively widens that safety
 window. The effective per-domain delay is
-`max(DOMAIN_DELAY_MS, job.rate_limit.per_domain_delay_ms, robots Crawl-delay
-if respected, 1000 / requests_per_second)`. `rate_limit.default_crawl_delay_ms`
+`max(adaptive delay, job.rate_limit.per_domain_delay_ms (default 0), robots
+Crawl-delay if respected, 1000 / requests_per_second)`. The dispatcher takes
+politeness slots one URL at a time but sends a batch's granted URLs to the
+bus concurrently (one serial send waits ~20 ms of producer linger plus the
+broker ack, about 45 sends/s). `rate_limit.default_crawl_delay_ms`
 (config default `0`) is a fallback `Crawl-delay` used only when robots.txt was
 fetched and set no `Crawl-delay` of its own, and the job set no explicit delay
 or rate — it never lowers an explicit value. With `REDIS_URL` set on the
@@ -727,8 +736,9 @@ GROUP BY date ORDER BY date;
 | `LAB_INSTANCE_ID` / `LAB_INSTANCE_SECRET` | API and content worker (the API's values), hosted only, required; the standalone API refuses them (a standalone worker ignores them, warned). Minted by the Lab (`bin/rails lab:hosted_engine:create PRODUCT=scrapix REGION=... URL=... CREDENTIAL=<LAB_SERVICE_TOKEN>` prints `LAB_URL`, `LAB_INSTANCE_ID`, `LAB_INSTANCE_SECRET` once; rotate with `lab:hosted_engine:rotate ID=`): a uuid and 64 hex chars. Sent as `X-Lab-Instance-Id` + `Authorization: Bearer <secret>` on `{LAB_URL}/internal/*`; the secret also signs event batches (`X-Lab-Signature`) |
 | `LAB_SERVICE_TOKEN` | API, hosted only, required (≥32 chars; generated first and passed to the Lab at mint time as `CREDENTIAL=`, stored per engine), inbound only: the Lab presents it (with `X-Scrapix-Account-Id`) when it calls the engine for an account (saved-config cron). Never sent to the Lab |
 | `LAB_EVENTS_SECRET` | **Deprecated, ignored** (warned at boot): batches are signed with `LAB_INSTANCE_SECRET` |
-| `DOMAIN_DELAY_MS` | Frontier: minimum per-domain delay (default `250`) |
-| `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `4`) |
+| `DOMAIN_DELAY_MS` | Frontier: starting per-domain delay, then adaptive (default `250`) |
+| `MIN_DOMAIN_DELAY_MS` | Frontier: lowest adaptive per-domain delay (default `25`) |
+| `CONCURRENT_PER_DOMAIN` | Frontier: max concurrent in-flight requests per domain (default `8`) |
 | `FRONTIER_KEY_PREFIX` | Frontier: Redis key prefix for the frontier store (default `scrapix:frontier`) |
 | `JOB_RETENTION_HOURS` | Frontier: how long a finished/cancelled job's state stays queryable after release (default `168`) |
 | `WAKE_PORT` | Every worker: bare-TCP port serving `/metrics` and `/health` (default `8081`) |

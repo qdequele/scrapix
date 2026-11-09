@@ -4631,7 +4631,7 @@
           "per_domain_delay_ms": {
             "type": "integer",
             "format": "int64",
-            "description": "Minimum delay between requests to same domain (ms)",
+            "description": "Minimum delay between requests to same domain (ms). 0 (default)\nlets the frontier adapt the delay to the server's response time.",
             "minimum": 0
           },
           "requests_per_minute": {

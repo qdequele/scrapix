@@ -77,7 +77,9 @@ return 0
 /// `KEYS`: domain hash, domain zset, job zset.
 /// `ARGV`: token, signal (ok|rate|error|none), crawl delay ms (`""` = none),
 /// retry-until ms since epoch (`""` = none), now, default delay, max delay,
-/// state ttl, robots checked (0/1).
+/// state ttl, robots checked (0/1), fetch ms (`""` = none),
+/// concurrent_per_domain, floor.
+/// On success the delay follows [`crate::politeness::adapt_on_success`].
 /// Error/success accounting only applies when the slot was still held
 /// (duplicate or expired feedback only updates robots and Retry-After).
 const REPORT_LUA: &str = r#"
@@ -94,7 +96,14 @@ local sig = ARGV[2]
 if owned == 0 then sig = 'none' end
 if sig == 'ok' then
   errors = 0
-  if delay > base then delay = math.max(math.floor(delay * 0.9), base) end
+  if ARGV[10] ~= '' then
+    local floor = tonumber(ARGV[12])
+    local target = math.floor(tonumber(ARGV[10]) / tonumber(ARGV[11]))
+    local halfway = math.floor((delay + target) / 2)
+    if halfway < delay then halfway = math.max(halfway, math.floor(delay * 9 / 10)) end
+    delay = halfway
+    delay = math.min(math.max(delay, floor), math.max(maxd, floor))
+  elseif delay > base then delay = math.max(math.floor(delay * 0.9), base) end
 elseif sig == 'rate' or sig == 'error' then
   errors = errors + 1
   if sig == 'rate' or errors >= 3 then delay = math.min(math.floor(delay * 1.5), maxd) end
@@ -168,7 +177,9 @@ impl RedisPoliteness {
         crawl_delay_ms: Option<u64>,
         robots_checked: bool,
         retry_until_ms: Option<i64>,
+        fetch_ms: Option<u64>,
     ) -> Result<()> {
+        let c = &self.config;
         let mut conn = self.conn.clone();
         let _: i64 = self
             .report
@@ -180,10 +191,13 @@ impl RedisPoliteness {
             .arg(crawl_delay_ms.map(|v| v.to_string()).unwrap_or_default())
             .arg(retry_until_ms.map(|v| v.to_string()).unwrap_or_default())
             .arg(now_ms())
-            .arg(self.config.default_delay_ms)
-            .arg(self.config.max_delay_ms)
+            .arg(c.default_delay_ms)
+            .arg(c.max_delay_ms)
             .arg(DOMAIN_STATE_TTL_MS)
             .arg(if robots_checked { "1" } else { "0" })
+            .arg(fetch_ms.map(|v| v.to_string()).unwrap_or_default())
+            .arg(c.concurrent_per_domain.max(1))
+            .arg(c.min_delay_ms.min(c.default_delay_ms))
             .invoke_async(&mut conn)
             .await
             .map_err(storage_err)?;
@@ -241,7 +255,7 @@ impl PolitenessStore for RedisPoliteness {
     }
 
     async fn release(&self, domain: &str, job_id: &str, token: &str) -> Result<()> {
-        self.run_report(domain, job_id, token, "none", None, false, None)
+        self.run_report(domain, job_id, token, "none", None, false, None, None)
             .await
     }
 
@@ -260,6 +274,7 @@ impl PolitenessStore for RedisPoliteness {
             r.crawl_delay_ms,
             r.robots_checked,
             r.retry_until_ms,
+            r.fetch_ms,
         )
         .await
     }
