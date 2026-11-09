@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use scrapix_lifecycle::{
     consumer_drain_timeout, idle_minutes_from_env, install_signal_handlers,
@@ -81,6 +82,8 @@ const ADMIT_BACKOFF_MIN: Duration = Duration::from_millis(100);
 const ADMIT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Initial per-job pop size (see [`FrontierService::pop_sizes`]).
 const INITIAL_POP_SIZE: usize = 64;
+/// How many politeness slots of failed sends are released at once.
+const RELEASE_CONCURRENCY: usize = 64;
 /// Renew the dispatch lease at least this often while sending a batch.
 const LEASE_RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Per-job dispatch lease TTL; renewed on every dispatcher tick.
@@ -148,14 +151,22 @@ pub struct Args {
     #[arg(long, env = "BLOOM_FP_RATE", default_value = "0.01")]
     pub bloom_fp_rate: f64,
 
-    /// Default delay between requests to the same domain (ms). Jobs can
-    /// only raise it (`rate_limit`), as can robots.txt `Crawl-delay`.
+    /// Starting delay between requests to the same domain (ms). After each
+    /// successful fetch it moves toward the fetch time divided by
+    /// `CONCURRENT_PER_DOMAIN`, down to `MIN_DOMAIN_DELAY_MS`; errors and
+    /// 429s raise it. Jobs (`rate_limit`) and robots.txt `Crawl-delay` can
+    /// only raise it.
     #[arg(long, env = "DOMAIN_DELAY_MS", default_value = "250")]
     pub domain_delay_ms: u64,
 
+    /// Lowest delay between requests to the same domain the adaptive delay
+    /// may reach (ms). Set it to `DOMAIN_DELAY_MS` to keep a fixed delay.
+    #[arg(long, env = "MIN_DOMAIN_DELAY_MS", default_value = "25")]
+    pub min_domain_delay_ms: u64,
+
     /// Maximum concurrent requests per domain (in flight until the crawler
     /// reports the fetch back)
-    #[arg(long, env = "CONCURRENT_PER_DOMAIN", default_value = "4")]
+    #[arg(long, env = "CONCURRENT_PER_DOMAIN", default_value = "8")]
     pub concurrent_per_domain: usize,
 
     /// Crawler request timeout (s). A politeness slot whose feedback never
@@ -177,7 +188,7 @@ pub struct Args {
     pub dispatch_interval_ms: u64,
 
     /// On graceful shutdown, how long the dispatcher may take to finish its
-    /// in-flight send and put every popped-but-unsent URL back (ms). Keep it
+    /// in-flight sends and put every popped-but-unsent URL back (ms). Keep it
     /// below the platform's kill timeout (the time between SIGTERM and SIGKILL).
     #[arg(long, env = "DISPATCH_SHUTDOWN_GRACE_MS", default_value = "10000")]
     pub dispatch_shutdown_grace_ms: u64,
@@ -256,7 +267,7 @@ pub async fn build_store(args: &Args) -> anyhow::Result<Arc<dyn FrontierStore>> 
 pub fn politeness_config(args: &Args) -> PolitenessConfig {
     PolitenessConfig {
         default_delay_ms: args.domain_delay_ms,
-        min_delay_ms: 100,
+        min_delay_ms: args.min_domain_delay_ms,
         max_delay_ms: 30_000,
         respect_robots_delay: true,
         robots_delay_multiplier: args.robots_delay_multiplier,
@@ -786,10 +797,11 @@ impl FrontierService {
     }
 
     /// Wait for the dispatcher to stop after `shutdown` was set: it stops
-    /// popping, finishes its in-flight send and requeues the rest of its
-    /// batch. After 4/5 of the grace, `hard_stop` makes it abandon a send
-    /// that is still stuck (that URL is requeued as well; with Kafka it may
-    /// also have been delivered, i.e. crawled twice, which is safe). Only if
+    /// taking slots, sends the URLs it already granted, and requeues the
+    /// rest of its batch. After 4/5 of the grace, `hard_stop` makes it
+    /// abandon the sends still stuck (those URLs are requeued as well; with
+    /// Kafka some may also have been delivered, i.e. crawled twice, which is
+    /// safe). Only if
     /// the dispatcher is still running at the end of the grace is it
     /// aborted, which can lose its batch (logged).
     async fn drain_dispatcher(&self, mut handle: tokio::task::JoinHandle<()>) {
@@ -800,7 +812,7 @@ impl FrontierService {
         }
         warn!(
             waited_ms = soft.as_millis() as u64,
-            "Dispatcher still busy at shutdown; abandoning its in-flight send"
+            "Dispatcher still busy at shutdown; abandoning its in-flight sends"
         );
         let _ = self.hard_stop.send(true);
         if tokio::time::timeout(grace.saturating_sub(soft), &mut handle)
@@ -1193,6 +1205,12 @@ impl FrontierService {
     /// pop in the counters, so nothing is counted twice). Returns whether
     /// this instance holds the job's dispatch lease.
     ///
+    /// Politeness slots are taken one URL at a time, in pop order, but the
+    /// granted URLs' bus sends all run at once and are awaited together at
+    /// the end of the batch: one send waits for the producer's linger and
+    /// the broker's ack, so sending them one after another capped the
+    /// frontier at a few dozen URLs per second.
+    ///
     /// The pop size adapts per job (`2 × dispatched last time + 1`, capped
     /// at `dispatch_batch_size`), so a job throttled by politeness pops only
     /// a little more than it can send instead of churning a full batch
@@ -1240,7 +1258,8 @@ impl FrontierService {
         let mut not_ready: HashMap<String, Duration> = HashMap::new();
         let mut lease_held = true;
         let mut last_renew = std::time::Instant::now();
-        let mut hard_stop = self.hard_stop.subscribe();
+        let hard_stop = self.hard_stop.subscribe();
+        let mut sends = FuturesUnordered::new();
         let mut urls = urls.into_iter();
         while let Some(url) = urls.next() {
             if self.shutdown.load(Ordering::Relaxed) {
@@ -1337,19 +1356,28 @@ impl FrontierService {
 
             let mut msg = template.child(url);
             msg.message_id = token;
+            let mut hard_stop = hard_stop.clone();
+            sends.push(async move {
+                let key = msg.partition_key();
+                let send = self
+                    .producer
+                    .send(topic_names::URL_PROCESSING, Some(&key), &msg);
+                // Raced only against the shutdown hard stop (see
+                // `drain_dispatcher`); normally the send runs to completion.
+                let sent = tokio::select! {
+                    r = send => r,
+                    _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
+                        "send abandoned at shutdown".to_string(),
+                    )),
+                };
+                (domain, msg, sent)
+            });
+        }
 
-            let key = msg.partition_key();
-            let send = self
-                .producer
-                .send(topic_names::URL_PROCESSING, Some(&key), &msg);
-            // Raced only against the shutdown hard stop (see
-            // `drain_dispatcher`); normally the send runs to completion.
-            let sent = tokio::select! {
-                r = send => r,
-                _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
-                    "send abandoned at shutdown".to_string(),
-                )),
-            };
+        // Every granted URL's send is in flight: collect the outcomes.
+        // Slots of failed sends: (domain, token).
+        let mut unsent_slots = Vec::new();
+        while let Some((domain, msg, sent)) = sends.next().await {
             match sent {
                 Ok(_) => {
                     dispatched += 1;
@@ -1361,21 +1389,7 @@ impl FrontierService {
                 }
                 Err(e) => {
                     error!(url = %msg.url.url, job_id = %job_id, error = %e, "Failed to dispatch URL");
-                    // A bus outage is not the domain's fault: free the slot
-                    // without error accounting (no backoff, no pause).
-                    let released = tokio::time::timeout(
-                        STORE_CALL_TIMEOUT,
-                        self.politeness.release(&domain, job_id, &msg.message_id),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(scrapix_core::ScrapixError::Timeout(
-                            "politeness release timed out".to_string(),
-                        ))
-                    });
-                    if let Err(e) = released {
-                        warn!(domain = %domain, error = %e, "Failed to release politeness slot; it will expire");
-                    }
+                    unsent_slots.push((domain, msg.message_id));
                     let mut url = msg.url;
                     url.not_before_ms = Some(now + ERROR_RETRY.as_millis() as i64);
                     bounced.push(url);
@@ -1391,7 +1405,33 @@ impl FrontierService {
             self.pop_sizes.lock().insert(job_id.to_string(), next);
         }
 
+        // Put the URLs back before anything else: at shutdown the grace may
+        // run out, and popped URLs must not be lost.
         self.requeue_or_stash(job_id, bounced).await;
+
+        // A bus outage is not the domain's fault: free the failed sends'
+        // slots without error accounting (no backoff, no pause). Skipped
+        // after a hard stop (the slots expire on their own) so shutdown
+        // never waits on one store call per abandoned send.
+        if !unsent_slots.is_empty() && !*hard_stop.borrow() {
+            futures::stream::iter(unsent_slots)
+                .for_each_concurrent(RELEASE_CONCURRENCY, |(domain, token)| async move {
+                    let released = tokio::time::timeout(
+                        STORE_CALL_TIMEOUT,
+                        self.politeness.release(&domain, job_id, &token),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(scrapix_core::ScrapixError::Timeout(
+                            "politeness release timed out".to_string(),
+                        ))
+                    });
+                    if let Err(e) = released {
+                        warn!(domain = %domain, error = %e, "Failed to release politeness slot; it will expire");
+                    }
+                })
+                .await;
+        }
         Ok(lease_held)
     }
 
@@ -1553,6 +1593,7 @@ impl FrontierService {
             signal: feedback_signal(fb),
             crawl_delay_ms: fb.crawl_delay_ms,
             robots_checked: fb.robots_checked,
+            fetch_ms: fb.fetch_ms,
             retry_until_ms: fb.retry_after_ms.map(|ms| {
                 // Measured from when the crawler saw the response (old
                 // feedback without a timestamp: from now).
@@ -3100,10 +3141,12 @@ mod tests {
         n
     }
 
-    /// Final review fix 1: a graceful shutdown in the middle of a dispatch
-    /// batch (slow producer) finishes the in-flight send and puts every
+    /// Final review fix 1: a graceful shutdown in the middle of dispatching
+    /// (slow producer) finishes the sends already in flight and puts every
     /// popped-but-unsent URL back, instead of aborting the dispatcher and
-    /// losing them (they were counted `dispatched` by `pop_ready`).
+    /// losing them (they were counted `dispatched` by `pop_ready`). A
+    /// batch's sends run together, so small batches make the shutdown land
+    /// with URLs still unsent.
     #[tokio::test]
     async fn graceful_shutdown_mid_batch_requeues_unsent_urls() {
         const N: u64 = 20;
@@ -3112,6 +3155,7 @@ mod tests {
         let mut args = test_args();
         args.domain_delay_ms = 0;
         args.concurrent_per_domain = 10_000;
+        args.dispatch_batch_size = 5;
         // One-slot topics: every send waits for the slow reader below.
         let h = Harness::start_on(ChannelBus::with_capacity(1), args, store.clone()).await;
         let reader = Arc::new(h.consumer(topic_names::URL_PROCESSING));

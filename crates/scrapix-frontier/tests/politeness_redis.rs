@@ -81,7 +81,57 @@ fn report<'a>(
         crawl_delay_ms: None,
         robots_checked: false,
         retry_until_ms: None,
+        fetch_ms: None,
     }
+}
+
+#[tokio::test]
+async fn success_delay_follows_fetch_time_like_the_memory_store() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let c = PolitenessConfig {
+        concurrent_per_domain: 8,
+        default_delay_ms: 250,
+        min_delay_ms: 25,
+        ..Default::default()
+    };
+    let (a, _b) = pair(&url, &prefix, c.clone()).await;
+    let l = JobLimits::default();
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("{prefix}:pol:d:f.test");
+    let mut delay = 250;
+    for (i, fetch_ms) in [200u64, 200, 8_000].into_iter().enumerate() {
+        let token = format!("f{i}");
+        let _: () = redis::cmd("HDEL")
+            .arg(&key)
+            .arg("last_ms")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.try_acquire(&req("f.test", "j", &token, l)).await.unwrap(),
+            Acquire::Granted
+        );
+        a.report(&FetchReport {
+            fetch_ms: Some(fetch_ms),
+            ..report("f.test", "j", &token, FetchSignal::Success)
+        })
+        .await
+        .unwrap();
+        delay = scrapix_frontier::adapt_on_success(&c, delay, Some(fetch_ms));
+        let stored: u64 = redis::cmd("HGET")
+            .arg(&key)
+            .arg("delay_ms")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(stored, delay, "after a {fetch_ms} ms fetch");
+    }
+    // 250 → 225 → 202 (at most ×0.9 down) → 601 (an 8 s fetch: target 1 s)
+    assert_eq!(delay, 601);
+
+    cleanup(&url, &prefix).await;
 }
 
 #[tokio::test]

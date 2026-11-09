@@ -149,10 +149,10 @@ scrapix domains --top 10
 
 | Cause | Fix |
 |-------|-----|
-| Rate limiting yourself | Increase `CONCURRENCY`, lower `DOMAIN_DELAY_MS` |
+| Rate limiting yourself | Increase `CONCURRENCY`, lower `MIN_DOMAIN_DELAY_MS` |
 | Target site is slow | Nothing to do — respect the site's capacity |
 | DNS bottleneck | Enable `DNS_CACHE=true` (default) |
-| Single domain crawl | Limited by `CONCURRENT_PER_DOMAIN` |
+| Single domain crawl | Limited by `CONCURRENT_PER_DOMAIN` and the site's response time (the per-domain delay adapts to it) |
 | Browser rendering | Reduce `BROWSER_CONCURRENCY` or switch to HTTP mode for non-JS sites |
 
 ### Build Failures

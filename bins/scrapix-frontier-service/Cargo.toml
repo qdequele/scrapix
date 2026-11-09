@@ -21,6 +21,7 @@ scrapix-queue = { path = "../../crates/scrapix-queue" }
 scrapix-lifecycle = { path = "../../crates/scrapix-lifecycle" }
 
 tokio = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

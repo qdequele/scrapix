@@ -5733,6 +5733,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "futures",
  "parking_lot",
  "scrapix-core",
  "scrapix-frontier",

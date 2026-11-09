@@ -13,8 +13,12 @@
 //!   `max(adaptive delay, job min delay, 1000 / job rps, robots crawl-delay ×
 //!   multiplier)`, clamped to `[min(min_delay_ms, default_delay_ms),
 //!   max_delay_ms]`. The adaptive delay starts at `default_delay_ms` (the
-//!   worker's `DOMAIN_DELAY_MS`), grows on errors and shrinks back on
-//!   success. The robots term applies only to jobs that respect robots.txt:
+//!   worker's `DOMAIN_DELAY_MS`) and grows ×1.5 on rate limits and error
+//!   streaks. On success it follows the server's response time
+//!   ([`adapt_on_success`]): halfway toward `fetch_ms /
+//!   concurrent_per_domain`, so a fast server is crawled with about
+//!   `concurrent_per_domain` requests in flight and a slowing one gets a
+//!   longer delay, down to the `min_delay_ms` floor. The robots term applies only to jobs that respect robots.txt:
 //!   it is the domain's `Crawl-delay` when robots.txt sets one, else the
 //!   job's `default_crawl_delay_ms` — but only when robots.txt was actually
 //!   fetched (and set none) and the job set no explicit delay
@@ -38,10 +42,11 @@ use tracing::{debug, warn};
 /// Configuration for politeness scheduling
 #[derive(Debug, Clone)]
 pub struct PolitenessConfig {
-    /// Default delay between requests to the same domain (milliseconds)
+    /// Starting delay between requests to the same domain (milliseconds),
+    /// before any response time is known
     pub default_delay_ms: u64,
-    /// Minimum delay between requests (milliseconds). Never raises the
-    /// delay above `default_delay_ms` on its own: the floor is
+    /// Lowest delay the adaptive delay may reach (milliseconds). Never
+    /// raises the delay above `default_delay_ms` on its own: the floor is
     /// `min(min_delay_ms, default_delay_ms)`.
     pub min_delay_ms: u64,
     /// Maximum delay between requests (milliseconds)
@@ -156,6 +161,36 @@ pub fn effective_delay(
         .min(config.max_delay_ms.max(floor))
 }
 
+/// The adaptive delay after a successful fetch.
+///
+/// With the fetch time known, the delay moves halfway toward
+/// `fetch_ms / concurrent_per_domain` (the spacing that keeps about
+/// `concurrent_per_domain` requests in flight), within `[floor, max]`
+/// where `floor = min(min_delay_ms, default_delay_ms)`. It drops by at most
+/// ×0.9 per success, so the successes already in flight when a 429 or an
+/// error streak raised it do not undo the backoff at once. Without the
+/// fetch time (old crawlers), a delay raised by errors decays ×0.9 back
+/// toward `default_delay_ms`, as before.
+pub fn adapt_on_success(config: &PolitenessConfig, delay_ms: u64, fetch_ms: Option<u64>) -> u64 {
+    match fetch_ms {
+        Some(fetch_ms) => {
+            let floor = config.min_delay_ms.min(config.default_delay_ms);
+            let target = fetch_ms / config.concurrent_per_domain.max(1) as u64;
+            let halfway = delay_ms.saturating_add(target) / 2;
+            let next = if halfway < delay_ms {
+                halfway.max(delay_ms.saturating_mul(9) / 10)
+            } else {
+                halfway
+            };
+            next.clamp(floor, config.max_delay_ms.max(floor))
+        }
+        None if delay_ms > config.default_delay_ms => {
+            ((delay_ms as f64 * 0.9) as u64).max(config.default_delay_ms)
+        }
+        None => delay_ms,
+    }
+}
+
 /// Result of [`PolitenessStore::try_acquire`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acquire {
@@ -209,6 +244,9 @@ pub struct FetchReport<'a> {
     /// measured from when the crawler saw the response): pause the domain
     /// until then; ignored if already past
     pub retry_until_ms: Option<i64>,
+    /// How long the fetch took (ms). On success the domain's delay moves
+    /// toward `fetch_ms / concurrent_per_domain` (see [`adapt_on_success`]).
+    pub fetch_ms: Option<u64>,
 }
 
 /// Politeness state behind the frontier dispatcher: in memory
@@ -415,13 +453,9 @@ impl PolitenessScheduler {
         });
     }
 
-    fn on_success(&self, state: &mut DomainState) {
+    fn on_success(&self, state: &mut DomainState, fetch_ms: Option<u64>) {
         state.consecutive_errors = 0;
-        // Gradually reduce delay back toward default after recovery
-        if state.delay_ms > self.config.default_delay_ms {
-            state.delay_ms =
-                ((state.delay_ms as f64 * 0.9) as u64).max(self.config.default_delay_ms);
-        }
+        state.delay_ms = adapt_on_success(&self.config, state.delay_ms, fetch_ms);
     }
 
     fn on_error(&self, domain: &str, state: &mut DomainState, is_rate_limited: bool) {
@@ -451,7 +485,7 @@ impl PolitenessScheduler {
     pub fn complete_request(&self, domain: &str) {
         if let Some(state) = self.domains.write().get_mut(domain) {
             state.free(None);
-            self.on_success(state);
+            self.on_success(state, None);
         }
     }
 
@@ -639,7 +673,7 @@ impl PolitenessScheduler {
             // failure seen by every instance is not counted N times.
             if owned {
                 match r.signal {
-                    FetchSignal::Success => self.on_success(state),
+                    FetchSignal::Success => self.on_success(state, r.fetch_ms),
                     FetchSignal::RateLimited => self.on_error(r.domain, state, true),
                     FetchSignal::Error => self.on_error(r.domain, state, false),
                     FetchSignal::NoRequest => {}
@@ -775,6 +809,7 @@ mod tests {
             crawl_delay_ms: None,
             robots_checked: false,
             retry_until_ms: None,
+            fetch_ms: None,
         }
     }
 
@@ -1106,5 +1141,93 @@ mod tests {
             "Delay should not exceed max: {}",
             stats.delay_ms
         );
+    }
+
+    fn adaptive(concurrent: usize) -> PolitenessConfig {
+        PolitenessConfig {
+            default_delay_ms: 250,
+            min_delay_ms: 25,
+            max_delay_ms: 30_000,
+            concurrent_per_domain: concurrent,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn success_moves_the_delay_halfway_toward_fetch_time_over_concurrency() {
+        let c = adaptive(8);
+        // 400 ms fetches with 8 slots: target 50 ms. Halfway is 150, but a
+        // success lowers the delay by at most ×0.9.
+        assert_eq!(adapt_on_success(&c, 250, Some(400)), 225);
+        assert_eq!(adapt_on_success(&c, 60, Some(400)), 55);
+        // A slow server raises the delay above the starting one.
+        assert_eq!(adapt_on_success(&c, 250, Some(8_000)), 625);
+        // Clamped to the floor and to max_delay_ms.
+        assert_eq!(adapt_on_success(&c, 26, Some(0)), 25);
+        assert_eq!(adapt_on_success(&c, 30_000, Some(10_000_000)), 30_000);
+        // The floor never exceeds the starting delay.
+        let low = PolitenessConfig {
+            default_delay_ms: 10,
+            ..c.clone()
+        };
+        assert_eq!(adapt_on_success(&low, 10, Some(0)), 10);
+    }
+
+    #[test]
+    fn success_without_fetch_time_keeps_the_old_decay() {
+        let c = adaptive(8);
+        assert_eq!(adapt_on_success(&c, 1_000, None), 900);
+        assert_eq!(adapt_on_success(&c, 260, None), 250);
+        // Never below the starting delay without a fetch time.
+        assert_eq!(adapt_on_success(&c, 250, None), 250);
+        assert_eq!(adapt_on_success(&c, 100, None), 100);
+    }
+
+    #[test]
+    fn fast_domain_converges_below_the_starting_delay() {
+        let p = PolitenessScheduler::new(adaptive(8));
+        let l = JobLimits::default();
+        for i in 0..40 {
+            let token = format!("t{i}");
+            p.with_state("a.test", |s| s.last_request = None);
+            assert_eq!(p.acquire(&req("a.test", "j", &token, l)), Acquire::Granted);
+            p.apply_report(&FetchReport {
+                fetch_ms: Some(200),
+                ..report("a.test", "j", &token, FetchSignal::Success)
+            });
+        }
+        // 200 ms / 8 slots = 25 ms: the floor.
+        assert_eq!(p.effective_delay_ms("a.test"), 25);
+
+        // A rate limit still backs off from there, and the next success
+        // only takes back a tenth of it.
+        p.with_state("a.test", |s| s.last_request = None);
+        assert_eq!(p.acquire(&req("a.test", "j", "rl", l)), Acquire::Granted);
+        p.apply_report(&report("a.test", "j", "rl", FetchSignal::RateLimited));
+        assert_eq!(p.effective_delay_ms("a.test"), 37);
+        p.with_state("a.test", |s| s.last_request = None);
+        assert_eq!(p.acquire(&req("a.test", "j", "ok", l)), Acquire::Granted);
+        p.apply_report(&FetchReport {
+            fetch_ms: Some(200),
+            ..report("a.test", "j", "ok", FetchSignal::Success)
+        });
+        assert_eq!(p.effective_delay_ms("a.test"), 33);
+    }
+
+    #[test]
+    fn job_delay_and_rate_still_floor_the_adaptive_delay() {
+        let c = adaptive(8);
+        let none = RobotsInfo::default();
+        let explicit = JobLimits {
+            min_delay_ms: 100,
+            ..JobLimits::default()
+        };
+        assert_eq!(effective_delay(&c, 25, none, &explicit), 100);
+        let rate = JobLimits {
+            max_rps: Some(5.0),
+            ..JobLimits::default()
+        };
+        assert_eq!(effective_delay(&c, 25, none, &rate), 200);
+        assert_eq!(effective_delay(&c, 25, none, &JobLimits::default()), 25);
     }
 }

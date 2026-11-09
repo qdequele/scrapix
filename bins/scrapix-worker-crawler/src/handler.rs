@@ -109,7 +109,7 @@ impl CrawlerWorker {
         // free it (status None, no request made) before acking.
         if self.cancelled.contains(&msg.job_id) {
             debug!(url = %msg.url.url, job_id = %msg.job_id, "Skipping message of a cancelled job");
-            self.publish_feedback(&msg, None).await;
+            self.publish_feedback(&msg, None, Duration::ZERO).await;
             ack.ack();
             return;
         }
@@ -138,7 +138,7 @@ impl CrawlerWorker {
 
         // Release the frontier's politeness slot for this dispatch (every
         // handled message, including fail-closed ones that made no request).
-        self.publish_feedback(&msg, result.as_ref()).await;
+        self.publish_feedback(&msg, result.as_ref(), elapsed).await;
 
         let published = match outcome {
             Outcome::Crawled => match result {
@@ -185,9 +185,23 @@ impl CrawlerWorker {
         &self,
         msg: &UrlMessage,
         result: Option<&scrapix_core::Result<FetchResult>>,
+        elapsed: Duration,
     ) {
         let via_proxy = msg.job.as_ref().is_some_and(|j| j.proxy.is_some());
         let mut feedback = fetch_feedback(msg, result, via_proxy);
+        // The server's response time drives the frontier's adaptive delay;
+        // only for a response from the domain itself (not a proxy error,
+        // not a fail-closed precheck). The page's own fetch/render time
+        // when known, else the handler's (an error status).
+        if feedback.status.is_some() {
+            feedback.fetch_ms = Some(match result {
+                Some(Ok(FetchResult::Fetched(page))) => page.fetch_duration_ms,
+                Some(Ok(FetchResult::NotModified {
+                    fetch_duration_ms, ..
+                })) => *fetch_duration_ms,
+                _ => elapsed.as_millis() as u64,
+            });
+        }
         let respects_robots = !matches!(msg.job, Some(ref j) if !j.respect_robots_txt);
         if respects_robots && result.is_some() {
             if let Some(delay) = self.fetcher.cached_crawl_delay(&msg.url.url) {
@@ -1310,7 +1324,11 @@ mod tests {
     async fn success_publishes_fetch_feedback_keyed_by_domain() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw("<p>ok</p>", "text/html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<p>ok</p>", "text/html")
+                    .set_delay(Duration::from_millis(120)),
+            )
             .mount(&server)
             .await;
         let bus = ChannelBus::new();
@@ -1326,6 +1344,9 @@ mod tests {
         assert_eq!(fb.retry_after_ms, None);
         assert_eq!(fb.crawl_delay_ms, None, "robots not consulted");
         assert!(!fb.robots_checked);
+        // The response time, for the frontier's adaptive delay.
+        let fetch_ms = fb.fetch_ms.expect("fetch time reported");
+        assert!((120..5_000).contains(&fetch_ms), "{fetch_ms}");
     }
 
     #[tokio::test]
@@ -1362,6 +1383,7 @@ mod tests {
         let fb = feedback_for(&bus, &msg).await;
         assert_eq!(fb.status, None);
         assert!(!fb.transport_error, "no request was made");
+        assert_eq!(fb.fetch_ms, None, "no response time without a request");
     }
 
     #[tokio::test]
@@ -1376,6 +1398,7 @@ mod tests {
         let fb = feedback_for(&bus, &msg).await;
         assert_eq!(fb.status, None);
         assert!(fb.transport_error);
+        assert_eq!(fb.fetch_ms, None, "no response from the domain");
     }
 
     #[tokio::test]
