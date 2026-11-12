@@ -3,7 +3,8 @@
 
 use scrapix_core::url_glob::{matches_glob, matches_include_exclude};
 use scrapix_core::FeaturesConfig;
-use scrapix_extractor::{SchemaConfig, SchemaExtractor};
+use scrapix_extractor::{merge_microdata, SchemaConfig, SchemaExtractor, SchemaItem};
+use std::sync::LazyLock;
 
 /// Whether a feature with these page filters applies to `url`.
 ///
@@ -87,24 +88,29 @@ pub fn extract_schema(extractor: &SchemaExtractor, html: &str) -> Option<serde_j
 }
 
 /// The document `schema` field for a page, extracted from its parsed DOM
-/// with the job's schema options: the matching items (one object, or an
+/// with the job's schema options: the matching JSON-LD items, then the
+/// Microdata items of a type the JSON-LD does not have (one object, or an
 /// array), or `None`.
 pub fn schema_from_dom(
     extractor: &SchemaExtractor,
     dom: &scrapix_extractor::scraper::Html,
 ) -> Option<serde_json::Value> {
-    let mut values: Vec<serde_json::Value> = extractor
-        .extract_from_dom(dom)
-        .ok()?
-        .items
-        .into_iter()
-        .map(|item| item.data)
-        .collect();
-    match values.len() {
+    let extracted = extractor.extract_from_dom(dom).ok()?;
+    let mut values: Vec<serde_json::Value> =
+        extracted.items.into_iter().map(|item| item.data).collect();
+    let json_ld = match values.len() {
         0 => None,
         1 => values.pop(),
         _ => Some(serde_json::Value::Array(values)),
-    }
+    };
+    merge_microdata(json_ld, extracted.microdata)
+}
+
+/// The page's Microdata items, for a job without schema options: the parser
+/// collects its JSON-LD, and [`merge_microdata`] adds these to it.
+pub fn microdata_from_dom(dom: &scrapix_extractor::scraper::Html) -> Vec<SchemaItem> {
+    static DEFAULT: LazyLock<SchemaExtractor> = LazyLock::new(SchemaExtractor::default);
+    DEFAULT.microdata_from_dom(dom)
 }
 
 #[cfg(test)]
@@ -185,5 +191,26 @@ mod tests {
 
         let default = FeaturesConfig::from_cli_args(true, true, true, false, false, false, None);
         assert!(schema_key(&default).is_none());
+    }
+
+    /// A job with schema options gets the page's Microdata too: filtered by
+    /// `only_types`, and not when the JSON-LD already has that type.
+    #[test]
+    fn schema_options_apply_to_microdata() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">{"@type":"Product","name":"json-ld"}</script>
+            </head><body>
+            <div itemscope itemtype="https://schema.org/Product"><b itemprop="name">dup</b></div>
+            <div itemscope itemtype="https://schema.org/Recipe"><b itemprop="name">soup</b></div>
+            <div itemscope itemtype="https://schema.org/Person"><b itemprop="name">Ada</b></div>
+            </body></html>"#;
+        let extractor = schema_extractor(&(vec!["Product".into(), "Recipe".into()], false));
+        assert_eq!(
+            extract_schema(&extractor, html).unwrap(),
+            serde_json::json!([
+                {"@type": "Product", "name": "json-ld"},
+                {"@type": "Recipe", "name": "soup"}
+            ])
+        );
     }
 }
