@@ -264,9 +264,34 @@ pub struct Args {
     #[arg(long, env = "CRAWL_BROWSER_AVAILABLE")]
     pub crawl_browser_available: Option<bool>,
 
+    /// Pages the API's own browser renders at once (`/scrape` and `/map`
+    /// with `render_js`, screenshots, actions), across all callers. At
+    /// least 1. `/map` leaves part of it to `/scrape`
+    /// (`map_render_concurrency`).
+    #[arg(
+        long,
+        env = "API_BROWSER_CONCURRENCY",
+        default_value_t = DEFAULT_API_BROWSER_CONCURRENCY,
+        value_parser = parse_api_browser_concurrency
+    )]
+    pub api_browser_concurrency: usize,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+/// Default of [`Args::api_browser_concurrency`].
+pub const DEFAULT_API_BROWSER_CONCURRENCY: usize = 5;
+
+/// `API_BROWSER_CONCURRENCY`: a page count of at least 1 (0 would make
+/// every render wait forever).
+fn parse_api_browser_concurrency(value: &str) -> Result<usize, String> {
+    match value.trim().parse::<usize>() {
+        Ok(pages) if pages >= 1 => Ok(pages),
+        Ok(_) => Err("must be at least 1".to_string()),
+        Err(e) => Err(format!("not a page count: {e}")),
+    }
 }
 
 /// Crawl job state: jobs, events, activity tracking
@@ -5635,8 +5660,24 @@ const MAP_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAP_INITIAL_CONCURRENCY: usize = 32;
 const MAP_MIN_CONCURRENCY: usize = 4;
 const MAP_MAX_CONCURRENCY: usize = 100;
-/// Browser renders run at a fixed concurrency.
+/// Most browser renders one `/map` call runs at once; the browser's page
+/// pool lowers it (`map_render_concurrency`).
 const MAP_RENDER_CONCURRENCY: usize = 50;
+
+/// Concurrent browser renders of one `/map` call on a browser of
+/// `pool_pages` pages: the pool minus a reserve for `/scrape` (a fifth of
+/// it, at least one page when the pool has more than one), so a map never
+/// holds every page, and never queues renders dozens deep behind the pool.
+fn map_render_concurrency(pool_pages: usize) -> usize {
+    let reserve = if pool_pages > 1 {
+        (pool_pages / 5).max(1)
+    } else {
+        0
+    };
+    pool_pages
+        .saturating_sub(reserve)
+        .clamp(1, MAP_RENDER_CONCURRENCY)
+}
 /// At most one halving per this interval, so a burst of failures from the
 /// fetches already in flight counts as one signal.
 const MAP_BACKOFF_COOLDOWN: Duration = Duration::from_secs(1);
@@ -5709,10 +5750,18 @@ async fn map_fetch(
 
     let crawl_url = CrawlUrl::seed(&url);
     let result = if let Some(renderer) = browser {
-        match tokio::time::timeout(MAP_RENDER_TIMEOUT, renderer.fetch(&crawl_url)).await {
-            Ok(result) => result,
-            Err(_) => return MapFetchOutcome::Throttled,
-        }
+        // The timeout starts once the render has its browser page: time
+        // queued behind other renders (other `/map` calls, `/scrape`) is
+        // not taken from the page's budget. `MAP_DEADLINE` bounds the wait.
+        let options = PageOptions {
+            timeout: Some(MAP_RENDER_TIMEOUT),
+            timeout_after_slot: true,
+            ..Default::default()
+        };
+        renderer
+            .render_page(&crawl_url.url, &options)
+            .await
+            .map(|rendered| CdpRenderer::raw_page(&crawl_url, rendered))
     } else {
         // A missing title is fine; a page whose links we follow gets more
         // time and a retry (when the first attempt fails fast, e.g. a 503),
@@ -5974,8 +6023,10 @@ async fn map_url(
             None => seed_fetch.abort(),
         }
     }
-    let mut concurrency = if browser.is_some() {
-        MapConcurrency::fixed(MAP_RENDER_CONCURRENCY)
+    let mut concurrency = if let Some(renderer) = browser.as_ref() {
+        MapConcurrency::fixed(map_render_concurrency(
+            renderer.config().max_concurrent_pages,
+        ))
     } else {
         MapConcurrency::adaptive()
     };
@@ -7584,16 +7635,25 @@ pub async fn run_with_bus(
     info!("Shared HTTP fetcher initialized for /scrape endpoint");
 
     // Initialize browser renderer for JS rendering in /scrape and /map (optional)
+    // Renders that return no pixels skip images, fonts and media (a render
+    // with a screenshot or actions loads everything, decided per render by
+    // the renderer). Stylesheets still load: pages can gate content on them.
     let browser_renderer = match CdpRendererBuilder::new()
         .headless(true)
-        .max_concurrent_pages(5)
+        .max_concurrent_pages(args.api_browser_concurrency)
+        .block_images(true)
+        .block_fonts(true)
+        .block_media(true)
         .timeout(Duration::from_secs(30))
         .wait_until(WaitUntil::Load)
         .build()
         .await
     {
         Ok(renderer) => {
-            info!("Browser renderer initialized for JS rendering");
+            info!(
+                concurrency = args.api_browser_concurrency,
+                "Browser renderer initialized for JS rendering"
+            );
             Some(Arc::new(renderer))
         }
         Err(e) => {

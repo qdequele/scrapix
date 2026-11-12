@@ -55,7 +55,9 @@ use scrapix_core::browser::Action;
 
 use scrapix_core::browser::RequestCookie;
 
-use crate::cdp_actions::{execute_actions, install_request_guard, ACTIONS_BUDGET};
+use crate::cdp_actions::{
+    execute_actions, install_request_interception, BlockedResources, ACTIONS_BUDGET,
+};
 use crate::cdp_stealth::{
     chrome_major, emulate_desktop, emulate_mobile, stealth_script, BrowserIdentity, LAUNCH_ARGS,
 };
@@ -124,11 +126,21 @@ pub struct PageOptions {
     /// cache), disposed afterwards, so nothing this render sets or receives
     /// is visible to any other render on the shared browser.
     pub isolate: bool,
-    /// Bound the whole render, from waiting for a browser slot to capturing
-    /// the page (actions and screenshot included). On expiry the render
-    /// fails with [`ScrapixError::Timeout`]; the page and its context are
-    /// still closed. `None` leaves only the renderer's own timeouts.
+    /// Bound the whole render, from waiting for a browser slot (unless
+    /// `timeout_after_slot`) to capturing the page (actions and screenshot
+    /// included). On expiry the render fails with
+    /// [`ScrapixError::Timeout`]; the page and its context are still closed. `None` leaves only the renderer's own timeouts.
     pub timeout: Option<Duration>,
+    /// Start `timeout` once the render holds its browser slot instead of
+    /// when it starts waiting for one, so time queued behind other renders
+    /// is not taken from the page's own budget. The wait for a slot is then
+    /// unbounded: the caller bounds it (by dropping the render).
+    pub timeout_after_slot: bool,
+    /// Download every subresource, whatever the renderer's `block_*`
+    /// settings. A render with a `screenshot` or `actions` always does; set
+    /// this for any other render whose result depends on images, fonts,
+    /// media or styles being loaded.
+    pub load_all_resources: bool,
 }
 
 /// Whether a request is the page's own document, not one of its
@@ -463,17 +475,26 @@ pub struct CdpConfig {
     #[serde(default)]
     pub user_agent: Option<String>,
 
-    /// Whether to block images
+    /// Do not download images. Like the other `block_*` settings it only
+    /// applies to renders that need no pixels: a render that takes a
+    /// screenshot, runs actions or sets `PageOptions::load_all_resources`
+    /// always loads everything.
     #[serde(default)]
     pub block_images: bool,
 
-    /// Whether to block stylesheets
+    /// Do not download stylesheets. Riskier than the other types: a page
+    /// whose scripts wait on styles, or that hides or reveals content with
+    /// CSS, can render differently without them.
     #[serde(default)]
     pub block_stylesheets: bool,
 
-    /// Whether to block fonts
+    /// Do not download web fonts.
     #[serde(default)]
     pub block_fonts: bool,
+
+    /// Do not download audio and video.
+    #[serde(default)]
+    pub block_media: bool,
 
     /// Custom JavaScript to inject before page load
     #[serde(default)]
@@ -526,6 +547,7 @@ impl Default for CdpConfig {
             block_images: false,
             block_stylesheets: false,
             block_fonts: false,
+            block_media: false,
             inject_script: None,
             proxy: None,
             extra_args: Vec::new(),
@@ -769,7 +791,7 @@ impl CdpRenderer {
         };
         check_render_target(url, self.config.allow_private_ips, robots).await?;
 
-        let deadline = req.timeout.map(|t| tokio::time::Instant::now() + t);
+        let mut deadline = req.timeout.map(|t| tokio::time::Instant::now() + t);
         let timed_out = || {
             ScrapixError::Timeout(format!(
                 "rendering took longer than {} ms",
@@ -780,12 +802,15 @@ impl CdpRenderer {
         // Acquire semaphore
         let acquire = self.semaphore.acquire();
         let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+            Some(deadline) if !req.timeout_after_slot => tokio::time::timeout_at(deadline, acquire)
                 .await
                 .map_err(|_| timed_out())?,
-            None => acquire.await,
+            _ => acquire.await,
         };
         let _permit = permit.map_err(|_| CdpError::PoolExhausted)?;
+        if req.timeout_after_slot {
+            deadline = req.timeout.map(|t| tokio::time::Instant::now() + t);
+        }
 
         let start = Instant::now();
 
@@ -844,70 +869,113 @@ impl CdpRenderer {
         start: Instant,
         guard: &mut Option<tokio::task::JoinHandle<()>>,
     ) -> Result<RenderResult> {
-        // Setup page
-        self.setup_page(page, req.mobile).await?;
-        block_link_local_urls(page).await;
-
-        if req.guard_requests {
-            *guard = Some(
-                install_request_guard(page, self.config.allow_private_ips)
-                    .await
-                    .map_err(CdpError::NavigationFailed)?,
-            );
-        }
-
+        // Page setup. Each step sets a separate piece of page state (init
+        // scripts, blocked URLs, request interception, user agent, device
+        // metrics, cookies, extra headers), none reads what another wrote,
+        // and all of them are awaited before the navigation, so they are
+        // sent together instead of one round trip after the other. Steps
+        // whose order matters stay serial inside their own future (the
+        // stealth script before `inject_script`, metrics before touch).
+        let blocked = self.blocked_resources(req);
+        let guard_requests = req.guard_requests;
+        let interception = async {
+            if !guard_requests && !blocked.any() {
+                return Ok(None);
+            }
+            let guard_mode = guard_requests.then_some(self.config.allow_private_ips);
+            match install_request_interception(page, guard_mode, blocked).await {
+                Ok(task) => Ok(Some(task)),
+                // The guard is a security check: fail closed.
+                Err(e) if guard_requests => Err(ScrapixError::from(CdpError::NavigationFailed(e))),
+                // Blocking alone is an optimization: render without it.
+                Err(e) => {
+                    warn!(error = %e, "Could not block subresources on the page");
+                    Ok(None)
+                }
+            }
+        };
         // Per-job user agent, device and headers, set on this page only (the
         // browser is shared by every job on the worker).
-        if let Some(ua) = req.user_agent.as_deref() {
-            page.set_user_agent(ua.to_string())
-                .await
-                .map_err(|e| CdpError::NavigationFailed(format!("set user agent: {e}")))?;
-        } else if req.mobile {
-            BrowserIdentity::mobile(&self.chrome_major)
-                .apply(page)
+        let identity = async {
+            if let Some(ua) = req.user_agent.as_deref() {
+                page.set_user_agent(ua.to_string())
+                    .await
+                    .map_err(|e| CdpError::NavigationFailed(format!("set user agent: {e}")))?;
+            } else if req.mobile {
+                BrowserIdentity::mobile(&self.chrome_major)
+                    .apply(page)
+                    .await
+                    .map_err(CdpError::NavigationFailed)?;
+            } else if let Some(identity) = &self.desktop_identity {
+                identity
+                    .apply(page)
+                    .await
+                    .map_err(CdpError::NavigationFailed)?;
+            }
+            Ok::<(), ScrapixError>(())
+        };
+        let device = async {
+            if req.mobile {
+                emulate_mobile(page)
+                    .await
+                    .map_err(CdpError::NavigationFailed)?;
+            } else {
+                emulate_desktop(
+                    page,
+                    self.config.viewport_width,
+                    self.config.viewport_height,
+                )
                 .await
                 .map_err(CdpError::NavigationFailed)?;
-        } else if let Some(identity) = &self.desktop_identity {
-            identity
-                .apply(page)
+            }
+            Ok::<(), ScrapixError>(())
+        };
+        let cookies = async {
+            if !req.cookies.is_empty() {
+                let cookies = req
+                    .cookies
+                    .iter()
+                    .map(|c| browser_cookie(c, url))
+                    .collect::<Vec<_>>();
+                page.execute(SetCookiesParams::new(cookies))
+                    .await
+                    .map_err(|e| CdpError::NavigationFailed(format!("set cookies: {e}")))?;
+            }
+            Ok::<(), ScrapixError>(())
+        };
+        let extra_headers = async {
+            if !req.extra_headers.is_empty() {
+                let headers: serde_json::Map<String, serde_json::Value> = req
+                    .extra_headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                page.execute(SetExtraHttpHeadersParams::new(Headers::new(
+                    serde_json::Value::Object(headers),
+                )))
                 .await
-                .map_err(CdpError::NavigationFailed)?;
-        }
-        if req.mobile {
-            emulate_mobile(page)
-                .await
-                .map_err(CdpError::NavigationFailed)?;
-        } else {
-            emulate_desktop(
-                page,
-                self.config.viewport_width,
-                self.config.viewport_height,
-            )
-            .await
-            .map_err(CdpError::NavigationFailed)?;
-        }
-        if !req.cookies.is_empty() {
-            let cookies = req
-                .cookies
-                .iter()
-                .map(|c| browser_cookie(c, url))
-                .collect::<Vec<_>>();
-            page.execute(SetCookiesParams::new(cookies))
-                .await
-                .map_err(|e| CdpError::NavigationFailed(format!("set cookies: {e}")))?;
-        }
-        if !req.extra_headers.is_empty() {
-            let headers: serde_json::Map<String, serde_json::Value> = req
-                .extra_headers
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            page.execute(SetExtraHttpHeadersParams::new(Headers::new(
-                serde_json::Value::Object(headers),
-            )))
-            .await
-            .map_err(|e| CdpError::NavigationFailed(format!("set extra headers: {e}")))?;
-        }
+                .map_err(|e| CdpError::NavigationFailed(format!("set extra headers: {e}")))?;
+            }
+            Ok::<(), ScrapixError>(())
+        };
+        let (scripts, (), interception, identity, device, cookies, extra_headers) = tokio::join!(
+            self.setup_page(page, req.mobile),
+            block_link_local_urls(page),
+            interception,
+            identity,
+            device,
+            cookies,
+            extra_headers,
+        );
+        // The interception task is handed to the caller before any error is
+        // returned, so it is always aborted with the page.
+        let interception = interception.map(|task| *guard = task);
+        scripts?;
+        interception?;
+        identity?;
+        device?;
+        cookies?;
+        extra_headers?;
 
         // Navigate to URL
         page.goto(url)
@@ -1029,6 +1097,23 @@ impl CdpRenderer {
             js_errors,
             render_duration,
         })
+    }
+
+    /// The subresource types this render does not download: the renderer's
+    /// `block_*` settings, unless the render needs pixels (a screenshot),
+    /// depends on the page's layout (actions: a click lands on an element's
+    /// box, a scroll on the page's height) or asks for everything
+    /// (`PageOptions::load_all_resources`).
+    fn blocked_resources(&self, req: &PageOptions) -> BlockedResources {
+        if req.screenshot.is_some() || !req.actions.is_empty() || req.load_all_resources {
+            return BlockedResources::default();
+        }
+        BlockedResources {
+            images: self.config.block_images,
+            stylesheets: self.config.block_stylesheets,
+            fonts: self.config.block_fonts,
+            media: self.config.block_media,
+        }
     }
 
     /// Setup page with configured options
@@ -1292,6 +1377,16 @@ impl CdpRendererBuilder {
 
     pub fn block_stylesheets(mut self, block: bool) -> Self {
         self.config.block_stylesheets = block;
+        self
+    }
+
+    pub fn block_fonts(mut self, block: bool) -> Self {
+        self.config.block_fonts = block;
+        self
+    }
+
+    pub fn block_media(mut self, block: bool) -> Self {
+        self.config.block_media = block;
         self
     }
 
