@@ -600,11 +600,18 @@ fn parse_html_page(
         // A job's schema extractor replaces the parser's schema output.
         extract_schema: features.schema_enabled() && schema_extractor.is_none(),
     };
-    let (mut document, (schema, custom, blocks)) =
+    let (mut document, (schema, microdata, custom, blocks)) =
         parser.parse_with_dom(raw_page, &options, |dom, document| {
             let schema = schema_extractor
                 .filter(|_| features.schema_enabled())
                 .map(|extractor| features::schema_from_dom(extractor, dom));
+            // The parser only reads JSON-LD: the Microdata items are added
+            // to its output below.
+            let microdata = if options.extract_schema {
+                features::microdata_from_dom(dom)
+            } else {
+                Vec::new()
+            };
             let custom = if features.custom_selectors_enabled() {
                 ContentWorker::custom_selectors_from_dom(dom, features)
             } else {
@@ -615,11 +622,13 @@ fn parse_html_page(
             let blocks = splitter
                 .filter(|_| has_content)
                 .map(|s| s.split_from_dom(dom).map_err(|e| e.to_string()));
-            (schema, custom, blocks)
+            (schema, microdata, custom, blocks)
         })?;
     ContentWorker::filter_document(&mut document, features);
     if let Some(schema) = schema {
         document.schema = schema;
+    } else if !microdata.is_empty() {
+        document.schema = scrapix_extractor::merge_microdata(document.schema.take(), microdata);
     }
     document.custom = custom;
     // A block-split page with no block is indexed whole, with its markdown.
@@ -4546,6 +4555,10 @@ mod tests {
         <p>The content worker parses the HTML once, extracts the main content, converts it to
         Markdown when the job asks for it and detects the language of the page.</p>
         <ul><li>Schema.org data is read from JSON-LD</li><li>Custom selectors pick fields</li></ul>
+        <p itemscope itemtype="https://schema.org/Organization">Built by
+        <span itemprop="name">Scrapix</span>.</p>
+        <p itemscope itemtype="https://schema.org/Product">The <span itemprop="name">crawler
+        (microdata)</span> is described twice.</p>
         <h3>Blocks</h3>
         <p>With block splitting, every heading starts a new document that carries the heading
         hierarchy of the page, so a search hit points at the right section.</p>
@@ -4627,6 +4640,45 @@ mod tests {
         matrix
     }
 
+    /// Without schema options the parser reads the JSON-LD; the Microdata
+    /// items of another type are added to it, and none when schema is off.
+    #[test]
+    fn default_schema_field_has_the_pages_microdata() {
+        let parser = HtmlParser::with_defaults();
+        let raw_page = RawPage {
+            url: "https://a.test/docs/guide".into(),
+            final_url: "https://a.test/docs/guide".into(),
+            status: 200,
+            headers: HashMap::new(),
+            html: ARTICLE.to_string(),
+            content_type: Some("text/html".into()),
+            js_rendered: false,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: 1,
+        };
+        let on = FeaturesConfig::from_cli_args(true, true, true, false, false, false, None);
+        let parsed = parse_html_page(&parser, &raw_page, &on, None, None).unwrap();
+        let schema = parsed.document.schema.expect("schema");
+        let summary: Vec<_> = schema
+            .as_array()
+            .expect("several items")
+            .iter()
+            .map(|item| (item["@type"].as_str().unwrap(), item.get("name").cloned()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("Article", None),
+                ("Product", Some("Crawler".into())),
+                ("Organization", Some("Scrapix".into())),
+            ]
+        );
+
+        let off = FeaturesConfig::from_cli_args(true, true, false, false, false, false, None);
+        let parsed = parse_html_page(&parser, &raw_page, &off, None, None).unwrap();
+        assert!(parsed.document.schema.is_none());
+    }
+
     /// The documents the worker indexed for an HTML page before the DOM was
     /// shared: a full parse (markdown always converted, then dropped by
     /// `filter_document`), and one more parse of the HTML for each of the
@@ -4651,6 +4703,12 @@ mod tests {
         if features.schema_enabled() {
             if let Some(extractor) = w.schema_extractor_for(&features) {
                 document.schema = features::extract_schema(&extractor, &msg.html);
+            } else {
+                let dom = scrapix_extractor::scraper::Html::parse_document(&msg.html);
+                document.schema = scrapix_extractor::merge_microdata(
+                    document.schema.take(),
+                    features::microdata_from_dom(&dom),
+                );
             }
         }
         if features.custom_selectors_enabled() {

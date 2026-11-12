@@ -10,6 +10,15 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **Microdata in crawled documents.** The `schema` field of a crawled
+  document now also carries the page's schema.org Microdata items
+  (`itemscope` / `itemprop`), after its JSON-LD: until now only `/scrape`
+  returned them. `schema.only_types` and `schema.convert_dates` apply to
+  them. A Microdata item is left out when the page's JSON-LD already has a
+  top-level item of the same type. A page with one JSON-LD script and
+  Microdata of another type now has an array in `schema` where it had an
+  object.
+
 - **AI usage and cost on jobs and scrapes.** `GET /jobs/{id}` (crawl and
   extract jobs), `GET /extract/{id}`, `POST /scrape` and `POST /parse` carry
   `ai_usage`: the LLM calls made (AI summary, extraction, vision OCR), their
@@ -256,6 +265,14 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   them at about twice its `limit` instead of 100,000 URLs.
 
 ### Fixed
+
+- **Microdata extraction** (`/scrape` `schema.microdata`, crawled
+  documents). An item inside another item without `itemprop` is read as
+  its own item (an `Article` in a `<body>` marked as `WebPage` was lost),
+  `itemref` is followed, `itemprop="name headline"` sets both properties,
+  `content` is read on any element, `itemid` is returned as `@id`, text
+  values have their whitespace collapsed, and `convert_dates` applies. The
+  work on one page is bounded (nesting depth, `itemref` loops).
 
 - **Page text that looks like deeply nested Markdown links no longer
   crashes the process.** Resolving links recursed once per link nested in a

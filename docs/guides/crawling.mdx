@@ -228,6 +228,13 @@ Enabled by default. Extracts `<title>`, `<meta>` tags, Open Graph, and Twitter c
 }
 ```
 
+The document's `schema` field holds the page's JSON-LD, followed by its
+Microdata items (`itemscope` / `itemprop`). A Microdata item is left out when
+the JSON-LD already has a top-level item of the same type, since pages that
+publish both formats describe the same thing twice. The field is one object
+when the page has a single item, an array otherwise. `only_types` and
+`convert_dates` apply to both formats. RDFa is not read.
+
 ### Custom CSS Selectors
 
 Extract specific fields from every crawled page:

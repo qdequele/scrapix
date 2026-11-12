@@ -87,7 +87,9 @@ pub mod selectors;
 // Re-export main types for convenience
 pub use blocks::{BlockConfig, BlockError, BlockSplitter, ContentBlock, ExtractedBlocks};
 pub use metadata::{ExtractedMetadata, FeedLink, MetadataError, MetadataExtractor};
-pub use schema::{ExtractedSchema, SchemaConfig, SchemaError, SchemaExtractor, SchemaItem};
+pub use schema::{
+    merge_microdata, ExtractedSchema, SchemaConfig, SchemaError, SchemaExtractor, SchemaItem,
+};
 pub use selectors::{
     combined_matches, ExtractedSelectors, ExtractionMode, FieldDefinition, SelectorDefinition,
     SelectorError, SelectorExtractor, SelectorInput, Transform,
