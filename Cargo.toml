@@ -77,6 +77,9 @@ rdkafka = { version = "0.38", features = ["cmake-build", "ssl"] }
 # Object storage (S3-compatible: RustFS, MinIO, AWS S3)
 # Using rust-s3 crate directly in scrapix-storage
 
+# Global allocator of the binaries (feature `mimalloc`, on by default)
+mimalloc = "0.1"
+
 # Bloom filter
 bloomfilter = "1.0"
 probabilistic-collections = "0.7"

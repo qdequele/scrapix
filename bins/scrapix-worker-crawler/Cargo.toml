@@ -15,10 +15,15 @@ name = "scrapix-worker-crawler"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["mimalloc"]
 browser = ["scrapix-crawler/browser-cdp", "scrapix-crawler/browser-lightpanda"]
+# `mimalloc`: use mimalloc as the binary's global allocator (set in
+# `src/main.rs`). On by default; build with `--no-default-features` for the
+# system allocator.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 scrapix-core = { path = "../../crates/scrapix-core" }
 scrapix-crawler = { path = "../../crates/scrapix-crawler" }
 # PDF link extraction (`features.pdf.extract_links`)

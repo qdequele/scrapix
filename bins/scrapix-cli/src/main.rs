@@ -2,6 +2,10 @@ use clap::Parser;
 
 use scrapix_cli::Cli;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();

@@ -17,6 +17,10 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Scrapix — high-performance web crawler and search indexer
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "scrapix")]
 #[command(version, about = "Scrapix web crawler — unified binary")]

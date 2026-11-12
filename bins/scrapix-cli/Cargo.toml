@@ -17,7 +17,15 @@ path = "src/lib.rs"
 name = "scrapix-cli"
 path = "src/main.rs"
 
+[features]
+default = ["mimalloc"]
+# `mimalloc`: use mimalloc as the binary's global allocator (set in
+# `src/main.rs`). On by default; build with `--no-default-features` for the
+# system allocator.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 scrapix-core = { path = "../../crates/scrapix-core" }
 scrapix-parser = { path = "../../crates/scrapix-parser" }
 scrapix-extractor = { path = "../../crates/scrapix-extractor" }
