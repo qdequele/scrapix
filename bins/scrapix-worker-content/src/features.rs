@@ -77,11 +77,24 @@ pub fn schema_extractor(key: &(Vec<String>, bool)) -> SchemaExtractor {
     })
 }
 
-/// The document `schema` field for a page, extracted with the job's schema
-/// options: the matching items (one object, or an array), or `None`.
+/// `schema_from_dom` on HTML text (one more DOM parse; tests only).
+#[cfg(test)]
 pub fn extract_schema(extractor: &SchemaExtractor, html: &str) -> Option<serde_json::Value> {
+    schema_from_dom(
+        extractor,
+        &scrapix_extractor::scraper::Html::parse_document(html),
+    )
+}
+
+/// The document `schema` field for a page, extracted from its parsed DOM
+/// with the job's schema options: the matching items (one object, or an
+/// array), or `None`.
+pub fn schema_from_dom(
+    extractor: &SchemaExtractor,
+    dom: &scrapix_extractor::scraper::Html,
+) -> Option<serde_json::Value> {
     let mut values: Vec<serde_json::Value> = extractor
-        .extract(html)
+        .extract_from_dom(dom)
         .ok()?
         .items
         .into_iter()

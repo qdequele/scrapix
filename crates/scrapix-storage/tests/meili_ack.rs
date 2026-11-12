@@ -404,3 +404,245 @@ async fn settings_fingerprint_is_independent_of_map_order() {
         .await;
     // PATCH expect(1) is verified when the mock server drops.
 }
+
+/// Number of documents in each document-addition request received so far.
+async fn batch_sizes(ms: &MockServer) -> Vec<usize> {
+    ms.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/documents"))
+        .map(|r| {
+            serde_json::from_slice::<Vec<serde_json::Value>>(&r.body)
+                .unwrap()
+                .len()
+        })
+        .collect()
+}
+
+/// A document whose JSON is a little over `bytes` bytes.
+fn big_doc(n: usize, bytes: usize) -> Document {
+    let mut doc = doc(n);
+    doc.content = Some("x".repeat(bytes));
+    doc
+}
+
+#[tokio::test]
+async fn batches_are_cut_by_serialized_size() {
+    let ms = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(task_accepted())
+        .mount(&ms)
+        .await;
+
+    // Each document is ~10 KB; 25 KB per request holds two of them.
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(100)
+        .max_batch_bytes(25_000)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    for n in 0..5 {
+        storage
+            .add_document_to_index(big_doc(n, 10_000), "i", counting_ack(&acked))
+            .await
+            .unwrap();
+    }
+    storage.flush().await.unwrap();
+
+    let sizes = batch_sizes(&ms).await;
+    assert_eq!(sizes.iter().sum::<usize>(), 5, "every document sent once");
+    assert!(
+        sizes.iter().all(|n| *n <= 2),
+        "no request above the byte cap: {sizes:?}"
+    );
+    assert_eq!(acked.load(Ordering::SeqCst), 5);
+    assert_eq!(storage.pending_count(), 0);
+    for request in ms.received_requests().await.unwrap() {
+        assert!(request.body.len() <= 25_000 + 2, "request over the cap");
+    }
+}
+
+#[tokio::test]
+async fn a_document_larger_than_the_byte_cap_is_sent_alone() {
+    let ms = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(task_accepted())
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(100)
+        .max_batch_bytes(1_000)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    for n in 0..3 {
+        storage
+            .add_document_to_index(big_doc(n, 5_000), "i", counting_ack(&acked))
+            .await
+            .unwrap();
+    }
+    storage.flush().await.unwrap();
+    assert_eq!(batch_sizes(&ms).await, vec![1, 1, 1]);
+    assert_eq!(acked.load(Ordering::SeqCst), 3);
+}
+
+fn payload_too_large() -> ResponseTemplate {
+    ResponseTemplate::new(413).set_body_json(serde_json::json!({
+        "message": "The provided payload reached the size limit.",
+        "code": "payload_too_large", "type": "invalid_request",
+        "link": "https://docs.meilisearch.com/errors#payload_too_large"}))
+}
+
+/// Documents in a document-addition request body.
+fn docs_in(request: &wiremock::Request) -> Vec<serde_json::Value> {
+    serde_json::from_slice(&request.body).unwrap()
+}
+
+#[tokio::test]
+async fn payload_too_large_splits_the_batch_and_retries_the_halves() {
+    let ms = MockServer::start().await;
+    // Meilisearch accepts at most one document per request here.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(|request: &wiremock::Request| {
+            if docs_in(request).len() > 1 {
+                payload_too_large()
+            } else {
+                task_accepted()
+            }
+        })
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(10)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    for n in 0..4 {
+        let r = rejected.clone();
+        let ack = scrapix_storage::DocAck::new(counting_ack(&acked)).on_reject(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        storage
+            .add_document_to_index(doc(n), "i", ack)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(storage.flush().await.unwrap(), 4);
+    assert_eq!(acked.load(Ordering::SeqCst), 4, "every document accepted");
+    assert_eq!(rejected.load(Ordering::SeqCst), 0, "none rejected");
+    assert_eq!(storage.pending_count(), 0);
+    // 4 -> 2 + 2 -> 1 + 1 + 1 + 1, halves in buffer order.
+    assert_eq!(batch_sizes(&ms).await, vec![4, 2, 1, 1, 2, 1, 1]);
+    let single: Vec<String> = ms
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(docs_in)
+        .filter(|docs| docs.len() == 1)
+        .map(|docs| docs[0]["url"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        single,
+        (0..4)
+            .map(|n| format!("https://a.test/{n}"))
+            .collect::<Vec<_>>(),
+        "documents are accepted in buffer order"
+    );
+}
+
+#[tokio::test]
+async fn a_single_document_refused_for_its_size_is_rejected() {
+    let ms = MockServer::start().await;
+    // A proxy's bare 413 (no Meilisearch error body) for the oversized
+    // document only.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(|request: &wiremock::Request| {
+            if request.body.len() > 5_000 {
+                ResponseTemplate::new(413)
+            } else {
+                task_accepted()
+            }
+        })
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(10)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for (n, size) in [(0, 10), (1, 6_000), (2, 10)] {
+        let r = rejected.clone();
+        let ack = scrapix_storage::DocAck::new(counting_ack(&acked))
+            .on_reject(move |reason| r.lock().unwrap().push((n, reason)));
+        storage
+            .add_document_to_index(big_doc(n, size), "i", ack)
+            .await
+            .unwrap();
+    }
+
+    assert!(storage.flush().await.is_err(), "the refusal is reported");
+    assert_eq!(acked.load(Ordering::SeqCst), 2, "the small documents pass");
+    let rejected = rejected.lock().unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].0, 1, "only the oversized document is rejected");
+    assert!(rejected[0].1.contains("413"), "{}", rejected[0].1);
+    assert_eq!(storage.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn retryable_failure_after_a_split_keeps_the_unsent_documents_in_order() {
+    let ms = MockServer::start().await;
+    // First: the batch of 4 is too large. Then the first half passes and
+    // the second half hits a 500.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/indexes/.*/documents$"))
+        .respond_with(
+            move |_: &wiremock::Request| match seen.fetch_add(1, Ordering::SeqCst) {
+                0 => payload_too_large(),
+                1 => task_accepted(),
+                2 => ResponseTemplate::new(500),
+                _ => task_accepted(),
+            },
+        )
+        .mount(&ms)
+        .await;
+
+    let storage = MeilisearchStorageBuilder::new(ms.uri(), "i")
+        .batch_size(10)
+        .connect()
+        .unwrap();
+    let acked = Arc::new(AtomicUsize::new(0));
+    for n in 0..4 {
+        storage
+            .add_document_to_index(doc(n), "i", counting_ack(&acked))
+            .await
+            .unwrap();
+    }
+
+    assert!(storage.flush().await.is_err());
+    assert_eq!(acked.load(Ordering::SeqCst), 2, "first half accepted");
+    assert_eq!(storage.pending_count(), 2, "second half kept for retry");
+
+    assert_eq!(storage.flush().await.unwrap(), 2);
+    assert_eq!(acked.load(Ordering::SeqCst), 4);
+    let last = ms.received_requests().await.unwrap().pop().unwrap();
+    let urls: Vec<String> = docs_in(&last)
+        .iter()
+        .map(|d| d["url"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(urls, vec!["https://a.test/2", "https://a.test/3"]);
+}
