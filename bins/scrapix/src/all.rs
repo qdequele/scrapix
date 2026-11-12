@@ -432,6 +432,11 @@ fn build_api_args(args: &AllArgs, brokers: String) -> scrapix_api::Args {
         ) as usize,
         // The crawler runs in this process: it renders pages iff BROWSER_RENDER.
         crawl_browser_available: Some(args.browser_render),
+        api_browser_concurrency: env_or(
+            "API_BROWSER_CONCURRENCY",
+            scrapix_api::DEFAULT_API_BROWSER_CONCURRENCY as u64,
+        )
+        .max(1) as usize,
         verbose: args.verbose,
     }
 }

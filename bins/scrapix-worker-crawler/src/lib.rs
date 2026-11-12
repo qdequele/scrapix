@@ -23,6 +23,7 @@ mod handler;
 pub mod job_fetch;
 pub mod outcome;
 pub mod page_history;
+mod publish;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use crate::page_history::PageHistory;
 use std::collections::HashSet;
 
 use crate::job_fetch::JobFetchShaper;
+use crate::publish::{send_concurrently, PublishedLinks, SEND_CONCURRENCY};
 
 /// Crawler worker for fetching web pages from the URL frontier
 #[derive(Parser, Debug)]
@@ -400,6 +402,12 @@ struct CrawlerWorker {
     cancelled: Arc<CancelledJobs>,
     /// `JOB_STATUS` consumer feeding `cancelled` (per-worker group).
     control_consumer: Option<Arc<AnyConsumer>>,
+    /// Links this worker already published to the frontier, per job: a
+    /// link repeated on every page is sent once.
+    published_links: PublishedLinks,
+    /// Largest serialized message the producer accepts (`None`: no limit,
+    /// the in-process bus). A page over it fails instead of being sent.
+    max_publish_bytes: Option<usize>,
 }
 
 /// Maximum number of `(job_id, domain)` pairs [`SitemapSeen`] remembers
@@ -653,7 +661,14 @@ impl CrawlerWorker {
             // Create CDP renderer
             // The renderer checks robots.txt (same cache as the HTTP
             // fetcher) and the SSRF rules before every navigation.
+            // Crawl renders only keep the HTML: images, fonts and media
+            // are not downloaded. Stylesheets still load, since pages can
+            // gate content on them (and the "almost no text" checks read
+            // the rendered page).
             let mut cdp_builder = CdpRendererBuilder::new()
+                .block_images(true)
+                .block_fonts(true)
+                .block_media(true)
                 .robots_cache(fetcher_robots_cache.clone())
                 .allow_private_ips(args.allow_private_ips)
                 .timeout(Duration::from_secs(args.browser_timeout))
@@ -748,6 +763,9 @@ impl CrawlerWorker {
             None
         };
 
+        let max_publish_bytes =
+            matches!(producer, AnyProducer::Kafka(_)).then(publish::kafka_max_message_bytes);
+
         Ok(Self {
             consumer,
             producer,
@@ -775,6 +793,8 @@ impl CrawlerWorker {
             sitemap_seen: Arc::new(SitemapSeen::new(SITEMAP_SEEN_CAPACITY)),
             cancelled: Arc::new(CancelledJobs::default()),
             control_consumer: None,
+            published_links: PublishedLinks::default(),
+            max_publish_bytes,
         })
     }
 
@@ -961,7 +981,8 @@ impl CrawlerWorker {
     ) -> usize {
         let job_id = parent.job_id.as_str();
 
-        let discovered_count = self.run_sitemap_discovery(domain, origin, parent).await;
+        let published = self.run_sitemap_discovery(domain, origin, parent).await;
+        let discovered_count = published.len();
 
         if discovered_count > 0 {
             self.metrics
@@ -994,19 +1015,23 @@ impl CrawlerWorker {
             url_message_id: parent.message_id.clone(),
             timestamp,
         };
-        if let Err(e) = self.publish_event(job_id, &sitemap_published).await {
-            warn!(
+        match self.publish_event(job_id, &sitemap_published).await {
+            // The entries are sent and counted: pages linking to them need
+            // not publish them again.
+            Ok(()) => self.record_published_links(job_id, &published),
+            Err(e) => warn!(
                 domain,
                 error = %e,
                 "Failed to publish SitemapPublished event; this job's work accounting may never balance for this domain"
-            );
+            ),
         }
 
         discovered_count
     }
 
     /// Fetch, filter and publish this domain's sitemap URLs to the
-    /// frontier. Returns the count actually published to the frontier.
+    /// frontier. Returns the [`PublishedLinks`] keys of the URLs actually
+    /// published to the frontier (their number is the published count).
     ///
     /// Never fails outward: a missing parser, a fetch error, an empty
     /// result, or every entry being filtered out all collapse to `0`, so
@@ -1018,7 +1043,7 @@ impl CrawlerWorker {
         domain: &str,
         origin: &str,
         parent: &UrlMessage,
-    ) -> usize {
+    ) -> Vec<u64> {
         let explicit_urls: &[String] = match parent.job.as_ref() {
             Some(job) => job.sitemap.urls.as_slice(),
             None => &[],
@@ -1026,7 +1051,7 @@ impl CrawlerWorker {
 
         let sitemap_parser = match &self.sitemap_parser {
             Some(parser) => parser,
-            None => return 0,
+            None => return Vec::new(),
         };
 
         let sitemap_entries = if !explicit_urls.is_empty() {
@@ -1047,7 +1072,7 @@ impl CrawlerWorker {
                 Ok(urls) => urls,
                 Err(e) => {
                     debug!(domain, error = %e, "Sitemap discovery failed");
-                    return 0;
+                    return Vec::new();
                 }
             }
         };
@@ -1063,49 +1088,62 @@ impl CrawlerWorker {
                 (f.is_pdf_enabled(), f.is_documents_enabled())
             });
 
-        let mut discovered_count = 0;
-        for sitemap_entry in sitemap_entries {
-            if !sitemap_entry_allowed(
-                &sitemap_entry.loc,
-                parent.url_patterns.as_ref(),
-                pdf_enabled,
-                documents_enabled,
-            ) {
-                continue;
-            }
+        // The entries to publish, normalized like a discovered link
+        // (fragment, trailing `/`), so the entry and a link to the same page
+        // are one frontier entry. A query, if any, is kept: the entry names
+        // that exact page.
+        let entries: Vec<(String, Option<f32>)> = sitemap_entries
+            .into_iter()
+            .filter(|entry| {
+                sitemap_entry_allowed(
+                    &entry.loc,
+                    parent.url_patterns.as_ref(),
+                    pdf_enabled,
+                    documents_enabled,
+                )
+            })
+            .filter_map(|entry| {
+                let loc = scrapix_core::url_normalize::normalize_entry_url(&entry.loc)?;
+                Some((loc, entry.priority))
+            })
+            .collect();
 
-            // Normalized like a discovered link (fragment, trailing `/`), so
-            // the entry and a link to the same page are one frontier entry.
-            // Its query, if any, is kept: the entry names that exact page.
-            let Some(loc) = scrapix_core::url_normalize::normalize_entry_url(&sitemap_entry.loc)
-            else {
-                continue;
-            };
+        // Sent a bounded number at a time, not one after the other: a send
+        // waits for its delivery report, so 10,000 entries in series took
+        // minutes. The messages are built as they are sent.
+        let locs: Vec<String> = entries.iter().map(|(loc, _)| loc.clone()).collect();
+        let messages = entries.into_iter().map(|(loc, priority)| {
             let mut crawl_url = CrawlUrl::seed(loc);
             crawl_url.parent_url = Some(format!("sitemap:{domain}"));
-
-            if let Some(priority) = sitemap_entry.priority {
+            if let Some(priority) = priority {
                 crawl_url.priority = (priority * 100.0) as i32;
             }
-
             let url_msg = parent.child(crawl_url);
+            (url_msg.partition_key(), url_msg)
+        });
+        let results = send_concurrently(
+            &self.producer,
+            topic_names::URL_FRONTIER,
+            messages,
+            SEND_CONCURRENCY,
+        )
+        .await;
 
-            if let Err(e) = self
-                .producer
-                .send(
-                    topic_names::URL_FRONTIER,
-                    Some(&url_msg.partition_key()),
-                    &url_msg,
-                )
-                .await
-            {
-                warn!(url = sitemap_entry.loc, error = %e, "Failed to publish sitemap URL");
-            } else {
-                discovered_count += 1;
+        let mut published = Vec::with_capacity(locs.len());
+        for (loc, result) in locs.iter().zip(results) {
+            match result {
+                Ok(()) => published.push(self.published_links.key(loc)),
+                Err(e) => warn!(url = %loc, error = %e, "Failed to publish sitemap URL"),
             }
         }
+        published
+    }
 
-        discovered_count
+    /// Record links as published for `job_id` (see [`PublishedLinks`]):
+    /// call it once they were sent and the event counting them was sent.
+    fn record_published_links(&self, job_id: &str, keys: &[u64]) {
+        self.published_links
+            .record(job_id, keys, |job| self.cancelled.contains(job));
     }
 
     /// Publish a crawl event

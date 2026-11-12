@@ -163,6 +163,49 @@ fn fixed_concurrency_never_moves() {
     assert_eq!(c.limit(), 7);
 }
 
+/// With links to follow, the start page is fetched while the sitemaps are
+/// read: once, when the site has no sitemap and it is the only seed.
+#[tokio::test]
+async fn the_start_page_is_fetched_once_alongside_sitemap_discovery() {
+    let server = MockServer::start().await;
+    let base = root(&server);
+    page(&server, "/start", html("Start", &["/next"]), 1).await;
+    page(&server, "/next", html("Next", &[]), 1).await;
+
+    let response = map(serde_json::json!({"url": format!("{base}/start"), "depth": 1})).await;
+    assert_eq!(response.total, 2);
+    assert_eq!(title_of(&response, &format!("{base}/start")), Some("Start"));
+    assert_eq!(title_of(&response, &format!("{base}/next")), Some("Next"));
+}
+
+/// A start page the sitemaps do not list is not part of the map: its early
+/// fetch is dropped, whatever it found.
+#[tokio::test]
+async fn an_unlisted_start_page_stays_out_of_the_map() {
+    let server = MockServer::start().await;
+    let base = root(&server);
+    Mock::given(method("GET"))
+        .and(path("/sitemap.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>{base}/x</loc></url></urlset>"#
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(html("Start", &["/hidden"]), "text/html"),
+        )
+        .mount(&server)
+        .await;
+    page(&server, "/x", html("X", &[]), 1).await;
+    page(&server, "/hidden", html("Hidden", &[]), 0).await;
+
+    let response = map(serde_json::json!({"url": format!("{base}/start"), "depth": 1})).await;
+    assert_eq!(response.total, 1);
+    assert_eq!(title_of(&response, &format!("{base}/x")), Some("X"));
+}
+
 /// Times `/map` on live sites (network; not run by default):
 ///
 /// ```text

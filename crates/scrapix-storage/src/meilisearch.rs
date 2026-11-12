@@ -20,6 +20,11 @@ use scrapix_core::config::{FeaturesConfig, MeilisearchSettings};
 use scrapix_core::crawl_scope::{CRAWL_JOB_ID_FIELD, CRAWL_SCOPE_FIELD};
 use scrapix_core::{Ack, CrawlScope, Document, JobSpec, Result, ScrapixError};
 
+/// Default cap on the serialized size of one document-addition request
+/// (20 MiB): well under Meilisearch's default payload limit (100 MB) and
+/// small enough to be accepted within the request timeout.
+pub const DEFAULT_MAX_BATCH_BYTES: usize = 20 * 1024 * 1024;
+
 /// Meilisearch configuration
 #[derive(Debug, Clone)]
 pub struct MeilisearchConfig {
@@ -47,6 +52,11 @@ pub struct MeilisearchConfig {
     pub max_total_hits: usize,
     /// Batch size for document indexing
     pub batch_size: usize,
+    /// Largest serialized size (JSON bytes) of one document-addition
+    /// request. A batch is cut at `batch_size` documents or at this many
+    /// bytes, whichever comes first (a single larger document is still sent,
+    /// alone).
+    pub max_batch_bytes: usize,
     /// Timeout for each Meilisearch request (document batches, index
     /// lookups, settings). A timed-out request counts as a retryable failure.
     pub timeout: Duration,
@@ -85,6 +95,7 @@ impl Default for MeilisearchConfig {
             distinct_attribute: None,
             max_total_hits: 10000,
             batch_size: 1000,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             timeout: Duration::from_secs(30),
             backpressure_timeout: Duration::from_secs(60),
         }
@@ -135,8 +146,82 @@ impl From<Ack> for DocAck {
     }
 }
 
-/// Buffered documents waiting to be sent, each with its completion token.
-type PendingBatch = VecDeque<(Document, DocAck)>;
+/// One buffered document with its completion token and its serialized
+/// size (JSON bytes, plus one for the separator).
+struct Pending {
+    doc: Document,
+    ack: DocAck,
+    bytes: usize,
+}
+
+/// Documents buffered for one index, oldest first.
+#[derive(Default)]
+struct IndexBuffer {
+    queue: VecDeque<Pending>,
+    /// Sum of the queue's `bytes`.
+    bytes: usize,
+}
+
+impl IndexBuffer {
+    fn push_back(&mut self, pending: Pending) {
+        self.bytes += pending.bytes;
+        self.queue.push_back(pending);
+    }
+
+    fn push_front(&mut self, pending: Pending) {
+        self.bytes += pending.bytes;
+        self.queue.push_front(pending);
+    }
+
+    /// Take the next batch: up to `max_docs` documents and `max_bytes`
+    /// serialized bytes, always at least one document.
+    fn take_batch(&mut self, max_docs: usize, max_bytes: usize) -> Vec<Pending> {
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        while batch.len() < max_docs {
+            let Some(next) = self.queue.front() else {
+                break;
+            };
+            if !batch.is_empty() && bytes.saturating_add(next.bytes) > max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(next.bytes);
+            batch.extend(self.queue.pop_front());
+        }
+        self.bytes = self.bytes.saturating_sub(bytes);
+        batch
+    }
+}
+
+/// Size of `doc` in a JSON array payload: its JSON bytes plus a separator.
+fn serialized_len(doc: &Document) -> usize {
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter(0);
+    // A document that fails to serialize counts as empty here; the request
+    // carrying it fails and is handled there.
+    let _ = serde_json::to_writer(&mut counter, doc);
+    counter.0 + 1
+}
+
+/// Whether Meilisearch (or a proxy in front of it) refused a request for
+/// its size: HTTP 413 / `payload_too_large`.
+fn is_payload_too_large(e: &meilisearch_sdk::errors::Error) -> bool {
+    use meilisearch_sdk::errors::{Error, ErrorCode};
+    match e {
+        Error::Meilisearch(m) => m.error_code == ErrorCode::PayloadTooLarge,
+        Error::MeilisearchCommunication(c) => c.status_code == 413,
+        _ => false,
+    }
+}
 
 /// Whether a Meilisearch error will not go away by retrying the same
 /// request: authentication / invalid-request errors and any non-retryable
@@ -246,12 +331,15 @@ fn canonical_json(v: &serde_json::Value) -> String {
 enum CallError {
     Permanent(String),
     Retryable(String),
+    /// The request was refused for its size (413): permanent for this
+    /// payload, but a smaller one may pass.
+    TooLarge(String),
 }
 
 impl CallError {
     fn message(&self) -> &str {
         match self {
-            Self::Permanent(m) | Self::Retryable(m) => m,
+            Self::Permanent(m) | Self::Retryable(m) | Self::TooLarge(m) => m,
         }
     }
 }
@@ -259,16 +347,17 @@ impl CallError {
 /// Meilisearch storage backend
 ///
 /// Documents are buffered per target index together with an [`Ack`]. A
-/// flush sends each index's buffer in batches of `batch_size`; the acks of a
-/// batch fire only once Meilisearch accepted it (HTTP 202 + task uid). A
+/// flush sends each index's buffer in batches of at most `batch_size`
+/// documents and `max_batch_bytes` serialized bytes; the acks of a batch
+/// fire only once Meilisearch accepted it (HTTP 202 + task uid). A
 /// rejected batch keeps its (document, ack) pairs, in order, for the next
-/// flush. Waiting for the Meilisearch task itself to succeed is out of scope
+/// flush; a batch refused for its size (413) is split in two and retried. Waiting for the Meilisearch task itself to succeed is out of scope
 /// (the API checks failed tasks at job completion).
 pub struct MeilisearchStorage {
     client: Client,
     config: MeilisearchConfig,
     index: Index,
-    pending: parking_lot::Mutex<HashMap<String, PendingBatch>>,
+    pending: parking_lot::Mutex<HashMap<String, IndexBuffer>>,
     /// Serializes flushes so a failed batch is re-queued before the next
     /// attempt reads the buffer (keeps per-index order, no double sends).
     flush_lock: tokio::sync::Mutex<()>,
@@ -316,6 +405,12 @@ impl MeilisearchStorage {
     /// Documents per Meilisearch request.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size.max(1)
+    }
+
+    /// Serialized bytes per Meilisearch request (see
+    /// [`MeilisearchConfig::max_batch_bytes`]).
+    pub fn max_batch_bytes(&self) -> usize {
+        self.config.max_batch_bytes.max(1)
     }
 
     /// Initialize index with configured settings
@@ -387,8 +482,9 @@ impl MeilisearchStorage {
     /// Buffer `doc` for `index_uid`; `ack` fires once Meilisearch accepted
     /// the batch containing it (or its reject callback, see [`DocAck`]).
     ///
-    /// Reaching `batch_size` buffered documents for the index sends them
-    /// right away. Backpressure: while `4 * batch_size` documents are
+    /// Reaching `batch_size` buffered documents (or `max_batch_bytes`
+    /// buffered bytes) for the index sends them right away. Backpressure:
+    /// while `4 * batch_size` documents (or `4 * max_batch_bytes` bytes) are
     /// already buffered for the index (Meilisearch keeps failing them
     /// retryably), this waits and retries the flush before buffering more,
     /// for at most `backpressure_timeout`; then the document is rejected and
@@ -402,16 +498,18 @@ impl MeilisearchStorage {
     ) -> Result<()> {
         let ack = ack.into();
         let batch_size = self.batch_size();
+        let max_bytes = self.max_batch_bytes();
+        let bytes = serialized_len(&doc);
         let deadline = tokio::time::Instant::now() + self.config.backpressure_timeout;
         let mut backoff = Duration::from_millis(500);
-        while self.pending_for(index_uid) >= 4 * batch_size {
+        while self.buffer_full(index_uid) {
             if tokio::time::Instant::now() >= deadline {
                 let reason = "meilisearch backpressure timeout".to_string();
                 ack.reject(reason.clone());
                 return Err(ScrapixError::Storage(format!("{reason} ({index_uid})")));
             }
             if let Err(e) = self.flush_index(index_uid).await {
-                if self.pending_for(index_uid) < 4 * batch_size {
+                if !self.buffer_full(index_uid) {
                     // A permanently refused batch freed space: re-check now.
                     continue;
                 }
@@ -428,14 +526,14 @@ impl MeilisearchStorage {
             }
         }
 
-        let buffered = {
+        let (buffered, buffered_bytes) = {
             let mut pending = self.pending.lock();
-            let queue = pending.entry(index_uid.to_string()).or_default();
-            queue.push_back((doc, ack));
-            queue.len()
+            let buffer = pending.entry(index_uid.to_string()).or_default();
+            buffer.push_back(Pending { doc, ack, bytes });
+            (buffer.queue.len(), buffer.bytes)
         };
 
-        if buffered >= batch_size {
+        if buffered >= batch_size || buffered_bytes >= max_bytes {
             // A retryable failure keeps the documents buffered; the periodic
             // flush (or the next add) retries them.
             if let Err(e) = self.flush_index(index_uid).await {
@@ -448,11 +546,16 @@ impl MeilisearchStorage {
 
     /// Number of buffered (not yet accepted) documents, all indexes.
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().values().map(VecDeque::len).sum()
+        self.pending.lock().values().map(|b| b.queue.len()).sum()
     }
 
-    fn pending_for(&self, index_uid: &str) -> usize {
-        self.pending.lock().get(index_uid).map_or(0, VecDeque::len)
+    /// Whether `index_uid`'s buffer reached the backpressure bound: four
+    /// batches' worth of documents or of serialized bytes.
+    fn buffer_full(&self, index_uid: &str) -> bool {
+        self.pending.lock().get(index_uid).is_some_and(|b| {
+            b.queue.len() >= self.batch_size().saturating_mul(4)
+                || b.bytes >= self.max_batch_bytes().saturating_mul(4)
+        })
     }
 
     /// Flush every index's buffer. Returns the number of documents accepted
@@ -476,27 +579,30 @@ impl MeilisearchStorage {
         }
     }
 
-    /// Send `index_uid`'s buffer in `batch_size` batches, acking each batch
-    /// once accepted. A permanently refused batch is rejected (its tokens'
-    /// reject callbacks run, nothing is kept) and the next batch is tried; a
-    /// retryable failure puts the batch back at the front of the buffer and
+    /// Send `index_uid`'s buffer in batches of at most `batch_size`
+    /// documents and `max_batch_bytes` bytes, acking each batch once
+    /// accepted. A permanently refused batch is rejected (its tokens' reject
+    /// callbacks run, nothing is kept) and the next batch is tried; a batch
+    /// refused for its size (413) is split in two and each half retried (a
+    /// single document refused for its size is rejected); a retryable
+    /// failure puts the unsent documents back at the front of the buffer and
     /// stops. Returns the accepted count, or the first error.
     async fn flush_index(&self, index_uid: &str) -> Result<usize> {
         let _guard = self.flush_lock.lock().await;
         let batch_size = self.batch_size();
+        let max_bytes = self.max_batch_bytes();
         let index = self.client.index(index_uid);
         let mut accepted = 0;
         let mut permanent_error = None;
 
         loop {
-            let batch: Vec<(Document, DocAck)> = {
+            let batch: Vec<Pending> = {
                 let mut pending = self.pending.lock();
-                let Some(queue) = pending.get_mut(index_uid) else {
+                let Some(buffer) = pending.get_mut(index_uid) else {
                     break;
                 };
-                let n = queue.len().min(batch_size);
-                let batch = queue.drain(..n).collect();
-                if queue.is_empty() {
+                let batch = buffer.take_batch(batch_size, max_bytes);
+                if buffer.queue.is_empty() {
                     pending.remove(index_uid);
                 }
                 batch
@@ -505,49 +611,72 @@ impl MeilisearchStorage {
                 break;
             }
 
-            let (docs, acks): (Vec<Document>, Vec<DocAck>) = batch.into_iter().unzip();
-            let count = docs.len();
-            debug!(count, index = %index_uid, "Submitting documents to Meilisearch");
+            // Sub-batches still to send, in buffer order (more than one only
+            // after a 413 split).
+            let mut work: VecDeque<Vec<Pending>> = VecDeque::from([batch]);
+            while let Some(chunk) = work.pop_front() {
+                let count = chunk.len();
+                debug!(count, index = %index_uid, "Submitting documents to Meilisearch");
 
-            let sent = self
-                .bounded(index.add_documents(&docs, Some(&self.config.primary_key)))
-                .await;
-            match sent {
-                Ok(task) => {
-                    for ack in acks {
-                        ack.accept();
+                let sent = {
+                    let docs: Vec<&Document> = chunk.iter().map(|p| &p.doc).collect();
+                    self.bounded(index.add_documents(&docs, Some(&self.config.primary_key)))
+                        .await
+                };
+                match sent {
+                    Ok(task) => {
+                        for pending in chunk {
+                            pending.ack.accept();
+                        }
+                        accepted += count;
+                        info!(
+                            count,
+                            task_uid = task.task_uid,
+                            index = %index_uid,
+                            "Documents accepted by Meilisearch"
+                        );
                     }
-                    accepted += count;
-                    info!(
-                        count,
-                        task_uid = task.task_uid,
-                        index = %index_uid,
-                        "Documents accepted by Meilisearch"
-                    );
-                }
-                Err(CallError::Permanent(e)) => {
-                    error!(
-                        count,
-                        index = %index_uid,
-                        error = %e,
-                        "Meilisearch permanently refused a batch; its documents are rejected"
-                    );
-                    let reason = format!("Meilisearch refused documents for {index_uid}: {e}");
-                    for ack in acks {
-                        ack.reject(reason.clone());
+                    Err(CallError::TooLarge(e)) if count > 1 => {
+                        warn!(
+                            count,
+                            index = %index_uid,
+                            error = %e,
+                            "Meilisearch refused a batch for its size; splitting it in two"
+                        );
+                        let mut first = chunk;
+                        let second = first.split_off(count / 2);
+                        work.push_front(second);
+                        work.push_front(first);
                     }
-                    permanent_error.get_or_insert(reason);
-                }
-                Err(CallError::Retryable(e)) => {
-                    let mut pending = self.pending.lock();
-                    let queue = pending.entry(index_uid.to_string()).or_default();
-                    for pair in docs.into_iter().zip(acks).rev() {
-                        queue.push_front(pair);
+                    Err(CallError::Permanent(e)) | Err(CallError::TooLarge(e)) => {
+                        error!(
+                            count,
+                            index = %index_uid,
+                            error = %e,
+                            "Meilisearch permanently refused a batch; its documents are rejected"
+                        );
+                        let reason = format!("Meilisearch refused documents for {index_uid}: {e}");
+                        for pending in chunk {
+                            pending.ack.reject(reason.clone());
+                        }
+                        permanent_error.get_or_insert(reason);
                     }
-                    return Err(ScrapixError::Storage(format!(
-                        "Failed to add documents to {}: {}",
-                        index_uid, e
-                    )));
+                    Err(CallError::Retryable(e)) => {
+                        let mut pending = self.pending.lock();
+                        let buffer = pending.entry(index_uid.to_string()).or_default();
+                        for sub in work.into_iter().rev() {
+                            for doc in sub.into_iter().rev() {
+                                buffer.push_front(doc);
+                            }
+                        }
+                        for doc in chunk.into_iter().rev() {
+                            buffer.push_front(doc);
+                        }
+                        return Err(ScrapixError::Storage(format!(
+                            "Failed to add documents to {}: {}",
+                            index_uid, e
+                        )));
+                    }
                 }
             }
         }
@@ -566,6 +695,7 @@ impl MeilisearchStorage {
     ) -> std::result::Result<T, CallError> {
         match tokio::time::timeout(self.config.timeout, call).await {
             Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) if is_payload_too_large(&e) => Err(CallError::TooLarge(e.to_string())),
             Ok(Err(e)) if is_permanent(&e) => Err(CallError::Permanent(e.to_string())),
             Ok(Err(e)) => Err(CallError::Retryable(e.to_string())),
             Err(_) => Err(CallError::Retryable(format!(
@@ -1396,6 +1526,13 @@ impl MeilisearchStorageBuilder {
 
     pub fn batch_size(mut self, size: usize) -> Self {
         self.config.batch_size = size;
+        self
+    }
+
+    /// Cap on the serialized size of one document-addition request
+    /// (default [`DEFAULT_MAX_BATCH_BYTES`]).
+    pub fn max_batch_bytes(mut self, bytes: usize) -> Self {
+        self.config.max_batch_bytes = bytes;
         self
     }
 

@@ -395,6 +395,104 @@
           }
         }
       }
+    },
+    "/internal/deploys": {
+      "post": {
+        "operationId": "postDeploys",
+        "summary": "Report deploy attempts of the Lab and the hosted engines (qdq-server autodeploy)",
+        "description": "Called by qdq-server's autodeploy scripts, not by an engine: each deploy attempt of the Lab, the Scrapix engine, the hosted Gateway (Lumen) and Pipelines (glutony), once when it starts and once when it ends, listed on Admin > Deploys. Signed with the box's own key: X-Lab-Timestamp (unix seconds, within 300 s) and X-Lab-Signature: sha256=HMAC-SHA256(LAB_DEPLOYS_SECRET, \"<timestamp>.<raw body>\"); during a rotation LAB_DEPLOYS_SECRET holds both keys, comma-separated. 503 while LAB_DEPLOYS_SECRET is unset. At most 100 reports. A report is the whole attempt; its id makes a resend harmless, and a `started` report never reopens an attempt that ended. The reporter drops every id in `accepted` and `rejected`.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Lab-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Lab-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "deploys"
+                ],
+                "properties": {
+                  "deploys": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "$ref": "#/components/schemas/DeployReport"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored and refused reports",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "accepted",
+                    "rejected"
+                  ],
+                  "properties": {
+                    "accepted": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "rejected": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body or more than 100 reports"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "LAB_DEPLOYS_SECRET is not set: keep the reports and retry"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -721,6 +819,124 @@
           },
           "js_rendering": {
             "type": "boolean"
+          }
+        }
+      },
+      "DeployReport": {
+        "type": "object",
+        "required": [
+          "id",
+          "product",
+          "repo",
+          "status",
+          "trigger"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The attempt's id: the same in its started and its final report"
+          },
+          "product": {
+            "type": "string",
+            "enum": [
+              "lab",
+              "scrapix",
+              "gateway",
+              "pipelines"
+            ]
+          },
+          "repo": {
+            "type": "string",
+            "description": "owner/name on GitHub",
+            "examples": [
+              "qdequele/lumen"
+            ]
+          },
+          "commit_sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "7 to 40 hex chars"
+          },
+          "previous_commit_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "description": "The release (a Lumen tag) or the version the service reports"
+          },
+          "previous_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "started",
+              "succeeded",
+              "failed",
+              "rolled_back",
+              "manual_intervention",
+              "cancelled"
+            ]
+          },
+          "attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "Which try at this commit or release"
+          },
+          "trigger": {
+            "type": "string",
+            "enum": [
+              "timer",
+              "force",
+              "drill",
+              "backfill"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, or a note; cut at 2000 chars. Never secrets"
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 255
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Null while the attempt runs"
           }
         }
       }

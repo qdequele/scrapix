@@ -134,6 +134,69 @@ async fn success_delay_follows_fetch_time_like_the_memory_store() {
     cleanup(&url, &prefix).await;
 }
 
+/// Same as `grant_reports_the_effective_delay` on the memory scheduler.
+#[tokio::test]
+async fn grant_reports_the_effective_delay_like_the_memory_store() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let c = PolitenessConfig {
+        concurrent_per_domain: 8,
+        default_delay_ms: 250,
+        min_delay_ms: 25,
+        ..Default::default()
+    };
+    let (a, b) = pair(&url, &prefix, c).await;
+    let l = JobLimits::default();
+    assert_eq!(
+        a.try_acquire_spaced(&req("a.test", "j", "t1", l))
+            .await
+            .unwrap(),
+        (Acquire::Granted, Duration::from_millis(250))
+    );
+    // Free slots do not help: the delay has not elapsed.
+    let (again, spacing) = b
+        .try_acquire_spaced(&req("a.test", "j", "t2", l))
+        .await
+        .unwrap();
+    assert!(matches!(again, Acquire::Wait(_)), "{again:?}");
+    assert_eq!(spacing, Duration::ZERO);
+    // A job delay above the adaptive one is the one reported.
+    let slow = JobLimits {
+        min_delay_ms: 2_000,
+        ..JobLimits::default()
+    };
+    assert_eq!(
+        a.try_acquire_spaced(&req("b.test", "j", "t3", slow))
+            .await
+            .unwrap(),
+        (Acquire::Granted, Duration::from_millis(2_000))
+    );
+    cleanup(&url, &prefix).await;
+
+    // Zero delay: the domain can be granted again at once.
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let (a, b) = pair(&url, &prefix, config(2)).await;
+    assert_eq!(
+        a.try_acquire_spaced(&req("a.test", "j", "t1", l))
+            .await
+            .unwrap(),
+        (Acquire::Granted, Duration::ZERO)
+    );
+    assert_eq!(
+        b.try_acquire_spaced(&req("a.test", "j", "t2", l))
+            .await
+            .unwrap(),
+        (Acquire::Granted, Duration::ZERO)
+    );
+    assert_eq!(
+        a.try_acquire_spaced(&req("a.test", "j", "t3", l))
+            .await
+            .unwrap(),
+        (Acquire::DomainBusy, Duration::ZERO)
+    );
+    cleanup(&url, &prefix).await;
+}
+
 #[tokio::test]
 async fn domain_slot_is_shared_and_released_by_feedback() {
     let Some(url) = redis_url() else { return };

@@ -60,9 +60,10 @@ pub use document::{
     build_document, detect_kind, parse_document, DocumentDispatch, DocumentKind, DocumentParser,
     ParseOptions, ParsedDocument,
 };
-pub use html::{HtmlParser, HtmlParserBuilder, HtmlParserConfig};
+pub use html::{HtmlParseOptions, HtmlParser, HtmlParserBuilder, HtmlParserConfig};
 pub use language::{
-    detect_language, detect_language_info, detect_language_with_threshold, LanguageInfo,
+    detect_language, detect_language_info, detect_language_sampled, detect_language_with_threshold,
+    LanguageInfo, LANGUAGE_SAMPLE_BYTES,
 };
 pub use markdown::{
     absolutize_markdown_links, document_base_url, html_to_main_content_markdown, html_to_markdown,
@@ -113,7 +114,7 @@ pub fn parse_markdown_page(url: &str, markdown: &str) -> Result<Document> {
         doc.content = Some(content.clone());
 
         // Detect language from content
-        doc.language = detect_language(&content);
+        doc.language = detect_language_sampled(&content);
     }
 
     // Extract URL tags (path segments)

@@ -61,6 +61,7 @@ The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, s
 | `MAX_PENDING_ACKS` | `50000` | Maximum event acks held while waiting for the accounting flush; the event consumer blocks (backpressure) at this cap until a flush frees room |
 | `ALLOW_PRIVATE_IPS` | `false` | Allow webhook deliveries to reach private/loopback addresses (SSRF opt-out; same policy as the crawler's own `ALLOW_PRIVATE_IPS`, off by default, tests only). Link-local and cloud metadata addresses (169.254.0.0/16, fe80::/10, fd00:ec2::254) stay refused even when set |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Maximum webhook deliveries in flight at once, across all jobs and hooks |
+| `API_BROWSER_CONCURRENCY` | `5` | Pages the API's browser renders at once (`/scrape` and `/map` with `render_js`, screenshots, actions). At least `1`. `/map` uses at most the pool minus a fifth (at least one page), kept for `/scrape` |
 | `CRAWL_BROWSER_AVAILABLE` | unset | Whether the crawler workers can render pages in a browser. Unset: unknown, `crawler_type: "browser"` crawls are accepted. `false`: `POST /crawl` refuses them (`503 render_js_unavailable`). Reported as `crawl_browser_available` by `GET /health/services`. `scrapix all` sets it from `BROWSER_RENDER` |
 | `WORKER_WAKE_HOSTS` | unset | Comma-separated `host:port` list (each a worker's `WAKE_PORT`) the API opens a fire-and-forget TCP connection to on `POST /crawl`, to wake workers on a platform that suspends idle machines. Unset: no wake pings |
 
@@ -222,7 +223,7 @@ lightpanda serve --host 127.0.0.1 --port 9222 --cdp-max-connections 16 --block-p
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BATCH_SIZE` | `2000` | Meilisearch indexing batch size |
-| `BATCH_TIMEOUT_SECS` | `5` | Maximum seconds to wait before flushing batch |
+| `FLUSH_INTERVAL_MS` | `1000` | Milliseconds between periodic Meilisearch flushes of partly filled batches (minimum `50`). A batch is also sent as soon as it reaches `BATCH_SIZE` documents or 20 MiB |
 | `EXTRACT_CONTENT` | `true` | Enable readability content extraction |
 | `CONVERT_MARKDOWN` | `true` | Convert extracted content to markdown |
 | `DETECT_LANGUAGE` | `true` | Detect page language |
