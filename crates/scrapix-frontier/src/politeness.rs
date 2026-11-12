@@ -42,11 +42,25 @@
 //!   raised since the last grant applies at once);
 //! - the grant then sets `last = max(last + delay, now - credit,
 //!   pause end)`: the domain's schedule advances by one delay, and is at
-//!   most `credit` behind the clock. `credit` is
-//!   [`PolitenessConfig::spacing_credit_ms`] (100 ms) when `delay <`
-//!   [`PolitenessConfig::strict_spacing_ms`] (1 s), else 0.
+//!   most `credit` behind the clock.
 //!
-//! Consequences, for a constant delay `D` and credit `C`:
+//! **Only the adaptive delay gets credit.** `credit` is
+//! [`PolitenessConfig::spacing_credit_ms`] (100 ms) when the effective
+//! delay is the domain's adaptive delay itself and is below
+//! [`PolitenessConfig::strict_spacing_ms`] (1 s). It is 0 whenever an
+//! explicit term sets the delay, i.e. is strictly above the adaptive delay:
+//! the job's `per_domain_delay_ms`, its `requests_per_second`, the robots
+//! `Crawl-delay` or the job's `default_crawl_delay_ms`. Those are promises
+//! made to the job's owner or asked by the site, so they stay a floor on
+//! the real gap between two requests: such a request also needs `now >=
+//! real last grant + delay`, where the real last grant is tracked next to
+//! the virtual one, and sets `last = now`. A request whose delay is the
+//! adaptive one but whose job also has a (lower) explicit term is credited,
+//! and still never comes less than that explicit term after the real last
+//! grant. Jobs with different limits share a domain's state; each call is
+//! judged on its own delay ([`spacing`]).
+//!
+//! Consequences, for a constant adaptive delay `D` and credit `C`:
 //!
 //! - any `n + 1` consecutive grants span at least `n × D − C`: the long-run
 //!   rate never exceeds `1 / D`, and a pass that comes late grants what it
@@ -55,12 +69,10 @@
 //! - at most `1 + floor(C / D)` grants at one instant (5 at the 25 ms
 //!   floor), and never more than the free in-flight slots of the domain and
 //!   the job;
-//! - with `D >= strict_spacing_ms` (a robots `Crawl-delay`, a slow job
-//!   rate) `C` is 0: `last = now`, two requests are never less than `D`
-//!   apart, exactly as before;
-//! - with `C < D < strict_spacing_ms` there is no burst (one grant per
-//!   instant), but a grant that came late lets the next one come up to `C`
-//!   early: gaps are at least `D − C` and average `D`;
+//! - an explicit delay (any value), and any delay of `strict_spacing_ms` or
+//!   more, is strict: one grant per call, two requests never less than the
+//!   delay apart, no catching up after an idle period or a late pass,
+//!   exactly as before SCR-90;
 //! - no credit builds up during a pause (`Retry-After`, error streak): the
 //!   schedule restarts at the pause's end. A 429 or an error drops the
 //!   credit banked so far.
@@ -189,6 +201,36 @@ pub fn effective_delay(
     robots: RobotsInfo,
     limits: &JobLimits,
 ) -> u64 {
+    spacing(config, adaptive_ms, robots, limits).delay_ms
+}
+
+/// How one job's requests to a domain are spaced right now (see the module
+/// docs, "Spacing credit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spacing {
+    /// The effective delay: a grant needs `now >= virtual last + delay_ms`.
+    pub delay_ms: u64,
+    /// How far the domain's schedule may lag behind the clock. 0 (strict
+    /// spacing) when an explicit term sets the delay or the delay is
+    /// `strict_spacing_ms` or more.
+    pub credit_ms: u64,
+    /// A grant also needs `now >= real last grant + real_gap_ms`: the whole
+    /// delay when spacing is strict, else the job's explicit terms (0 for a
+    /// job with none).
+    pub real_gap_ms: u64,
+}
+
+/// The spacing of a job's requests to a domain whose adaptive delay is
+/// `adaptive_ms`. The explicit terms are the job's `min_delay_ms`, its
+/// rate, and the robots term (`Crawl-delay` × multiplier, or the job's
+/// default crawl delay); the spacing is strict when one of them is above
+/// the (clamped) adaptive delay.
+pub fn spacing(
+    config: &PolitenessConfig,
+    adaptive_ms: u64,
+    robots: RobotsInfo,
+    limits: &JobLimits,
+) -> Spacing {
     let robots = if config.respect_robots_delay && limits.respect_robots {
         let raw = match robots.crawl_delay_ms {
             Some(d) => d,
@@ -202,21 +244,23 @@ pub fn effective_delay(
         0
     };
     let floor = config.min_delay_ms.min(config.default_delay_ms);
-    adaptive_ms
-        .max(limits.min_delay_ms)
+    let cap = config.max_delay_ms.max(floor);
+    let explicit = limits
+        .min_delay_ms
         .max(limits.rps_delay_ms())
         .max(robots)
-        .max(floor)
-        .min(config.max_delay_ms.max(floor))
-}
-
-/// The spacing credit of a domain whose effective delay is `delay_ms` (see
-/// the module docs): `spacing_credit_ms` below `strict_spacing_ms`, else 0.
-pub fn spacing_credit(config: &PolitenessConfig, delay_ms: u64) -> u64 {
-    if delay_ms >= config.strict_spacing_ms {
+        .min(cap);
+    let adaptive = adaptive_ms.max(floor).min(cap);
+    let delay_ms = adaptive.max(explicit);
+    let credit_ms = if explicit > adaptive || delay_ms >= config.strict_spacing_ms {
         0
     } else {
         config.spacing_credit_ms
+    };
+    Spacing {
+        delay_ms,
+        credit_ms,
+        real_gap_ms: if credit_ms == 0 { delay_ms } else { explicit },
     }
 }
 
@@ -422,6 +466,9 @@ struct DomainState {
     /// last grant, or up to the spacing credit earlier when that grant came
     /// late (see the module docs)
     last_request: Option<Instant>,
+    /// Time of the last grant (what explicit delays are measured from);
+    /// only meaningful while `last_request` is set
+    last_grant: Option<Instant>,
     /// Error-adapted delay (starts at `default_delay_ms`)
     delay_ms: u64,
     /// robots.txt `Crawl-delay` / whether robots.txt was fetched
@@ -442,6 +489,7 @@ impl DomainState {
     fn new(delay_ms: u64) -> Self {
         Self {
             last_request: None,
+            last_grant: None,
             delay_ms,
             robots: RobotsInfo::default(),
             job_limits: JobLimits::default(),
@@ -600,7 +648,9 @@ impl PolitenessScheduler {
                 token: None,
                 started: Instant::now(),
             });
-            state.last_request = Some(Instant::now());
+            let now = Instant::now();
+            state.last_request = Some(now);
+            state.last_grant = Some(now);
         });
     }
 
@@ -798,9 +848,10 @@ impl PolitenessScheduler {
             jobs.remove(req.job_id);
         }
         let job_cap = req.limits.max_in_flight.filter(|c| *c > 0);
-        let delay_ms = self.state_delay(state, &req.limits);
-        let delay = Duration::from_millis(delay_ms);
-        let credit = Duration::from_millis(spacing_credit(&self.config, delay_ms));
+        let spacing = spacing(&self.config, state.delay_ms, state.robots, &req.limits);
+        let delay = Duration::from_millis(spacing.delay_ms);
+        let credit = Duration::from_millis(spacing.credit_ms);
+        let real_gap = Duration::from_millis(spacing.real_gap_ms);
         // The schedule is at most `credit` behind the clock, and never
         // behind the end of a pause.
         let floor = match (now.checked_sub(credit), state.paused_until) {
@@ -816,7 +867,11 @@ impl PolitenessScheduler {
                 break Acquire::DomainBusy;
             }
             let due = state.last_request.map(|last| last + delay);
-            if let Some(due) = due.filter(|due| *due > now) {
+            // The real last grant is never before the virtual one.
+            let real_due = state
+                .last_request
+                .map(|last| state.last_grant.map_or(last, |real| real.max(last)) + real_gap);
+            if let Some(due) = due.max(real_due).filter(|due| *due > now) {
                 break Acquire::Wait(due - now);
             }
             let Some(token) = req.tokens.get(granted) else {
@@ -827,6 +882,7 @@ impl PolitenessScheduler {
                 (Some(due), None) => due,
                 (None, _) => now,
             });
+            state.last_grant = Some(now);
             state.in_flight.push(Slot {
                 token: Some(token.clone()),
                 started: now,
@@ -1723,26 +1779,186 @@ mod tests {
         }
     }
 
-    /// Between the credit and the strict threshold there is no burst: one
-    /// grant per instant, gaps of at least `delay − credit`, `delay` on
-    /// average.
+    /// An explicit delay is a floor on the real gap between two requests,
+    /// whatever its value: a job's `per_domain_delay_ms`, its
+    /// `requests_per_second`, a robots `Crawl-delay`. No credit, no burst
+    /// after an idle period, nothing given back after a late pass.
     #[test]
-    fn medium_delays_never_burst() {
-        let limits = JobLimits {
-            min_delay_ms: 500,
+    fn explicit_delays_are_spaced_strictly() {
+        let job = |min_delay_ms| JobLimits {
+            min_delay_ms,
             ..JobLimits::default()
         };
-        let mut sim = Sim::new(spaced(25, 100), limits);
-        sim.run(0, 10_000, 33);
-        sim.run(60_000, 70_000, 33);
+        let rate = JobLimits {
+            max_rps: Some(10.0),
+            ..JobLimits::default()
+        };
+        let robots = spaced(25, 100);
+        robots.set_delay("a.test", 300);
+        for (p, limits, delay) in [
+            (spaced(25, 100), job(50), 50u64),
+            (spaced(25, 100), job(250), 250),
+            (spaced(25, 100), rate, 100),
+            (robots, JobLimits::default(), 300),
+        ] {
+            assert_eq!(
+                spacing(
+                    p.config(),
+                    25,
+                    p.domains
+                        .read()
+                        .get("a.test")
+                        .map_or(RobotsInfo::default(), |s| s.robots),
+                    &limits
+                ),
+                Spacing {
+                    delay_ms: delay,
+                    credit_ms: 0,
+                    real_gap_ms: delay
+                }
+            );
+            let mut sim = Sim::new(p, limits);
+            sim.run(0, 3_000, 33);
+            // One grant per delay, each at the first pass after it.
+            let step = delay.div_ceil(33) * 33;
+            assert_eq!(sim.grants.len() as u64, 1 + 2_970 / step, "delay {delay}");
+            // After ten idle seconds: one grant, and the delay again.
+            assert_eq!(
+                sim.pass(13_000, 50),
+                Grants {
+                    granted: 1,
+                    next: Acquire::Wait(Duration::from_millis(delay))
+                },
+                "delay {delay}"
+            );
+            assert_eq!(sim.pass(13_000 + delay - 1, 50).granted, 0);
+            // A pass that comes 60 ms late: one grant, and the next one a
+            // full delay after it, not 60 ms sooner.
+            assert_eq!(sim.pass(13_000 + delay + 60, 50).granted, 1);
+            assert_eq!(
+                sim.pass(13_000 + 2 * delay + 59, 50),
+                Grants {
+                    granted: 0,
+                    next: Acquire::Wait(Duration::from_millis(1))
+                },
+                "delay {delay}"
+            );
+            sim.run(20_000, 23_000, 33);
+            assert_eq!(most_at_once(&sim.grants), 1, "delay {delay}");
+            for w in sim.grants.windows(2) {
+                assert!(
+                    w[1] - w[0] >= delay,
+                    "delay {delay}: {} ms apart",
+                    w[1] - w[0]
+                );
+            }
+        }
+    }
+
+    /// Jobs with and without an explicit delay share a domain: each call is
+    /// judged on its own delay, and the strict one is measured from the
+    /// real last request, not from the credited job's schedule.
+    #[test]
+    fn strict_job_is_never_granted_early_on_a_domain_shared_with_a_credited_job() {
+        let p = spaced(25, 100);
+        let base = Instant::now();
+        let adaptive = JobLimits::default();
+        let strict = JobLimits {
+            min_delay_ms: 50,
+            ..JobLimits::default()
+        };
+        let mut n = 0;
+        let mut ask = |job: &str, limits: JobLimits, at_ms: u64, want: usize| {
+            let tokens: Vec<String> = (0..want).map(|i| format!("t{}", n + i)).collect();
+            n += want;
+            p.acquire_many_at(
+                &SlotsRequest {
+                    domain: "a.test",
+                    job_id: job,
+                    tokens: &tokens,
+                    limits,
+                },
+                base + Duration::from_millis(at_ms),
+            )
+        };
+        let wait = |ms| Acquire::Wait(Duration::from_millis(ms));
+        assert_eq!(ask("a", adaptive, 0, 50).granted, 1);
+        // The adaptive job uses its credit after an idle second...
+        assert_eq!(ask("a", adaptive, 1_000, 50).granted, 5);
+        // ...and the strict job waits its 50 ms from that real request.
+        assert_eq!(
+            ask("b", strict, 1_010, 50),
+            Grants {
+                granted: 0,
+                next: wait(40)
+            }
+        );
+        assert_eq!(
+            ask("b", strict, 1_050, 50),
+            Grants {
+                granted: 1,
+                next: wait(50)
+            }
+        );
+        // A strict grant leaves no credit behind for the adaptive job.
+        assert_eq!(
+            ask("a", adaptive, 1_060, 50),
+            Grants {
+                granted: 0,
+                next: wait(15)
+            }
+        );
+        // The adaptive job is granted late (due at 1075, granted at 1200):
+        // its schedule only advances to 1100, but the strict job is spaced
+        // from 1200.
+        assert_eq!(ask("a", adaptive, 1_200, 1).granted, 1);
+        assert_eq!(
+            ask("b", strict, 1_210, 50),
+            Grants {
+                granted: 0,
+                next: wait(40)
+            }
+        );
+        assert_eq!(ask("b", strict, 1_250, 50).granted, 1);
+    }
+
+    /// A job's explicit delay below the adaptive delay does not set the
+    /// spacing (the adaptive delay does, with its credit), but stays a
+    /// floor on the real gap: never two requests at once.
+    #[test]
+    fn explicit_delay_below_the_adaptive_one_is_still_a_floor() {
+        let limits = JobLimits {
+            min_delay_ms: 50,
+            ..JobLimits::default()
+        };
+        let p = spaced(80, 100);
+        assert_eq!(
+            spacing(p.config(), 80, RobotsInfo::default(), &limits),
+            Spacing {
+                delay_ms: 80,
+                credit_ms: 100,
+                real_gap_ms: 50
+            }
+        );
+        let mut sim = Sim::new(p, limits);
+        sim.run(0, 2_000, 33);
+        // After an idle period: one grant, the next 50 ms later.
+        assert_eq!(
+            sim.pass(10_000, 50),
+            Grants {
+                granted: 1,
+                next: Acquire::Wait(Duration::from_millis(50))
+            }
+        );
+        sim.run(10_033, 12_000, 33);
         assert_eq!(most_at_once(&sim.grants), 1);
         for w in sim.grants.windows(2) {
-            assert!(w[1] - w[0] >= 400, "{} ms apart", w[1] - w[0]);
+            assert!(w[1] - w[0] >= 50, "{} ms apart", w[1] - w[0]);
         }
-        assert_conforms(&sim.grants, 500, 100);
-        // 20 s of passes at 2 per second, give or take one per run.
+        assert_conforms(&sim.grants, 80, 100);
+        // 4 s of passes at one per 80 ms, give or take a couple.
         assert!(
-            (39..=41).contains(&sim.grants.len()),
+            (48..=52).contains(&sim.grants.len()),
             "{}",
             sim.grants.len()
         );

@@ -303,10 +303,12 @@ pub async fn build_store(args: &Args) -> anyhow::Result<Arc<dyn FrontierStore>> 
 /// `DOMAIN_SPACING_CREDIT_MS`: the spacing credit (ms), i.e. how much of
 /// the time lost between a request to a domain becoming due and the
 /// dispatch pass that sends it is given back, as requests sent closer
-/// together (never more than `1 + credit / delay` at once, and none for
-/// delays of 1 s or more). It makes a domain's rate `1 / delay` whatever
-/// the dispatch interval. `0` spaces requests strictly from the last one
-/// sent. Default 100. Read from the environment rather than `Args`, whose
+/// together (never more than `1 + credit / delay` at once). Only the
+/// adaptive delay is credited: a delay set by the job (`per_domain_delay_ms`,
+/// `requests_per_second`), by robots.txt or of 1 s or more is always
+/// strict. It makes an adaptively paced domain's rate `1 / delay` whatever
+/// the dispatch interval. `0` spaces every request strictly from the last
+/// one sent. Default 100. Read from the environment rather than `Args`, whose
 /// fields other binaries (`scrapix all`) list one by one.
 fn spacing_credit_from_env() -> u64 {
     let default = PolitenessConfig::default().spacing_credit_ms;
@@ -1474,8 +1476,9 @@ impl FrontierService {
     /// than serially). One call asks for a slot per URL of the domain (at
     /// most `MAX_SLOTS_PER_ASK`) and the store grants as many as the
     /// domain's schedule and the caps allow: one, or several when this pass
-    /// came later than the domain's delay (its spacing credit, see
-    /// `scrapix_frontier::politeness`), so the rate a domain gets does not
+    /// came later than the domain's adaptive delay (its spacing credit,
+    /// see `scrapix_frontier::politeness`; never for a delay set by the job
+    /// or robots.txt), so the rate an adaptively paced domain gets does not
     /// depend on how often the dispatcher passes. The store also says how
     /// long the domain's next grant is away: its other URLs of the batch
     /// are parked for that long without asking again; only a domain that
@@ -3105,15 +3108,11 @@ mod tests {
             "4 rps over 1.5 s: at least 3 dispatches, got {}",
             at.len()
         );
-        // One at the start, then one per 250 ms: never more than the rate.
-        assert!(at.len() <= 7, "4 rps over 1.5 s: {} dispatches", at.len());
         for w in at.windows(2) {
             let gap = w[1] - w[0];
-            // 250 ms, minus the spacing credit a late pass gives back (at
-            // most 100 ms) and receive jitter (dispatch tick + poll
-            // interval): no two requests at once.
+            // 250 ms minus receive jitter (dispatch tick + poll interval).
             assert!(
-                gap >= Duration::from_millis(120),
+                gap >= Duration::from_millis(200),
                 "dispatches {gap:?} apart"
             );
         }

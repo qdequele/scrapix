@@ -10,7 +10,7 @@
 //!
 //! | Key | Type | Contents |
 //! |-----|------|----------|
-//! | `{p}:pol:d:{domain}` | hash | `last_ms` (virtual last request: the last grant's time, or up to the spacing credit earlier), `delay_ms` (adaptive), `robots_ms` (Crawl-delay, absent when none), `robots_checked` (`1` once robots.txt was fetched), `errors`, `pause_until` |
+//! | `{p}:pol:d:{domain}` | hash | `last_ms` (virtual last request: the last grant's time, or up to the spacing credit earlier), `real_ms` (time of the last grant by this script; the real last grant is `max(real_ms, last_ms)`), `delay_ms` (adaptive), `robots_ms` (Crawl-delay, absent when none), `robots_checked` (`1` once robots.txt was fetched), `errors`, `pause_until` |
 //! | `{p}:pol:f:{domain}` | zset | in-flight slots: member = token, score = expiry ms |
 //! | `{p}:pol:j:{job_id}` | zset | the job's in-flight slots, same encoding |
 //!
@@ -21,14 +21,22 @@
 //!
 //! ## Mixed versions
 //!
-//! `last_ms` is the only spacing state, as before SCR-90, so instances
-//! running the previous script can share the keys with this one. An old
-//! instance grants when `now - last_ms >= delay` and writes `last_ms = now`:
-//! under this script's rule that is a grant that banks no credit. It reads
-//! a `last_ms` written here as the last request time, so it may grant up to
-//! the credit (100 ms) earlier than a full delay after the real last
-//! request, which is what this script would do too. Either way a domain's
-//! long-run rate stays at most `1 / delay`.
+//! Instances running the script of before SCR-90 can share the keys with
+//! this one. That script only knows `last_ms`: it grants when `now -
+//! last_ms >= delay` and writes `last_ms = now`.
+//!
+//! - A hash it wrote has no `real_ms` (or a stale one): this script takes
+//!   the real last grant as `max(real_ms, last_ms)`, which is that grant's
+//!   time, so both the credited and the strict rule space from it, and it
+//!   left no credit behind.
+//! - It reads a `last_ms` written here as the last request time. After a
+//!   strict grant that is the real time. After a credited grant it can be
+//!   up to the credit (100 ms) earlier, so an old instance may then grant
+//!   up to 100 ms early, including to a job with an explicit delay: until
+//!   every instance is upgraded, the strict guarantee holds on a domain
+//!   only while no adaptive-only job shares it. Old instances never burst.
+//!
+//! Either way a domain's long-run rate stays at most `1 / delay`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -60,30 +68,39 @@ const RECENT_DOMAIN_WINDOW: Duration = Duration::from_secs(600);
 /// (a slot, only when every token was granted), `1` (wait `ms`: the delay
 /// or a pause has not elapsed), `-1` (domain busy) or `-2` (job busy).
 ///
-/// The spacing rule is the one of [`crate::politeness`] ("Spacing credit"):
-/// a grant needs `now - last_ms >= effective delay` and sets `last_ms =
-/// max(last_ms + delay, now - credit, pause_until)` (`now` for a domain
-/// never requested), with no credit for a delay at or above the strict
-/// spacing threshold. So one call grants at most `1 + floor(credit /
-/// delay)` slots, and never more than the domain and the job have free.
+/// The spacing rule is the one of [`crate::politeness`] ("Spacing credit",
+/// [`crate::politeness::spacing`]): with `adp` the clamped adaptive delay
+/// and `exp` the job's explicit terms (job delay, rate, robots), the delay
+/// is `max(adp, exp)`; the credit is 0 when `exp > adp` or the delay is at
+/// or above the strict spacing threshold. A grant needs `now - last_ms >=
+/// delay` and `now - real >= gap`, where `real = max(real_ms, last_ms)` is
+/// the real last grant and `gap` is the delay without credit, else `exp`.
+/// It sets `last_ms = max(last_ms + delay, now - credit, pause_until)`
+/// (`now` for a domain never requested) and `real_ms = now`. So one call
+/// grants at most `1 + floor(credit / delay)` slots (one when spacing is
+/// strict), and never more than the domain and the job have free.
 const ACQUIRE_LUA: &str = r#"
 local now = tonumber(ARGV[1])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
-local h = redis.call('HMGET', KEYS[1], 'last_ms', 'delay_ms', 'robots_ms', 'pause_until', 'robots_checked')
+local h = redis.call('HMGET', KEYS[1], 'last_ms', 'delay_ms', 'robots_ms', 'pause_until', 'robots_checked', 'real_ms')
 local pause = tonumber(h[4]) or 0
 if pause > now then return {1, pause - now, 0} end
-local eff = tonumber(h[2]) or tonumber(ARGV[4])
-eff = math.max(eff, tonumber(ARGV[7]), tonumber(ARGV[8]))
+local floor = tonumber(ARGV[5])
+local cap = math.max(tonumber(ARGV[6]), floor)
+local exp = math.max(tonumber(ARGV[7]), tonumber(ARGV[8]))
 if ARGV[9] == '1' then
   local r = tonumber(h[3])
   if not r and h[5] == '1' then r = tonumber(ARGV[10]) end
-  if r then eff = math.max(eff, math.floor(r * tonumber(ARGV[11]))) end
+  if r then exp = math.max(exp, math.floor(r * tonumber(ARGV[11]))) end
 end
-local floor = tonumber(ARGV[5])
-eff = math.min(math.max(eff, floor), math.max(tonumber(ARGV[6]), floor))
+exp = math.min(exp, cap)
+local adp = math.min(math.max(tonumber(h[2]) or tonumber(ARGV[4]), floor), cap)
+local eff = math.max(adp, exp)
 local credit = tonumber(ARGV[12])
-if eff >= tonumber(ARGV[15]) then credit = 0 end
+if exp > adp or eff >= tonumber(ARGV[15]) then credit = 0 end
+local gap = exp
+if credit == 0 then gap = eff end
 local domcap = tonumber(ARGV[2])
 local jobcap = tonumber(ARGV[3])
 local dom_n = redis.call('ZCARD', KEYS[2])
@@ -91,19 +108,25 @@ local job_n = redis.call('ZCARD', KEYS[3])
 local ttl = tonumber(ARGV[13])
 local want = #ARGV - 15
 local last = tonumber(h[1])
+local real = last
+if last then real = math.max(tonumber(h[6]) or last, last) end
 local granted = 0
 local status = 0
 local ms = 0
 while true do
   if jobcap > 0 and job_n >= jobcap then status = -2 break end
   if dom_n >= domcap then status = -1 break end
-  if last and now - last < eff then
-    status = 1
-    ms = eff - (now - last)
-    break
+  if last then
+    local wait = math.max(eff - (now - last), gap - (now - real))
+    if wait > 0 then
+      status = 1
+      ms = wait
+      break
+    end
   end
   if granted >= want then break end
   if last then last = math.max(last + eff, now - credit, pause) else last = now end
+  real = now
   granted = granted + 1
   local token = ARGV[15 + granted]
   redis.call('ZADD', KEYS[2], now + ttl, token)
@@ -112,7 +135,7 @@ while true do
   job_n = job_n + 1
 end
 if granted > 0 then
-  redis.call('HSET', KEYS[1], 'last_ms', last)
+  redis.call('HSET', KEYS[1], 'last_ms', last, 'real_ms', real)
   redis.call('PEXPIRE', KEYS[1], ARGV[14])
   redis.call('PEXPIRE', KEYS[2], 2 * ttl)
   redis.call('PEXPIRE', KEYS[3], 2 * ttl)
