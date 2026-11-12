@@ -39,7 +39,8 @@ use scrapix_lifecycle::{
     shutdown_timeout_from_env, spawn_idle_watchdog, spawn_shutdown_deadline, spawn_wake_listener,
     wake_port_from_env,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use scrapix_ai::{
@@ -48,12 +49,14 @@ use scrapix_ai::{
 };
 use scrapix_core::content_types;
 use scrapix_core::{Ack, Document, FeaturesConfig, RawPage, ScrapixError};
-use scrapix_extractor::{BlockConfig, BlockSplitter, ContentBlock, SchemaExtractor};
+use scrapix_extractor::{
+    BlockConfig, BlockSplitter, ContentBlock, ExtractedBlocks, SchemaExtractor,
+};
 use scrapix_frontier::{NearDuplicateConfig, NearDuplicateDetector};
 use scrapix_lab::{log_lab_error, HostedAiClients, LabClient};
 use scrapix_ocr::{OcrEngine, OcrReport, OcrRequest};
 use scrapix_parser::ParseOptions;
-use scrapix_parser::{HtmlParser, HtmlParserConfig};
+use scrapix_parser::{HtmlParseOptions, HtmlParser, HtmlParserConfig};
 use scrapix_queue::{
     control_group_id, topic_names, AnyConsumer, AnyProducer, CancelledJobs, ConsumerBuilder,
     CrawlEvent, CrawlHistoryMessage, DocumentMessage, ProducerBuilder, RawPageMessage,
@@ -95,6 +98,47 @@ pub const WARN_OCR_UNAVAILABLE: &str =
 /// splitting (AI only runs on whole pages).
 pub const WARN_AI_BLOCK_SPLIT: &str =
     "AI enrichment is skipped for block-split pages (features.block_split is enabled)";
+
+/// Outcome events (`DocumentIndexed` / `DocumentSkipped` / `DocumentFailed`)
+/// published at once. Each publish awaits its delivery report (about one
+/// producer linger), so a serial publisher caps a worker near 45 pages/s.
+const MAX_IN_FLIGHT_PUBLISHES: usize = 256;
+
+/// Skipped/failed pages whose event is queued or being published. Past it,
+/// page handlers wait, so a slow events topic applies backpressure to the
+/// consumer instead of growing the queue.
+const MAX_QUEUED_OUTCOMES: usize = 1024;
+
+/// Default interval between periodic Meilisearch flushes (`FLUSH_INTERVAL_MS`).
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1000;
+
+/// How long the periodic flush leaves a storage alone after a failed flush
+/// (the flush interval before it became configurable).
+const FLUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// A per-job storage unused for this long, with nothing buffered or in
+/// flight, is dropped from the cache.
+const STORAGE_IDLE_EVICT_AFTER: Duration = Duration::from_secs(600);
+
+/// Interval between periodic Meilisearch flushes: `FLUSH_INTERVAL_MS`
+/// (milliseconds, default 1000, at least 50). Read from the environment
+/// rather than declared on [`Args`], which `scrapix all` builds field by
+/// field.
+fn flush_interval_from_env() -> Duration {
+    flush_interval(std::env::var("FLUSH_INTERVAL_MS").ok().as_deref())
+}
+
+/// The flush interval for a `FLUSH_INTERVAL_MS` value (`None` = unset).
+fn flush_interval(raw: Option<&str>) -> Duration {
+    let ms = match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => raw.parse::<u64>().unwrap_or_else(|_| {
+            warn!(value = %raw, "Invalid FLUSH_INTERVAL_MS; using {DEFAULT_FLUSH_INTERVAL_MS} ms");
+            DEFAULT_FLUSH_INTERVAL_MS
+        }),
+        None => DEFAULT_FLUSH_INTERVAL_MS,
+    };
+    Duration::from_millis(ms.max(50))
+}
 
 /// Content processing worker for parsing HTML and creating documents
 #[derive(Parser, Debug)]
@@ -429,15 +473,29 @@ enum PageOutcome {
     Failed(String),
 }
 
-/// A page whose documents all reached a final Meilisearch outcome: publish
-/// its event (`DocumentIndexed`, or `DocumentFailed` if any document was
-/// refused), then ack its message.
+/// A page that reached its final outcome: publish its event, then ack its
+/// message. Either all of its documents reached a final Meilisearch outcome
+/// (`DocumentIndexed`, or `DocumentFailed` if any document was refused), or
+/// it was skipped / failed before indexing.
 struct IndexedNotice {
     job_id: String,
     event: CrawlEvent,
-    /// Documents indexed (0 when the page failed)
-    docs: u64,
+    /// What to count once the event is published.
+    metric: NoticeMetric,
     ack: Ack,
+    /// Held by skipped/failed pages until published (see
+    /// [`MAX_QUEUED_OUTCOMES`]).
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+/// What the publisher counts once a notice's event is published.
+enum NoticeMetric {
+    /// Meilisearch accepted the page's documents.
+    Indexed(u64),
+    /// Meilisearch refused a document of the page.
+    IndexFailed,
+    /// Already counted by the page handler (skipped / failed pages).
+    Counted,
 }
 
 /// Tracks one page's buffered documents until each is accepted or refused.
@@ -478,7 +536,7 @@ impl PageTracker {
                     timestamp: now_ms(),
                 };
             }
-            notice.docs = 0;
+            notice.metric = NoticeMetric::IndexFailed;
         }
         self.pending.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(notice).is_err() {
@@ -496,6 +554,104 @@ struct StorageKey {
     index_uid: String,
     primary_key: String,
     batch_size: usize,
+}
+
+/// A per-job buffered storage and what the periodic flush tracks about it.
+struct CachedStorage {
+    storage: Arc<MeilisearchStorage>,
+    /// Last time a page asked for this storage.
+    last_used: Instant,
+    /// A periodic flush of this storage is running (the next tick skips it,
+    /// so a slow Meilisearch only delays its own tenant).
+    flushing: Arc<AtomicBool>,
+}
+
+/// Clears a flag when dropped (also on panic or cancellation).
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The CPU-bound stage of an HTML page: the parsed document with the job's
+/// schema / custom selectors applied, and its blocks when the page is split.
+struct ParsedHtml {
+    document: Document,
+    /// `Some` when block splitting applies to the page and it has content.
+    blocks: Option<Result<ExtractedBlocks, String>>,
+}
+
+/// Parse an HTML page and run every DOM-based extraction on one parsed DOM.
+///
+/// Markdown is only converted when the page's features keep it: not when
+/// `features.markdown` is off, and for a block-split page only when no block
+/// comes out (the page is then indexed whole).
+fn parse_html_page(
+    parser: &HtmlParser,
+    raw_page: &RawPage,
+    features: &FeaturesConfig,
+    schema_extractor: Option<&SchemaExtractor>,
+    splitter: Option<&BlockSplitter>,
+) -> Result<ParsedHtml, ScrapixError> {
+    let options = HtmlParseOptions {
+        convert_to_markdown: features.markdown_enabled() && splitter.is_none(),
+        // A job's schema extractor replaces the parser's schema output.
+        extract_schema: features.schema_enabled() && schema_extractor.is_none(),
+    };
+    let (mut document, (schema, custom, blocks)) =
+        parser.parse_with_dom(raw_page, &options, |dom, document| {
+            let schema = schema_extractor
+                .filter(|_| features.schema_enabled())
+                .map(|extractor| features::schema_from_dom(extractor, dom));
+            let custom = if features.custom_selectors_enabled() {
+                ContentWorker::custom_selectors_from_dom(dom, features)
+            } else {
+                None
+            };
+            // A page without content is skipped: no need to split it.
+            let has_content = document.content.as_ref().is_some_and(|c| !c.is_empty());
+            let blocks = splitter
+                .filter(|_| has_content)
+                .map(|s| s.split_from_dom(dom).map_err(|e| e.to_string()));
+            (schema, custom, blocks)
+        })?;
+    ContentWorker::filter_document(&mut document, features);
+    if let Some(schema) = schema {
+        document.schema = schema;
+    }
+    document.custom = custom;
+    // A block-split page with no block is indexed whole, with its markdown.
+    let has_blocks = matches!(&blocks, Some(Ok(extracted)) if extracted.count > 0);
+    if splitter.is_some()
+        && !has_blocks
+        && features.markdown_enabled()
+        && document.content.is_some()
+    {
+        document.markdown = Some(scrapix_parser::html_to_markdown_for_page(
+            &raw_page.html,
+            &raw_page.final_url,
+            true,
+        ));
+    }
+    Ok(ParsedHtml { document, blocks })
+}
+
+/// Run CPU-bound `work` on a blocking thread, at most `slots` at once. A
+/// panic (or a runtime shutting down) is reported as an error.
+async fn run_cpu_bound<T: Send + 'static>(
+    slots: &Semaphore,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let _slot = slots.acquire().await.map_err(|e| e.to_string())?;
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        work()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Jobs whose near-duplicate fingerprints a worker keeps at once; past
@@ -564,7 +720,10 @@ const MAX_REMEMBERED_WARNINGS: usize = 10_000;
 struct ContentWorker {
     consumer: Arc<AnyConsumer>,
     producer: Arc<AnyProducer>,
-    parser: HtmlParser,
+    parser: Arc<HtmlParser>,
+    /// Bounds the CPU-bound parse stage (run on blocking threads) to the
+    /// number of cores; `CONCURRENCY` stays the bound on pages in flight.
+    parse_slots: Arc<Semaphore>,
     /// `false` only with `SKIP_MEILISEARCH`. A Meilisearch that is
     /// unreachable at startup does not disable indexing: per-job storages
     /// connect lazily and retry, and nothing is acked until accepted.
@@ -575,7 +734,9 @@ struct ContentWorker {
     default_meilisearch_key: String,
     /// Per-job buffered storages. A storage's index is configured (created,
     /// settings applied unless `keep_settings`) when it is first created.
-    storage_cache: tokio::sync::Mutex<HashMap<StorageKey, Arc<MeilisearchStorage>>>,
+    storage_cache: tokio::sync::Mutex<HashMap<StorageKey, CachedStorage>>,
+    /// Interval between periodic flushes (`FLUSH_INTERVAL_MS`).
+    flush_interval: Duration,
     /// Standalone: the env AI provider (`None` without one, and always in
     /// hosted mode).
     ai_service: Option<Arc<AiService>>,
@@ -588,7 +749,10 @@ struct ContentWorker {
     ai_usage_rx: parking_lot::Mutex<Option<scrapix_ai::AiUsageReceiver>>,
     /// Near-duplicate detection (`ENABLE_DEDUP`), one detector per job.
     dedup_detector: Option<JobDedup>,
-    block_splitter: Option<BlockSplitter>,
+    block_splitter: Option<Arc<BlockSplitter>>,
+    /// Splitter for jobs enabling `block_split` on a worker without
+    /// `ENABLE_BLOCK_SPLIT`, built on first use.
+    default_block_splitter: std::sync::OnceLock<Arc<BlockSplitter>>,
     /// Schema extractors for jobs with `schema.only_types` / `convert_dates`,
     /// keyed by those options.
     schema_extractors: parking_lot::Mutex<HashMap<SchemaKey, Arc<SchemaExtractor>>>,
@@ -596,8 +760,10 @@ struct ContentWorker {
     warned: parking_lot::Mutex<HashSet<(String, String)>>,
     indexed_tx: mpsc::UnboundedSender<IndexedNotice>,
     indexed_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<IndexedNotice>>>,
-    /// Indexed notices sent but not yet published/acked.
+    /// Notices sent but not yet published/acked.
     pending_notices: Arc<AtomicU64>,
+    /// See [`MAX_QUEUED_OUTCOMES`].
+    outcome_slots: Arc<Semaphore>,
     metrics: Arc<WorkerMetrics>,
     shutdown: Arc<AtomicBool>,
     worker_id: String,
@@ -708,8 +874,8 @@ impl ContentWorker {
         indexing_enabled: bool,
     ) -> anyhow::Result<Self> {
         let lab = hosted_lab(args)?;
-        // Always extract everything; per-job features are applied as a
-        // post-parse filter so the parser can be reused.
+        // The parser can extract everything; each page's features decide
+        // what is computed (see `parse_html_page`).
         let parser = HtmlParser::new(HtmlParserConfig {
             extract_content: true,
             convert_to_markdown: true,
@@ -800,28 +966,31 @@ impl ContentWorker {
                 min_content_length = args.block_split_min_length,
                 "Block splitting enabled - will create multiple documents per page"
             );
-            Some(BlockSplitter::new(BlockConfig {
+            Some(Arc::new(BlockSplitter::new(BlockConfig {
                 min_level: args.block_split_min_level,
                 max_level: args.block_split_max_level,
                 min_content_length: args.block_split_min_length,
                 include_hierarchy: true,
                 extract_anchors: true,
                 ..Default::default()
-            }))
+            })))
         } else {
             None
         };
 
         let (indexed_tx, indexed_rx) = mpsc::unbounded_channel();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
 
         Ok(Self {
             consumer,
             producer,
-            parser,
+            parser: Arc::new(parser),
+            parse_slots: Arc::new(Semaphore::new(cores)),
             indexing_enabled,
             default_meilisearch_url: args.meilisearch_url.clone(),
             default_meilisearch_key: args.meilisearch_key.clone().unwrap_or_default(),
             storage_cache: tokio::sync::Mutex::new(HashMap::new()),
+            flush_interval: flush_interval_from_env(),
             ai_service,
             hosted_ai,
             ocr: None,
@@ -829,11 +998,13 @@ impl ContentWorker {
             ai_usage_rx: parking_lot::Mutex::new(ai_usage_rx),
             dedup_detector,
             block_splitter,
+            default_block_splitter: std::sync::OnceLock::new(),
             schema_extractors: parking_lot::Mutex::new(HashMap::new()),
             warned: parking_lot::Mutex::new(HashSet::new()),
             indexed_tx,
             indexed_rx: parking_lot::Mutex::new(Some(indexed_rx)),
             pending_notices: Arc::new(AtomicU64::new(0)),
+            outcome_slots: Arc::new(Semaphore::new(MAX_QUEUED_OUTCOMES)),
             metrics: Arc::new(WorkerMetrics::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
             worker_id,
@@ -899,8 +1070,11 @@ impl ContentWorker {
         // client construction, never Meilisearch I/O.
         let storage = {
             let mut cache = self.storage_cache.lock().await;
-            match cache.get(&key) {
-                Some(storage) => storage.clone(),
+            match cache.get_mut(&key) {
+                Some(cached) => {
+                    cached.last_used = Instant::now();
+                    cached.storage.clone()
+                }
                 None => {
                     let mut builder = MeilisearchStorageBuilder::new(&key.url, &key.index_uid)
                         .primary_key(&key.primary_key)
@@ -920,7 +1094,14 @@ impl ContentWorker {
                         batch_size = key.batch_size,
                         "Created per-job Meilisearch storage"
                     );
-                    cache.insert(key.clone(), storage.clone());
+                    cache.insert(
+                        key.clone(),
+                        CachedStorage {
+                            storage: storage.clone(),
+                            last_used: Instant::now(),
+                            flushing: Arc::new(AtomicBool::new(false)),
+                        },
+                    );
                     storage
                 }
             }
@@ -933,57 +1114,84 @@ impl ContentWorker {
         Ok(Some(storage))
     }
 
-    /// Flush all buffered storages (acks follow Meilisearch acceptance).
+    /// Flush all buffered storages, concurrently, and wait for them (acks
+    /// follow Meilisearch acceptance). One slow or unreachable Meilisearch
+    /// does not delay the others.
     async fn flush_all_storages(&self) {
-        let storages: Vec<(StorageKey, Arc<MeilisearchStorage>)> = self
+        let storages: Vec<(String, Arc<MeilisearchStorage>)> = self
             .storage_cache
             .lock()
             .await
             .iter()
-            .map(|(k, s)| (k.clone(), s.clone()))
+            .map(|(k, cached)| (k.index_uid.clone(), cached.storage.clone()))
             .collect();
-        for (key, storage) in storages {
-            let flush_started = Instant::now();
-            let result = storage.flush().await;
-            scrapix_core::metrics::content_flush_duration_seconds()
-                .observe(flush_started.elapsed().as_secs_f64());
-            match result {
-                Ok(count) if count > 0 => {
-                    debug!(count, index = %key.index_uid, "Flushed Meilisearch storage");
-                }
-                Err(e) => warn!(
-                    error = %e,
-                    index = %key.index_uid,
-                    pending = storage.pending_count(),
-                    "Failed to flush Meilisearch storage; documents kept for retry"
-                ),
-                _ => {}
+        let mut flushes = JoinSet::new();
+        for (index_uid, storage) in storages {
+            flushes.spawn(async move { flush_storage(&index_uid, &storage).await });
+        }
+        while let Some(joined) = flushes.join_next().await {
+            if let Err(e) = joined {
+                error!(error = %e, "Meilisearch flush task failed");
             }
         }
     }
 
-    /// Spawn the task that publishes `DocumentIndexed` for accepted pages
-    /// and then acks their messages. Call once.
-    fn spawn_indexed_publisher(&self) -> Option<tokio::task::JoinHandle<()>> {
-        let mut rx = self.indexed_rx.lock().take()?;
-        let producer = self.producer.clone();
-        let metrics = self.metrics.clone();
-        let pending = self.pending_notices.clone();
-        Some(tokio::spawn(async move {
-            while let Some(notice) = rx.recv().await {
-                if publish_with_retry(&producer, &notice.job_id, &notice.event).await {
-                    notice.ack.ack();
-                    if notice.docs > 0 {
-                        metrics.record_indexed(notice.docs);
-                    } else {
-                        metrics.record_failure();
-                    }
-                }
-                // Not published: the ack is dropped, the message stays
-                // un-acked and is redelivered.
-                pending.fetch_sub(1, Ordering::AcqRel);
+    /// One periodic flush tick: start a flush of every storage with
+    /// buffered documents, unless its previous flush is still running, and
+    /// drop the storages idle for `idle_after`. Does not wait for the
+    /// flushes, so the tick cadence holds whatever a Meilisearch does.
+    async fn flush_tick(&self, idle_after: Duration) {
+        let mut cache = self.storage_cache.lock().await;
+        let now = Instant::now();
+        // Storages are handed out under this lock, so a storage only the
+        // cache references has no page buffering into it and no flush in
+        // flight: with an empty buffer it holds nothing.
+        cache.retain(|key, cached| {
+            let idle = Arc::strong_count(&cached.storage) == 1
+                && cached.storage.pending_count() == 0
+                && now.duration_since(cached.last_used) >= idle_after;
+            if idle {
+                info!(url = %key.url, index = %key.index_uid, "Dropped idle Meilisearch storage");
             }
-        }))
+            !idle
+        });
+        for (key, cached) in cache.iter() {
+            if cached.storage.pending_count() == 0 {
+                continue;
+            }
+            if cached.flushing.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let running = ClearOnDrop(cached.flushing.clone());
+            let (index_uid, storage) = (key.index_uid.clone(), cached.storage.clone());
+            tokio::spawn(async move {
+                let _running = running;
+                if !flush_storage(&index_uid, &storage).await {
+                    // Refused or unreachable: the periodic flush leaves this
+                    // storage alone for a while instead of retrying on every
+                    // tick (a full batch still flushes on its own).
+                    tokio::time::sleep(FLUSH_RETRY_DELAY).await;
+                }
+            });
+        }
+    }
+
+    /// Spawn the task that publishes the outcome event of finished pages
+    /// (`DocumentIndexed` for accepted pages, `DocumentSkipped` /
+    /// `DocumentFailed`) and then acks their messages. Call once.
+    fn spawn_indexed_publisher(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let rx = self.indexed_rx.lock().take()?;
+        let producer = self.producer.clone();
+        Some(tokio::spawn(run_notice_publisher(
+            rx,
+            self.metrics.clone(),
+            self.pending_notices.clone(),
+            MAX_IN_FLIGHT_PUBLISHES,
+            move |job_id: String, event: CrawlEvent| {
+                let producer = producer.clone();
+                async move { publish_with_retry(&producer, &job_id, &event).await }
+            },
+        )))
     }
 
     /// Spawn the task forwarding AI usage events as `AiUsage` crawl events
@@ -1087,10 +1295,11 @@ impl ContentWorker {
             let worker = self.clone();
             let done = consumer_stop.clone();
             Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut interval = tokio::time::interval(worker.flush_interval);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 while !done.load(Ordering::Relaxed) {
                     interval.tick().await;
-                    worker.flush_all_storages().await;
+                    worker.flush_tick(STORAGE_IDLE_EVICT_AFTER).await;
                 }
             }))
         } else {
@@ -1243,11 +1452,22 @@ impl ContentWorker {
             .fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Publish a terminal event, then ack (a failed publish leaves the
-    /// message un-acked for redelivery).
+    /// Hand a terminal event to the publisher, which publishes it and then
+    /// acks (a failed publish leaves the message un-acked for redelivery).
+    /// The page handler does not wait for the delivery, only for a free
+    /// slot when [`MAX_QUEUED_OUTCOMES`] events are already waiting.
     async fn finish(&self, msg: &RawPageMessage, event: CrawlEvent, ack: Ack) {
-        if publish_with_retry(&self.producer, &msg.job_id, &event).await {
-            ack.ack();
+        let slot = self.outcome_slots.clone().acquire_owned().await.ok();
+        self.pending_notices.fetch_add(1, Ordering::AcqRel);
+        let notice = IndexedNotice {
+            job_id: msg.job_id.clone(),
+            event,
+            metric: NoticeMetric::Counted,
+            ack,
+            slot,
+        };
+        if self.indexed_tx.send(notice).is_err() {
+            self.pending_notices.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -1290,16 +1510,29 @@ impl ContentWorker {
         // Publish documents to Kafka if enabled (a failure leaves the page
         // un-acked; redelivery re-publishes).
         if self.publish_to_kafka {
+            // One awaited delivery per document: send them together.
+            let mut sends = JoinSet::new();
             for doc in &docs {
                 let doc_msg = DocumentMessage::new(doc.clone(), &msg.job_id, &msg.index_uid);
-                if let Err(e) = self
-                    .producer
-                    .send(topic_names::DOCUMENTS, Some(&msg.job_id), &doc_msg)
-                    .await
-                {
-                    warn!(url = %msg.url, error = %e, "Failed to publish document to Kafka");
-                    return;
+                let (producer, job_id) = (self.producer.clone(), msg.job_id.clone());
+                sends.spawn(async move {
+                    producer
+                        .send(topic_names::DOCUMENTS, Some(&job_id), &doc_msg)
+                        .await
+                        .map_err(|e| e.to_string())
+                });
+            }
+            let mut failure = None;
+            while let Some(sent) = sends.join_next().await {
+                match sent {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => failure = Some(e),
+                    Err(e) => failure = Some(e.to_string()),
                 }
+            }
+            if let Some(e) = failure {
+                warn!(url = %msg.url, error = %e, "Failed to publish document to Kafka");
+                return;
             }
         }
 
@@ -1336,8 +1569,9 @@ impl ContentWorker {
                     ai_usage,
                     documents: docs.len() as u64,
                 },
-                docs: docs.len() as u64,
+                metric: NoticeMetric::Indexed(docs.len() as u64),
                 ack,
+                slot: None,
             })),
             tx: self.indexed_tx.clone(),
             pending: self.pending_notices.clone(),
@@ -1468,23 +1702,40 @@ impl ContentWorker {
             fetch_duration_ms: msg.fetch_duration_ms,
         };
 
-        let mut document = match self.parser.parse(&raw_page) {
-            Ok(doc) => doc,
-            Err(e) => return PageOutcome::Failed(format!("Parse error: {}", e)),
-        };
-
+        // Parsing (DOM, readability, markdown, language, schema, selectors,
+        // blocks) is CPU-bound: it runs on a blocking thread, on one DOM.
         let features = features::page_features(&self.resolve_features(msg), indexed_url(msg));
+        let schema_extractor = if features.schema_enabled() {
+            self.schema_extractor_for(&features)
+        } else {
+            None
+        };
+        let splitter = features
+            .block_split_enabled()
+            .then(|| self.block_splitter());
+        let parsed = {
+            let parser = self.parser.clone();
+            let features = features.clone();
+            run_cpu_bound(&self.parse_slots, move || {
+                parse_html_page(
+                    &parser,
+                    &raw_page,
+                    &features,
+                    schema_extractor.as_deref(),
+                    splitter.as_deref(),
+                )
+            })
+            .await
+        };
+        let ParsedHtml {
+            mut document,
+            blocks,
+        } = match parsed {
+            Ok(Ok(parsed)) => parsed,
+            Ok(Err(e)) => return PageOutcome::Failed(format!("Parse error: {}", e)),
+            Err(e) => return PageOutcome::Failed(format!("Parse task failed: {}", e)),
+        };
         self.stamp(&mut document, msg);
-        Self::filter_document(&mut document, &features);
-        if features.schema_enabled() {
-            if let Some(extractor) = self.schema_extractor_for(&features) {
-                document.schema = features::extract_schema(&extractor, &msg.html);
-            }
-        }
-
-        if features.custom_selectors_enabled() {
-            document.custom = Self::extract_custom_selectors(&msg.html, &features);
-        }
 
         let content_len = document.content.as_ref().map(|c| c.len()).unwrap_or(0);
         if content_len == 0 {
@@ -1509,20 +1760,8 @@ impl ContentWorker {
             if ai_requested(&features) {
                 self.warn_job_once(&msg.job_id, WARN_AI_BLOCK_SPLIT).await;
             }
-            let default_splitter;
-            let splitter = match self.block_splitter.as_ref() {
-                Some(s) => s,
-                None => {
-                    default_splitter = BlockSplitter::new(BlockConfig {
-                        include_hierarchy: true,
-                        extract_anchors: true,
-                        ..Default::default()
-                    });
-                    &default_splitter
-                }
-            };
-            match splitter.split(&msg.html) {
-                Ok(extracted) if extracted.count > 0 => {
+            match blocks {
+                Some(Ok(extracted)) if extracted.count > 0 => {
                     info!(url = %msg.url, block_count = extracted.count, "Split page into content blocks");
                     self.metrics
                         .record_success(page_size, extracted.count as u64);
@@ -1539,10 +1778,10 @@ impl ContentWorker {
                         ocr_pages: 0,
                     };
                 }
-                Ok(_) => {
+                Some(Ok(_)) | None => {
                     debug!(url = %msg.url, "No blocks extracted, indexing full document");
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     warn!(url = %msg.url, error = %e, "Block splitting failed, indexing full document");
                 }
             }
@@ -1765,6 +2004,24 @@ impl ContentWorker {
         let duplicate_of = detector.check_and_insert(&namespace, &msg.url, content)?;
         self.metrics.record_duplicate();
         Some(format!("Near-duplicate of {}", duplicate_of))
+    }
+
+    /// The block splitter: the worker's (`ENABLE_BLOCK_SPLIT` and its
+    /// levels), else the default one for jobs enabling `block_split`.
+    fn block_splitter(&self) -> Arc<BlockSplitter> {
+        match self.block_splitter.as_ref() {
+            Some(splitter) => splitter.clone(),
+            None => self
+                .default_block_splitter
+                .get_or_init(|| {
+                    Arc::new(BlockSplitter::new(BlockConfig {
+                        include_hierarchy: true,
+                        extract_anchors: true,
+                        ..Default::default()
+                    }))
+                })
+                .clone(),
+        }
     }
 
     /// The job's schema extractor, when it sets `only_types` / `convert_dates`.
@@ -2165,21 +2422,21 @@ impl ContentWorker {
         }
     }
 
-    /// Extract custom CSS selectors from HTML if the per-job config enables them
-    fn extract_custom_selectors(
-        html: &str,
+    /// Extract custom CSS selectors from the page's DOM if the per-job
+    /// config enables them
+    fn custom_selectors_from_dom(
+        dom: &scrapix_extractor::scraper::Html,
         features: &FeaturesConfig,
     ) -> Option<HashMap<String, serde_json::Value>> {
         let config = features.custom_selectors.as_ref()?;
         if !config.enabled || config.selectors.is_empty() {
             return None;
         }
-        let dom = scrapix_extractor::scraper::Html::parse_document(html);
         let values: HashMap<String, serde_json::Value> = config
             .selectors
             .iter()
             .filter_map(|(field, def)| {
-                scrapix_extractor::combined_matches(&dom, def.selectors())
+                scrapix_extractor::combined_matches(dom, def.selectors())
                     .map(|value| (field.clone(), value))
             })
             .collect();
@@ -2313,6 +2570,88 @@ fn single(document: Document, ai_enriched: bool) -> PageOutcome {
 
 fn ai_requested(features: &FeaturesConfig) -> bool {
     features.ai_summary_enabled() || features.ai_extraction_enabled()
+}
+
+/// Flush one storage, recording the flush duration. Returns whether
+/// Meilisearch accepted everything it was sent.
+async fn flush_storage(index_uid: &str, storage: &MeilisearchStorage) -> bool {
+    let flush_started = Instant::now();
+    let result = storage.flush().await;
+    scrapix_core::metrics::content_flush_duration_seconds()
+        .observe(flush_started.elapsed().as_secs_f64());
+    match result {
+        Ok(count) => {
+            if count > 0 {
+                debug!(count, index = %index_uid, "Flushed Meilisearch storage");
+            }
+            true
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                index = %index_uid,
+                pending = storage.pending_count(),
+                "Failed to flush Meilisearch storage; documents kept for retry"
+            );
+            false
+        }
+    }
+}
+
+/// Publish the event of each notice with `publish` (up to `max_in_flight`
+/// at once), then ack its message and count it. A notice whose event was
+/// not published is dropped with its ack: the message stays un-acked and is
+/// redelivered. Order across pages is not kept (each outcome carries its
+/// own `url_message_id`).
+async fn run_notice_publisher<F, Fut>(
+    mut rx: mpsc::UnboundedReceiver<IndexedNotice>,
+    metrics: Arc<WorkerMetrics>,
+    pending: Arc<AtomicU64>,
+    max_in_flight: usize,
+    publish: F,
+) where
+    F: Fn(String, CrawlEvent) -> Fut,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    /// One notice is no longer pending, however its task ends.
+    struct Settled(Arc<AtomicU64>);
+    impl Drop for Settled {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    let mut in_flight = JoinSet::new();
+    loop {
+        tokio::select! {
+            notice = rx.recv(), if in_flight.len() < max_in_flight.max(1) => {
+                let Some(notice) = notice else { break };
+                let IndexedNotice { job_id, event, metric, ack, slot } = notice;
+                let published = publish(job_id, event);
+                let settled = Settled(pending.clone());
+                let metrics = metrics.clone();
+                in_flight.spawn(async move {
+                    let (_settled, _slot) = (settled, slot);
+                    if published.await {
+                        ack.ack();
+                        match metric {
+                            NoticeMetric::Indexed(docs) => metrics.record_indexed(docs),
+                            NoticeMetric::IndexFailed => metrics.record_failure(),
+                            NoticeMetric::Counted => {}
+                        }
+                    }
+                    // Not published: the ack is dropped, the message stays
+                    // un-acked and is redelivered.
+                });
+            }
+            Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
+                if let Err(e) = joined {
+                    error!(error = %e, "Outcome event publish task failed");
+                }
+            }
+        }
+    }
+    while in_flight.join_next().await.is_some() {}
 }
 
 /// Publish an event to the events topic, retrying transient failures.
@@ -2622,7 +2961,7 @@ mod tests {
 
         w.handle_message(msg.clone(), ack).await;
 
-        assert!(acked.load(Ordering::SeqCst));
+        assert!(wait_for(&acked).await, "acked once its event is published");
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert!(
             events.iter().any(|e| matches!(
@@ -2649,7 +2988,7 @@ mod tests {
         w.handle_message(page("https://a.test/blog/1", 200, Some(job)), ack)
             .await;
 
-        assert!(acked.load(Ordering::SeqCst));
+        assert!(wait_for(&acked).await, "acked once its event is published");
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert!(
             events.iter().any(
@@ -2746,7 +3085,7 @@ mod tests {
         let ms = meilisearch(task_accepted()).await;
         let bus = ChannelBus::new();
         let events = events_reader(&bus);
-        let w = build_worker(&bus, &ms, &["--enable-dedup"]);
+        let w = started(build_worker(&bus, &ms, &["--enable-dedup"]));
 
         let a = page("https://a.test/guide", 200, None);
         let recrawl = page("https://a.test/guide", 200, None);
@@ -2760,7 +3099,7 @@ mod tests {
         }
         let (ack, acked) = tracked_ack();
         w.handle_message(copy.clone(), ack).await;
-        assert!(acked.load(Ordering::SeqCst), "duplicate skip is acked");
+        assert!(wait_for(&acked).await, "duplicate skip is acked");
 
         let events: Vec<CrawlEvent> = drain(&events).await;
         let skipped: Vec<&String> = events
@@ -2892,7 +3231,7 @@ mod tests {
 
         w.handle_message(msg.clone(), ack).await;
 
-        assert!(acked.load(Ordering::SeqCst));
+        assert!(wait_for(&acked).await, "acked once its event is published");
         let events: Vec<CrawlEvent> = drain(&events).await;
         assert!(
             events.iter().any(|e| matches!(
@@ -4184,5 +4523,526 @@ mod tests {
         assert!(!parse(&lab).unwrap());
         assert!(!parse(&["--lab-url", "http://lab.test"]).unwrap());
         assert!(parse(&["--mode", "cloud"]).is_err());
+    }
+
+    // ---- SCR-89: one DOM parse, markdown only when used, CPU off the runtime
+
+    const ARTICLE: &str = r#"<html><head><title>Field guide</title>
+        <meta name="description" content="A guide to the crawl pipeline">
+        <meta property="og:title" content="Field guide (og)">
+        <base href="https://cdn.a.test/docs/">
+        <script type="application/ld+json">{"@type":"Article","headline":"Field guide","datePublished":"2024-03-01"}</script>
+        <script type="application/ld+json">{"@type":"Product","name":"Crawler"}</script>
+        <style>.lead { color: red }</style></head>
+        <body><nav><a href="/home">Home</a> <a href="/docs">Docs</a></nav>
+        <header><h1>Field guide</h1></header>
+        <main><article>
+        <p class="lead">The crawler fetches pages, the frontier schedules them and the content
+        worker turns every raw page into documents that are indexed into Meilisearch.</p>
+        <h2 id="frontier">Frontier</h2>
+        <p>The frontier deduplicates URLs, assigns priorities and partitions the queue by
+        domain. Read the <a href="intro">introduction</a> or the <a href="/api#jobs">API</a>.</p>
+        <h2 id="content">Content worker</h2>
+        <p>The content worker parses the HTML once, extracts the main content, converts it to
+        Markdown when the job asks for it and detects the language of the page.</p>
+        <ul><li>Schema.org data is read from JSON-LD</li><li>Custom selectors pick fields</li></ul>
+        <h3>Blocks</h3>
+        <p>With block splitting, every heading starts a new document that carries the heading
+        hierarchy of the page, so a search hit points at the right section.</p>
+        <table><tr><th>Stage</th><th>Output</th></tr><tr><td>Parse</td><td>Document</td></tr></table>
+        <img src="img/diagram.png" alt="Pipeline diagram">
+        </article></main>
+        <aside><span class="tag">rust</span> <span class="tag">search</span></aside>
+        <footer>Copyright Example</footer>
+        <script>var html = "<h2>not content</h2>";</script></body></html>"#;
+
+    const TOO_SHORT: &str =
+        "<html><head><title>Short</title></head><body><h2>Tiny</h2><p>Too short.</p></body></html>";
+
+    fn on() -> Option<FeatureToggle> {
+        Some(FeatureToggle {
+            enabled: true,
+            include_pages: vec![],
+            exclude_pages: vec![],
+        })
+    }
+
+    /// Every combination of the features that shape an HTML page's documents.
+    fn feature_matrix() -> Vec<FeaturesConfig> {
+        let schemas = [
+            None,
+            Some(scrapix_core::SchemaFeatureConfig {
+                enabled: true,
+                only_types: vec![],
+                convert_dates: false,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+            Some(scrapix_core::SchemaFeatureConfig {
+                enabled: true,
+                only_types: vec!["Article".into()],
+                convert_dates: true,
+                include_pages: vec![],
+                exclude_pages: vec![],
+            }),
+        ];
+        let selectors = scrapix_core::CustomSelectorsConfig {
+            enabled: true,
+            selectors: HashMap::from([
+                (
+                    "tags".to_string(),
+                    scrapix_core::SelectorDef::Single(".tag".into()),
+                ),
+                (
+                    "lead".to_string(),
+                    scrapix_core::SelectorDef::Multiple(vec!["p.lead".into(), "h1".into()]),
+                ),
+                (
+                    "missing".to_string(),
+                    scrapix_core::SelectorDef::Single(".nope".into()),
+                ),
+            ]),
+            include_pages: vec![],
+            exclude_pages: vec![],
+        };
+        let mut matrix = Vec::new();
+        for markdown in [None, on()] {
+            for block_split in [None, on()] {
+                for metadata in [None, on()] {
+                    for schema in &schemas {
+                        for custom_selectors in [None, Some(selectors.clone())] {
+                            matrix.push(FeaturesConfig {
+                                markdown: markdown.clone(),
+                                block_split: block_split.clone(),
+                                metadata: metadata.clone(),
+                                schema: schema.clone(),
+                                custom_selectors,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        matrix
+    }
+
+    /// The documents the worker indexed for an HTML page before the DOM was
+    /// shared: a full parse (markdown always converted, then dropped by
+    /// `filter_document`), and one more parse of the HTML for each of the
+    /// job's schema options, its custom selectors and the block split.
+    /// `None` = the page is skipped (no content).
+    fn separate_parses(w: &ContentWorker, msg: &RawPageMessage) -> Option<Vec<Document>> {
+        let raw_page = RawPage {
+            url: msg.url.clone(),
+            final_url: msg.final_url.clone(),
+            status: msg.status,
+            headers: HashMap::new(),
+            html: msg.html.clone(),
+            content_type: msg.content_type.clone(),
+            js_rendered: msg.js_rendered,
+            fetched_at: chrono::Utc::now(),
+            fetch_duration_ms: msg.fetch_duration_ms,
+        };
+        let mut document = w.parser.parse(&raw_page).unwrap();
+        let features = features::page_features(&w.resolve_features(msg), indexed_url(msg));
+        w.stamp(&mut document, msg);
+        ContentWorker::filter_document(&mut document, &features);
+        if features.schema_enabled() {
+            if let Some(extractor) = w.schema_extractor_for(&features) {
+                document.schema = features::extract_schema(&extractor, &msg.html);
+            }
+        }
+        if features.custom_selectors_enabled() {
+            let config = features.custom_selectors.as_ref().unwrap();
+            let dom = scrapix_extractor::scraper::Html::parse_document(&msg.html);
+            let values: HashMap<String, serde_json::Value> = config
+                .selectors
+                .iter()
+                .filter_map(|(field, def)| {
+                    scrapix_extractor::combined_matches(&dom, def.selectors())
+                        .map(|value| (field.clone(), value))
+                })
+                .collect();
+            document.custom = (!values.is_empty()).then_some(values);
+        }
+        if document.content.as_ref().map_or(0, |c| c.len()) == 0 {
+            return None;
+        }
+        if features.block_split_enabled() {
+            let splitter = BlockSplitter::new(BlockConfig {
+                include_hierarchy: true,
+                extract_anchors: true,
+                ..Default::default()
+            });
+            if let Ok(extracted) = splitter.split(&msg.html) {
+                if extracted.count > 0 {
+                    let mut used_ids = HashSet::new();
+                    return Some(
+                        extracted
+                            .blocks
+                            .iter()
+                            .map(|block| {
+                                ContentWorker::create_block_document(
+                                    &document,
+                                    block,
+                                    &mut used_ids,
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Some(vec![document])
+    }
+
+    /// Documents as JSON, without the parse timestamp.
+    fn comparable(docs: Vec<Document>) -> Vec<serde_json::Value> {
+        docs.into_iter()
+            .map(|doc| {
+                let mut value = serde_json::to_value(doc).unwrap();
+                value.as_object_mut().unwrap().remove("crawled_at");
+                value
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_dom_parse_indexes_the_same_documents_as_separate_parses() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = build_worker(&bus, &ms, &[]);
+        let mut with_markdown = 0;
+        let mut split_pages = 0;
+        for (name, html) in [("article", ARTICLE), ("page", PAGE), ("short", TOO_SHORT)] {
+            for (i, features) in feature_matrix().into_iter().enumerate() {
+                let mut msg = page(&format!("https://a.test/docs/{name}"), 200, None);
+                msg.html = html.to_string();
+                msg.features = Some(features.clone());
+
+                let expected = separate_parses(&w, &msg).map(comparable);
+                let actual = match w.process_page(&msg).await {
+                    PageOutcome::Index { docs, .. } => Some(comparable(docs)),
+                    PageOutcome::Skipped(reason) => {
+                        assert_eq!(reason, "no content");
+                        None
+                    }
+                    PageOutcome::Failed(e) => panic!("{name} #{i}: {e}"),
+                };
+                assert_eq!(actual, expected, "{name} #{i}: {features:?}");
+
+                if let Some(docs) = &actual {
+                    let has_markdown = docs.iter().any(|d| !d["markdown"].is_null());
+                    if !features.block_split_enabled() {
+                        assert_eq!(has_markdown, features.markdown_enabled(), "{name} #{i}");
+                    }
+                    with_markdown += usize::from(has_markdown);
+                    split_pages += usize::from(docs.len() > 1);
+                }
+            }
+        }
+        assert!(with_markdown > 0, "the matrix covers markdown documents");
+        assert!(split_pages > 0, "the matrix covers block-split pages");
+    }
+
+    /// A block-split page with no block is indexed whole, with the markdown
+    /// the parse skipped at first.
+    #[tokio::test]
+    async fn block_split_page_without_blocks_keeps_its_markdown() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        // Split on h5/h6 only: the article has none below its h3.
+        let w = build_worker(
+            &bus,
+            &ms,
+            &[
+                "--enable-block-split",
+                "--block-split-min-level",
+                "5",
+                "--block-split-max-level",
+                "6",
+                "--block-split-min-length",
+                "100000",
+            ],
+        );
+        let mut msg = page("https://a.test/docs/article", 200, None);
+        msg.html = ARTICLE.to_string();
+        msg.features = Some(FeaturesConfig {
+            markdown: on(),
+            block_split: on(),
+            ..Default::default()
+        });
+        let PageOutcome::Index { docs, .. } = w.process_page(&msg).await else {
+            panic!("page not indexed");
+        };
+        assert_eq!(docs.len(), 1, "indexed whole");
+        let markdown = docs[0].markdown.as_deref().expect("markdown kept");
+        let expected = w
+            .parser
+            .parse(&RawPage {
+                url: msg.url.clone(),
+                final_url: msg.final_url.clone(),
+                status: 200,
+                headers: HashMap::new(),
+                html: msg.html.clone(),
+                content_type: msg.content_type.clone(),
+                js_rendered: false,
+                fetched_at: chrono::Utc::now(),
+                fetch_duration_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(Some(markdown), expected.markdown.as_deref());
+        assert!(markdown.contains("Frontier\n---"), "{markdown}");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_parse_is_a_page_failure_not_a_worker_crash() {
+        let slots = Semaphore::new(1);
+        let failed: Result<(), String> = run_cpu_bound(&slots, || panic!("parser bug")).await;
+        let error = failed.expect_err("a panic is reported");
+        assert!(error.contains("panic"), "{error}");
+        // The slot is free again and the next page parses.
+        assert_eq!(run_cpu_bound(&slots, || 7).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn cpu_bound_work_is_bounded_by_its_slots() {
+        let slots = Arc::new(Semaphore::new(2));
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = JoinSet::new();
+        for _ in 0..8 {
+            let (slots, running, peak) = (slots.clone(), running.clone(), peak.clone());
+            tasks.spawn(async move {
+                run_cpu_bound(&slots, move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- SCR-89: concurrent outcome publisher
+
+    fn notice(i: usize, published: bool) -> (IndexedNotice, Arc<AtomicBool>) {
+        let (ack, acked) = tracked_ack();
+        let notice = IndexedNotice {
+            job_id: "job-1".into(),
+            event: CrawlEvent::DocumentSkipped {
+                job_id: "job-1".into(),
+                url: format!("https://a.test/{i}"),
+                url_message_id: format!("m-{i}"),
+                reason: if published { "ok" } else { "unpublished" }.into(),
+                timestamp: 0,
+            },
+            metric: NoticeMetric::Indexed(2),
+            ack,
+            slot: None,
+        };
+        (notice, acked)
+    }
+
+    /// Whether the fake publisher "publishes" this event.
+    fn publishable(event: &CrawlEvent) -> bool {
+        !matches!(event, CrawlEvent::DocumentSkipped { reason, .. } if reason == "unpublished")
+    }
+
+    #[tokio::test]
+    async fn publisher_is_concurrent_and_acks_only_published_pages() {
+        const N: usize = 16;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let metrics = Arc::new(WorkerMetrics::default());
+        let pending = Arc::new(AtomicU64::new(0));
+        // A publish only resolves once all N are in flight together: a
+        // publisher that awaits one delivery at a time never gets there.
+        let all_in_flight = Arc::new(tokio::sync::Barrier::new(N));
+        let publisher = tokio::spawn(run_notice_publisher(
+            rx,
+            metrics.clone(),
+            pending.clone(),
+            N,
+            move |_job_id: String, event: CrawlEvent| {
+                let all_in_flight = all_in_flight.clone();
+                async move {
+                    all_in_flight.wait().await;
+                    publishable(&event)
+                }
+            },
+        ));
+
+        let mut acks = Vec::new();
+        for i in 0..N {
+            let published = i % 4 != 0;
+            let (notice, acked) = notice(i, published);
+            pending.fetch_add(1, Ordering::AcqRel);
+            tx.send(notice).unwrap();
+            acks.push((published, acked));
+        }
+        assert!(
+            ContentWorker::wait_until(Duration::from_secs(5), || {
+                pending.load(Ordering::Acquire) == 0
+            })
+            .await,
+            "every notice settles (published concurrently)"
+        );
+        for (i, (published, acked)) in acks.iter().enumerate() {
+            assert_eq!(
+                acked.load(Ordering::SeqCst),
+                *published,
+                "page {i}: acked if and only if its event was published"
+            );
+        }
+        let published = acks.iter().filter(|(p, _)| *p).count() as u64;
+        assert_eq!(
+            metrics.documents_indexed.load(Ordering::Relaxed),
+            2 * published,
+            "only published pages are counted"
+        );
+        drop(tx);
+        publisher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publisher_keeps_at_most_max_in_flight_publishes() {
+        const MAX: usize = 4;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut acks = Vec::new();
+        for i in 0..32 {
+            let (notice, acked) = notice(i, true);
+            pending.fetch_add(1, Ordering::AcqRel);
+            tx.send(notice).unwrap();
+            acks.push(acked);
+        }
+        drop(tx);
+        let (r, p) = (running.clone(), peak.clone());
+        run_notice_publisher(
+            rx,
+            Arc::new(WorkerMetrics::default()),
+            pending.clone(),
+            MAX,
+            move |_job_id: String, _event: CrawlEvent| {
+                let (running, peak) = (r.clone(), p.clone());
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    true
+                }
+            },
+        )
+        .await;
+        // The publisher returns once the channel is closed and drained.
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(acks.iter().all(|a| a.load(Ordering::SeqCst)));
+        assert_eq!(peak.load(Ordering::SeqCst), MAX);
+    }
+
+    // ---- SCR-89: Meilisearch flushing
+
+    #[test]
+    fn flush_interval_defaults_to_one_second() {
+        assert_eq!(flush_interval(None), Duration::from_millis(1000));
+        assert_eq!(flush_interval(Some("250")), Duration::from_millis(250));
+        assert_eq!(flush_interval(Some(" 5000 ")), Duration::from_millis(5000));
+        assert_eq!(flush_interval(Some("0")), Duration::from_millis(50));
+        assert_eq!(flush_interval(Some("soon")), Duration::from_millis(1000));
+    }
+
+    #[tokio::test]
+    async fn a_slow_meilisearch_does_not_delay_the_other_tenants() {
+        let fast = meilisearch(task_accepted()).await;
+        let slow = meilisearch(task_accepted().set_delay(Duration::from_secs(3))).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &fast);
+
+        let (slow_ack, slow_acked) = tracked_ack();
+        let mut slow_page = page("https://slow.test/1", 200, None);
+        slow_page.meilisearch_url = Some(slow.uri());
+        w.handle_message(slow_page, slow_ack).await;
+        let (fast_ack, fast_acked) = tracked_ack();
+        w.handle_message(page("https://fast.test/1", 200, None), fast_ack)
+            .await;
+
+        // The tick starts both flushes and waits for neither.
+        let started = Instant::now();
+        w.flush_tick(STORAGE_IDLE_EVICT_AFTER).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "tick blocked");
+        // A second tick while the slow flush runs does not start another.
+        w.flush_tick(STORAGE_IDLE_EVICT_AFTER).await;
+
+        assert!(wait_for(&fast_acked).await, "fast tenant indexed");
+        assert!(
+            !slow_acked.load(Ordering::SeqCst),
+            "the slow tenant is still waiting for its Meilisearch"
+        );
+
+        // Waiting for every storage takes the slowest one, once.
+        w.flush_all_storages().await;
+        assert!(wait_for(&slow_acked).await, "slow tenant indexed");
+        let slow_batches = slow
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/documents"))
+            .count();
+        assert_eq!(slow_batches, 1, "the slow batch was sent once");
+    }
+
+    async fn cached_storages(w: &ContentWorker) -> usize {
+        w.storage_cache.lock().await.len()
+    }
+
+    #[tokio::test]
+    async fn idle_storages_are_evicted_only_once_empty() {
+        let ms = meilisearch(task_accepted()).await;
+        let bus = ChannelBus::new();
+        let w = worker(&bus, &ms);
+
+        let (ack, acked) = tracked_ack();
+        w.handle_message(page("https://a.test/1", 200, None), ack)
+            .await;
+        assert_eq!(cached_storages(&w).await, 1);
+
+        // Idle "forever" but holding a buffered document: kept, and flushed.
+        w.flush_tick(Duration::ZERO).await;
+        assert_eq!(cached_storages(&w).await, 1, "a buffered document is kept");
+        assert!(wait_for(&acked).await, "the buffered document is indexed");
+
+        // Empty, but used recently: kept.
+        w.flush_tick(Duration::from_secs(600)).await;
+        assert_eq!(cached_storages(&w).await, 1);
+
+        // Empty and idle: dropped (once the flush task let go of it).
+        let mut evicted = false;
+        for _ in 0..100 {
+            w.flush_tick(Duration::ZERO).await;
+            if cached_storages(&w).await == 0 {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(evicted, "idle storage dropped");
+
+        // The next page of the job gets a fresh storage and is indexed.
+        let (ack, acked) = tracked_ack();
+        w.handle_message(page("https://a.test/2", 200, None), ack)
+            .await;
+        assert_eq!(cached_storages(&w).await, 1);
+        w.flush_all_storages().await;
+        assert!(wait_for(&acked).await);
     }
 }
