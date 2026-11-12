@@ -4148,6 +4148,7 @@
           "success",
           "links",
           "total",
+          "sitemaps",
           "duration_ms"
         ],
         "properties": {
@@ -4162,6 +4163,13 @@
             "items": {
               "$ref": "#/components/schemas/MapLink"
             }
+          },
+          "sitemaps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sitemaps the links were read from (as declared in robots.txt or\nfound at a usual location). Empty when the site has no sitemap, or\nwith `sitemap: false`: the links then come from the pages."
           },
           "success": {
             "type": "boolean"

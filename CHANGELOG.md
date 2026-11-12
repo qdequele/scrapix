@@ -10,6 +10,18 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **Sitemap discovery finds more sitemaps** (`/map`, `/extract` globs and
+  crawls; SCR-91).
+  - With no sitemap declared in `robots.txt`, `sitemap_index.xml`,
+    `sitemap-index.xml`, `sitemap.xml.gz` and `wp-sitemap.xml` are tried at
+    the root as well as `sitemap.xml`. They are also tried when the declared
+    sitemaps give no URL.
+  - A start URL with a path also reads `sitemap.xml` in its folder and in
+    its first folder (`/docs/sitemap.xml` for `/docs/guide/`).
+  - RSS and Atom feeds and plain-text sitemaps (one URL per line) are read.
+  - `POST /map` returns `sitemaps`: the sitemaps its links were read from
+    (empty when the site has none).
+
 - **AI usage and cost on jobs and scrapes.** `GET /jobs/{id}` (crawl and
   extract jobs), `GET /extract/{id}`, `POST /scrape` and `POST /parse` carry
   `ai_usage`: the LLM calls made (AI summary, extraction, vision OCR), their
@@ -47,6 +59,21 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   when the version copies disagree.
 
 ### Changed
+
+- **`/map` treats `example.com` and `www.example.com` as one site.** A map
+  of `example.com` whose sitemap lists `www.example.com` URLs dropped them
+  all and returned only the start URL; URLs and links on either host are
+  now kept. When `robots.txt` redirects to the other host (or to https),
+  the sitemaps are looked up there, and when the host does not answer at
+  all the other one is tried once (SCR-91).
+- **`/map` of a URL with a path lists that section first.** The URLs under
+  the folder of the start URL come before the rest of the site, so `limit`
+  keeps them. Nothing is filtered out.
+- **A `robots.txt` that cannot be fetched no longer stops sitemap
+  discovery** (the usual locations are tried, robots.txt is given 10 s), and
+  an HTML page served with a 200 in place of a sitemap is skipped instead of
+  being read as an empty sitemap. A gzipped sitemap is refused past 50 MB
+  once decompressed.
 
 - **A site paced by the adaptive delay is crawled at the rate that delay
   allows, whatever the dispatch period.** The frontier granted a domain one

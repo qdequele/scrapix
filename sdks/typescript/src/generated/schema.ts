@@ -2302,6 +2302,12 @@ export interface components {
              */
             duration_ms: number;
             links: components["schemas"]["MapLink"][];
+            /**
+             * @description The sitemaps the links were read from (as declared in robots.txt or
+             *     found at a usual location). Empty when the site has no sitemap, or
+             *     with `sitemap: false`: the links then come from the pages.
+             */
+            sitemaps: string[];
             success: boolean;
             /** @description Total number of links discovered */
             total: number;
