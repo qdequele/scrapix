@@ -556,10 +556,14 @@ slot without feedback expires after `2 × REQUEST_TIMEOUT` (default `30`s), so
 a lagging `scrapix.urls.processing` consumer effectively widens that safety
 window. The effective per-domain delay is
 `max(adaptive delay, job.rate_limit.per_domain_delay_ms (default 0), robots
-Crawl-delay if respected, 1000 / requests_per_second)`. The dispatcher takes
-politeness slots one URL at a time but sends a batch's granted URLs to the
-bus concurrently (one serial send waits ~20 ms of producer linger plus the
-broker ack, about 45 sends/s). `rate_limit.default_crawl_delay_ms`
+Crawl-delay if respected, 1000 / requests_per_second)`. The dispatcher runs
+up to 32 jobs concurrently per pass (never the same job twice), asks for one
+politeness slot per domain per round (up to 32 domains at once; after a grant
+the domain's other URLs in the batch are parked without asking) and sends a
+batch's granted URLs to the bus concurrently (one serial send waits ~20 ms of
+producer linger plus the broker ack, about 45 sends/s). Paused jobs and jobs
+leased by another instance are polled every 200 ms, idle running jobs every
+100 ms. `rate_limit.default_crawl_delay_ms`
 (config default `0`) is a fallback `Crawl-delay` used only when robots.txt was
 fetched and set no `Crawl-delay` of its own, and the job set no explicit delay
 or rate — it never lowers an explicit value. With `REDIS_URL` set on the
@@ -745,6 +749,8 @@ GROUP BY date ORDER BY date;
 | `DOCUMENT_MAX_SIZE_MB` | API: max document size for `/scrape` of a document and `/parse` uploads (default `50`) |
 | `OCR_BACKEND` | API + content workers: `auto` (vision if an AI provider is set, else tesseract), `vision`, `tesseract`, `off` |
 | `PDFIUM_LIB_PATH` | API + content workers: PDFium library used to rasterize pages for OCR (`/opt/pdfium/lib` in the images) |
+| `API_BROWSER_CONCURRENCY` | API: pages its browser renders at once (default `5`, at least 1); `/map` with `render_js` uses at most the pool minus a fifth, kept for `/scrape` |
+| `FLUSH_INTERVAL_MS` | Content worker: milliseconds between periodic Meilisearch flushes (default `1000`, minimum `50`); a request is also cut at `BATCH_SIZE` documents or 20 MiB |
 | `OCR_MAX_PAGES_PER_DOCUMENT` / `OCR_DAILY_PAGE_BUDGET` | OCR cost controls (defaults `50` / `1000` per account per UTC day, `0` = unlimited) |
 
 `BLOOM_CAPACITY`/`BLOOM_FP_RATE` on the frontier are now deprecated and

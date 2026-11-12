@@ -48,6 +48,98 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Changed
 
+- **The crawler publishes a page's messages together.** Each message
+  waited about 20 ms for its delivery report while the page held a worker
+  slot, so a page with 100 links took about 2 s to publish. A page, its
+  links (256 at a time) and its fetch feedback are now sent together, and
+  sitemap entries 256 at a time. `PageCrawled` is still published after the
+  page and its links (SCR-89).
+
+- **A crawler worker publishes a link once per job.** Links repeated on
+  every page (navigation, sidebar, footer) were sent to the frontier from
+  each page and refused there as duplicates. A worker now skips the links
+  it already sent for the job, so `links_published` and
+  `UrlsDiscovered.count` are the links actually sent. A skipped link is
+  sent again after 10 to 20 minutes, or by another worker; the frontier
+  still decides what is a duplicate.
+
+- **The frontier dispatches every running job concurrently.** One pass
+  used to handle the jobs one after another, each waiting for its batch's
+  sends, so ten single-site jobs shared about 40 URLs/s. A pass now runs up
+  to 32 jobs at once (never the same job twice), and a batch asks for the
+  politeness slots of up to 32 domains at once. After a grant, the domain's
+  other URLs in the batch are parked without asking the politeness store
+  again. Paused jobs and jobs leased by another instance are checked every
+  200 ms, idle running jobs every 100 ms, instead of every 20 ms tick.
+  Politeness rules and defaults are unchanged.
+
+- **The content worker publishes page outcomes concurrently.**
+  `DocumentIndexed`, `DocumentSkipped` and `DocumentFailed` go out with up
+  to 256 sends in flight, each page acked when its own event is delivered.
+  One awaited send per page capped a worker near 45 pages/s and delayed job
+  completion. Outcome events of different pages can arrive out of order.
+
+- **The content worker parses a page once, off the async runtime.** The
+  job's schema options, custom selectors and block splitting reuse the
+  parser's DOM, Markdown is converted only when the page's features keep
+  it, and the parse runs on blocking threads (one per core). Language
+  detection reads the first 8 KiB of the content. The crawler worker parses
+  pages over 32 KiB for links on blocking threads too, and URL pattern
+  matching no longer allocates on each call.
+
+- **Meilisearch flushes are faster and isolated per tenant.** The periodic
+  flush runs every `FLUSH_INTERVAL_MS` (new, content worker, default
+  `1000`; it was a fixed 5 s) and per storage, so a slow or unreachable
+  Meilisearch only delays its own tenant. A document request is cut at
+  `BATCH_SIZE` documents or 20 MiB, whichever comes first, and a request
+  refused for its size (413) is split in two and retried instead of failing
+  every document in it. A storage idle for 10 minutes is dropped from
+  memory.
+
+- **Browser renders skip images, fonts, audio and video.** The Chrome
+  renderer's `block_images`, `block_fonts` and `block_stylesheets` options
+  were never applied; they now are, with a new `block_media`. The crawler
+  worker and the API (`/scrape`, `/map` with `render_js`) block images,
+  fonts and media. A render with a screenshot or page actions loads
+  everything, and stylesheets always load. Page setup before navigation is
+  sent in one batch instead of one CDP round trip after the other.
+
+- **The API's browser pool is configurable, and `/map` no longer starves
+  it.** `API_BROWSER_CONCURRENCY` (new, default `5`) sets how many pages
+  the API's browser renders at once. `/map` with `render_js` runs at most
+  the pool minus a reserve for `/scrape` (a fifth of it, at least one
+  page) instead of 50 renders queued on 5 pages, and its 30 s render
+  timeout starts when the render gets its page.
+
+- **`/scrape` fails faster on a page that is down.** A page answering 429
+  or 5xx is fetched twice (one retry) instead of four times with 3.5 s of
+  backoff, in `/scrape`, `/batch/scrape` and `/extract`. `timeout_ms` now
+  bounds the whole fetch for requests with `headers` or `cookies` too: a
+  slower page is a `timeout` (504), where it used to be reported as
+  `fetch_error` (502) after every attempt.
+
+- **`/scrape` does its HTML work once, off the async runtime.** The page is
+  parsed once instead of once per format, Markdown is converted once when
+  `markdown` and `content` are both requested, and the stage runs on
+  blocking threads. Responses are unchanged.
+
+- **`/scrape` requests with `headers` reuse the shared HTTP client**
+  (connection pool, DNS cache) instead of building two clients per request.
+  They no longer keep a cookie store, so a cookie set along a redirect
+  chain is not sent back on the next hop. Requests with `cookies` or a
+  `Cookie` header keep their own client and cookie store.
+
+- **Responses are gzipped.** Bodies of 1 KB and more are compressed when
+  the client sends `Accept-Encoding: gzip`, `/metrics` included. Event
+  streams and WebSockets are not.
+
+- **`/batch/scrape` and `/extract` scrape on separate tasks**, so pages
+  keep being fetched while finished results are stored. **`/search` uses
+  one pooled client with timeouts**: a Meilisearch that does not answer
+  within 30 s (5 s to connect) is a `timeout` (504) instead of a request
+  that never returns. **`/map` with `depth`** fetches the start page while
+  it reads the sitemaps.
+
 - **Single-site crawls up to about 10× faster: the per-domain delay
   adapts to the site.** It used to be a fixed 250 ms floor
   (`DOMAIN_DELAY_MS`), capping one site at about 4 pages/s; a job could
@@ -99,6 +191,21 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   them at about twice its `limit` instead of 100,000 URLs.
 
 ### Fixed
+
+- **A page too large to publish fails instead of stalling its job.** A
+  document between about 7.5 and 10 MB is over the 10 MiB message limit
+  once base64-encoded, and so is HTML that grows past it when escaped. Its
+  send failed every time, the message was never acknowledged and the job
+  ended `FailStalled`. Such a page is now a failed page (`page too large to
+  publish`) and the crawl goes on.
+
+- **`exclude_selectors` removes every matched element.** An element whose
+  HTML was not written the way a parser serializes it (unquoted attributes,
+  unclosed tags, tables without `<tbody>`) was silently kept. The page is
+  also parsed once instead of once per selector.
+
+- **A crashed scrape no longer hangs its batch or extract job.** The URL
+  gets an `internal_error` result and the job finishes.
 
 - **Re-crawling an index failed on sites that send `ETag` or
   `Last-Modified`.** On an `update` crawl, an unchanged page answered `304`
