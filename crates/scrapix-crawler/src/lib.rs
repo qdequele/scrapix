@@ -103,7 +103,8 @@ pub use robots::{
 pub use safe_client::safe_client_builder;
 pub use safe_dns::{is_link_local_or_metadata, is_public_ip, validate_proxy_url};
 pub use sitemap::{
-    ChangeFrequency, SitemapConfig, SitemapContent, SitemapEntry, SitemapParser, SitemapUrl,
+    hosts_match_ignoring_www, section_prefix, ChangeFrequency, SitemapConfig, SitemapContent,
+    SitemapDiscovery, SitemapEntry, SitemapParser, SitemapUrl,
 };
 
 // CDP renderer re-exports
