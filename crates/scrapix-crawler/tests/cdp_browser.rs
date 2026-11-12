@@ -29,6 +29,13 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 /// A renderer on the test browser, or `None` (skip) when
 /// `SCRAPIX_TEST_CHROME` is not set.
 async fn renderer() -> Option<CdpRenderer> {
+    renderer_with(|builder| builder).await
+}
+
+/// [`renderer`], with the builder adjusted by `configure`.
+async fn renderer_with(
+    configure: impl FnOnce(CdpRendererBuilder) -> CdpRendererBuilder,
+) -> Option<CdpRenderer> {
     let chrome = std::env::var("SCRAPIX_TEST_CHROME")
         .ok()
         .filter(|s| !s.is_empty());
@@ -44,7 +51,12 @@ async fn renderer() -> Option<CdpRenderer> {
     if chrome != "1" {
         builder = builder.executable_path(chrome);
     }
-    Some(builder.build().await.expect("launch test browser"))
+    Some(
+        configure(builder)
+            .build()
+            .await
+            .expect("launch test browser"),
+    )
 }
 
 /// Serve `html` at `route` and return the page URL (on `localhost`).
@@ -646,5 +658,325 @@ async fn subresources_do_not_replace_the_document_response() {
         assert_eq!(result.status, 200);
         assert!(result.html.contains("Styled page"));
     }
+    r.close().await;
+}
+
+/// Mount a page at `/{tag}` that loads its own image, stylesheet (which
+/// loads a web font), audio clip and script, and return its URL. Each tag
+/// has its own subresource URLs, so the browser's caches cannot hide a
+/// request from the server.
+async fn serve_page_with_subresources(server: &MockServer, tag: &str) -> String {
+    let asset = |route: String, body: Vec<u8>, mime: &'static str| async move {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, mime))
+            .mount(server)
+            .await;
+    };
+    asset(format!("/{tag}/pixel.png"), vec![0u8; 64], "image/png").await;
+    asset(format!("/{tag}/bg.png"), vec![0u8; 64], "image/png").await;
+    asset(format!("/{tag}/font.woff2"), vec![0u8; 64], "font/woff2").await;
+    asset(format!("/{tag}/clip.wav"), vec![0u8; 64], "audio/wav").await;
+    asset(
+        format!("/{tag}/style.css"),
+        format!(
+            "@font-face {{ font-family: F; src: url(/{tag}/font.woff2) format('woff2'); }} \
+             body {{ font-family: F; background: url(/{tag}/bg.png); }}"
+        )
+        .into_bytes(),
+        "text/css; charset=utf-8",
+    )
+    .await;
+    asset(
+        format!("/{tag}/app.js"),
+        b"document.getElementById('out').textContent = 'script ran';".to_vec(),
+        "application/javascript",
+    )
+    .await;
+    serve(
+        server,
+        &format!("/{tag}"),
+        &format!(
+            r#"<html><head><link rel="stylesheet" href="/{tag}/style.css"></head>
+            <body><h1>Page with subresources</h1><p id="out">waiting</p>
+            <img src="/{tag}/pixel.png"><audio src="/{tag}/clip.wav" preload="auto"></audio>
+            <script src="/{tag}/app.js"></script></body></html>"#
+        ),
+    )
+    .await
+}
+
+/// How many requests the server received for `route`.
+async fn requests_for(server: &MockServer, route: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == route)
+        .count()
+}
+
+/// With `block_images` / `block_fonts` / `block_media`, a render that
+/// returns no pixels does not request those subresources (the document,
+/// stylesheets and scripts still load), with or without the request guard;
+/// a screenshot render, or one asking for every resource, loads them all.
+#[tokio::test]
+async fn blocked_resources_are_not_requested_unless_the_render_needs_pixels() {
+    let Some(r) = renderer_with(|b| b.block_images(true).block_fonts(true).block_media(true)).await
+    else {
+        return;
+    };
+    let server = MockServer::start().await;
+
+    // Plain renders: the crawler's options, then `/scrape`'s (request
+    // guard, isolated context).
+    for (tag, opts) in [
+        ("plain", PageOptions::default()),
+        (
+            "guarded",
+            PageOptions {
+                guard_requests: true,
+                isolate: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let url = serve_page_with_subresources(&server, tag).await;
+        let result = r.render_page(&url, &opts).await.unwrap();
+        assert_eq!(result.status, 200, "{tag}");
+        assert!(result.html.contains("Page with subresources"), "{tag}");
+        assert!(
+            result.html.contains("script ran"),
+            "{tag}: scripts must run"
+        );
+        // Let any request still on its way reach the server.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for blocked in ["pixel.png", "bg.png", "font.woff2", "clip.wav"] {
+            assert_eq!(
+                requests_for(&server, &format!("/{tag}/{blocked}")).await,
+                0,
+                "{tag}: {blocked} must not be requested"
+            );
+        }
+        for loaded in ["style.css", "app.js"] {
+            assert!(
+                requests_for(&server, &format!("/{tag}/{loaded}")).await >= 1,
+                "{tag}: {loaded} must still load"
+            );
+        }
+    }
+
+    // Renders that need everything.
+    for (tag, opts) in [
+        (
+            "shot",
+            PageOptions {
+                screenshot: Some(ScreenshotOptions { full_page: false }),
+                ..Default::default()
+            },
+        ),
+        (
+            "shot-guarded",
+            PageOptions {
+                screenshot: Some(ScreenshotOptions { full_page: true }),
+                guard_requests: true,
+                isolate: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "all",
+            PageOptions {
+                load_all_resources: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let url = serve_page_with_subresources(&server, tag).await;
+        let result = r.render_page(&url, &opts).await.unwrap();
+        assert!(result.html.contains("script ran"), "{tag}");
+        if opts.screenshot.is_some() {
+            assert!(result.screenshot.is_some(), "{tag}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for loaded in ["pixel.png", "bg.png", "font.woff2", "style.css", "app.js"] {
+            assert!(
+                requests_for(&server, &format!("/{tag}/{loaded}")).await >= 1,
+                "{tag}: {loaded} must be requested"
+            );
+        }
+    }
+    r.close().await;
+}
+
+/// Blocking stylesheets is its own switch, and a renderer without any
+/// `block_*` setting (the default) loads everything.
+#[tokio::test]
+async fn stylesheets_are_blocked_only_when_asked() {
+    let Some(r) = renderer_with(|b| b.block_stylesheets(true)).await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let url = serve_page_with_subresources(&server, "nocss").await;
+    let result = r.render_page(&url, &PageOptions::default()).await.unwrap();
+    assert!(result.html.contains("script ran"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(requests_for(&server, "/nocss/style.css").await, 0);
+    // The font is only referenced by the stylesheet.
+    assert_eq!(requests_for(&server, "/nocss/font.woff2").await, 0);
+    assert!(requests_for(&server, "/nocss/pixel.png").await >= 1);
+    r.close().await;
+
+    let Some(r) = renderer().await else { return };
+    let url = serve_page_with_subresources(&server, "default").await;
+    let result = r.render_page(&url, &PageOptions::default()).await.unwrap();
+    assert!(result.html.contains("script ran"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for loaded in ["pixel.png", "font.woff2", "style.css"] {
+        assert!(
+            requests_for(&server, &format!("/default/{loaded}")).await >= 1,
+            "{loaded} must be requested"
+        );
+    }
+    r.close().await;
+}
+
+/// Mount an "internal" endpoint (addressed by raw loopback IP, never
+/// public) and a page on `localhost` showing one internal and one public
+/// image; returns the page URL and the internal base URL. The internal
+/// routes expect no request at all (verified when the server is dropped).
+async fn serve_guarded_page(server: &MockServer) -> (String, String) {
+    Mock::given(path("/secret"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("access-control-allow-origin", "*")
+                .set_body_string("top-secret"),
+        )
+        .expect(0)
+        .mount(server)
+        .await;
+    Mock::given(path("/secret.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0u8; 64], "image/png"))
+        .expect(0)
+        .mount(server)
+        .await;
+    Mock::given(path("/public.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0u8; 64], "image/png"))
+        .mount(server)
+        .await;
+    let internal = server.uri();
+    let page = format!(
+        r#"<!doctype html><html><body><p>guarded</p>
+        <img src="{internal}/secret.png"><img src="/public.png"></body></html>"#
+    );
+    (serve(server, "/guarded-page", &page).await, internal)
+}
+
+/// The request guard keeps failing internal targets when resource blocking
+/// shares its interception. Without pixels neither image is requested (the
+/// internal one would be refused by the guard anyway); with a screenshot
+/// and actions everything loads again, and the guard alone still keeps the
+/// internal image and an internal `fetch` from being sent.
+#[tokio::test]
+async fn request_guard_still_applies_with_resource_blocking() {
+    let Some(r) = renderer_with(|b| b.block_images(true)).await else {
+        return;
+    };
+
+    let server = MockServer::start().await;
+    let (url, _) = serve_guarded_page(&server).await;
+    let opts = PageOptions {
+        guard_requests: true,
+        isolate: true,
+        ..Default::default()
+    };
+    let result = r.render_page(&url, &opts).await.unwrap();
+    assert!(result.html.contains("guarded"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(requests_for(&server, "/public.png").await, 0);
+    drop(server);
+
+    let server = MockServer::start().await;
+    let (url, internal) = serve_guarded_page(&server).await;
+    let script = format!(
+        "await fetch('{internal}/secret').then(r => r.text()).catch(e => 'blocked: ' + e.message)"
+    );
+    let mut opts = with_actions(vec![Action::ExecuteJavascript { script }]);
+    opts.isolate = true;
+    opts.screenshot = Some(ScreenshotOptions { full_page: false });
+    let result = r.render_page(&url, &opts).await.unwrap();
+    let fetched = result.javascript_returns[0].as_str().unwrap().to_string();
+    assert!(fetched.starts_with("blocked"), "{fetched}");
+    assert!(result.screenshot.is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(requests_for(&server, "/public.png").await >= 1);
+    drop(server);
+    r.close().await;
+}
+
+/// A render that runs page actions loads everything: clicks and scrolls
+/// depend on the page's layout.
+#[tokio::test]
+async fn renders_with_actions_load_every_resource() {
+    let Some(r) = renderer_with(|b| b.block_images(true).block_fonts(true).block_media(true)).await
+    else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let url = serve_page_with_subresources(&server, "acted").await;
+    let opts = with_actions(actions(serde_json::json!([{"type": "wait", "ms": 100}])));
+    let result = r.render_page(&url, &opts).await.unwrap();
+    assert!(result.html.contains("script ran"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for loaded in ["pixel.png", "font.woff2", "style.css"] {
+        assert!(
+            requests_for(&server, &format!("/acted/{loaded}")).await >= 1,
+            "{loaded} must be requested"
+        );
+    }
+    r.close().await;
+}
+
+/// `timeout_after_slot` starts the render's timeout once it holds its
+/// browser slot: a render queued behind another keeps its whole budget.
+#[tokio::test]
+async fn timeout_can_start_after_the_browser_slot() {
+    let Some(r) = renderer_with(|b| b.max_concurrent_pages(1)).await else {
+        return;
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slowish"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(1500))
+                .set_body_raw("<html><body>slow page</body></html>", "text/html"),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/slowish", server.uri().replace("127.0.0.1", "localhost"));
+
+    // Two renders on one slot, each needing ~1.5 s, with a 2.5 s timeout.
+    let queued = PageOptions {
+        timeout: Some(Duration::from_millis(2500)),
+        timeout_after_slot: true,
+        ..Default::default()
+    };
+    let (a, b) = tokio::join!(r.render_page(&url, &queued), r.render_page(&url, &queued));
+    assert!(a.is_ok(), "{a:?}");
+    assert!(b.is_ok(), "{b:?}");
+
+    // Default: the wait for the slot counts, so the queued one times out.
+    let strict = PageOptions {
+        timeout: Some(Duration::from_millis(2500)),
+        ..Default::default()
+    };
+    let (a, b) = tokio::join!(r.render_page(&url, &strict), r.render_page(&url, &strict));
+    let timeouts = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, Err(ScrapixError::Timeout(_))))
+        .count();
+    assert_eq!(timeouts, 1, "{a:?} / {b:?}");
     r.close().await;
 }

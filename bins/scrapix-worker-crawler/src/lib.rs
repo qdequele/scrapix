@@ -653,7 +653,14 @@ impl CrawlerWorker {
             // Create CDP renderer
             // The renderer checks robots.txt (same cache as the HTTP
             // fetcher) and the SSRF rules before every navigation.
+            // Crawl renders only keep the HTML: images, fonts and media
+            // are not downloaded. Stylesheets still load, since pages can
+            // gate content on them (and the "almost no text" checks read
+            // the rendered page).
             let mut cdp_builder = CdpRendererBuilder::new()
+                .block_images(true)
+                .block_fonts(true)
+                .block_media(true)
                 .robots_cache(fetcher_robots_cache.clone())
                 .allow_private_ips(args.allow_private_ips)
                 .timeout(Duration::from_secs(args.browser_timeout))

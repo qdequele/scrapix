@@ -17,7 +17,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, InsertTextParams,
 };
-use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::keys;
 use chromiumoxide::Page;
@@ -409,15 +409,87 @@ async fn request_allowed(
     verdict
 }
 
-/// Pause every request `page` makes (`Fetch.enable`) and fail the ones to
-/// non-public addresses — navigations triggered by clicks or scripts,
-/// redirects, subresources, `fetch`/XHR — so the page can never *request*
-/// an internal URL, not just never *end* on one. Returns the task answering
-/// the paused requests; abort it once the page is closed.
-pub(crate) async fn install_request_guard(
+/// Subresource types a render does not download (they are failed with
+/// `BlockedByClient` before they are sent). Only for renders that need no
+/// pixels: a screenshot must load everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlockedResources {
+    pub images: bool,
+    pub stylesheets: bool,
+    pub fonts: bool,
+    pub media: bool,
+}
+
+impl BlockedResources {
+    /// Whether any type is blocked.
+    pub(crate) fn any(&self) -> bool {
+        self.images || self.stylesheets || self.fonts || self.media
+    }
+
+    /// The blocked CDP resource types.
+    fn types(&self) -> Vec<ResourceType> {
+        [
+            (self.images, ResourceType::Image),
+            (self.stylesheets, ResourceType::Stylesheet),
+            (self.fonts, ResourceType::Font),
+            (self.media, ResourceType::Media),
+        ]
+        .into_iter()
+        .filter_map(|(blocked, ty)| blocked.then_some(ty))
+        .collect()
+    }
+
+    /// Whether a request of this type is blocked. The page's own document
+    /// (and scripts, XHR/fetch, ...) never is.
+    pub(crate) fn blocks(&self, resource_type: &ResourceType) -> bool {
+        match resource_type {
+            ResourceType::Image => self.images,
+            ResourceType::Stylesheet => self.stylesheets,
+            ResourceType::Font => self.fonts,
+            ResourceType::Media => self.media,
+            _ => false,
+        }
+    }
+}
+
+/// Intercept the requests `page` makes (`Fetch.enable`) and answer each
+/// paused one. Returns the task answering them; abort it once the page is
+/// closed. One interception serves both purposes:
+///
+/// - **Request guard** (`guard = Some(allow_private_ips)`): every request
+///   is paused and the ones to non-public addresses are failed —
+///   navigations triggered by clicks or scripts, redirects, subresources,
+///   `fetch`/XHR — so the page can never *request* an internal URL, not
+///   just never *end* on one.
+/// - **Resource blocking** (`blocked`): requests of the blocked types are
+///   failed without being sent. Without the guard only those types are
+///   paused at all, so every other request costs no CDP round trip.
+///
+/// A request failed for its type is never sent, so blocking cannot let
+/// anything past the guard; every request that is continued went through
+/// the guard's check exactly as without blocking.
+///
+/// Call it only with a guard or at least one blocked type: `Fetch.enable`
+/// without a pattern pauses every request.
+pub(crate) async fn install_request_interception(
     page: &Page,
-    allow_private_ips: bool,
+    guard: Option<bool>,
+    blocked: BlockedResources,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
+    let patterns: Vec<RequestPattern> = if guard.is_some() {
+        vec![RequestPattern::builder().url_pattern("*").build()]
+    } else {
+        blocked
+            .types()
+            .into_iter()
+            .map(|ty| {
+                RequestPattern::builder()
+                    .url_pattern("*")
+                    .resource_type(ty)
+                    .build()
+            })
+            .collect()
+    };
     let mut paused = page
         .event_listener::<EventRequestPaused>()
         .await
@@ -430,12 +502,26 @@ pub(crate) async fn install_request_guard(
             let verdicts = verdicts.clone();
             tokio::spawn(async move {
                 let url = event.request.url.clone();
-                if request_allowed(&url, allow_private_ips, &verdicts).await {
+                let allowed = if blocked.blocks(&event.resource_type) {
+                    debug!(url = %url, resource_type = ?event.resource_type, "Browser subresource not needed for this render blocked");
+                    false
+                } else {
+                    match guard {
+                        Some(allow_private_ips) => {
+                            let allowed = request_allowed(&url, allow_private_ips, &verdicts).await;
+                            if !allowed {
+                                debug!(url = %url, "Browser request to a non-public address blocked");
+                            }
+                            allowed
+                        }
+                        None => true,
+                    }
+                };
+                if allowed {
                     let _ = page
                         .execute(ContinueRequestParams::new(event.request_id.clone()))
                         .await;
                 } else {
-                    debug!(url = %url, "Browser request to a non-public address blocked");
                     let _ = page
                         .execute(FailRequestParams::new(
                             event.request_id.clone(),
@@ -446,9 +532,7 @@ pub(crate) async fn install_request_guard(
             });
         }
     });
-    let enable = FetchEnableParams::builder()
-        .pattern(RequestPattern::builder().url_pattern("*").build())
-        .build();
+    let enable = FetchEnableParams::builder().patterns(patterns).build();
     if let Err(e) = page.execute(enable).await {
         task.abort();
         return Err(format!("request guard: {e}"));
@@ -485,5 +569,42 @@ mod tests {
         assert!(!request_allowed("http://localhost:1234/", false, &v).await);
         assert!(request_allowed("http://localhost:1234/", true, &v).await);
         assert!(!request_allowed("not a url", false, &v).await);
+    }
+
+    #[test]
+    fn blocked_resources_never_cover_documents_or_scripts() {
+        let none = BlockedResources::default();
+        assert!(!none.any());
+        assert!(none.types().is_empty());
+        let crawl = BlockedResources {
+            images: true,
+            fonts: true,
+            media: true,
+            stylesheets: false,
+        };
+        assert!(crawl.any());
+        assert_eq!(
+            crawl.types(),
+            vec![ResourceType::Image, ResourceType::Font, ResourceType::Media]
+        );
+        for ty in [ResourceType::Image, ResourceType::Font, ResourceType::Media] {
+            assert!(crawl.blocks(&ty), "{ty:?}");
+            assert!(!none.blocks(&ty), "{ty:?}");
+        }
+        for ty in [
+            ResourceType::Document,
+            ResourceType::Script,
+            ResourceType::Xhr,
+            ResourceType::Fetch,
+            ResourceType::Stylesheet,
+            ResourceType::Other,
+        ] {
+            assert!(!crawl.blocks(&ty), "{ty:?}");
+        }
+        let all = BlockedResources {
+            stylesheets: true,
+            ..crawl
+        };
+        assert!(all.blocks(&ResourceType::Stylesheet));
     }
 }
