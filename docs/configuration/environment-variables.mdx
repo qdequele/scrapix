@@ -70,6 +70,7 @@ The Lab's own settings (Stripe, email, the saved-config cron, encryption keys, s
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KAFKA_BROKERS` | `localhost:9092` | Comma-separated Kafka/Redpanda broker addresses |
+| `KAFKA_LINGER_MS` | `0` | Producer `linger.ms` of every service with a Kafka producer (API, frontier, crawler, content, `scrapix all`), an integer from `0` to `1000`. `0` sends immediately. A send waits for its delivery report, so each publish stage costs at least one linger; raise it (e.g. `5`) only to trade latency for fewer produce requests. An invalid value refuses to start |
 | `KAFKA_GROUP_ID` | varies per service | Consumer group ID |
 
 <Note>
@@ -119,6 +120,7 @@ modes.
 | `DISPATCH_BATCH_SIZE` | `2000` | URLs per dispatch batch |
 | `DOMAIN_DELAY_MS` | `250` | Starting delay between requests to the same domain. After each successful fetch it moves halfway toward the fetch time divided by `CONCURRENT_PER_DOMAIN`; rate limits and error streaks raise it ×1.5. Jobs' `rate_limit` and robots.txt `Crawl-delay` can only raise it |
 | `MIN_DOMAIN_DELAY_MS` | `25` | Lowest delay between requests to the same domain the adaptive delay may reach. Set it to `DOMAIN_DELAY_MS` for a fixed delay |
+| `DOMAIN_SPACING_CREDIT_MS` | `100` | How much of the time lost between a request becoming due and the dispatch pass is given back to a domain paced by its adaptive delay: at most `1 + credit / delay` requests at once (5 at the 25 ms floor). `0` = strict spacing. Never applies to a delay set by the job (`per_domain_delay_ms`, `requests_per_second`), by robots.txt, or of 1 s or more |
 | `BLOOM_CAPACITY` | `10000000` | **Deprecated and ignored.** Dedup now lives in the `FrontierStore` (Redis or in-memory), not a bloom filter; kept only so old env files don't fail to parse |
 | `BLOOM_FP_RATE` | `0.01` | **Deprecated and ignored** (see `BLOOM_CAPACITY`) |
 | `MAX_PENDING_PER_JOB` | `1000000` | Maximum pending URLs per job |

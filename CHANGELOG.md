@@ -48,6 +48,71 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Changed
 
+- **A site paced by the adaptive delay is crawled at the rate that delay
+  allows, whatever the dispatch period.** The frontier granted a domain one
+  URL per dispatcher pass, and only once a full delay had passed since the
+  last one, so the time between a request becoming due and the pass that
+  sent it was lost: a 25 ms delay with a pass every 33 ms gave 30 pages/s
+  instead of 40. The politeness stores now keep a schedule per domain and
+  give that time back: a late pass sends the URLs it is owed in one call.
+  The credit is 100 ms (`DOMAIN_SPACING_CREDIT_MS`, `0` restores the old
+  spacing), so such a site gets at most `1 + 100 / delay` requests at once
+  (5 at the 25 ms floor), never more than its free in-flight slots, and
+  never more than `1 / delay` on average. Explicit delays are unchanged: a
+  job's `per_domain_delay_ms` or `requests_per_second`, a robots
+  `Crawl-delay`, `default_crawl_delay_ms` and any delay of 1 s or more stay
+  a strict floor on the gap between two requests. A `Retry-After` pause
+  banks no credit, and a 429 or an error drops it (SCR-90). Measured end to
+  end on a local stack: a single site goes from 26 to 37 pages/s (24 with
+  the credit at `0`), against a ceiling of 40 at the 25 ms floor.
+
+- **Kafka producers no longer wait 20 ms before sending.** Every publish
+  stage awaits its delivery report, so the old `linger.ms=20` added about
+  20 ms to each one (about 40 ms per page in the crawler, one linger per
+  frontier dispatch pass). The default is now `0`: on a local Redpanda an
+  awaited send takes 0.12 ms instead of 22 ms, and sustained throughput is
+  unchanged because batches fill by size. End to end, a crawl of 20 sites
+  in one job runs at about 84 pages/s with `0` and 65 with `20`; a single
+  site is paced by politeness and does not change. The new `KAFKA_LINGER_MS`
+  (integer, 0 to 1000) sets it for every producer; an invalid value refuses
+  to start.
+
+- **The binaries can be built with mimalloc.** A new cargo feature,
+  `mimalloc`, on each binary crate, off by default (`--features mimalloc`).
+  On the parser benchmarks in a Linux container it is 3 to 4% faster on HTML
+  parsing and 8 to 10% faster on Markdown conversion and the full parse
+  pipeline. It is not the default because a full crawl is not faster with
+  it (84 pages/s with and without, 20 sites in one job, macOS arm64) and
+  the content worker's peak memory doubles (about 230 MB against 105 MB).
+
+- **Markdown conversion is up to a third faster, with the same output.**
+  The tags dropped from a page are found in one scan instead of one regex
+  pass per tag, the Markdown cleanup skips the patterns that cannot match,
+  and links on ordinary lines are resolved without the regex engine. On the
+  parser benches: 29 to 37% less time for the crawl's conversion, 12 to 20%
+  for `html_to_markdown`. The Markdown is byte-identical: the previous
+  implementation is kept as a test reference and compared on 1,750 pages.
+
+- **robots.txt costs one connection and one request per new origin.** The
+  crawler worker fetches robots.txt through the page fetcher's DNS cache
+  and connection pool, and the first URLs of an origin share a single
+  robots.txt fetch instead of each fetching it. The body is read up to
+  500 KiB (the rest is ignored, cut at a line end), and the cache drops
+  expired entries and keeps at most 100,000 origins. What robots.txt
+  allows, its TTL, `Crawl-delay` and the SSRF checks are unchanged. The
+  request now also carries the fetcher's `Accept-Language` header.
+
+- **The engine asks the Lab once per credential, not once per request.**
+  When a cached Lab answer expired (every 30 s for a busy API key), every
+  request in flight for that key called the Lab at the same time.
+  Concurrent requests for the same key now share one Lab call, and a key in
+  use is refreshed in the background from 80% of its `cache_ttl`. The
+  guarantees are unchanged: a revoked key works for at most `cache_ttl`,
+  answers are served stale for at most 5 minutes while the Lab is down, and
+  `cache_ttl` 0 answers are fetched by every request. `/scrape`, `/map` and
+  `/search` also record their usage event in one database round trip
+  instead of three.
+
 - **The crawler publishes a page's messages together.** Each message
   waited about 20 ms for its delivery report while the page held a worker
   slot, so a page with 100 links took about 2 s to publish. A page, its
@@ -191,6 +256,13 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   them at about twice its `limit` instead of 100,000 URLs.
 
 ### Fixed
+
+- **Page text that looks like deeply nested Markdown links no longer
+  crashes the process.** Resolving links recursed once per link nested in a
+  link text, so a 160 KB page repeating `[![a](b)` overflowed the stack and
+  aborted the content worker (or the API on `/scrape`), which then got the
+  page again. The nesting is followed 32 levels deep; past that the text of
+  a link is kept as it is.
 
 - **A page too large to publish fails instead of stalling its job.** A
   document between about 7.5 and 10 MB is over the 10 MiB message limit
