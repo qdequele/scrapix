@@ -931,7 +931,7 @@ fn links_are_rewritten_as_before() {
     for line in &lines {
         let expected = legacy::rewrite_links(line, &base);
         assert_eq!(
-            rewrite_links_with_regex(line, &base),
+            rewrite_links_with_regex(line, &base, 0),
             expected,
             "regex: {}",
             excerpt(line)

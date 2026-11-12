@@ -211,7 +211,7 @@ fn push_rewritten_links(out: &mut String, line: &str, base: &url::Url) {
     if plain {
         push_rewritten_plain_links(out, line, base);
     } else {
-        out.push_str(&rewrite_links_with_regex(line, base));
+        out.push_str(&rewrite_links_with_regex(line, base, 0));
     }
 }
 
@@ -302,17 +302,26 @@ fn push_resolved_target(out: &mut String, target: &str, base: &url::Url) {
     }
 }
 
+/// How deep [`rewrite_links_with_regex`] follows links nested in link texts.
+///
+/// html2md nests a link in a link text once (a linked image). Deeper nesting
+/// only comes from page text that looks like markdown, and each level is a
+/// stack frame and a pass over the text: `[![a](b)` repeated 20,000 times
+/// used to overflow the stack and abort the process. Past this depth the
+/// text of a link is kept as it is.
+const MAX_LINK_NESTING: usize = 32;
+
 /// Rewrite the links and images of one line of markdown (no code in it)
-/// with [`link_regex`].
-fn rewrite_links_with_regex(line: &str, base: &url::Url) -> String {
+/// with [`link_regex`]. `depth` is how many link texts enclose `line`.
+fn rewrite_links_with_regex(line: &str, base: &url::Url, depth: usize) -> String {
     link_regex()
         .replace_all(line, |caps: &regex::Captures| {
             let is_image = !caps[1].is_empty();
             // The text of a link may be an image: rewrite it too.
-            let text = if is_image || !caps[2].contains("](") {
+            let text = if is_image || !caps[2].contains("](") || depth >= MAX_LINK_NESTING {
                 caps[2].to_string()
             } else {
-                rewrite_links_with_regex(&caps[2], base)
+                rewrite_links_with_regex(&caps[2], base, depth + 1)
             };
             let target = &caps[3];
             let title = &caps[4];
@@ -1014,6 +1023,34 @@ mod tests {
     }
 
     /// The previous implementation: every pattern copies the whole text.
+    /// Page text that looks like deeply nested markdown links used to cost
+    /// one stack frame per level and abort the process (a page any site can
+    /// serve). On a thread with a small stack, as the workers' are.
+    #[test]
+    fn deeply_nested_link_text_does_not_overflow_the_stack() {
+        let html = format!("<p>{}](c)</p>", "[![a](b)".repeat(20_000));
+        let converted = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || html_to_markdown_for_page(&html, "https://x.example/dir/", false))
+            .unwrap()
+            .join()
+            .expect("the conversion must not panic or overflow");
+        // The outer levels are still resolved against the page.
+        assert!(converted.starts_with("[![a](https://x.example/dir/b)"));
+        assert!(converted.ends_with("](https://x.example/dir/c)"));
+    }
+
+    /// Up to the nesting cap the output is what it always was.
+    #[test]
+    fn nested_link_text_within_the_cap_is_fully_rewritten() {
+        let base = url::Url::parse("https://x.example/dir/").unwrap();
+        let line = format!("{}](c)", "[![a](b)".repeat(MAX_LINK_NESTING - 2));
+        assert_eq!(
+            absolutize_markdown_links(&line, &base),
+            legacy::absolutize_markdown_links(&line, &base)
+        );
+    }
+
     fn strip_copying(html: &str, tags: &[&str]) -> String {
         let mut result = html.to_string();
         for tag in tags {
