@@ -440,3 +440,620 @@ async fn default_crawl_delay_needs_checked_robots_and_accounting_needs_the_slot(
     assert!(a.tracked_domain_count() >= 4);
     cleanup(&url, &prefix).await;
 }
+
+// ---- Spacing credit (SCR-90): Redis and memory apply the same rule ----
+
+use scrapix_frontier::{Grants, PolitenessScheduler, SlotsRequest};
+
+/// The same requests sent to a `RedisPoliteness` and to a
+/// `PolitenessScheduler`, on one simulated clock (`at_ms` after a common
+/// start): every answer must be identical.
+struct Parity {
+    redis: RedisPoliteness,
+    memory: PolitenessScheduler,
+    start: std::time::Instant,
+    start_ms: i64,
+    next_token: usize,
+    /// Time (ms) of every grant, in order.
+    grants: Vec<u64>,
+}
+
+impl Parity {
+    async fn new(url: &str, prefix: &str, c: PolitenessConfig) -> Self {
+        Self {
+            redis: RedisPoliteness::new(url, prefix, c.clone()).await.unwrap(),
+            memory: PolitenessScheduler::new(c),
+            start: std::time::Instant::now(),
+            start_ms: chrono::Utc::now().timestamp_millis(),
+            next_token: 0,
+            grants: Vec::new(),
+        }
+    }
+
+    /// Ask both stores for `want` slots on `domain` at `at_ms`.
+    async fn pass(&mut self, domain: &str, limits: JobLimits, at_ms: u64, want: usize) -> Grants {
+        let tokens: Vec<String> = (0..want)
+            .map(|i| format!("t{}", self.next_token + i))
+            .collect();
+        let req = SlotsRequest {
+            domain,
+            job_id: "j",
+            tokens: &tokens,
+            limits,
+        };
+        let memory = self
+            .memory
+            .acquire_many_at(&req, self.start + Duration::from_millis(at_ms));
+        let redis = self
+            .redis
+            .acquire_many_at(&req, self.start_ms + at_ms as i64)
+            .await
+            .unwrap();
+        assert_eq!(redis, memory, "{domain} at {at_ms} ms, {want} wanted");
+        self.next_token += redis.granted;
+        self.grants
+            .extend(std::iter::repeat_n(at_ms, redis.granted));
+        redis
+    }
+
+    async fn report(&mut self, r: FetchReport<'_>, at_ms: u64) {
+        let now_ms = self.start_ms + at_ms as i64;
+        self.memory
+            .apply_report_at(&r, self.start + Duration::from_millis(at_ms), now_ms);
+        self.redis.report_at(&r, now_ms).await.unwrap();
+    }
+}
+
+fn spaced(delay_ms: u64, concurrent: usize) -> PolitenessConfig {
+    PolitenessConfig {
+        default_delay_ms: delay_ms,
+        min_delay_ms: delay_ms,
+        concurrent_per_domain: concurrent,
+        ..Default::default()
+    }
+}
+
+/// Over a simulated second, Redis grants exactly what the memory scheduler
+/// grants, pass by pass, and that is what the delay allows whatever the
+/// pass period.
+#[tokio::test]
+async fn spacing_credit_matches_the_memory_store_pass_by_pass() {
+    let Some(url) = redis_url() else { return };
+    let l = JobLimits::default();
+    for delay in [10u64, 25, 40, 100] {
+        for period in [20u64, 25, 33] {
+            let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+            let mut p = Parity::new(&url, &prefix, spaced(delay, 100_000)).await;
+            let mut t = 0;
+            while t < 1_000 {
+                p.pass("a.test", l, t, 50).await;
+                t += period;
+            }
+            let last_pass = (999 / period) * period;
+            assert_eq!(
+                p.grants.len() as u64,
+                1 + last_pass / delay,
+                "delay {delay} ms, pass every {period} ms"
+            );
+            // n + 1 consecutive grants span at least n × delay − credit.
+            for (i, a) in p.grants.iter().enumerate() {
+                for (n, b) in p.grants[i..].iter().enumerate() {
+                    assert!(b - a + 100 >= n as u64 * delay, "delay {delay}: burst");
+                }
+            }
+            cleanup(&url, &prefix).await;
+        }
+    }
+}
+
+/// Burst bound, strict long delays, pauses, backoff and the in-flight caps:
+/// the same answers from both stores.
+#[tokio::test]
+async fn spacing_credit_bounds_match_the_memory_store() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let l = JobLimits::default();
+    let wait = |ms| Acquire::Wait(Duration::from_millis(ms));
+
+    // Burst after an idle period: 1 + credit / delay, then the delay.
+    let mut p = Parity::new(&url, &prefix, spaced(25, 100_000)).await;
+    assert_eq!(p.pass("burst.test", l, 0, 50).await.granted, 1);
+    assert_eq!(
+        p.pass("burst.test", l, 10_000, 50).await,
+        Grants {
+            granted: 5,
+            next: wait(25)
+        }
+    );
+    assert_eq!(p.pass("burst.test", l, 10_010, 50).await.granted, 0);
+    assert_eq!(p.pass("burst.test", l, 10_025, 50).await.granted, 1);
+    // A pass 60 ms late is owed two; asking for fewer leaves the rest.
+    assert_eq!(p.pass("late.test", l, 0, 50).await.granted, 1);
+    assert_eq!(
+        p.pass("late.test", l, 60, 1).await,
+        Grants {
+            granted: 1,
+            next: Acquire::Granted
+        }
+    );
+    assert_eq!(
+        p.pass("late.test", l, 60, 50).await,
+        Grants {
+            granted: 1,
+            next: wait(15)
+        }
+    );
+
+    // A 2 s delay (job rate, or robots Crawl-delay) is strict: one grant
+    // per delay however late the pass, never two at once.
+    let slow = JobLimits {
+        max_rps: Some(0.5),
+        ..l
+    };
+    let mut at = Vec::new();
+    for t in (0..9_000).step_by(330).chain((30_000..39_000).step_by(330)) {
+        let got = p.pass("slow.test", slow, t, 50).await;
+        assert!(got.granted <= 1, "{got:?}");
+        if got.granted == 1 {
+            at.push(t);
+        }
+    }
+    assert_eq!(at.len(), 8);
+    for w in at.windows(2) {
+        assert!(w[1] - w[0] >= 2_000, "{} ms apart", w[1] - w[0]);
+    }
+    assert_eq!(p.pass("robots.test", l, 0, 50).await.granted, 1);
+    let robots_at = p.grants.len() - 1;
+    p.report(
+        FetchReport {
+            crawl_delay_ms: Some(2_000),
+            ..report(
+                "robots.test",
+                "j",
+                &format!("t{robots_at}"),
+                FetchSignal::Success,
+            )
+        },
+        100,
+    )
+    .await;
+    assert_eq!(
+        p.pass("robots.test", l, 1_000, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(1_000)
+        }
+    );
+    assert_eq!(
+        p.pass("robots.test", l, 60_000, 50).await,
+        Grants {
+            granted: 1,
+            next: wait(2_000)
+        }
+    );
+
+    // A Retry-After pause banks no credit: 60 ms after its end, the three
+    // requests due since then.
+    assert_eq!(p.pass("pause.test", l, 0, 50).await.granted, 1);
+    let token = format!("t{}", p.grants.len() - 1);
+    let until = p.start_ms + 1_000;
+    p.report(
+        FetchReport {
+            retry_until_ms: Some(until),
+            ..report("pause.test", "j", &token, FetchSignal::NoRequest)
+        },
+        0,
+    )
+    .await;
+    assert_eq!(
+        p.pass("pause.test", l, 400, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(600)
+        }
+    );
+    assert_eq!(
+        p.pass("pause.test", l, 1_060, 50).await,
+        Grants {
+            granted: 3,
+            next: wait(15)
+        }
+    );
+
+    // A 429 raises the delay and drops the banked credit.
+    assert_eq!(p.pass("rate.test", l, 0, 50).await.granted, 1);
+    let token = format!("t{}", p.grants.len() - 1);
+    p.report(
+        report("rate.test", "j", &token, FetchSignal::RateLimited),
+        1_000,
+    )
+    .await;
+    assert_eq!(
+        p.pass("rate.test", l, 1_000, 50).await,
+        Grants {
+            granted: 1,
+            next: wait(37)
+        }
+    );
+    assert_eq!(p.pass("rate.test", l, 1_036, 50).await.granted, 0);
+    assert_eq!(p.pass("rate.test", l, 1_080, 50).await.granted, 2);
+    cleanup(&url, &prefix).await;
+
+    // The domain's free slots cap the burst (3 slots, 1 held)...
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let mut p = Parity::new(&url, &prefix, spaced(10, 3)).await;
+    assert_eq!(p.pass("cap.test", l, 0, 50).await.granted, 1);
+    assert_eq!(
+        p.pass("cap.test", l, 5_000, 50).await,
+        Grants {
+            granted: 2,
+            next: Acquire::DomainBusy
+        }
+    );
+    // ...a freed slot is granted at once while credit is left...
+    p.report(report("cap.test", "j", "t1", FetchSignal::Success), 5_040)
+        .await;
+    assert_eq!(
+        p.pass("cap.test", l, 5_040, 50).await,
+        Grants {
+            granted: 1,
+            next: Acquire::DomainBusy
+        }
+    );
+    // ...and so does the job's cap, across domains.
+    let capped = JobLimits {
+        max_in_flight: Some(5),
+        ..l
+    };
+    assert_eq!(p.pass("job1.test", capped, 5_040, 50).await.granted, 1);
+    assert_eq!(
+        p.pass("job1.test", capped, 9_000, 50).await,
+        Grants {
+            granted: 1,
+            next: Acquire::JobBusy
+        }
+    );
+    assert_eq!(
+        p.pass("job2.test", capped, 9_000, 50).await,
+        Grants {
+            granted: 0,
+            next: Acquire::JobBusy
+        }
+    );
+    cleanup(&url, &prefix).await;
+}
+
+/// The script every instance ran before SCR-90 (one slot per call, spacing
+/// from `last_ms = now`), for the mixed-version test.
+const OLD_ACQUIRE_LUA: &str = r#"
+local now = tonumber(ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+local h = redis.call('HMGET', KEYS[1], 'last_ms', 'delay_ms', 'robots_ms', 'pause_until', 'robots_checked')
+local pause = tonumber(h[4]) or 0
+if pause > now then return {1, pause - now} end
+local jobcap = tonumber(ARGV[3])
+if jobcap > 0 and redis.call('ZCARD', KEYS[3]) >= jobcap then return {-2, 0} end
+if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[2]) then return {-1, 0} end
+local eff = tonumber(h[2]) or tonumber(ARGV[4])
+eff = math.max(eff, tonumber(ARGV[7]), tonumber(ARGV[8]))
+if ARGV[9] == '1' then
+  local r = tonumber(h[3])
+  if not r and h[5] == '1' then r = tonumber(ARGV[10]) end
+  if r then eff = math.max(eff, math.floor(r * tonumber(ARGV[11]))) end
+end
+local floor = tonumber(ARGV[5])
+eff = math.min(math.max(eff, floor), math.max(tonumber(ARGV[6]), floor))
+local last = tonumber(h[1])
+if last and now - last < eff then return {1, eff - (now - last)} end
+local ttl = tonumber(ARGV[13])
+redis.call('ZADD', KEYS[2], now + ttl, ARGV[12])
+redis.call('ZADD', KEYS[3], now + ttl, ARGV[12])
+redis.call('HSET', KEYS[1], 'last_ms', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[14])
+redis.call('PEXPIRE', KEYS[2], 2 * ttl)
+redis.call('PEXPIRE', KEYS[3], 2 * ttl)
+return {0, eff}
+"#;
+
+/// Rolling upgrade: an instance running the previous script shares a
+/// domain's keys with one running the new script. Each honours the other's
+/// grants, and together they never exceed one request per delay (plus the
+/// new script's credit).
+#[tokio::test]
+async fn old_and_new_scripts_share_a_domain() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let c = spaced(25, 100_000);
+    let new = RedisPoliteness::new(&url, &prefix, c.clone())
+        .await
+        .unwrap();
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let conn = client.get_multiplexed_async_connection().await.unwrap();
+    let old_script = redis::Script::new(OLD_ACQUIRE_LUA);
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let l = JobLimits::default();
+    let mut n = 0;
+    // The old instance asks for one slot at `at_ms`: `(status, ms)`.
+    let mut old = |at_ms: i64| {
+        n += 1;
+        let mut call = old_script.prepare_invoke();
+        call.key(format!("{prefix}:pol:d:mix.test"))
+            .key(format!("{prefix}:pol:f:mix.test"))
+            .key(format!("{prefix}:pol:j:j"))
+            .arg(start_ms + at_ms)
+            .arg(c.concurrent_per_domain)
+            .arg(0)
+            .arg(c.default_delay_ms)
+            .arg(c.min_delay_ms)
+            .arg(c.max_delay_ms)
+            .arg(0)
+            .arg(0)
+            .arg("1")
+            .arg(0)
+            .arg(c.robots_delay_multiplier)
+            .arg(format!("old{n}"))
+            .arg(c.slot_ttl.as_millis() as u64)
+            .arg(86_400_000u64);
+        let mut conn = conn.clone();
+        async move {
+            let got: (i64, i64) = call.invoke_async(&mut conn).await.unwrap();
+            got
+        }
+    };
+    let mut m = 0;
+    let mut new_pass = |at_ms: i64, want: usize| {
+        let tokens: Vec<String> = (0..want).map(|i| format!("new{}", m + i)).collect();
+        m += want;
+        let new = &new;
+        async move {
+            let req = SlotsRequest {
+                domain: "mix.test",
+                job_id: "j",
+                tokens: &tokens,
+                limits: l,
+            };
+            new.acquire_many_at(&req, start_ms + at_ms).await.unwrap()
+        }
+    };
+    let wait = |ms| Acquire::Wait(Duration::from_millis(ms));
+
+    // A hash written by the old script only (`last_ms`): the new script
+    // spaces from it, and banks credit against it.
+    assert_eq!(old(0).await, (0, 25));
+    assert_eq!(
+        new_pass(10, 5).await,
+        Grants {
+            granted: 0,
+            next: wait(15)
+        }
+    );
+    assert_eq!(
+        new_pass(25, 5).await,
+        Grants {
+            granted: 1,
+            next: wait(25)
+        }
+    );
+    // The old script honours the new one's grant.
+    assert_eq!(old(40).await, (1, 10));
+    assert_eq!(old(50).await, (0, 25));
+    assert_eq!(new_pass(60, 5).await.granted, 0);
+
+    // After an idle second the new script uses its credit (5 grants at
+    // 1050: the schedule is then at 1050)...
+    assert_eq!(
+        new_pass(1_050, 50).await,
+        Grants {
+            granted: 5,
+            next: wait(25)
+        }
+    );
+    // ...which the old script waits out like any delay...
+    assert_eq!(old(1_060).await, (1, 15));
+    assert_eq!(old(1_075).await, (0, 25));
+    // ...and an old grant leaves no credit behind for the new script.
+    assert_eq!(
+        new_pass(1_090, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(10)
+        }
+    );
+    // A new grant that came late (schedule at 1100, granted at 1140) lets
+    // the old script grant up to the credit early, as the new one would:
+    // 1125 is the next slot of the schedule.
+    assert_eq!(
+        new_pass(1_140, 1).await,
+        Grants {
+            granted: 1,
+            next: Acquire::Granted
+        }
+    );
+    assert_eq!(old(1_141).await, (0, 25));
+    assert_eq!(new_pass(1_150, 50).await.granted, 0);
+
+    // A job with an explicit 50 ms delay is spaced from the old script's
+    // grant (1141), although `real_ms` still says 1140.
+    let strict = JobLimits {
+        min_delay_ms: 50,
+        ..l
+    };
+    let strict_at = |at_ms: i64, token: &'static str| {
+        let new = &new;
+        async move {
+            let tokens = [token.to_string()];
+            let req = SlotsRequest {
+                domain: "mix.test",
+                job_id: "k",
+                tokens: &tokens,
+                limits: strict,
+            };
+            new.acquire_many_at(&req, start_ms + at_ms).await.unwrap()
+        }
+    };
+    assert_eq!(
+        strict_at(1_180, "s1").await,
+        Grants {
+            granted: 0,
+            next: wait(11)
+        }
+    );
+
+    let last: i64 = redis::cmd("HGET")
+        .arg(format!("{prefix}:pol:d:mix.test"))
+        .arg("last_ms")
+        .query_async(&mut conn.clone())
+        .await
+        .unwrap();
+    assert_eq!(last - start_ms, 1_141, "the old script wrote its own clock");
+    // After a strict grant by the new script, `last_ms` is the real time:
+    // the old script cannot grant early.
+    assert_eq!(strict_at(1_191, "s2").await.granted, 1);
+    assert_eq!(old(1_215).await, (1, 1));
+    assert_eq!(old(1_216).await, (0, 25));
+    cleanup(&url, &prefix).await;
+}
+
+/// Explicit delays (job delay, job rate, robots `Crawl-delay`) are strict
+/// in both stores, whatever their value; only the adaptive delay is
+/// credited, also on a domain the two kinds of job share.
+#[tokio::test]
+async fn explicit_delays_are_strict_like_the_memory_store() {
+    let Some(url) = redis_url() else { return };
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let l = JobLimits::default();
+    let wait = |ms| Acquire::Wait(Duration::from_millis(ms));
+    let job = |min_delay_ms| JobLimits { min_delay_ms, ..l };
+    let rate = JobLimits {
+        max_rps: Some(10.0),
+        ..l
+    };
+    let mut p = Parity::new(&url, &prefix, spaced(25, 100_000)).await;
+
+    // robots.txt of `robots300.test` asks for 300 ms.
+    assert_eq!(p.pass("robots300.test", l, 0, 50).await.granted, 1);
+    let token = format!("t{}", p.grants.len() - 1);
+    p.report(
+        FetchReport {
+            crawl_delay_ms: Some(300),
+            ..report("robots300.test", "j", &token, FetchSignal::Success)
+        },
+        1,
+    )
+    .await;
+
+    for (domain, limits, delay) in [
+        ("job50.test", job(50), 50u64),
+        ("job250.test", job(250), 250),
+        ("rps.test", rate, 100),
+        ("robots300.test", l, 300),
+    ] {
+        let mut at = Vec::new();
+        let mut ask = |t: u64, got: Grants| {
+            assert!(got.granted <= 1, "{domain} at {t}: {got:?}");
+            if got.granted == 1 {
+                at.push(t);
+            }
+        };
+        // Passes every 33 ms for 2 s (from 1 s on: robots300 was first
+        // requested at 0).
+        for t in (1_000..3_000).step_by(33) {
+            ask(t, p.pass(domain, limits, t, 50).await);
+        }
+        // Ten idle seconds bank nothing: one grant, then the delay.
+        let got = p.pass(domain, limits, 13_000, 50).await;
+        assert_eq!(
+            got,
+            Grants {
+                granted: 1,
+                next: wait(delay)
+            },
+            "{domain}"
+        );
+        ask(13_000, got);
+        ask(
+            13_000 + delay - 1,
+            p.pass(domain, limits, 13_000 + delay - 1, 50).await,
+        );
+        // A pass 60 ms late gives nothing back.
+        ask(
+            13_000 + delay + 60,
+            p.pass(domain, limits, 13_000 + delay + 60, 50).await,
+        );
+        let got = p.pass(domain, limits, 13_000 + 2 * delay + 59, 50).await;
+        assert_eq!(
+            got,
+            Grants {
+                granted: 0,
+                next: wait(1)
+            },
+            "{domain}"
+        );
+        for t in (20_000..22_000).step_by(33) {
+            ask(t, p.pass(domain, limits, t, 50).await);
+        }
+        let step = delay.div_ceil(33) * 33;
+        assert_eq!(at.len() as u64, 2 * (1 + 1_980 / step) + 2, "{domain}");
+        for w in at.windows(2) {
+            assert!(w[1] - w[0] >= delay, "{domain}: {} ms apart", w[1] - w[0]);
+        }
+    }
+
+    // A purely adaptive domain still gets its credit.
+    assert_eq!(p.pass("adaptive.test", l, 0, 50).await.granted, 1);
+    assert_eq!(p.pass("adaptive.test", l, 1_000, 50).await.granted, 5);
+
+    // A domain shared by an adaptive job and a job with a 50 ms delay: the
+    // strict job is spaced from the real last request.
+    assert_eq!(p.pass("shared.test", l, 0, 50).await.granted, 1);
+    assert_eq!(p.pass("shared.test", l, 1_000, 50).await.granted, 5);
+    assert_eq!(
+        p.pass("shared.test", job(50), 1_010, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(40)
+        }
+    );
+    assert_eq!(
+        p.pass("shared.test", job(50), 1_050, 50).await,
+        Grants {
+            granted: 1,
+            next: wait(50)
+        }
+    );
+    assert_eq!(
+        p.pass("shared.test", l, 1_060, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(15)
+        }
+    );
+    // Granted late (due at 1075): the schedule is at 1100, the real
+    // request at 1200.
+    assert_eq!(p.pass("shared.test", l, 1_200, 1).await.granted, 1);
+    assert_eq!(
+        p.pass("shared.test", job(50), 1_210, 50).await,
+        Grants {
+            granted: 0,
+            next: wait(40)
+        }
+    );
+    assert_eq!(p.pass("shared.test", job(50), 1_250, 50).await.granted, 1);
+    cleanup(&url, &prefix).await;
+
+    // An explicit delay below the adaptive one: credited, but never two
+    // requests less than it apart.
+    let prefix = format!("test-pol-{}", uuid::Uuid::new_v4());
+    let mut p = Parity::new(&url, &prefix, spaced(80, 100_000)).await;
+    assert_eq!(p.pass("low.test", job(50), 0, 50).await.granted, 1);
+    assert_eq!(
+        p.pass("low.test", job(50), 10_000, 50).await,
+        Grants {
+            granted: 1,
+            next: wait(50)
+        }
+    );
+    assert_eq!(p.pass("low.test", job(50), 10_050, 50).await.granted, 1);
+    cleanup(&url, &prefix).await;
+}

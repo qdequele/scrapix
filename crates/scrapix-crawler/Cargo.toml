@@ -24,6 +24,8 @@ url = { workspace = true }
 
 # HTML parsing (for link extraction)
 scraper = { workspace = true }
+# `http::Response`, to decode a size-capped robots.txt body as reqwest does
+hyper = { workspace = true }
 
 # Robots.txt
 robotstxt = { workspace = true }

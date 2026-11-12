@@ -100,8 +100,8 @@ pub const WARN_AI_BLOCK_SPLIT: &str =
     "AI enrichment is skipped for block-split pages (features.block_split is enabled)";
 
 /// Outcome events (`DocumentIndexed` / `DocumentSkipped` / `DocumentFailed`)
-/// published at once. Each publish awaits its delivery report (about one
-/// producer linger), so a serial publisher caps a worker near 45 pages/s.
+/// published at once. Each publish awaits its delivery report (the producer
+/// linger plus the broker ack), so a serial publisher caps a worker's rate.
 const MAX_IN_FLIGHT_PUBLISHES: usize = 256;
 
 /// Skipped/failed pages whose event is queued or being published. Past it,

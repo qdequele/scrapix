@@ -9,7 +9,8 @@
 //!   the fetch back (`FetchFeedback`), not when the URL reaches the bus.
 //!   Every slot also expires after [`PolitenessConfig::slot_ttl`], so lost
 //!   feedback cannot wedge a domain.
-//! - Two requests to one domain are at least the *effective delay* apart:
+//! - Requests to one domain are one *effective delay* apart (on average
+//!   below 1 s, at least from 1 s up: see "Spacing credit"):
 //!   `max(adaptive delay, job min delay, 1000 / job rps, robots crawl-delay ×
 //!   multiplier)`, clamped to `[min(min_delay_ms, default_delay_ms),
 //!   max_delay_ms]`. The adaptive delay starts at `default_delay_ms` (the
@@ -26,6 +27,56 @@
 //! - A `Retry-After` (429/503) pauses the domain until
 //!   `feedback timestamp + Retry-After` (ignored if already past).
 //! - A job has at most `JobLimits::max_in_flight` requests in flight.
+//!
+//! ## Spacing credit (SCR-90)
+//!
+//! The dispatcher asks for slots in passes (every `DISPATCH_INTERVAL_MS` at
+//! best). Spacing requests from the *time of the last grant* loses whatever
+//! time passed between the moment a request was due and the pass that
+//! granted it, so the achieved rate was `1 / (ceil(delay / period) ×
+//! period)` instead of `1 / delay`. The stores therefore keep a *virtual*
+//! last-request time per domain (GCRA, a leaky bucket in time units):
+//!
+//! - a request is granted when `now >= last + delay` (`delay` is the
+//!   effective delay of the asking job, evaluated at each check, so a delay
+//!   raised since the last grant applies at once);
+//! - the grant then sets `last = max(last + delay, now - credit,
+//!   pause end)`: the domain's schedule advances by one delay, and is at
+//!   most `credit` behind the clock.
+//!
+//! **Only the adaptive delay gets credit.** `credit` is
+//! [`PolitenessConfig::spacing_credit_ms`] (100 ms) when the effective
+//! delay is the domain's adaptive delay itself and is below
+//! [`PolitenessConfig::strict_spacing_ms`] (1 s). It is 0 whenever an
+//! explicit term sets the delay, i.e. is strictly above the adaptive delay:
+//! the job's `per_domain_delay_ms`, its `requests_per_second`, the robots
+//! `Crawl-delay` or the job's `default_crawl_delay_ms`. Those are promises
+//! made to the job's owner or asked by the site, so they stay a floor on
+//! the real gap between two requests: such a request also needs `now >=
+//! real last grant + delay`, where the real last grant is tracked next to
+//! the virtual one, and sets `last = now`. A request whose delay is the
+//! adaptive one but whose job also has a (lower) explicit term is credited,
+//! and still never comes less than that explicit term after the real last
+//! grant. Jobs with different limits share a domain's state; each call is
+//! judged on its own delay ([`spacing`]).
+//!
+//! Consequences, for a constant adaptive delay `D` and credit `C`:
+//!
+//! - any `n + 1` consecutive grants span at least `n × D − C`: the long-run
+//!   rate never exceeds `1 / D`, and a pass that comes late grants what it
+//!   is owed (several grants for one domain in one call, each taking one
+//!   in-flight slot);
+//! - at most `1 + floor(C / D)` grants at one instant (5 at the 25 ms
+//!   floor), and never more than the free in-flight slots of the domain and
+//!   the job;
+//! - an explicit delay (any value), and any delay of `strict_spacing_ms` or
+//!   more, is strict: one grant per call, two requests never less than the
+//!   delay apart, no catching up after an idle period or a late pass,
+//!   exactly as before SCR-90;
+//! - no credit builds up during a pause (`Retry-After`, error streak): the
+//!   schedule restarts at the pause's end. A 429 or an error drops the
+//!   credit banked so far.
+//! - a domain never requested before starts with no credit.
 //!
 //! [`PolitenessScheduler`] keeps this state in memory (one frontier
 //! instance); `RedisPoliteness` (feature `redis-store`) shares it between
@@ -60,6 +111,14 @@ pub struct PolitenessConfig {
     /// How long an in-flight slot is held without feedback before it is
     /// considered lost and freed (2 × the crawler request timeout).
     pub slot_ttl: Duration,
+    /// How far a domain's schedule may lag behind the clock (milliseconds):
+    /// time lost between a request becoming due and the dispatcher pass
+    /// that grants it is kept, up to this much, and granted back (see the
+    /// module docs). `0` spaces requests from the time of the last grant.
+    pub spacing_credit_ms: u64,
+    /// Effective delays at or above this (milliseconds) get no spacing
+    /// credit: their requests are never less than the delay apart.
+    pub strict_spacing_ms: u64,
 }
 
 impl Default for PolitenessConfig {
@@ -72,6 +131,8 @@ impl Default for PolitenessConfig {
             robots_delay_multiplier: 1.0,
             concurrent_per_domain: 2,
             slot_ttl: Duration::from_secs(60),
+            spacing_credit_ms: 100,
+            strict_spacing_ms: 1_000,
         }
     }
 }
@@ -140,6 +201,36 @@ pub fn effective_delay(
     robots: RobotsInfo,
     limits: &JobLimits,
 ) -> u64 {
+    spacing(config, adaptive_ms, robots, limits).delay_ms
+}
+
+/// How one job's requests to a domain are spaced right now (see the module
+/// docs, "Spacing credit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spacing {
+    /// The effective delay: a grant needs `now >= virtual last + delay_ms`.
+    pub delay_ms: u64,
+    /// How far the domain's schedule may lag behind the clock. 0 (strict
+    /// spacing) when an explicit term sets the delay or the delay is
+    /// `strict_spacing_ms` or more.
+    pub credit_ms: u64,
+    /// A grant also needs `now >= real last grant + real_gap_ms`: the whole
+    /// delay when spacing is strict, else the job's explicit terms (0 for a
+    /// job with none).
+    pub real_gap_ms: u64,
+}
+
+/// The spacing of a job's requests to a domain whose adaptive delay is
+/// `adaptive_ms`. The explicit terms are the job's `min_delay_ms`, its
+/// rate, and the robots term (`Crawl-delay` × multiplier, or the job's
+/// default crawl delay); the spacing is strict when one of them is above
+/// the (clamped) adaptive delay.
+pub fn spacing(
+    config: &PolitenessConfig,
+    adaptive_ms: u64,
+    robots: RobotsInfo,
+    limits: &JobLimits,
+) -> Spacing {
     let robots = if config.respect_robots_delay && limits.respect_robots {
         let raw = match robots.crawl_delay_ms {
             Some(d) => d,
@@ -153,12 +244,24 @@ pub fn effective_delay(
         0
     };
     let floor = config.min_delay_ms.min(config.default_delay_ms);
-    adaptive_ms
-        .max(limits.min_delay_ms)
+    let cap = config.max_delay_ms.max(floor);
+    let explicit = limits
+        .min_delay_ms
         .max(limits.rps_delay_ms())
         .max(robots)
-        .max(floor)
-        .min(config.max_delay_ms.max(floor))
+        .min(cap);
+    let adaptive = adaptive_ms.max(floor).min(cap);
+    let delay_ms = adaptive.max(explicit);
+    let credit_ms = if explicit > adaptive || delay_ms >= config.strict_spacing_ms {
+        0
+    } else {
+        config.spacing_credit_ms
+    };
+    Spacing {
+        delay_ms,
+        credit_ms,
+        real_gap_ms: if credit_ms == 0 { delay_ms } else { explicit },
+    }
 }
 
 /// The adaptive delay after a successful fetch.
@@ -215,6 +318,42 @@ pub struct SlotRequest<'a> {
     pub limits: JobLimits,
 }
 
+/// One dispatch pass asking for up to `tokens.len()` slots on one domain.
+#[derive(Debug, Clone)]
+pub struct SlotsRequest<'a> {
+    pub domain: &'a str,
+    pub job_id: &'a str,
+    /// One token per wanted slot, taken in order (see
+    /// [`SlotRequest::token`]).
+    pub tokens: &'a [String],
+    pub limits: JobLimits,
+}
+
+/// Result of [`PolitenessStore::try_acquire_many`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grants {
+    /// Slots taken, for the first `granted` tokens of the request.
+    pub granted: usize,
+    /// What one more request for the domain would be answered right now:
+    /// why the store stopped granting (`Wait`: until the domain's next
+    /// grant is due; `DomainBusy`; `JobBusy`), or `Granted` when every
+    /// token got a slot and another one is available.
+    pub next: Acquire,
+}
+
+impl Grants {
+    /// As the answer to a one-token request: the outcome and, for a grant,
+    /// the wait before the domain's next one (see
+    /// [`PolitenessStore::try_acquire_spaced`]).
+    pub fn into_single(self) -> (Acquire, Duration) {
+        match (self.granted, self.next) {
+            (0, next) => (next, Duration::ZERO),
+            (_, Acquire::Wait(wait)) => (Acquire::Granted, wait),
+            _ => (Acquire::Granted, Duration::ZERO),
+        }
+    }
+}
+
 /// What a fetch told us about the domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchSignal {
@@ -256,15 +395,49 @@ pub trait PolitenessStore: Send + Sync {
     /// Atomically check the domain's delay/pause, the domain and job
     /// in-flight caps, and take a slot if all allow it.
     async fn try_acquire(&self, req: &SlotRequest<'_>) -> Result<Acquire>;
-    /// [`Self::try_acquire`], plus, for a grant, the delay the domain now
-    /// imposes on this job before its next request (the effective delay at
-    /// the grant). The dispatcher parks the domain's other URLs for that
-    /// long instead of asking again only to be told to wait.
-    /// `Duration::ZERO` means no such delay is known: the domain may be
-    /// granted again right away (a zero effective delay, or a store that
-    /// does not report it). Always zero when the outcome is not a grant.
+    /// [`Self::try_acquire`], plus, for a grant, how long the domain makes
+    /// this job wait before its next request (the effective delay, less any
+    /// spacing credit left). `Duration::ZERO` means no such wait is known:
+    /// the domain may be granted again right away (a zero delay, credit
+    /// left, or a store that does not report it) or is busy. Always zero
+    /// when the outcome is not a grant.
     async fn try_acquire_spaced(&self, req: &SlotRequest<'_>) -> Result<(Acquire, Duration)> {
         Ok((self.try_acquire(req).await?, Duration::ZERO))
+    }
+    /// Atomically take as many slots as the domain's schedule, the domain
+    /// cap and the job cap allow right now, at most one per token (see the
+    /// module docs, "Spacing credit"), and say what one more request would
+    /// get. The dispatcher sends one URL per granted token and parks the
+    /// domain's other URLs for the reported wait instead of asking again.
+    ///
+    /// The default asks for one slot at a time; a store should override it
+    /// with a single atomic call.
+    async fn try_acquire_many(&self, req: &SlotsRequest<'_>) -> Result<Grants> {
+        let mut granted = 0;
+        for token in req.tokens {
+            let one = SlotRequest {
+                domain: req.domain,
+                job_id: req.job_id,
+                token,
+                limits: req.limits,
+            };
+            match self.try_acquire_spaced(&one).await? {
+                (Acquire::Granted, spacing) => {
+                    granted += 1;
+                    if !spacing.is_zero() {
+                        return Ok(Grants {
+                            granted,
+                            next: Acquire::Wait(spacing),
+                        });
+                    }
+                }
+                (next, _) => return Ok(Grants { granted, next }),
+            }
+        }
+        Ok(Grants {
+            granted,
+            next: Acquire::Granted,
+        })
     }
     /// Free a slot without any accounting (the dispatch never reached the
     /// domain, e.g. the bus refused it).
@@ -289,8 +462,13 @@ struct Slot {
 
 /// Per-domain scheduling state
 struct DomainState {
-    /// Last request time (`None`: never requested)
+    /// Virtual last request time (`None`: never requested): the time of the
+    /// last grant, or up to the spacing credit earlier when that grant came
+    /// late (see the module docs)
     last_request: Option<Instant>,
+    /// Time of the last grant (what explicit delays are measured from);
+    /// only meaningful while `last_request` is set
+    last_grant: Option<Instant>,
     /// Error-adapted delay (starts at `default_delay_ms`)
     delay_ms: u64,
     /// robots.txt `Crawl-delay` / whether robots.txt was fetched
@@ -311,6 +489,7 @@ impl DomainState {
     fn new(delay_ms: u64) -> Self {
         Self {
             last_request: None,
+            last_grant: None,
             delay_ms,
             robots: RobotsInfo::default(),
             job_limits: JobLimits::default(),
@@ -328,8 +507,9 @@ impl DomainState {
             .count()
     }
 
-    fn expire(&mut self, ttl: Duration) {
-        self.in_flight.retain(|s| s.started.elapsed() < ttl);
+    fn expire(&mut self, ttl: Duration, now: Instant) {
+        self.in_flight
+            .retain(|s| now.saturating_duration_since(s.started) < ttl);
     }
 
     /// Remove the slot for `token` (or the oldest token-less/any slot when
@@ -352,18 +532,27 @@ impl DomainState {
     }
 
     /// Remaining pause, if any.
-    fn pause_left(&self) -> Option<Duration> {
+    fn pause_left(&self, now: Instant) -> Option<Duration> {
         if self.paused {
             return Some(Duration::from_secs(60));
         }
         let until = self.paused_until?;
-        let now = Instant::now();
         (until > now).then(|| until - now)
     }
 
-    fn pause_for(&mut self, d: Duration) {
-        let until = Instant::now() + d;
+    fn pause_for(&mut self, d: Duration, now: Instant) {
+        let until = now + d;
         self.paused_until = Some(self.paused_until.map_or(until, |u| u.max(until)));
+    }
+
+    /// Drop the spacing credit banked so far: the next grant is due no
+    /// earlier than `now` (a 429 or an error must not be followed by a
+    /// catch-up burst).
+    fn forfeit_credit(&mut self, now: Instant) {
+        let floor = now.checked_sub(Duration::from_millis(self.delay_ms));
+        if let (Some(last), Some(floor)) = (self.last_request, floor) {
+            self.last_request = Some(last.max(floor));
+        }
     }
 
     /// Time left before the delay since the last request elapsed.
@@ -420,7 +609,7 @@ impl PolitenessScheduler {
         let Some(state) = domains.get(domain) else {
             return Duration::ZERO;
         };
-        if let Some(left) = state.pause_left() {
+        if let Some(left) = state.pause_left(Instant::now()) {
             return left;
         }
         if state.live_in_flight(self.config.slot_ttl) >= self.config.concurrent_per_domain {
@@ -459,7 +648,9 @@ impl PolitenessScheduler {
                 token: None,
                 started: Instant::now(),
             });
-            state.last_request = Some(Instant::now());
+            let now = Instant::now();
+            state.last_request = Some(now);
+            state.last_grant = Some(now);
         });
     }
 
@@ -468,7 +659,7 @@ impl PolitenessScheduler {
         state.delay_ms = adapt_on_success(&self.config, state.delay_ms, fetch_ms);
     }
 
-    fn on_error(&self, domain: &str, state: &mut DomainState, is_rate_limited: bool) {
+    fn on_error(&self, domain: &str, state: &mut DomainState, is_rate_limited: bool, now: Instant) {
         state.consecutive_errors += 1;
 
         // Adaptive backoff
@@ -486,9 +677,10 @@ impl PolitenessScheduler {
         // Pause the domain for a while if too many errors (timed, so a
         // flaky domain cannot wedge a job forever)
         if state.consecutive_errors >= 10 {
-            state.pause_for(Duration::from_millis(self.config.max_delay_ms));
+            state.pause_for(Duration::from_millis(self.config.max_delay_ms), now);
             warn!(domain, "Domain paused due to excessive errors");
         }
+        state.forfeit_credit(now);
     }
 
     /// Record that a request completed successfully (frees one slot)
@@ -512,7 +704,7 @@ impl PolitenessScheduler {
     pub fn failed_request(&self, domain: &str, is_rate_limited: bool) {
         if let Some(state) = self.domains.write().get_mut(domain) {
             state.free(None);
-            self.on_error(domain, state, is_rate_limited);
+            self.on_error(domain, state, is_rate_limited, Instant::now());
         }
     }
 
@@ -521,8 +713,9 @@ impl PolitenessScheduler {
     pub fn failed_request_with_retry_after(&self, domain: &str, retry_after: Duration) {
         self.with_state(domain, |state| {
             state.free(None);
-            self.on_error(domain, state, true);
-            state.pause_for(retry_after);
+            let now = Instant::now();
+            self.on_error(domain, state, true, now);
+            state.pause_for(retry_after, now);
         });
     }
 
@@ -570,7 +763,7 @@ impl PolitenessScheduler {
         domains.get(domain).map(|state| DomainStats {
             delay_ms: self.state_delay(state, &state.job_limits),
             in_flight: state.live_in_flight(self.config.slot_ttl),
-            paused: state.pause_left().is_some(),
+            paused: state.pause_left(Instant::now()).is_some(),
             consecutive_errors: state.consecutive_errors,
             time_since_last_request_ms: state
                 .last_request
@@ -611,21 +804,42 @@ impl PolitenessScheduler {
     }
 
     /// Synchronous core of [`PolitenessStore::try_acquire_spaced`]: the
-    /// outcome and, for a grant, the effective delay that was checked.
+    /// outcome and, for a grant, the wait before the domain's next one.
     pub fn acquire_spaced(&self, req: &SlotRequest<'_>) -> (Acquire, Duration) {
+        let tokens = [req.token.to_string()];
+        self.acquire_many(&SlotsRequest {
+            domain: req.domain,
+            job_id: req.job_id,
+            tokens: &tokens,
+            limits: req.limits,
+        })
+        .into_single()
+    }
+
+    /// Synchronous core of [`PolitenessStore::try_acquire_many`].
+    pub fn acquire_many(&self, req: &SlotsRequest<'_>) -> Grants {
+        self.acquire_many_at(req, Instant::now())
+    }
+
+    /// [`Self::acquire_many`] at a given time (tests drive the clock).
+    #[doc(hidden)]
+    pub fn acquire_many_at(&self, req: &SlotsRequest<'_>, now: Instant) -> Grants {
         let ttl = self.config.slot_ttl;
         let mut domains = self.domains.write();
         let mut jobs = self.jobs.write();
         let state = domains
             .entry(req.domain.to_string())
             .or_insert_with(|| DomainState::new(self.config.default_delay_ms));
-        state.expire(ttl);
-        if let Some(left) = state.pause_left() {
-            return (Acquire::Wait(left), Duration::ZERO);
+        state.expire(ttl, now);
+        if let Some(left) = state.pause_left(now) {
+            return Grants {
+                granted: 0,
+                next: Acquire::Wait(left),
+            };
         }
-        let job_held = match jobs.get_mut(req.job_id) {
+        let mut job_held = match jobs.get_mut(req.job_id) {
             Some(slots) => {
-                slots.retain(|(_, t)| t.elapsed() < ttl);
+                slots.retain(|(_, t)| now.saturating_duration_since(*t) < ttl);
                 slots.len()
             }
             None => 0,
@@ -633,29 +847,53 @@ impl PolitenessScheduler {
         if job_held == 0 {
             jobs.remove(req.job_id);
         }
-        if let Some(cap) = req.limits.max_in_flight.filter(|c| *c > 0) {
-            if job_held >= cap as usize {
-                return (Acquire::JobBusy, Duration::ZERO);
+        let job_cap = req.limits.max_in_flight.filter(|c| *c > 0);
+        let spacing = spacing(&self.config, state.delay_ms, state.robots, &req.limits);
+        let delay = Duration::from_millis(spacing.delay_ms);
+        let credit = Duration::from_millis(spacing.credit_ms);
+        let real_gap = Duration::from_millis(spacing.real_gap_ms);
+        // The schedule is at most `credit` behind the clock, and never
+        // behind the end of a pause.
+        let floor = match (now.checked_sub(credit), state.paused_until) {
+            (Some(a), Some(b)) => Some(a.max(b.min(now))),
+            (a, b) => a.or(b.map(|b| b.min(now))),
+        };
+        let mut granted = 0;
+        let next = loop {
+            if job_cap.is_some_and(|cap| job_held >= cap as usize) {
+                break Acquire::JobBusy;
             }
-        }
-        if state.in_flight.len() >= self.config.concurrent_per_domain {
-            return (Acquire::DomainBusy, Duration::ZERO);
-        }
-        let delay_ms = self.state_delay(state, &req.limits);
-        let left = state.delay_left(delay_ms);
-        if !left.is_zero() {
-            return (Acquire::Wait(left), Duration::ZERO);
-        }
-        let now = Instant::now();
-        state.in_flight.push(Slot {
-            token: Some(req.token.to_string()),
-            started: now,
-        });
-        state.last_request = Some(now);
-        jobs.entry(req.job_id.to_string())
-            .or_default()
-            .push((req.token.to_string(), now));
-        (Acquire::Granted, Duration::from_millis(delay_ms))
+            if state.in_flight.len() >= self.config.concurrent_per_domain {
+                break Acquire::DomainBusy;
+            }
+            let due = state.last_request.map(|last| last + delay);
+            // The real last grant is never before the virtual one.
+            let real_due = state
+                .last_request
+                .map(|last| state.last_grant.map_or(last, |real| real.max(last)) + real_gap);
+            if let Some(due) = due.max(real_due).filter(|due| *due > now) {
+                break Acquire::Wait(due - now);
+            }
+            let Some(token) = req.tokens.get(granted) else {
+                break Acquire::Granted;
+            };
+            state.last_request = Some(match (due, floor) {
+                (Some(due), Some(floor)) => due.max(floor),
+                (Some(due), None) => due,
+                (None, _) => now,
+            });
+            state.last_grant = Some(now);
+            state.in_flight.push(Slot {
+                token: Some(token.clone()),
+                started: now,
+            });
+            jobs.entry(req.job_id.to_string())
+                .or_default()
+                .push((token.clone(), now));
+            job_held += 1;
+            granted += 1;
+        };
+        Grants { granted, next }
     }
 
     /// Free `token`'s slots. Returns whether this instance held the domain
@@ -678,6 +916,13 @@ impl PolitenessScheduler {
 
     /// Synchronous core of [`PolitenessStore::report`].
     pub fn apply_report(&self, r: &FetchReport<'_>) {
+        self.apply_report_at(r, Instant::now(), chrono::Utc::now().timestamp_millis())
+    }
+
+    /// [`Self::apply_report`] at a given time, `now_ms` being the same
+    /// time in ms since the epoch (tests drive the clock).
+    #[doc(hidden)]
+    pub fn apply_report_at(&self, r: &FetchReport<'_>, now: Instant, now_ms: i64) {
         let owned = self.free_token(r.domain, r.job_id, r.token);
         self.with_state(r.domain, |state| {
             if r.crawl_delay_ms.is_some() || r.robots_checked {
@@ -691,15 +936,15 @@ impl PolitenessScheduler {
             if owned {
                 match r.signal {
                     FetchSignal::Success => self.on_success(state, r.fetch_ms),
-                    FetchSignal::RateLimited => self.on_error(r.domain, state, true),
-                    FetchSignal::Error => self.on_error(r.domain, state, false),
+                    FetchSignal::RateLimited => self.on_error(r.domain, state, true, now),
+                    FetchSignal::Error => self.on_error(r.domain, state, false, now),
                     FetchSignal::NoRequest => {}
                 }
             }
             if let Some(until) = r.retry_until_ms {
-                let left = until - chrono::Utc::now().timestamp_millis();
+                let left = until - now_ms;
                 if left > 0 {
-                    state.pause_for(Duration::from_millis(left as u64));
+                    state.pause_for(Duration::from_millis(left as u64), now);
                 }
             }
         });
@@ -714,6 +959,10 @@ impl PolitenessStore for PolitenessScheduler {
 
     async fn try_acquire_spaced(&self, req: &SlotRequest<'_>) -> Result<(Acquire, Duration)> {
         Ok(self.acquire_spaced(req))
+    }
+
+    async fn try_acquire_many(&self, req: &SlotsRequest<'_>) -> Result<Grants> {
+        Ok(self.acquire_many(req))
     }
 
     async fn release(&self, domain: &str, job_id: &str, token: &str) -> Result<()> {
@@ -1296,5 +1545,607 @@ mod tests {
         };
         assert_eq!(effective_delay(&c, 25, none, &rate), 200);
         assert_eq!(effective_delay(&c, 25, none, &JobLimits::default()), 25);
+    }
+
+    // ---- Spacing credit (SCR-90) ----
+
+    /// One domain with a fixed `delay_ms` and room for any number of
+    /// requests in flight.
+    fn spaced(delay_ms: u64, credit_ms: u64) -> PolitenessScheduler {
+        PolitenessScheduler::new(PolitenessConfig {
+            default_delay_ms: delay_ms,
+            min_delay_ms: delay_ms,
+            concurrent_per_domain: 100_000,
+            spacing_credit_ms: credit_ms,
+            ..Default::default()
+        })
+    }
+
+    /// A simulated dispatcher on one domain: tokens are numbered, time is
+    /// `base + ms`.
+    struct Sim {
+        p: PolitenessScheduler,
+        base: Instant,
+        limits: JobLimits,
+        next_token: usize,
+        /// Time (ms) of every grant, in order.
+        grants: Vec<u64>,
+    }
+
+    impl Sim {
+        fn new(p: PolitenessScheduler, limits: JobLimits) -> Self {
+            Self {
+                p,
+                base: Instant::now(),
+                limits,
+                next_token: 0,
+                grants: Vec::new(),
+            }
+        }
+
+        /// A pass at `at_ms` asking for `want` slots.
+        fn pass(&mut self, at_ms: u64, want: usize) -> Grants {
+            let tokens: Vec<String> = (0..want)
+                .map(|i| format!("t{}", self.next_token + i))
+                .collect();
+            let got = self.p.acquire_many_at(
+                &SlotsRequest {
+                    domain: "a.test",
+                    job_id: "j",
+                    tokens: &tokens,
+                    limits: self.limits,
+                },
+                self.base + Duration::from_millis(at_ms),
+            );
+            self.next_token += got.granted;
+            self.grants.extend(std::iter::repeat_n(at_ms, got.granted));
+            got
+        }
+
+        /// A pass every `period_ms` over `[from_ms, to_ms)`, each asking
+        /// for 50 slots.
+        fn run(&mut self, from_ms: u64, to_ms: u64, period_ms: u64) {
+            let mut t = from_ms;
+            while t < to_ms {
+                self.pass(t, 50);
+                t += period_ms;
+            }
+        }
+
+        fn report(&mut self, token: &str, signal: FetchSignal, at_ms: u64) {
+            self.report_with(report("a.test", "j", token, signal), at_ms);
+        }
+
+        fn report_with(&mut self, r: FetchReport<'_>, at_ms: u64) {
+            // The wall clock of the simulation starts at 0.
+            self.p
+                .apply_report_at(&r, self.base + Duration::from_millis(at_ms), at_ms as i64);
+        }
+    }
+
+    /// The politeness guarantee: any `n + 1` consecutive grants span at
+    /// least `n × delay − credit`, so the rate never exceeds `1 / delay` on
+    /// average and a burst is at most `1 + credit / delay` grants.
+    fn assert_conforms(grants: &[u64], delay_ms: u64, credit_ms: u64) {
+        for (i, a) in grants.iter().enumerate() {
+            for (n, b) in grants[i..].iter().enumerate() {
+                assert!(
+                    b - a + credit_ms >= n as u64 * delay_ms,
+                    "{} grants within {} ms (delay {delay_ms}, credit {credit_ms})",
+                    n + 1,
+                    b - a
+                );
+            }
+        }
+    }
+
+    fn most_at_once(grants: &[u64]) -> usize {
+        grants
+            .chunk_by(|a, b| a == b)
+            .map(|same| same.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The rate a domain gets is the one its delay allows, whatever the
+    /// dispatcher's pass period, and never more.
+    #[test]
+    fn rate_follows_the_delay_whatever_the_pass_period() {
+        for delay in [10u64, 25, 40, 100] {
+            for period in [20u64, 25, 33] {
+                let mut sim = Sim::new(spaced(delay, 100), JobLimits::default());
+                sim.run(0, 1_000, period);
+                // Exactly the requests due by the last pass of the second
+                // (one at 0, then one per delay): no pass loses time. That
+                // is `1000 / delay`, less what falls due after that pass.
+                let last_pass = (999 / period) * period;
+                assert_eq!(
+                    sim.grants.len() as u64,
+                    1 + last_pass / delay,
+                    "delay {delay} ms, pass every {period} ms"
+                );
+                let short = 1_000 / delay - (sim.grants.len() as u64).min(1_000 / delay);
+                assert!(
+                    short <= (1_000 - last_pass) / delay,
+                    "delay {delay} ms, pass every {period} ms: {short} grants short"
+                );
+                assert_conforms(&sim.grants, delay, 100);
+                // Passes are at most 33 ms apart: a pass grants what became
+                // due since the previous one, not the whole credit.
+                assert!(
+                    most_at_once(&sim.grants) as u64 <= period.div_ceil(delay).max(1),
+                    "delay {delay} ms, pass every {period} ms: {} at once",
+                    most_at_once(&sim.grants)
+                );
+            }
+        }
+    }
+
+    /// Without credit (`spacing_credit_ms = 0`, the rule before SCR-90) the
+    /// rate is quantized by the pass period: a 25 ms delay with a pass
+    /// every 33 ms gets one grant per pass, a 40 ms delay one every other.
+    #[test]
+    fn without_credit_the_rate_is_quantized_by_the_pass_period() {
+        let mut sim = Sim::new(spaced(25, 0), JobLimits::default());
+        sim.run(0, 1_000, 33);
+        assert_eq!(sim.grants.len(), 31);
+        assert_eq!(most_at_once(&sim.grants), 1);
+        let mut sim = Sim::new(spaced(40, 0), JobLimits::default());
+        sim.run(0, 1_000, 33);
+        assert_eq!(sim.grants.len(), 16);
+        assert_conforms(&sim.grants, 40, 0);
+    }
+
+    /// The burst after an idle period is `1 + credit / delay` grants, and a
+    /// domain never requested starts with one.
+    #[test]
+    fn burst_is_bounded_by_the_credit() {
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        let first = sim.pass(0, 50);
+        assert_eq!(
+            first,
+            Grants {
+                granted: 1,
+                next: Acquire::Wait(Duration::from_millis(25))
+            }
+        );
+        // Ten seconds idle bank 100 ms, not ten seconds: 1 + 100 / 25.
+        let late = sim.pass(10_000, 50);
+        assert_eq!(
+            late,
+            Grants {
+                granted: 5,
+                next: Acquire::Wait(Duration::from_millis(25))
+            }
+        );
+        // Then the delay again.
+        assert_eq!(sim.pass(10_010, 50).granted, 0);
+        assert_eq!(sim.pass(10_025, 50).granted, 1);
+        assert_conforms(&sim.grants, 25, 100);
+
+        // A pass 60 ms late is owed two grants, not the whole credit.
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        sim.pass(0, 50);
+        assert_eq!(
+            sim.pass(60, 50),
+            Grants {
+                granted: 2,
+                next: Acquire::Wait(Duration::from_millis(15))
+            }
+        );
+        // Asking for fewer than are owed leaves the rest available.
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        sim.pass(0, 1);
+        assert_eq!(
+            sim.pass(1_000, 2),
+            Grants {
+                granted: 2,
+                next: Acquire::Granted
+            }
+        );
+        assert_eq!(sim.pass(1_000, 50).granted, 3);
+    }
+
+    /// A delay of a second or more (a robots `Crawl-delay`, a slow job
+    /// rate) gets no credit at all: requests are never closer than it.
+    #[test]
+    fn long_delays_are_spaced_strictly() {
+        let robots = spaced(25, 100);
+        robots.set_delay("a.test", 2_000);
+        let slow_job = JobLimits {
+            min_delay_ms: 2_000,
+            ..JobLimits::default()
+        };
+        let at_threshold = JobLimits {
+            min_delay_ms: 1_000,
+            ..JobLimits::default()
+        };
+        for (p, limits, delay) in [
+            (robots, JobLimits::default(), 2_000),
+            (spaced(25, 100), slow_job, 2_000),
+            (spaced(25, 100), at_threshold, 1_000),
+        ] {
+            let mut sim = Sim::new(p, limits);
+            sim.run(0, 9_000, 33);
+            // Idle for a while, then passes again: still no catching up.
+            sim.run(30_000, 39_000, 33);
+            assert_conforms(&sim.grants, delay, 0);
+            assert_eq!(most_at_once(&sim.grants), 1);
+            for w in sim.grants.windows(2) {
+                assert!(w[1] - w[0] >= delay, "{} ms apart", w[1] - w[0]);
+            }
+            // Each grant waits for the first pass after the delay.
+            assert_eq!(sim.grants.len() as u64, 2 * (9_000 / (delay + 33) + 1));
+        }
+    }
+
+    /// An explicit delay is a floor on the real gap between two requests,
+    /// whatever its value: a job's `per_domain_delay_ms`, its
+    /// `requests_per_second`, a robots `Crawl-delay`. No credit, no burst
+    /// after an idle period, nothing given back after a late pass.
+    #[test]
+    fn explicit_delays_are_spaced_strictly() {
+        let job = |min_delay_ms| JobLimits {
+            min_delay_ms,
+            ..JobLimits::default()
+        };
+        let rate = JobLimits {
+            max_rps: Some(10.0),
+            ..JobLimits::default()
+        };
+        let robots = spaced(25, 100);
+        robots.set_delay("a.test", 300);
+        for (p, limits, delay) in [
+            (spaced(25, 100), job(50), 50u64),
+            (spaced(25, 100), job(250), 250),
+            (spaced(25, 100), rate, 100),
+            (robots, JobLimits::default(), 300),
+        ] {
+            assert_eq!(
+                spacing(
+                    p.config(),
+                    25,
+                    p.domains
+                        .read()
+                        .get("a.test")
+                        .map_or(RobotsInfo::default(), |s| s.robots),
+                    &limits
+                ),
+                Spacing {
+                    delay_ms: delay,
+                    credit_ms: 0,
+                    real_gap_ms: delay
+                }
+            );
+            let mut sim = Sim::new(p, limits);
+            sim.run(0, 3_000, 33);
+            // One grant per delay, each at the first pass after it.
+            let step = delay.div_ceil(33) * 33;
+            assert_eq!(sim.grants.len() as u64, 1 + 2_970 / step, "delay {delay}");
+            // After ten idle seconds: one grant, and the delay again.
+            assert_eq!(
+                sim.pass(13_000, 50),
+                Grants {
+                    granted: 1,
+                    next: Acquire::Wait(Duration::from_millis(delay))
+                },
+                "delay {delay}"
+            );
+            assert_eq!(sim.pass(13_000 + delay - 1, 50).granted, 0);
+            // A pass that comes 60 ms late: one grant, and the next one a
+            // full delay after it, not 60 ms sooner.
+            assert_eq!(sim.pass(13_000 + delay + 60, 50).granted, 1);
+            assert_eq!(
+                sim.pass(13_000 + 2 * delay + 59, 50),
+                Grants {
+                    granted: 0,
+                    next: Acquire::Wait(Duration::from_millis(1))
+                },
+                "delay {delay}"
+            );
+            sim.run(20_000, 23_000, 33);
+            assert_eq!(most_at_once(&sim.grants), 1, "delay {delay}");
+            for w in sim.grants.windows(2) {
+                assert!(
+                    w[1] - w[0] >= delay,
+                    "delay {delay}: {} ms apart",
+                    w[1] - w[0]
+                );
+            }
+        }
+    }
+
+    /// Jobs with and without an explicit delay share a domain: each call is
+    /// judged on its own delay, and the strict one is measured from the
+    /// real last request, not from the credited job's schedule.
+    #[test]
+    fn strict_job_is_never_granted_early_on_a_domain_shared_with_a_credited_job() {
+        let p = spaced(25, 100);
+        let base = Instant::now();
+        let adaptive = JobLimits::default();
+        let strict = JobLimits {
+            min_delay_ms: 50,
+            ..JobLimits::default()
+        };
+        let mut n = 0;
+        let mut ask = |job: &str, limits: JobLimits, at_ms: u64, want: usize| {
+            let tokens: Vec<String> = (0..want).map(|i| format!("t{}", n + i)).collect();
+            n += want;
+            p.acquire_many_at(
+                &SlotsRequest {
+                    domain: "a.test",
+                    job_id: job,
+                    tokens: &tokens,
+                    limits,
+                },
+                base + Duration::from_millis(at_ms),
+            )
+        };
+        let wait = |ms| Acquire::Wait(Duration::from_millis(ms));
+        assert_eq!(ask("a", adaptive, 0, 50).granted, 1);
+        // The adaptive job uses its credit after an idle second...
+        assert_eq!(ask("a", adaptive, 1_000, 50).granted, 5);
+        // ...and the strict job waits its 50 ms from that real request.
+        assert_eq!(
+            ask("b", strict, 1_010, 50),
+            Grants {
+                granted: 0,
+                next: wait(40)
+            }
+        );
+        assert_eq!(
+            ask("b", strict, 1_050, 50),
+            Grants {
+                granted: 1,
+                next: wait(50)
+            }
+        );
+        // A strict grant leaves no credit behind for the adaptive job.
+        assert_eq!(
+            ask("a", adaptive, 1_060, 50),
+            Grants {
+                granted: 0,
+                next: wait(15)
+            }
+        );
+        // The adaptive job is granted late (due at 1075, granted at 1200):
+        // its schedule only advances to 1100, but the strict job is spaced
+        // from 1200.
+        assert_eq!(ask("a", adaptive, 1_200, 1).granted, 1);
+        assert_eq!(
+            ask("b", strict, 1_210, 50),
+            Grants {
+                granted: 0,
+                next: wait(40)
+            }
+        );
+        assert_eq!(ask("b", strict, 1_250, 50).granted, 1);
+    }
+
+    /// A job's explicit delay below the adaptive delay does not set the
+    /// spacing (the adaptive delay does, with its credit), but stays a
+    /// floor on the real gap: never two requests at once.
+    #[test]
+    fn explicit_delay_below_the_adaptive_one_is_still_a_floor() {
+        let limits = JobLimits {
+            min_delay_ms: 50,
+            ..JobLimits::default()
+        };
+        let p = spaced(80, 100);
+        assert_eq!(
+            spacing(p.config(), 80, RobotsInfo::default(), &limits),
+            Spacing {
+                delay_ms: 80,
+                credit_ms: 100,
+                real_gap_ms: 50
+            }
+        );
+        let mut sim = Sim::new(p, limits);
+        sim.run(0, 2_000, 33);
+        // After an idle period: one grant, the next 50 ms later.
+        assert_eq!(
+            sim.pass(10_000, 50),
+            Grants {
+                granted: 1,
+                next: Acquire::Wait(Duration::from_millis(50))
+            }
+        );
+        sim.run(10_033, 12_000, 33);
+        assert_eq!(most_at_once(&sim.grants), 1);
+        for w in sim.grants.windows(2) {
+            assert!(w[1] - w[0] >= 50, "{} ms apart", w[1] - w[0]);
+        }
+        assert_conforms(&sim.grants, 80, 100);
+        // 4 s of passes at one per 80 ms, give or take a couple.
+        assert!(
+            (48..=52).contains(&sim.grants.len()),
+            "{}",
+            sim.grants.len()
+        );
+    }
+
+    /// A pause (`Retry-After`) is waited out, banks no credit, and the
+    /// schedule restarts at its end.
+    #[test]
+    fn pause_is_respected_and_banks_no_credit() {
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        assert_eq!(sim.pass(0, 50).granted, 1);
+        sim.report_with(
+            FetchReport {
+                retry_until_ms: Some(1_000),
+                ..report("a.test", "j", "t0", FetchSignal::NoRequest)
+            },
+            0,
+        );
+        assert_eq!(
+            sim.pass(400, 50),
+            Grants {
+                granted: 0,
+                next: Acquire::Wait(Duration::from_millis(600))
+            }
+        );
+        assert_eq!(sim.pass(999, 50).granted, 0);
+        // 60 ms after the pause: the requests due at 1000, 1025 and 1050,
+        // not the five a full credit would give.
+        assert_eq!(
+            sim.pass(1_060, 50),
+            Grants {
+                granted: 3,
+                next: Acquire::Wait(Duration::from_millis(15))
+            }
+        );
+        // Right at the end of a pause: one.
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        sim.pass(0, 50);
+        sim.report_with(
+            FetchReport {
+                retry_until_ms: Some(1_000),
+                ..report("a.test", "j", "t0", FetchSignal::NoRequest)
+            },
+            0,
+        );
+        assert_eq!(sim.pass(1_000, 50).granted, 1);
+    }
+
+    /// A 429 raises the delay (×1.5) and drops the banked credit; the rate
+    /// then follows the raised delay.
+    #[test]
+    fn rate_limit_drops_the_credit_and_the_backoff_holds() {
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        assert_eq!(sim.pass(0, 50).granted, 1);
+        // Idle until 1000 (full credit), then the 429 comes in.
+        sim.report("t0", FetchSignal::RateLimited, 1_000);
+        assert_eq!(sim.p.effective_delay_ms("a.test"), 37);
+        assert_eq!(
+            sim.pass(1_000, 50),
+            Grants {
+                granted: 1,
+                next: Acquire::Wait(Duration::from_millis(37))
+            }
+        );
+        sim.run(1_033, 2_000, 33);
+        assert_conforms(&sim.grants[1..], 37, 100);
+        // 1 s at 37 ms: 27 grants, give or take one.
+        let after = sim.grants.len() as i64 - 1;
+        assert!((26..=28).contains(&after), "{after} grants");
+
+        // An error streak pauses the domain: nothing is granted, whatever
+        // the credit.
+        let mut sim = Sim::new(spaced(25, 100), JobLimits::default());
+        assert_eq!(sim.pass(0, 10).granted, 1);
+        sim.run(25, 300, 25);
+        for i in 0..10 {
+            sim.report(&format!("t{i}"), FetchSignal::Error, 300);
+        }
+        let granted = sim.grants.len();
+        sim.run(300, 5_000, 33);
+        assert_eq!(sim.grants.len(), granted, "paused for max_delay_ms");
+    }
+
+    /// Credit never grants more than the free in-flight slots of the
+    /// domain or of the job.
+    #[test]
+    fn credit_never_exceeds_the_in_flight_caps() {
+        let capped = |concurrent: usize| {
+            PolitenessScheduler::new(PolitenessConfig {
+                default_delay_ms: 10,
+                min_delay_ms: 10,
+                concurrent_per_domain: concurrent,
+                ..Default::default()
+            })
+        };
+        // Domain cap 3: the 11 grants the credit allows become 2 (one slot
+        // is held by the first request).
+        let mut sim = Sim::new(capped(3), JobLimits::default());
+        assert_eq!(sim.pass(0, 50).granted, 1);
+        assert_eq!(
+            sim.pass(5_000, 50),
+            Grants {
+                granted: 2,
+                next: Acquire::DomainBusy
+            }
+        );
+        assert_eq!(sim.pass(5_033, 50).granted, 0);
+        // A freed slot is granted at once while credit is left.
+        sim.report("t1", FetchSignal::Success, 5_040);
+        assert_eq!(
+            sim.pass(5_040, 50),
+            Grants {
+                granted: 1,
+                next: Acquire::DomainBusy
+            }
+        );
+
+        // Job cap 2, checked before the domain's.
+        let limits = JobLimits {
+            max_in_flight: Some(2),
+            ..JobLimits::default()
+        };
+        let mut sim = Sim::new(capped(8), limits);
+        assert_eq!(sim.pass(0, 50).granted, 1);
+        assert_eq!(
+            sim.pass(5_000, 50),
+            Grants {
+                granted: 1,
+                next: Acquire::JobBusy
+            }
+        );
+        assert_eq!(sim.p.job_in_flight("j"), 2);
+        assert_eq!(
+            sim.pass(5_100, 50),
+            Grants {
+                granted: 0,
+                next: Acquire::JobBusy
+            }
+        );
+    }
+
+    /// A store that only implements the single-slot calls still serves
+    /// `try_acquire_many` (one slot at a time).
+    #[tokio::test]
+    async fn default_try_acquire_many_asks_one_slot_at_a_time() {
+        struct Single(PolitenessScheduler);
+        #[async_trait]
+        impl PolitenessStore for Single {
+            async fn try_acquire(&self, req: &SlotRequest<'_>) -> Result<Acquire> {
+                Ok(self.0.acquire(req))
+            }
+            async fn release(&self, d: &str, j: &str, t: &str) -> Result<()> {
+                self.0.release(d, j, t).await
+            }
+            async fn report(&self, r: &FetchReport<'_>) -> Result<()> {
+                self.0.report(r).await
+            }
+            fn is_shared(&self) -> bool {
+                false
+            }
+        }
+        let tokens: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let many = |domain| SlotsRequest {
+            domain,
+            job_id: "j",
+            tokens: &tokens,
+            limits: JobLimits::default(),
+        };
+        let p = Single(fast(3));
+        assert_eq!(
+            p.try_acquire_many(&many("a.test")).await.unwrap(),
+            Grants {
+                granted: 3,
+                next: Acquire::DomainBusy
+            }
+        );
+        let p = Single(fast(8));
+        assert_eq!(
+            p.try_acquire_many(&many("a.test")).await.unwrap(),
+            Grants {
+                granted: 5,
+                next: Acquire::Granted
+            }
+        );
+        let p = Single(spaced(250, 100));
+        let got = p.try_acquire_many(&many("a.test")).await.unwrap();
+        assert_eq!(got.granted, 1);
+        assert!(matches!(got.next, Acquire::Wait(_)), "{got:?}");
     }
 }

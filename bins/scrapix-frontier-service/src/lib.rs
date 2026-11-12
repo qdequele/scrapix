@@ -68,9 +68,9 @@ pub use timeout_store::{TimeoutStore, STORE_CALL_TIMEOUT};
 use scrapix_core::{Ack, CrawlUrl};
 use scrapix_frontier::{
     extract_domain, Acquire, Admission, CrawlRecord, FetchReport, FetchSignal, FrontierStore,
-    JobCounters, JobLimits, JobRunState, LinkGraph, LinkGraphConfig, MemoryFrontierStore,
+    Grants, JobCounters, JobLimits, JobRunState, LinkGraph, LinkGraphConfig, MemoryFrontierStore,
     PolitenessConfig, PolitenessScheduler, PolitenessStore, RecrawlConfig, RecrawlDecision,
-    RecrawlScheduler, SlotRequest, UrlHistory, UrlHistoryConfig,
+    RecrawlScheduler, SlotsRequest, UrlHistory, UrlHistoryConfig,
 };
 use scrapix_queue::{
     topic_names, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, CrawlHistoryMessage,
@@ -118,6 +118,10 @@ const DISPATCH_JOB_CONCURRENCY: usize = 32;
 /// How many politeness slots (one per distinct domain) a batch asks for at
 /// once.
 const ACQUIRE_CONCURRENCY: usize = 32;
+/// Most slots asked for one domain in one politeness call. The store grants
+/// far fewer (its spacing credit and the domain's free slots bound a call);
+/// a domain with no delay asks again in the same pass.
+const MAX_SLOTS_PER_ASK: usize = 32;
 /// How many jobs the progress publisher reads and publishes at once.
 const PROGRESS_CONCURRENCY: usize = 32;
 /// Pops that found nothing, in a row, before an idle job is polled less
@@ -296,7 +300,28 @@ pub async fn build_store(args: &Args) -> anyhow::Result<Arc<dyn FrontierStore>> 
     }
 }
 
-/// Politeness settings from `args`.
+/// `DOMAIN_SPACING_CREDIT_MS`: the spacing credit (ms), i.e. how much of
+/// the time lost between a request to a domain becoming due and the
+/// dispatch pass that sends it is given back, as requests sent closer
+/// together (never more than `1 + credit / delay` at once). Only the
+/// adaptive delay is credited: a delay set by the job (`per_domain_delay_ms`,
+/// `requests_per_second`), by robots.txt or of 1 s or more is always
+/// strict. It makes an adaptively paced domain's rate `1 / delay` whatever
+/// the dispatch interval. `0` spaces every request strictly from the last
+/// one sent. Default 100. Read from the environment rather than `Args`, whose
+/// fields other binaries (`scrapix all`) list one by one.
+fn spacing_credit_from_env() -> u64 {
+    let default = PolitenessConfig::default().spacing_credit_ms;
+    match std::env::var("DOMAIN_SPACING_CREDIT_MS") {
+        Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
+            warn!(value = %raw, default, "Invalid DOMAIN_SPACING_CREDIT_MS; using the default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+/// Politeness settings from `args` (and `DOMAIN_SPACING_CREDIT_MS`).
 pub fn politeness_config(args: &Args) -> PolitenessConfig {
     PolitenessConfig {
         default_delay_ms: args.domain_delay_ms,
@@ -306,6 +331,8 @@ pub fn politeness_config(args: &Args) -> PolitenessConfig {
         robots_delay_multiplier: args.robots_delay_multiplier,
         concurrent_per_domain: args.concurrent_per_domain.max(1),
         slot_ttl: Duration::from_secs(args.request_timeout_secs.max(1) * 2),
+        spacing_credit_ms: spacing_credit_from_env(),
+        ..PolitenessConfig::default()
     }
 }
 
@@ -1443,13 +1470,20 @@ impl FrontierService {
     /// pop in the counters, so nothing is counted twice). Returns whether
     /// this instance holds the job's dispatch lease.
     ///
-    /// Politeness slots are asked for one URL per domain at a time, in pop
-    /// order, `ACQUIRE_CONCURRENCY` domains at once (the store checks the
-    /// domain and job caps atomically, so asking concurrently cannot grant
-    /// more than serially). A domain that was granted a slot with a
-    /// non-zero delay cannot be granted another one before that delay, so
-    /// its other URLs of the batch are parked for it without asking; with a
-    /// zero delay they ask in the next round. The granted URLs' bus sends
+    /// Politeness slots are asked for one domain at a time, in pop order,
+    /// `ACQUIRE_CONCURRENCY` domains at once (the store checks the domain
+    /// and job caps atomically, so asking concurrently cannot grant more
+    /// than serially). One call asks for a slot per URL of the domain (at
+    /// most `MAX_SLOTS_PER_ASK`) and the store grants as many as the
+    /// domain's schedule and the caps allow: one, or several when this pass
+    /// came later than the domain's adaptive delay (its spacing credit,
+    /// see `scrapix_frontier::politeness`; never for a delay set by the job
+    /// or robots.txt), so the rate an adaptively paced domain gets does not
+    /// depend on how often the dispatcher passes. The store also says how
+    /// long the domain's next grant is away: its other URLs of the batch
+    /// are parked for that long without asking again; only a domain that
+    /// could be granted more right now asks in the next round. The granted
+    /// URLs' bus sends
     /// all run at once and are awaited together at the end of the batch: one
     /// send waits for the producer's linger and the broker's ack, so sending
     /// them one after another capped the frontier at a few dozen URLs per
@@ -1550,11 +1584,10 @@ impl FrontierService {
                 .flat_map(|(_, urls)| urls)
                 .collect()
         }
-        // Each round asks for one slot per domain, for the domain's first
-        // URL. A domain that then cannot take another URL of this batch
-        // (busy, waiting, or granted a slot with a delay) has its other URLs
-        // parked without asking again; one granted with no delay asks for
-        // its next URL in the next round.
+        // Each round asks once per domain, for its first URLs. A domain
+        // that then cannot take another URL of this batch (busy, or its
+        // next grant is not due) has its other URLs parked without asking
+        // again; one that could be granted more asks in the next round.
         'batch: while !domains.is_empty() {
             let mut next_round: Vec<DomainUrls> = Vec::new();
             let mut round = domains.into_iter();
@@ -1586,20 +1619,22 @@ impl FrontierService {
                     }
                 }
 
-                // The slot token becomes the dispatched message's id, which
+                // A slot's token becomes the dispatched message's id, which
                 // the crawler echoes back in its FetchFeedback.
-                let acquired = futures::future::join_all(chunk.iter().map(|(domain, _)| {
-                    let token = uuid::Uuid::new_v4().to_string();
+                let acquired = futures::future::join_all(chunk.iter().map(|(domain, urls)| {
+                    let tokens: Vec<String> = (0..urls.len().min(MAX_SLOTS_PER_ASK))
+                        .map(|_| uuid::Uuid::new_v4().to_string())
+                        .collect();
                     async move {
-                        let slot = SlotRequest {
+                        let slots = SlotsRequest {
                             domain,
                             job_id,
-                            token: &token,
+                            tokens: &tokens,
                             limits,
                         };
                         let acquired = tokio::time::timeout(
                             STORE_CALL_TIMEOUT,
-                            self.politeness.try_acquire_spaced(&slot),
+                            self.politeness.try_acquire_many(&slots),
                         )
                         .await
                         .unwrap_or_else(|_| {
@@ -1607,37 +1642,41 @@ impl FrontierService {
                                 "politeness try_acquire timed out".to_string(),
                             ))
                         });
-                        (token, acquired)
+                        (tokens, acquired)
                     }
                 }))
                 .await;
 
                 let mut job_busy = false;
-                for ((domain, mut urls), (token, acquired)) in chunk.into_iter().zip(acquired) {
-                    let Some(url) = urls.pop_front() else {
-                        continue;
-                    };
-                    // `granted`: the URL is sent. `wait`: how long the
-                    // domain's other URLs (and this one, when not granted)
-                    // are parked, so the next ticks don't pop and requeue
-                    // them over and over; `None`: the domain may be granted
-                    // again right away (zero delay). `by_politeness`: the
-                    // wait is the domain's or the job's, not an error.
+                for ((domain, mut urls), (tokens, acquired)) in chunk.into_iter().zip(acquired) {
+                    // `granted`: how many of the domain's URLs are sent.
+                    // `wait`: how long its other URLs are parked, so the
+                    // next ticks don't pop and requeue them over and over;
+                    // `None`: the domain may be granted more right away.
+                    // `by_politeness`: the wait is the domain's or the
+                    // job's, not an error.
                     let (granted, wait, by_politeness) = match acquired {
-                        Ok((Acquire::Granted, spacing)) => {
-                            (true, (!spacing.is_zero()).then_some(spacing), true)
-                        }
-                        Ok((Acquire::Wait(wait), _)) => (false, Some(wait), true),
-                        Ok((Acquire::DomainBusy, _)) => (false, Some(BUSY_RETRY), true),
-                        Ok((Acquire::JobBusy, _)) => {
-                            job_busy = true;
-                            (false, Some(BUSY_RETRY), true)
+                        Ok(Grants { granted, next }) => {
+                            let wait = match next {
+                                // A store that grants nothing and refuses
+                                // nothing would be asked forever.
+                                Acquire::Granted if granted == 0 => Some(BUSY_RETRY),
+                                Acquire::Granted => None,
+                                Acquire::Wait(wait) => Some(wait),
+                                Acquire::DomainBusy => Some(BUSY_RETRY),
+                                Acquire::JobBusy => {
+                                    job_busy = true;
+                                    Some(BUSY_RETRY)
+                                }
+                            };
+                            (granted.min(tokens.len()), wait, true)
                         }
                         Err(e) => {
                             warn!(job_id = %job_id, domain = %domain, error = %e, "Politeness check failed");
-                            (false, Some(ERROR_RETRY), false)
+                            (0, Some(ERROR_RETRY), false)
                         }
                     };
+                    let send: Vec<CrawlUrl> = urls.drain(..granted.min(urls.len())).collect();
                     let mut parked = 0;
                     match wait {
                         Some(wait) => {
@@ -1647,41 +1686,34 @@ impl FrontierService {
                         None if !urls.is_empty() => next_round.push((domain.clone(), urls)),
                         None => {}
                     }
-                    let url = if granted {
-                        Some(url)
-                    } else {
-                        parked += 1;
-                        bounced.push(park(url, wait.unwrap_or_default()));
-                        None
-                    };
                     self.metrics
                         .urls_delayed
                         .fetch_add(parked as u64, Ordering::Relaxed);
                     if by_politeness {
                         politeness_bounced += parked;
                     }
-                    let Some(url) = url else {
-                        continue;
-                    };
 
-                    let mut msg = template.child(url);
-                    msg.message_id = token;
-                    let mut hard_stop = hard_stop.clone();
-                    sends.push(async move {
-                        let key = msg.partition_key();
-                        let send = self
-                            .producer
-                            .send(topic_names::URL_PROCESSING, Some(&key), &msg);
-                        // Raced only against the shutdown hard stop (see
-                        // `drain_dispatcher`); normally the send runs to completion.
-                        let sent = tokio::select! {
-                            r = send => r,
-                            _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
-                                "send abandoned at shutdown".to_string(),
-                            )),
-                        };
-                        (domain, msg, sent)
-                    });
+                    for (url, token) in send.into_iter().zip(tokens) {
+                        let mut msg = template.child(url);
+                        msg.message_id = token;
+                        let mut hard_stop = hard_stop.clone();
+                        let domain = domain.clone();
+                        sends.push(async move {
+                            let key = msg.partition_key();
+                            let send =
+                                self.producer
+                                    .send(topic_names::URL_PROCESSING, Some(&key), &msg);
+                            // Raced only against the shutdown hard stop (see
+                            // `drain_dispatcher`); normally the send runs to completion.
+                            let sent = tokio::select! {
+                                r = send => r,
+                                _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
+                                    "send abandoned at shutdown".to_string(),
+                                )),
+                            };
+                            (domain, msg, sent)
+                        });
+                    }
                 }
                 if job_busy {
                     // Every other URL of the job would be refused too.
@@ -2285,6 +2317,7 @@ pub async fn run_with_bus(
 mod tests {
     use super::*;
     use scrapix_core::JobSpec;
+    use scrapix_frontier::SlotRequest;
     use scrapix_queue::{ChannelBus, CrawlEvent, FetchFeedback};
     use std::time::Instant;
 
@@ -3758,7 +3791,7 @@ mod tests {
         assert!(h.service.dispatching.lock().is_empty());
     }
 
-    /// Counts the slots asked of an in-memory politeness scheduler.
+    /// Counts the calls asking an in-memory politeness scheduler for slots.
     struct CountingPoliteness {
         inner: PolitenessScheduler,
         asks: AtomicU64,
@@ -3775,6 +3808,10 @@ mod tests {
         ) -> scrapix_core::Result<(Acquire, Duration)> {
             self.asks.fetch_add(1, Ordering::SeqCst);
             self.inner.try_acquire_spaced(req).await
+        }
+        async fn try_acquire_many(&self, req: &SlotsRequest<'_>) -> scrapix_core::Result<Grants> {
+            self.asks.fetch_add(1, Ordering::SeqCst);
+            self.inner.try_acquire_many(req).await
         }
         async fn release(
             &self,
@@ -3793,7 +3830,7 @@ mod tests {
     }
 
     /// One dispatcher pass over a job with `urls` URLs on one domain:
-    /// (slots asked, URLs dispatched, URLs back in the store).
+    /// (politeness calls, URLs dispatched, URLs back in the store).
     async fn one_pass_on_one_domain(args: Args, urls: usize) -> (u64, u64, u64) {
         let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
         seed_store(&*store, "job-asks", urls).await;
@@ -3823,15 +3860,126 @@ mod tests {
         assert_eq!(one_pass_on_one_domain(args, 10).await, (1, 1, 9));
     }
 
-    /// With a zero delay a domain can be granted again right away, up to
-    /// its concurrency: its URLs keep asking until the domain is busy.
+    /// With a zero delay a domain is granted up to its concurrency, in one
+    /// call.
     #[tokio::test]
-    async fn zero_delay_domain_keeps_asking_until_busy() {
+    async fn zero_delay_domain_is_granted_until_busy_in_one_call() {
         let mut args = test_args();
         args.domain_delay_ms = 0;
         args.concurrent_per_domain = 3;
-        // Three grants, then one `DomainBusy` parks the other six.
-        assert_eq!(one_pass_on_one_domain(args, 10).await, (4, 3, 7));
+        // Three grants and `DomainBusy` for the rest, which is parked.
+        assert_eq!(one_pass_on_one_domain(args, 10).await, (1, 3, 7));
+    }
+
+    /// With a zero delay and more URLs than one call asks for, the domain
+    /// asks again in the same pass.
+    #[tokio::test]
+    async fn zero_delay_domain_asks_again_past_one_call() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 10_000;
+        let urls = MAX_SLOTS_PER_ASK + 6;
+        assert!(urls <= INITIAL_POP_SIZE, "one pop takes them all");
+        assert_eq!(
+            one_pass_on_one_domain(args, urls).await,
+            (2, urls as u64, 0)
+        );
+    }
+
+    /// SCR-90: a pass that comes later than the domain's delay is granted
+    /// the slots it is owed in one call, up to the spacing credit, and the
+    /// other URLs are parked without asking again.
+    #[tokio::test]
+    async fn late_pass_gets_the_grants_it_is_owed_in_one_call() {
+        let mut args = test_args();
+        args.domain_delay_ms = 25;
+        args.min_domain_delay_ms = 25;
+        args.concurrent_per_domain = 8;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        seed_store(&*store, "job-late", 20).await;
+        let politeness = Arc::new(CountingPoliteness {
+            inner: PolitenessScheduler::new(politeness_config(&args)),
+            asks: AtomicU64::new(0),
+        });
+        let bus = ChannelBus::new();
+        let mut service = build_service(&bus, &args, store.clone()).await;
+        service.politeness = politeness.clone();
+        let sent = || service.metrics.urls_dispatched.load(Ordering::Relaxed);
+
+        // A domain never requested has no credit: one grant.
+        service.dispatch_tick().await;
+        assert_eq!((politeness.asks.load(Ordering::SeqCst), sent()), (1, 1));
+        // 60 ms later two delays have passed: two grants, in one call.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        service.dispatch_tick().await;
+        assert_eq!(politeness.asks.load(Ordering::SeqCst), 2);
+        // (Three if this pass ran over 75 ms after the first.)
+        assert!((3..=4).contains(&sent()), "{} sent", sent());
+        // After a long gap the credit is capped at 1 + 100 / 25 grants, and
+        // the domain has 8 slots, 3 (or 4) of them held: 8 sent in all.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        service.dispatch_tick().await;
+        assert_eq!((politeness.asks.load(Ordering::SeqCst), sent()), (3, 8));
+        assert_eq!(store.queued("job-late").await.unwrap(), 12);
+    }
+
+    /// URLs per second dispatched to one site with a 25 ms delay and a
+    /// dispatcher pass every 33 ms, measured over two seconds.
+    async fn single_site_rate(spacing_credit_ms: u64) -> f64 {
+        let store = Arc::new(FlakyStore::default());
+        seed_store(&*store, "job-rate", 500).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 25;
+        args.min_domain_delay_ms = 25;
+        args.dispatch_interval_ms = 33;
+        // No crawler sends feedback here: don't let held slots cap the test.
+        args.concurrent_per_domain = 10_000;
+        let bus = ChannelBus::new();
+        let mut service = build_service(&bus, &args, store.clone()).await;
+        service.politeness = Arc::new(PolitenessScheduler::new(PolitenessConfig {
+            spacing_credit_ms,
+            ..politeness_config(&args)
+        }));
+        let service = Arc::new(service);
+        let h = Harness {
+            bus,
+            handle: tokio::spawn(service.clone().run()),
+            service,
+        };
+        // Measure from the first dispatch.
+        let started = Instant::now();
+        while h.service.metrics.urls_dispatched.load(Ordering::Relaxed) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(2), "no dispatch");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let t0 = Instant::now();
+        let before = h.service.metrics.urls_dispatched.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        let after = h.service.metrics.urls_dispatched.load(Ordering::Relaxed);
+        let secs = t0.elapsed().as_secs_f64();
+        h.stop();
+        (after - before) as f64 / secs
+    }
+
+    /// SCR-90: a site's rate is what its delay allows, not what the
+    /// dispatch interval allows. A 25 ms delay is 40 URLs/s; with a pass
+    /// every 33 ms, one grant per pass is 30 URLs/s at best.
+    #[tokio::test]
+    async fn single_site_rate_follows_the_delay_not_the_dispatch_interval() {
+        let rate = single_site_rate(100).await;
+        // Never above the delay's rate (plus the 100 ms credit and the
+        // sends of the last pass, over two seconds); well above 30/s.
+        assert!(rate <= 43.5, "{rate:.1} URLs/s for a 25 ms delay");
+        assert!(rate >= 36.0, "{rate:.1} URLs/s for a 25 ms delay");
+    }
+
+    /// A spacing credit of 0 is the strict spacing of before: one
+    /// grant per pass.
+    #[tokio::test]
+    async fn without_spacing_credit_a_site_gets_one_url_per_pass() {
+        let rate = single_site_rate(0).await;
+        assert!(rate <= 31.5, "{rate:.1} URLs/s with a pass every 33 ms");
+        assert!(rate >= 20.0, "{rate:.1} URLs/s with a pass every 33 ms");
     }
 
     /// SCR-89: a job with nothing ready and a paused job are not asked

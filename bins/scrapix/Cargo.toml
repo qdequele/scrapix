@@ -13,14 +13,22 @@ path = "src/main.rs"
 [features]
 default = []
 browser = ["scrapix-worker-crawler/browser"]
+# `mimalloc`: use mimalloc as the binary's global allocator (set in
+# `src/main.rs`). Off by default: build with `--features mimalloc`. It is
+# faster on parsing (8 to 10% on Linux) but doubles the content worker's
+# peak memory, with no gain in crawl throughput end to end.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-scrapix-api = { path = "../scrapix-api" }
-scrapix-worker-crawler = { path = "../scrapix-worker-crawler" }
-scrapix-worker-content = { path = "../scrapix-worker-content" }
-scrapix-frontier-service = { path = "../scrapix-frontier-service" }
-scrapix-cli = { path = "../scrapix-cli" }
+# The service crates are used as libraries here: their own `mimalloc`
+# feature only concerns their standalone binaries.
+scrapix-api = { path = "../scrapix-api", default-features = false }
+scrapix-worker-crawler = { path = "../scrapix-worker-crawler", default-features = false }
+scrapix-worker-content = { path = "../scrapix-worker-content", default-features = false }
+scrapix-frontier-service = { path = "../scrapix-frontier-service", default-features = false }
+scrapix-cli = { path = "../scrapix-cli", default-features = false }
 scrapix-queue = { path = "../../crates/scrapix-queue" }
+mimalloc = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 clap = { workspace = true }

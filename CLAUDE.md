@@ -334,7 +334,9 @@ that names a Lab-owned table, reads included).
   (`{LAB_URL}/internal/*`, `X-Lab-Instance-Id: LAB_INSTANCE_ID` + Bearer
   `LAB_INSTANCE_SECRET`): credentials are sent to
   `POST /internal/auth/introspect` (cached for the Lab's `cache_ttl`, default
-  30 s, stale up to 5 min if the Lab is down, except answers with
+  30 s, one Lab call per key however many requests wait for it, and a key in
+  use is refreshed in the background from 80% of its `cache_ttl`, never
+  served past it because of a refresh; stale up to 5 min if the Lab is down, except answers with
   `cache_ttl` 0 (expired or expiring), which are never served stale; an unknown credential while the
   Lab is down is a 503 with `Retry-After: 5`; so a revoked key keeps working
   on the engine for up to `cache_ttl`, documented in
@@ -548,8 +550,18 @@ toward the crawler-reported `FetchFeedback.fetch_ms / CONCURRENT_PER_DOMAIN`
 (dropping at most ×0.9 per success), clamped to
 `[min(MIN_DOMAIN_DELAY_MS, DOMAIN_DELAY_MS), 30s]`; 429s and error streaks
 raise it ×1.5 (a job can only raise the delay, never lower it). A domain
-gets at most one URL per dispatch batch, so `DISPATCH_INTERVAL_MS` (20 ms)
-also caps one site at about 40 pages/s. The frontier holds a per-domain
+paced by its adaptive delay gets `1 / delay` whatever the dispatch period:
+the stores keep a virtual last-request time per domain (a grant needs
+`now >= last + delay` and sets `last = max(last + delay, now - credit, pause
+end)`), so a pass that comes late grants the URLs it is owed in one call. The
+credit is `DOMAIN_SPACING_CREDIT_MS` (default `100`, `0` = strict spacing
+everywhere): at most `1 + credit / delay` requests at once (5 at the 25 ms
+floor), within the free in-flight slots. Only the adaptive delay is
+credited. When a job's `per_domain_delay_ms` or `requests_per_second`, a
+robots `Crawl-delay` or `default_crawl_delay_ms` sets the delay, and for any
+delay of 1 s or more, spacing is strict: two requests are never closer than
+the delay. An explicit delay below the adaptive one is still a floor on the
+gap. A pause banks no credit, and a 429 or an error drops it. The frontier holds a per-domain
 slot from dispatch until the crawler's `FetchFeedback` — topic
 `scrapix.fetch.feedback` — reports the fetch back (not at dispatch time); a
 slot without feedback expires after `2 × REQUEST_TIMEOUT` (default `30`s), so
@@ -557,11 +569,11 @@ a lagging `scrapix.urls.processing` consumer effectively widens that safety
 window. The effective per-domain delay is
 `max(adaptive delay, job.rate_limit.per_domain_delay_ms (default 0), robots
 Crawl-delay if respected, 1000 / requests_per_second)`. The dispatcher runs
-up to 32 jobs concurrently per pass (never the same job twice), asks for one
-politeness slot per domain per round (up to 32 domains at once; after a grant
-the domain's other URLs in the batch are parked without asking) and sends a
-batch's granted URLs to the bus concurrently (one serial send waits ~20 ms of
-producer linger plus the broker ack, about 45 sends/s). Paused jobs and jobs
+up to 32 jobs concurrently per pass (never the same job twice), asks the
+politeness store once per domain per pass (one atomic call grants up to one
+slot per queued URL of that domain, up to 32 domains at once) and sends a
+batch's granted URLs to the bus concurrently (a send waits for its delivery
+report: `KAFKA_LINGER_MS`, default `0`, plus the broker ack). Paused jobs and jobs
 leased by another instance are polled every 200 ms, idle running jobs every
 100 ms. `rate_limit.default_crawl_delay_ms`
 (config default `0`) is a fallback `Crawl-delay` used only when robots.txt was
@@ -750,6 +762,8 @@ GROUP BY date ORDER BY date;
 | `OCR_BACKEND` | API + content workers: `auto` (vision if an AI provider is set, else tesseract), `vision`, `tesseract`, `off` |
 | `PDFIUM_LIB_PATH` | API + content workers: PDFium library used to rasterize pages for OCR (`/opt/pdfium/lib` in the images) |
 | `API_BROWSER_CONCURRENCY` | API: pages its browser renders at once (default `5`, at least 1); `/map` with `render_js` uses at most the pool minus a fifth, kept for `/scrape` |
+| `KAFKA_LINGER_MS` | Every service with a Kafka producer: producer `linger.ms`, `0` to `1000` (default `0`: send immediately). A send waits for its delivery report, so each publish stage costs at least one linger. An invalid value refuses to start |
+| `DOMAIN_SPACING_CREDIT_MS` | Frontier: how much of the time lost between a request becoming due and the dispatch pass is given back to a domain paced by its adaptive delay (default `100`; `0` = strict spacing). Never applies to a delay set by the job, by robots.txt, or of 1 s or more |
 | `FLUSH_INTERVAL_MS` | Content worker: milliseconds between periodic Meilisearch flushes (default `1000`, minimum `50`); a request is also cut at `BATCH_SIZE` documents or 20 MiB |
 | `OCR_MAX_PAGES_PER_DOCUMENT` / `OCR_DAILY_PAGE_BUDGET` | OCR cost controls (defaults `50` / `1000` per account per UTC day, `0` = unlimited) |
 

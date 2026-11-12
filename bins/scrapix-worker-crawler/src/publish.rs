@@ -13,9 +13,10 @@ use tokio::task::JoinSet;
 
 /// How many sends of one page (or one sitemap) are in flight at once.
 ///
-/// A send waits for its delivery report: about the producer's linger
-/// (20 ms) plus the broker ack. Sent one after the other, 100 links took
-/// about 2 s; in flight together they share the same batches.
+/// A send waits for its delivery report: the producer's linger
+/// (`KAFKA_LINGER_MS`, default 0) plus the broker ack. Sent one after the
+/// other, the sends of a page add up; in flight together they share the
+/// same batches.
 pub(crate) const SEND_CONCURRENCY: usize = 256;
 
 /// Room kept under the producer's message size limit for the record's key
