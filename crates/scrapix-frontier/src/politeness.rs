@@ -256,6 +256,16 @@ pub trait PolitenessStore: Send + Sync {
     /// Atomically check the domain's delay/pause, the domain and job
     /// in-flight caps, and take a slot if all allow it.
     async fn try_acquire(&self, req: &SlotRequest<'_>) -> Result<Acquire>;
+    /// [`Self::try_acquire`], plus, for a grant, the delay the domain now
+    /// imposes on this job before its next request (the effective delay at
+    /// the grant). The dispatcher parks the domain's other URLs for that
+    /// long instead of asking again only to be told to wait.
+    /// `Duration::ZERO` means no such delay is known: the domain may be
+    /// granted again right away (a zero effective delay, or a store that
+    /// does not report it). Always zero when the outcome is not a grant.
+    async fn try_acquire_spaced(&self, req: &SlotRequest<'_>) -> Result<(Acquire, Duration)> {
+        Ok((self.try_acquire(req).await?, Duration::ZERO))
+    }
     /// Free a slot without any accounting (the dispatch never reached the
     /// domain, e.g. the bus refused it).
     async fn release(&self, domain: &str, job_id: &str, token: &str) -> Result<()>;
@@ -597,6 +607,12 @@ impl PolitenessScheduler {
 
     /// Synchronous core of [`PolitenessStore::try_acquire`].
     pub fn acquire(&self, req: &SlotRequest<'_>) -> Acquire {
+        self.acquire_spaced(req).0
+    }
+
+    /// Synchronous core of [`PolitenessStore::try_acquire_spaced`]: the
+    /// outcome and, for a grant, the effective delay that was checked.
+    pub fn acquire_spaced(&self, req: &SlotRequest<'_>) -> (Acquire, Duration) {
         let ttl = self.config.slot_ttl;
         let mut domains = self.domains.write();
         let mut jobs = self.jobs.write();
@@ -605,7 +621,7 @@ impl PolitenessScheduler {
             .or_insert_with(|| DomainState::new(self.config.default_delay_ms));
         state.expire(ttl);
         if let Some(left) = state.pause_left() {
-            return Acquire::Wait(left);
+            return (Acquire::Wait(left), Duration::ZERO);
         }
         let job_held = match jobs.get_mut(req.job_id) {
             Some(slots) => {
@@ -619,15 +635,16 @@ impl PolitenessScheduler {
         }
         if let Some(cap) = req.limits.max_in_flight.filter(|c| *c > 0) {
             if job_held >= cap as usize {
-                return Acquire::JobBusy;
+                return (Acquire::JobBusy, Duration::ZERO);
             }
         }
         if state.in_flight.len() >= self.config.concurrent_per_domain {
-            return Acquire::DomainBusy;
+            return (Acquire::DomainBusy, Duration::ZERO);
         }
-        let left = state.delay_left(self.state_delay(state, &req.limits));
+        let delay_ms = self.state_delay(state, &req.limits);
+        let left = state.delay_left(delay_ms);
         if !left.is_zero() {
-            return Acquire::Wait(left);
+            return (Acquire::Wait(left), Duration::ZERO);
         }
         let now = Instant::now();
         state.in_flight.push(Slot {
@@ -638,7 +655,7 @@ impl PolitenessScheduler {
         jobs.entry(req.job_id.to_string())
             .or_default()
             .push((req.token.to_string(), now));
-        Acquire::Granted
+        (Acquire::Granted, Duration::from_millis(delay_ms))
     }
 
     /// Free `token`'s slots. Returns whether this instance held the domain
@@ -693,6 +710,10 @@ impl PolitenessScheduler {
 impl PolitenessStore for PolitenessScheduler {
     async fn try_acquire(&self, req: &SlotRequest<'_>) -> Result<Acquire> {
         Ok(self.acquire(req))
+    }
+
+    async fn try_acquire_spaced(&self, req: &SlotRequest<'_>) -> Result<(Acquire, Duration)> {
+        Ok(self.acquire_spaced(req))
     }
 
     async fn release(&self, domain: &str, job_id: &str, token: &str) -> Result<()> {
@@ -811,6 +832,52 @@ mod tests {
             retry_until_ms: None,
             fetch_ms: None,
         }
+    }
+
+    /// A grant reports the effective delay it was checked against (what
+    /// the dispatcher parks the domain's other URLs for); every other
+    /// outcome, and a zero delay, report none.
+    #[test]
+    fn grant_reports_the_effective_delay() {
+        let p = PolitenessScheduler::new(PolitenessConfig {
+            concurrent_per_domain: 8,
+            default_delay_ms: 250,
+            min_delay_ms: 25,
+            ..Default::default()
+        });
+        let l = JobLimits::default();
+        assert_eq!(
+            p.acquire_spaced(&req("a.test", "j", "t1", l)),
+            (Acquire::Granted, Duration::from_millis(250))
+        );
+        // Free slots do not help: the delay has not elapsed.
+        let (again, spacing) = p.acquire_spaced(&req("a.test", "j", "t2", l));
+        assert!(matches!(again, Acquire::Wait(_)), "{again:?}");
+        assert_eq!(spacing, Duration::ZERO);
+        // A job delay above the adaptive one is the one reported.
+        let slow = JobLimits {
+            min_delay_ms: 2_000,
+            ..JobLimits::default()
+        };
+        assert_eq!(
+            p.acquire_spaced(&req("b.test", "j", "t3", slow)),
+            (Acquire::Granted, Duration::from_millis(2_000))
+        );
+
+        // Zero delay: the domain can be granted again at once.
+        let p = fast(2);
+        assert_eq!(
+            p.acquire_spaced(&req("a.test", "j", "t1", l)),
+            (Acquire::Granted, Duration::ZERO)
+        );
+        assert_eq!(
+            p.acquire_spaced(&req("a.test", "j", "t2", l)),
+            (Acquire::Granted, Duration::ZERO)
+        );
+        assert_eq!(
+            p.acquire_spaced(&req("a.test", "j", "t3", l)),
+            (Acquire::DomainBusy, Duration::ZERO)
+        );
     }
 
     #[test]

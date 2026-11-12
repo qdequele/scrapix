@@ -42,17 +42,25 @@ const RECENT_DOMAIN_WINDOW: Duration = Duration::from_secs(600);
 /// floor, max delay, job min delay, rps delay, respect robots (0/1), default
 /// crawl delay (`0` unless the job set no explicit delay/rate), robots
 /// multiplier, token, slot ttl ms, state ttl ms.
-/// Returns 0 (granted), -1 (domain busy), -2 (job busy) or a wait in ms.
+/// Returns `{status, ms}`: `{0, effective delay}` (granted; the delay is the
+/// one this grant was checked against, i.e. the earliest the domain can be
+/// granted to this job again), `{1, wait}` (delay or pause not elapsed),
+/// `{-1, 0}` (domain busy) or `{-2, 0}` (job busy).
+///
+/// A second grant for one domain is only possible once `now - last_ms >=
+/// effective delay`, whatever `concurrent_per_domain` is (it only caps the
+/// in-flight count), so within one instant a domain is granted twice only
+/// when the effective delay is 0.
 const ACQUIRE_LUA: &str = r#"
 local now = tonumber(ARGV[1])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
 local h = redis.call('HMGET', KEYS[1], 'last_ms', 'delay_ms', 'robots_ms', 'pause_until', 'robots_checked')
 local pause = tonumber(h[4]) or 0
-if pause > now then return pause - now end
+if pause > now then return {1, pause - now} end
 local jobcap = tonumber(ARGV[3])
-if jobcap > 0 and redis.call('ZCARD', KEYS[3]) >= jobcap then return -2 end
-if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[2]) then return -1 end
+if jobcap > 0 and redis.call('ZCARD', KEYS[3]) >= jobcap then return {-2, 0} end
+if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[2]) then return {-1, 0} end
 local eff = tonumber(h[2]) or tonumber(ARGV[4])
 eff = math.max(eff, tonumber(ARGV[7]), tonumber(ARGV[8]))
 if ARGV[9] == '1' then
@@ -63,7 +71,7 @@ end
 local floor = tonumber(ARGV[5])
 eff = math.min(math.max(eff, floor), math.max(tonumber(ARGV[6]), floor))
 local last = tonumber(h[1])
-if last and now - last < eff then return eff - (now - last) end
+if last and now - last < eff then return {1, eff - (now - last)} end
 local ttl = tonumber(ARGV[13])
 redis.call('ZADD', KEYS[2], now + ttl, ARGV[12])
 redis.call('ZADD', KEYS[3], now + ttl, ARGV[12])
@@ -71,7 +79,7 @@ redis.call('HSET', KEYS[1], 'last_ms', now)
 redis.call('PEXPIRE', KEYS[1], ARGV[14])
 redis.call('PEXPIRE', KEYS[2], 2 * ttl)
 redis.call('PEXPIRE', KEYS[3], 2 * ttl)
-return 0
+return {0, eff}
 "#;
 
 /// `KEYS`: domain hash, domain zset, job zset.
@@ -208,6 +216,10 @@ impl RedisPoliteness {
 #[async_trait]
 impl PolitenessStore for RedisPoliteness {
     async fn try_acquire(&self, req: &SlotRequest<'_>) -> Result<Acquire> {
+        Ok(self.try_acquire_spaced(req).await?.0)
+    }
+
+    async fn try_acquire_spaced(&self, req: &SlotRequest<'_>) -> Result<(Acquire, Duration)> {
         let c = &self.config;
         let l = &req.limits;
         let respect = c.respect_robots_delay && l.respect_robots;
@@ -224,7 +236,7 @@ impl PolitenessStore for RedisPoliteness {
             recent.insert(req.domain.to_string(), Instant::now());
         }
         let mut conn = self.conn.clone();
-        let r: i64 = self
+        let (status, ms): (i64, i64) = self
             .acquire
             .key(self.domain_key(req.domain))
             .key(self.flight_key(req.domain))
@@ -246,11 +258,14 @@ impl PolitenessStore for RedisPoliteness {
             .invoke_async(&mut conn)
             .await
             .map_err(storage_err)?;
-        Ok(match r {
-            0 => Acquire::Granted,
-            -1 => Acquire::DomainBusy,
-            -2 => Acquire::JobBusy,
-            ms => Acquire::Wait(Duration::from_millis(ms.max(1) as u64)),
+        Ok(match status {
+            0 => (Acquire::Granted, Duration::from_millis(ms.max(0) as u64)),
+            -1 => (Acquire::DomainBusy, Duration::ZERO),
+            -2 => (Acquire::JobBusy, Duration::ZERO),
+            _ => (
+                Acquire::Wait(Duration::from_millis(ms.max(1) as u64)),
+                Duration::ZERO,
+            ),
         })
     }
 
