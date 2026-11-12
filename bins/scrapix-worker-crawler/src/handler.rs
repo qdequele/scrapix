@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 use crate::job_fetch::{headers_allowed_for, is_proxy_failure};
 use crate::outcome::{classify, is_retryable, Outcome};
 use crate::page_history::PageRecord;
+use crate::publish::{is_message_too_large, send_concurrently, serialized_len, SEND_CONCURRENCY};
 use crate::CrawlerWorker;
 
 /// `PageSkipped` reason of a page that answered 304 to an incremental crawl.
@@ -53,6 +54,69 @@ pub(crate) const BROWSER_PROXY_UNSUPPORTED: &str =
 
 /// Upper bound on the best-effort `FetchFeedback` publish.
 const FEEDBACK_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Start of the `PageFailed` reason of a page whose message is over the
+/// message size limit.
+pub(crate) const PAGE_TOO_LARGE: &str = "page too large to publish";
+
+/// Largest page body whose links are extracted on the runtime thread; a
+/// larger one is parsed on the blocking pool.
+const EXTRACT_INLINE_MAX_BYTES: usize = 32 * 1024;
+
+/// Largest page body sent to the content worker at the same time as the
+/// page's links; a larger one is sent first (see `on_crawled`).
+const RAW_PAGE_WITH_LINKS_MAX_BYTES: usize = 256 * 1024;
+
+/// The links of `page` to follow and the links to store, with `extractor`'s
+/// rules. A binary document is only read for links when it is a PDF (the
+/// caller checked that the job extracts PDF links).
+fn extract_page_links(
+    extractor: &UrlExtractor,
+    page: &RawPage,
+    depth: u32,
+) -> (Vec<CrawlUrl>, Vec<String>) {
+    let content_type = page.content_type.as_deref().unwrap_or_default();
+    if !scrapix_core::content_types::is_binary_document(content_type) {
+        return extractor.extract_with_outlinks(page, depth);
+    }
+    let Ok(bytes) = BASE64.decode(page.html.as_bytes()) else {
+        return (Vec::new(), Vec::new());
+    };
+    if scrapix_parser::detect_kind(Some(content_type), &bytes)
+        != Some(scrapix_parser::DocumentKind::Pdf)
+    {
+        return (Vec::new(), Vec::new());
+    }
+    match scrapix_parser::pdf::extract_links(&bytes, &page.final_url) {
+        Ok(links) => {
+            let discovered = extractor.extract_from_links(&page.final_url, links, depth);
+            let stored = discovered
+                .iter()
+                .take(MAX_STORED_LINKS)
+                .map(|u| u.url.clone())
+                .collect();
+            (discovered, stored)
+        }
+        Err(e) => {
+            debug!(url = %page.final_url, error = %e, "PDF link extraction failed");
+            (Vec::new(), Vec::new())
+        }
+    }
+}
+
+/// The `PageSkipped` event of `msg`.
+fn skipped_event(msg: &UrlMessage, reason: &str, skip: Skip) -> CrawlEvent {
+    CrawlEvent::PageSkipped {
+        job_id: msg.job_id.clone(),
+        url: msg.url.url.clone(),
+        reason: reason.to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        url_message_id: msg.message_id.clone(),
+        links_published: skip.links_published,
+        not_modified: skip.not_modified,
+        sitemap_pending: skip.sitemap_pending,
+    }
+}
 
 /// Build the `FetchFeedback` for one handled message (`crawl_delay_ms` is
 /// filled in by the caller). `result` is `None` when no fetch was attempted
@@ -123,7 +187,9 @@ impl CrawlerWorker {
         // free it (status None, no request made) before acking.
         if self.cancelled.contains(&msg.job_id) {
             debug!(url = %msg.url.url, job_id = %msg.job_id, "Skipping message of a cancelled job");
-            self.publish_feedback(&msg, None, Duration::ZERO).await;
+            self.published_links.forget(&msg.job_id);
+            let feedback = self.feedback(&msg, None, Duration::ZERO);
+            self.send_feedback(&msg.url.url, feedback).await;
             ack.ack();
             return;
         }
@@ -152,35 +218,45 @@ impl CrawlerWorker {
 
         // Release the frontier's politeness slot for this dispatch (every
         // handled message, including fail-closed ones that made no request).
-        self.publish_feedback(&msg, result.as_ref(), elapsed).await;
+        // The feedback is sent while the page's own messages are published,
+        // not before them: its delivery report takes a producer linger, and
+        // nothing below depends on it. Both are done before the ack.
+        let feedback = self.feedback(&msg, result.as_ref(), elapsed);
+        let feedback_sent = self.send_feedback(&msg.url.url, feedback);
 
-        let published = match outcome {
-            Outcome::Crawled => match result {
-                Some(Ok(FetchResult::Fetched(page))) => self.on_fetched(&msg, page, elapsed).await,
-                // `classify` only returns `Crawled` for `Ok(Fetched(2xx))`;
-                // never panic here (a panicking handler would lose the ack).
-                _ => {
-                    self.on_failed(
-                        &msg,
-                        "internal error: crawled outcome without a fetched page",
-                        None,
-                        false,
-                    )
-                    .await
+        let outcome_published = async {
+            match outcome {
+                Outcome::Crawled => match result {
+                    Some(Ok(FetchResult::Fetched(page))) => {
+                        self.on_fetched(&msg, page, elapsed).await
+                    }
+                    // `classify` only returns `Crawled` for `Ok(Fetched(2xx))`;
+                    // never panic here (a panicking handler would lose the ack).
+                    _ => {
+                        self.on_failed(
+                            &msg,
+                            "internal error: crawled outcome without a fetched page",
+                            None,
+                            false,
+                        )
+                        .await
+                    }
+                },
+                Outcome::NotModified => self.on_not_modified(&msg).await,
+                Outcome::Retry { reason, delay } => self.on_retry(&msg, &reason, delay).await,
+                Outcome::Failed { reason, status } => {
+                    let exhausted = result.as_ref().is_some_and(is_retryable);
+                    self.on_failed(&msg, &reason, status, exhausted).await
                 }
-            },
-            Outcome::NotModified => self.on_not_modified(&msg).await,
-            Outcome::Retry { reason, delay } => self.on_retry(&msg, &reason, delay).await,
-            Outcome::Failed { reason, status } => {
-                let exhausted = result.as_ref().is_some_and(is_retryable);
-                self.on_failed(&msg, &reason, status, exhausted).await
-            }
-            Outcome::Skipped { reason } => {
-                self.metrics.record_skipped();
-                info!(url = %msg.url.url, job_id = %msg.job_id, reason, "URL skipped");
-                self.on_skipped(&msg, &reason, Skip::default()).await
+                Outcome::Skipped { reason } => {
+                    self.metrics.record_skipped();
+                    info!(url = %msg.url.url, job_id = %msg.job_id, reason, "URL skipped");
+                    self.on_skipped(&msg, &reason, Skip::default()).await
+                }
             }
         };
+        // The feedback is polled first, so it is queued before the page work.
+        let ((), published) = tokio::join!(feedback_sent, outcome_published);
 
         match published {
             Ok(()) => ack.ack(),
@@ -197,15 +273,14 @@ impl CrawlerWorker {
         }
     }
 
-    /// Publish the `FetchFeedback` for `msg` (keyed by domain). Best-effort:
-    /// a failed or slow publish is logged and never blocks the ack — the
-    /// frontier's slot expiry covers lost feedback.
-    async fn publish_feedback(
+    /// The `FetchFeedback` for `msg`: status, timing and robots.txt
+    /// `Crawl-delay` of its fetch.
+    fn feedback(
         &self,
         msg: &UrlMessage,
         result: Option<&scrapix_core::Result<FetchResult>>,
         elapsed: Duration,
-    ) {
+    ) -> FetchFeedback {
         let via_proxy = msg.job.as_ref().is_some_and(|j| j.proxy.is_some());
         let mut feedback = fetch_feedback(msg, result, via_proxy);
         // The server's response time drives the frontier's adaptive delay;
@@ -228,6 +303,13 @@ impl CrawlerWorker {
                 feedback.crawl_delay_ms = delay;
             }
         }
+        feedback
+    }
+
+    /// Publish `feedback` (keyed by domain). Best-effort: a failed or slow
+    /// publish is logged and never blocks the ack — the frontier's slot
+    /// expiry covers lost feedback.
+    async fn send_feedback(&self, url: &str, feedback: FetchFeedback) {
         let send = self.producer.send(
             topic_names::FETCH_FEEDBACK,
             Some(&feedback.domain),
@@ -236,9 +318,9 @@ impl CrawlerWorker {
         match tokio::time::timeout(FEEDBACK_SEND_TIMEOUT, send).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                warn!(url = %msg.url.url, error = %e, "Failed to publish fetch feedback")
+                warn!(url, error = %e, "Failed to publish fetch feedback")
             }
-            Err(_) => warn!(url = %msg.url.url, "Timed out publishing fetch feedback"),
+            Err(_) => warn!(url, "Timed out publishing fetch feedback"),
         }
     }
 
@@ -463,7 +545,6 @@ impl CrawlerWorker {
         let page_size = page.html.len() as u64;
         let status = page.status;
         let js_rendered = page.js_rendered;
-        self.metrics.record_success(page_size);
 
         info!(
             url = %url.url,
@@ -474,19 +555,49 @@ impl CrawlerWorker {
             "Page fetched successfully"
         );
 
+        let (page, discovered_urls, outlinks) = self.extract_links(msg, page).await;
+        let page_final_url = page.final_url.clone();
+        let etag = page.headers.get("etag").cloned();
+        let last_modified = page.headers.get("last-modified").cloned();
+        let raw_page_msg =
+            RawPageMessage::from_url_message(msg, page, etag.clone(), last_modified.clone());
+
+        // A page whose message the producer can never accept (a document is
+        // base64-encoded, 4/3 of its size; JSON escaping grows HTML) is a
+        // failed page, not a send to retry: left unacked it would be
+        // redelivered forever, stall its partition's commits and end the job
+        // `FailStalled`. Decided before anything is published for the page
+        // (links, sitemap discovery), since `PageFailed` counts none of it.
+        if let Some(reason) = self.too_large_to_publish(&raw_page_msg) {
+            return self.on_failed(msg, &reason, None, false).await;
+        }
+
+        // A large page is sent before its links: if the broker still refuses
+        // it as too large (a topic limit below the producer's), it can fail
+        // the same way. Small pages are sent along with their links.
+        let raw_page_first = raw_page_msg.html.len() > RAW_PAGE_WITH_LINKS_MAX_BYTES;
+        if raw_page_first {
+            if let Err(e) = self.send_raw_page(msg, &raw_page_msg).await {
+                if is_message_too_large(&e) {
+                    let reason = format!("{PAGE_TOO_LARGE}: refused by the message broker");
+                    return self.on_failed(msg, &reason, None, false).await;
+                }
+                return Err(e);
+            }
+        }
+
+        self.metrics.record_success(page_size);
+        self.metrics.record_discovered(discovered_urls.len() as u64);
+
         // Whether *this* message is the one that owns (job, domain)'s
         // one-time sitemap discovery (R-18). This must be decided
         // synchronously, before `PageCrawled` is published below, because
         // `PageCrawled.sitemap_pending` tells job-completion accounting
         // whether to wait for a matching `SitemapPublished` — and because
         // deciding is itself the (one-shot) dedup side effect, so it must
-        // happen at most once per page.
-        let sitemap_pending = self.start_sitemap_discovery(msg, &page.final_url);
-
-        let (discovered_urls, outlinks) = self.extract_links(msg, &page);
-        let page_final_url = page.final_url.clone();
-        let discovered_count = discovered_urls.len();
-        self.metrics.record_discovered(discovered_count as u64);
+        // happen at most once per page, and only for a page that is
+        // reported `PageCrawled` (past the failures above).
+        let sitemap_pending = self.start_sitemap_discovery(msg, &page_final_url);
 
         let target_urls: Vec<String> = discovered_urls.iter().map(|u| u.url.clone()).collect();
         if let Some(ref graph) = self.link_graph {
@@ -499,9 +610,21 @@ impl CrawlerWorker {
             }
         }
 
+        // The page, its links, the PageRank input and the page history are
+        // independent: published together, each send's delivery report is
+        // awaited once for all of them instead of one after the other.
+        let raw_page_sent = async {
+            if raw_page_first {
+                return Ok(());
+            }
+            self.send_raw_page(msg, &raw_page_msg).await
+        };
         // Best effort: centralized PageRank input, not part of the page's
         // delivery guarantee.
-        if self.publish_links && !target_urls.is_empty() {
+        let pagerank_links_sent = async {
+            if !self.publish_links || target_urls.is_empty() {
+                return;
+            }
             let links_msg = LinksMessage::new(&url.url, target_urls, &msg.job_id);
             if let Err(e) = self
                 .producer
@@ -510,37 +633,42 @@ impl CrawlerWorker {
             {
                 debug!(error = %e, "Failed to publish links to frontier");
             }
-        }
-
-        let etag = page.headers.get("etag").cloned();
-        let last_modified = page.headers.get("last-modified").cloned();
-
+        };
         // Save the page history for future incremental crawls (Update
         // strategy only), with the page's in-scope links and final URL so a
-        // later 304 can still follow them.
-        if msg.incremental && (etag.is_some() || last_modified.is_some()) {
-            if let Some(ref history) = self.crawl_history {
-                let record = PageRecord {
-                    etag: etag.clone(),
-                    last_modified: last_modified.clone(),
-                    crawled_at: chrono::Utc::now().timestamp_millis(),
-                    final_url: Some(page_final_url),
-                    link_scope: Some(self.link_scope_key(msg)),
-                    outlinks: Some(outlinks),
-                };
-                if let Err(e) = history.save(&msg.index_uid, &url.url, &record).await {
-                    debug!(url = %url.url, error = %e, "Failed to save crawl history to Redis");
-                }
+        // later 304 can still follow them. Best effort.
+        let history_saved = async {
+            if !(msg.incremental && (etag.is_some() || last_modified.is_some())) {
+                return;
             }
-        }
+            let Some(ref history) = self.crawl_history else {
+                return;
+            };
+            let record = PageRecord {
+                etag,
+                last_modified,
+                crawled_at: chrono::Utc::now().timestamp_millis(),
+                final_url: Some(page_final_url),
+                link_scope: Some(self.link_scope_key(msg)),
+                outlinks: Some(outlinks),
+            };
+            if let Err(e) = history.save(&msg.index_uid, &url.url, &record).await {
+                debug!(url = %url.url, error = %e, "Failed to save crawl history to Redis");
+            }
+        };
+        let (raw_page_sent, links_sent, (), ()) = tokio::join!(
+            raw_page_sent,
+            self.publish_links(msg, discovered_urls),
+            pagerank_links_sent,
+            history_saved,
+        );
+        raw_page_sent?;
+        let links_sent = links_sent?;
+        drop(raw_page_msg);
 
-        let raw_page_msg = RawPageMessage::from_url_message(msg, page, etag, last_modified);
-        self.producer
-            .send(topic_names::PAGES_RAW, Some(&msg.job_id), &raw_page_msg)
-            .await?;
-
-        self.publish_links(msg, discovered_urls).await?;
-
+        // `PageCrawled` is the page's accounting event: published only once
+        // the page and its links are durably sent, and counting the links
+        // actually sent.
         let event = CrawlEvent::PageCrawled {
             job_id: msg.job_id.clone(),
             account_id: msg.account_id.clone(),
@@ -549,13 +677,71 @@ impl CrawlerWorker {
             content_length: page_size,
             duration_ms: elapsed.as_millis() as u64,
             timestamp: chrono::Utc::now().timestamp_millis(),
-            links_published: discovered_count as u64,
+            links_published: links_sent.len() as u64,
             url_message_id: msg.message_id.clone(),
             js_rendered,
             sitemap_pending,
         };
-        self.publish_event(&msg.job_id, &event).await?;
+        self.publish_outcome(msg, links_sent, &event).await
+    }
 
+    async fn send_raw_page(
+        &self,
+        msg: &UrlMessage,
+        raw_page_msg: &RawPageMessage,
+    ) -> scrapix_core::Result<()> {
+        self.producer
+            .send(topic_names::PAGES_RAW, Some(&msg.job_id), raw_page_msg)
+            .await?;
+        Ok(())
+    }
+
+    /// Why `raw_page_msg` cannot be published, when its serialized size is
+    /// over the producer's message size limit.
+    fn too_large_to_publish(&self, raw_page_msg: &RawPageMessage) -> Option<String> {
+        let limit = self.max_publish_bytes?;
+        // JSON escaping grows a string at most six times (`\u00XX`): a body
+        // this far under the limit fits without being measured.
+        if raw_page_msg.html.len() < limit / 8 {
+            return None;
+        }
+        let size = serialized_len(raw_page_msg)?;
+        (size > limit).then(|| {
+            format!("{PAGE_TOO_LARGE}: {size} bytes once encoded, the limit is {limit} bytes")
+        })
+    }
+
+    /// Publish a page's accounting `event` (`PageCrawled`, `PageSkipped`),
+    /// and `UrlsDiscovered` for the links `links_sent` that were just sent
+    /// to the frontier, then record those links as published by this worker.
+    ///
+    /// The links are recorded last, once the event counting them is sent:
+    /// if anything fails before, the redelivered page finds none of them
+    /// recorded, sends them again and counts them again, so a link is never
+    /// skipped without an accounting event that covers it.
+    async fn publish_outcome(
+        &self,
+        msg: &UrlMessage,
+        links_sent: Vec<u64>,
+        event: &CrawlEvent,
+    ) -> scrapix_core::Result<()> {
+        let discovered = async {
+            if links_sent.is_empty() {
+                return Ok(());
+            }
+            let event = CrawlEvent::UrlsDiscovered {
+                job_id: msg.job_id.clone(),
+                source_url: msg.url.url.clone(),
+                count: links_sent.len(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            self.publish_event(&msg.job_id, &event).await
+        };
+        let (discovered, outcome) =
+            tokio::join!(discovered, self.publish_event(&msg.job_id, event));
+        discovered?;
+        outcome?;
+        self.record_published_links(&msg.job_id, &links_sent);
         Ok(())
     }
 
@@ -567,42 +753,41 @@ impl CrawlerWorker {
     /// Also returns the links to store in the page history: the in-scope
     /// links (the job's domain, include/exclude and non-page filters),
     /// whatever the depth, at most [`MAX_STORED_LINKS`].
-    fn extract_links(&self, msg: &UrlMessage, page: &RawPage) -> (Vec<CrawlUrl>, Vec<String>) {
+    ///
+    /// Parsing a page into a DOM (or decoding a PDF) is CPU work: past
+    /// [`EXTRACT_INLINE_MAX_BYTES`] it runs on the blocking pool, so a large
+    /// page does not hold a runtime thread the other fetches need. The page
+    /// is handed back unchanged.
+    async fn extract_links(
+        &self,
+        msg: &UrlMessage,
+        page: RawPage,
+    ) -> (RawPage, Vec<CrawlUrl>, Vec<String>) {
         let depth = msg.url.depth;
-        let extractor = self.job_extractor(msg);
-
+        let pdf_links = msg.features.as_ref().is_some_and(|f| f.pdf_extract_links());
         let content_type = page.content_type.as_deref().unwrap_or_default();
-        if !scrapix_core::content_types::is_binary_document(content_type) {
-            return extractor.extract_with_outlinks(page, depth);
-        }
         // A binary document: its body is base64, not HTML. Only PDFs carry
         // followable links, and only when the job asks for them.
-        if !msg.features.as_ref().is_some_and(|f| f.pdf_extract_links()) {
-            return (Vec::new(), Vec::new());
+        if scrapix_core::content_types::is_binary_document(content_type) && !pdf_links {
+            return (page, Vec::new(), Vec::new());
         }
-        let Ok(bytes) = BASE64.decode(page.html.as_bytes()) else {
-            return (Vec::new(), Vec::new());
-        };
-        if scrapix_parser::detect_kind(Some(content_type), &bytes)
-            != Some(scrapix_parser::DocumentKind::Pdf)
-        {
-            return (Vec::new(), Vec::new());
+        let extractor = self.job_extractor(msg);
+        if page.html.len() <= EXTRACT_INLINE_MAX_BYTES {
+            let (discovered, stored) = extract_page_links(&extractor, &page, depth);
+            return (page, discovered, stored);
         }
-        match scrapix_parser::pdf::extract_links(&bytes, &page.final_url) {
-            Ok(links) => {
-                let discovered = extractor.extract_from_links(&page.final_url, links, depth);
-                let stored = discovered
-                    .iter()
-                    .take(MAX_STORED_LINKS)
-                    .map(|u| u.url.clone())
-                    .collect();
-                (discovered, stored)
-            }
-            Err(e) => {
-                debug!(url = %page.final_url, error = %e, "PDF link extraction failed");
-                (Vec::new(), Vec::new())
-            }
-        }
+        let page = Arc::new(page);
+        let shared = page.clone();
+        let extracted =
+            tokio::task::spawn_blocking(move || extract_page_links(&extractor, &shared, depth))
+                .await;
+        let (discovered, stored) = extracted.unwrap_or_else(|e| {
+            warn!(url = %msg.url.url, error = %e, "Link extraction failed; the page's links are not followed");
+            (Vec::new(), Vec::new())
+        });
+        // The task is done and dropped its handle: the page is ours again.
+        let page = Arc::try_unwrap(page).unwrap_or_else(|shared| (*shared).clone());
+        (page, discovered, stored)
     }
 
     /// The link extractor for `msg`'s job: its URL patterns, `max_depth`
@@ -693,18 +878,17 @@ impl CrawlerWorker {
         let links = self.stored_links(msg, record);
         debug!(url = %msg.url.url, links = links.len(), "Page not modified (304), following its stored links");
         let sitemap_pending = self.start_sitemap_discovery(msg, &page_url);
-        let links_published = links.len() as u64;
-        self.publish_links(msg, links).await?;
-        self.on_skipped(
+        let links_sent = self.publish_links(msg, links).await?;
+        let event = skipped_event(
             msg,
             NOT_MODIFIED,
             Skip {
-                links_published,
+                links_published: links_sent.len() as u64,
                 not_modified: true,
                 sitemap_pending,
             },
-        )
-        .await
+        );
+        self.publish_outcome(msg, links_sent, &event).await
     }
 
     /// The links to follow from a 304 page's history `record`, re-filtered by
@@ -795,50 +979,57 @@ impl CrawlerWorker {
         reason: &str,
         skip: Skip,
     ) -> scrapix_core::Result<()> {
-        let event = CrawlEvent::PageSkipped {
-            job_id: msg.job_id.clone(),
-            url: msg.url.url.clone(),
-            reason: reason.to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            url_message_id: msg.message_id.clone(),
-            links_published: skip.links_published,
-            not_modified: skip.not_modified,
-            sitemap_pending: skip.sitemap_pending,
-        };
+        let event = skipped_event(msg, reason, skip);
         self.publish_event(&msg.job_id, &event).await
     }
 
     /// Publish `links` to the frontier as children of `msg` (with the link
-    /// graph's priority boost), then `UrlsDiscovered` when there are any.
+    /// graph's priority boost), all at once, and wait for every send.
+    /// Links this worker already published for the job are skipped (see
+    /// [`PublishedLinks`](crate::publish::PublishedLinks)).
+    ///
+    /// Returns the keys of the links sent, for [`Self::publish_outcome`] to
+    /// count and record. Any failed send is an error: the message is then
+    /// not acked and the page redelivered.
     async fn publish_links(
         &self,
         msg: &UrlMessage,
         links: Vec<CrawlUrl>,
-    ) -> scrapix_core::Result<()> {
-        let count = links.len();
-        for mut discovered in links {
+    ) -> scrapix_core::Result<Vec<u64>> {
+        if links.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<u64> = links
+            .iter()
+            .map(|link| self.published_links.key(&link.url))
+            .collect();
+        let published = self.published_links.published(&msg.job_id, &keys);
+        let (keys, links): (Vec<u64>, Vec<CrawlUrl>) = keys
+            .into_iter()
+            .zip(links)
+            .zip(published)
+            .filter(|(_, published)| !published)
+            .map(|(link, _)| link)
+            .unzip();
+
+        let messages = links.into_iter().map(|mut discovered| {
             if let Some(ref graph) = self.link_graph {
                 discovered.priority += graph.get_priority_boost(&discovered.url);
             }
             let child = msg.child(discovered);
-            self.producer
-                .send(
-                    topic_names::URL_FRONTIER,
-                    Some(&child.partition_key()),
-                    &child,
-                )
-                .await?;
+            (child.partition_key(), child)
+        });
+        let results = send_concurrently(
+            &self.producer,
+            topic_names::URL_FRONTIER,
+            messages,
+            SEND_CONCURRENCY,
+        )
+        .await;
+        for result in results {
+            result?;
         }
-        if count > 0 {
-            let event = CrawlEvent::UrlsDiscovered {
-                job_id: msg.job_id.clone(),
-                source_url: msg.url.url.clone(),
-                count,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            self.publish_event(&msg.job_id, &event).await?;
-        }
-        Ok(())
+        Ok(keys)
     }
 
     /// Start `(job, host)`'s one-time sitemap discovery for a page served
@@ -1179,8 +1370,10 @@ mod tests {
         drain::<UrlMessage>(&t.frontier).await;
         drain::<CrawlEvent>(&t.events).await;
 
-        // Re-crawl: 304, no page, but the link is followed again.
-        let msg = message(url(&server, "/"), None);
+        // Re-crawl (another job: within one job this worker publishes a
+        // link once): 304, no page, but the link is followed again.
+        let mut msg = message(url(&server, "/"), None);
+        msg.job_id = "job-2".into();
         let (ack, acked) = tracked_ack();
         w.handle_message(msg.clone(), ack).await;
         assert!(acked.load(Ordering::SeqCst));
@@ -1514,6 +1707,258 @@ mod tests {
                 if *url_message_id == msg.message_id
         )));
         assert!(drain::<DlqMessage>(&t.dlq).await.is_empty());
+    }
+
+    /// A worker whose producer refuses messages over `limit` bytes.
+    async fn worker_with_message_limit(bus: &ChannelBus, limit: usize) -> Arc<CrawlerWorker> {
+        let mut args = Args::parse_from(["scrapix-worker-crawler"]);
+        args.allow_private_ips = true; // wiremock listens on 127.0.0.1
+        args.respect_robots = false;
+        args.sitemap_discovery = true;
+        args.redis_url = None;
+        args.browser_render = false;
+        args.max_retries = MAX_RETRIES;
+        let mut w = CrawlerWorker::build(
+            &args,
+            "test".into(),
+            AnyConsumer::from(bus.consumer()),
+            AnyProducer::from(bus.producer()),
+        )
+        .await
+        .unwrap();
+        w.max_publish_bytes = Some(limit);
+        Arc::new(w)
+    }
+
+    fn html_page(server: &MockServer, links: &[&str], padding: usize) -> String {
+        let anchors: String = links
+            .iter()
+            .map(|l| format!(r#"<a href="{}">l</a>"#, url(server, l)))
+            .collect();
+        format!(
+            "<html><body>{anchors}<p>{}</p></body></html>",
+            "x".repeat(padding)
+        )
+    }
+
+    async fn mount_html(server: &MockServer, at: &str, body: String) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/html"))
+            .mount(server)
+            .await;
+    }
+
+    fn links_published_of(events: &[CrawlEvent], msg: &UrlMessage) -> Option<u64> {
+        events.iter().find_map(|e| match e {
+            CrawlEvent::PageCrawled {
+                links_published,
+                url_message_id,
+                ..
+            } if *url_message_id == msg.message_id => Some(*links_published),
+            _ => None,
+        })
+    }
+
+    /// A link every page repeats (navigation) is published to the frontier
+    /// once per job by a worker; `links_published` and `UrlsDiscovered`
+    /// count the links actually sent. Another job publishes it again.
+    #[tokio::test]
+    async fn a_link_repeated_across_pages_is_published_once_per_job() {
+        let server = MockServer::start().await;
+        mount_html(&server, "/a", html_page(&server, &["/nav", "/only-a"], 0)).await;
+        mount_html(&server, "/b", html_page(&server, &["/nav", "/only-b"], 0)).await;
+        mount_html(&server, "/c", html_page(&server, &["/nav"], 0)).await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+
+        let sent = |children: Vec<UrlMessage>| {
+            let mut paths: Vec<String> = children
+                .iter()
+                .map(|c| url::Url::parse(&c.url.url).unwrap().path().to_string())
+                .collect();
+            paths.sort();
+            paths
+        };
+
+        let a = message(url(&server, "/a"), None);
+        let (ack, acked) = tracked_ack();
+        w.handle_message(a.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert_eq!(sent(drain(&t.frontier).await), vec!["/nav", "/only-a"]);
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_eq!(links_published_of(&events, &a), Some(2), "{events:?}");
+
+        let b = message(url(&server, "/b"), None);
+        let (ack, acked) = tracked_ack();
+        w.handle_message(b.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert_eq!(sent(drain(&t.frontier).await), vec!["/only-b"]);
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_eq!(links_published_of(&events, &b), Some(1), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CrawlEvent::UrlsDiscovered { count: 1, .. })),
+            "{events:?}"
+        );
+
+        // Nothing new: no link message, no `UrlsDiscovered`, and the page
+        // is still crawled and acked.
+        let c = message(url(&server, "/c"), None);
+        let (ack, acked) = tracked_ack();
+        w.handle_message(c.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<UrlMessage>(&t.frontier).await.is_empty());
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_eq!(links_published_of(&events, &c), Some(0), "{events:?}");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CrawlEvent::UrlsDiscovered { .. })));
+        assert_eq!(drain::<RawPageMessage>(&t.pages).await.len(), 3);
+
+        // Another job has published nothing yet.
+        let mut other = message(url(&server, "/c"), None);
+        other.job_id = "job-2".into();
+        let (ack, _) = tracked_ack();
+        w.handle_message(other.clone(), ack).await;
+        assert_eq!(sent(drain(&t.frontier).await), vec!["/nav"]);
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_eq!(links_published_of(&events, &other), Some(1), "{events:?}");
+    }
+
+    /// A page with many links (parsed on the blocking pool, sent a bounded
+    /// number at a time) publishes every one of them, then `PageCrawled`.
+    #[tokio::test]
+    async fn a_page_with_many_links_publishes_them_all() {
+        let server = MockServer::start().await;
+        let paths: Vec<String> = (0..700).map(|i| format!("/p/{i}")).collect();
+        let links: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let body = html_page(&server, &links, RAW_PAGE_WITH_LINKS_MAX_BYTES + 1);
+        mount_html(&server, "/", body).await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker(&bus).await;
+        let msg = message(url(&server, "/"), None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        let children: Vec<UrlMessage> = drain(&t.frontier).await;
+        let mut got: Vec<String> = children
+            .iter()
+            .map(|c| url::Url::parse(&c.url.url).unwrap().path().to_string())
+            .collect();
+        got.sort();
+        let mut expected = paths.clone();
+        expected.sort();
+        assert_eq!(got, expected);
+        assert!(children.iter().all(|c| c.url.depth == 1));
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_eq!(links_published_of(&events, &msg), Some(700), "{events:?}");
+        assert_eq!(drain::<RawPageMessage>(&t.pages).await.len(), 1);
+    }
+
+    fn assert_failed_as_too_large(events: &[CrawlEvent], msg: &UrlMessage) {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::PageFailed { error, status: None, url_message_id, .. }
+                    if *url_message_id == msg.message_id && error.starts_with(PAGE_TOO_LARGE)
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                CrawlEvent::PageCrawled { .. } | CrawlEvent::UrlsDiscovered { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A document that fits the body limit but not the message limit once
+    /// base64-encoded (4/3 of its size) is a failed page: `PageFailed`,
+    /// acked, nothing sent to the content worker. It used to be retried
+    /// forever, unacked, until the job ended `FailStalled`.
+    #[tokio::test]
+    async fn a_document_too_large_once_encoded_fails_instead_of_blocking() {
+        const LIMIT: usize = 64 * 1024;
+        let server = MockServer::start().await;
+        // 60 KiB of PDF: under the limit raw, 80 KiB in base64.
+        let mut pdf = pdf_with_text("big");
+        pdf.resize(60 * 1024, b' ');
+        Mock::given(method("GET"))
+            .and(path("/big.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(pdf, "application/pdf"))
+            .mount(&server)
+            .await;
+        // The same document, small enough: published as usual.
+        let mut small = pdf_with_text("small");
+        small.resize(30 * 1024, b' ');
+        Mock::given(method("GET"))
+            .and(path("/small.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(small, "application/pdf"))
+            .mount(&server)
+            .await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_message_limit(&bus, LIMIT).await;
+
+        let mut msg = message(url(&server, "/big.pdf"), None);
+        msg.features = Some(features(true, false, false));
+        let (ack, acked) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst), "a terminal failure is acked");
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        assert!(drain::<UrlMessage>(&t.frontier).await.is_empty());
+        let events: Vec<CrawlEvent> = drain(&t.events).await;
+        assert_failed_as_too_large(&events, &msg);
+        // The fetch itself went well: the frontier's slot is freed as usual.
+        assert_eq!(feedback_for(&bus, &msg).await.status, Some(200));
+
+        let mut msg = message(url(&server, "/small.pdf"), None);
+        msg.features = Some(features(true, false, false));
+        let (ack, acked) = tracked_ack();
+        w.handle_message(msg.clone(), ack).await;
+        assert!(acked.load(Ordering::SeqCst));
+        assert_eq!(drain::<RawPageMessage>(&t.pages).await.len(), 1);
+    }
+
+    /// An HTML page over the message limit fails the same way, before any
+    /// of its links is published or its sitemap discovery started (a
+    /// `PageFailed` counts neither).
+    #[tokio::test]
+    async fn an_html_page_too_large_to_publish_publishes_nothing_else() {
+        const LIMIT: usize = 64 * 1024;
+        let server = MockServer::start().await;
+        mount_html(&server, "/", html_page(&server, &["/next"], LIMIT)).await;
+        let bus = ChannelBus::new();
+        let t = topics(&bus);
+        let w = worker_with_message_limit(&bus, LIMIT).await;
+        let msg = message(url(&server, "/"), None);
+        let (ack, acked) = tracked_ack();
+
+        w.handle_message(msg.clone(), ack).await;
+
+        assert!(acked.load(Ordering::SeqCst));
+        assert!(drain::<RawPageMessage>(&t.pages).await.is_empty());
+        assert!(drain::<UrlMessage>(&t.frontier).await.is_empty());
+        // Give a (wrongly) started sitemap discovery the time to settle.
+        let events: Vec<CrawlEvent> = wait_for_event(&t.events, Duration::from_secs(1), |e| {
+            matches!(e, CrawlEvent::SitemapPublished { .. })
+        })
+        .await;
+        assert_failed_as_too_large(&events, &msg);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CrawlEvent::SitemapPublished { .. })),
+            "{events:?}"
+        );
     }
 
     /// R-18: even when the domain's sitemap discovery finds nothing (here,
