@@ -10,9 +10,18 @@
 //! just served stale is not retried for `stale_retry`, and negative answers
 //! live in their own cache so a spray of unknown credentials cannot evict
 //! the positive ones.
+//!
+//! A cached lookup that has to ask the Lab is a *flight*: one detached task
+//! per cache key, whose answer every caller of that key waits for, so an
+//! expiring entry costs one Lab call however many requests want it. An
+//! entry past [`REFRESH_AHEAD`] of its ttl is still served and refreshed by
+//! a background flight (once per entry, on access only), so a key in
+//! constant use never waits for the Lab. An entry is never served past the
+//! ttl the Lab gave for it because of a refresh: a failed one changes
+//! nothing.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -212,11 +221,24 @@ struct Entry<T> {
     ttl: Duration,
     /// Set when this entry was served stale: don't ask the Lab again before.
     retry_at: Option<Instant>,
+    /// A refresh-ahead was started for this entry (at most one per entry: a
+    /// failed one is not repeated, the entry just expires on time).
+    refresh_started: bool,
 }
+
+/// How far into its ttl a fresh entry is refreshed in the background (4/5:
+/// with the default 30 s ttl, from 24 s on).
+const REFRESH_AHEAD: (u32, u32) = (4, 5);
 
 impl<T> Entry<T> {
     fn fresh(&self) -> bool {
         self.fetched.elapsed() < self.ttl
+    }
+    /// Fresh, but close enough to its expiry to be refreshed ahead.
+    fn refresh_due(&self) -> bool {
+        !self.refresh_started
+            && !self.ttl.is_zero()
+            && self.fetched.elapsed() >= self.ttl / REFRESH_AHEAD.1 * REFRESH_AHEAD.0
     }
     /// Servable while the Lab is unreachable: within `grace` past its ttl,
     /// and only if it was cached with a positive ttl. A `cache_ttl: 0` (or
@@ -290,16 +312,28 @@ impl<T: Clone> Cache<T> {
                 fetched: Instant::now(),
                 ttl,
                 retry_at: None,
+                refresh_started: false,
             },
         );
     }
 }
 
+/// What a Lab lookup answers: the value (`None` = a negative answer) and how
+/// long it may be cached.
+type Fetched<T> = Result<(Option<T>, Duration), LabError>;
+
+/// The waiting side of a flight: `None` until the answer lands. A sender
+/// dropped without an answer (the flight panicked or was aborted) closes it.
+type FlightRx<T> = tokio::sync::watch::Receiver<Option<Fetched<T>>>;
+
 /// One lookup's cache: positive answers (servable stale) and negative ones
-/// (never stale), each with its own capacity.
+/// (never stale), each with its own capacity, and the flights in the air
+/// (at most one per key; under the same lock as the answers, so "no fresh
+/// answer and no flight" is decided atomically).
 struct Lookups<T> {
     positive: Cache<T>,
     negative: Cache<()>,
+    flights: HashMap<String, FlightRx<T>>,
 }
 
 impl<T: Clone> Lookups<T> {
@@ -307,17 +341,103 @@ impl<T: Clone> Lookups<T> {
         Self {
             positive: Cache::new(timing.capacity, timing.stale_grace),
             negative: Cache::new(timing.negative_capacity, Duration::ZERO),
+            flights: HashMap::new(),
+        }
+    }
+
+    /// Record a Lab answer asked at `started`. An error changes nothing: in
+    /// particular a failed refresh leaves the entry it was refreshing with
+    /// its original `fetched` and ttl.
+    fn store(&mut self, key: &str, started: Instant, result: &Fetched<T>) {
+        match result {
+            Ok((Some(value), ttl)) => {
+                // An answer cached after this one was asked for (the AI key
+                // re-resolution writes directly) is the newer one.
+                if self
+                    .positive
+                    .map
+                    .get(key)
+                    .is_some_and(|e| e.fetched > started)
+                {
+                    return;
+                }
+                self.negative.remove(key);
+                self.positive.put(key.to_string(), value.clone(), *ttl);
+            }
+            Ok((None, ttl)) => {
+                self.positive.remove(key);
+                self.negative.put(key.to_string(), (), *ttl);
+            }
+            Err(_) => {}
         }
     }
 }
 
+/// Selects one of the client's caches (a plain `fn`, so a detached flight
+/// can find its cache again without borrowing the caller).
+type CacheOf<T> = fn(&Inner) -> &Mutex<Lookups<T>>;
+
+fn identities(i: &Inner) -> &Mutex<Lookups<Identity>> {
+    &i.identities
+}
+fn meili(i: &Inner) -> &Mutex<Lookups<MeiliTarget>> {
+    &i.meili
+}
+fn ai(i: &Inner) -> &Mutex<Lookups<AiTarget>> {
+    &i.ai
+}
+
+/// The landing side of a flight, owned by its task. However the task ends
+/// (answer, panic, abort), the flight leaves the map *before* the sender is
+/// dropped, so a waiter that wakes on a closed channel never finds the dead
+/// flight again and can start a new one.
+struct Landing<T> {
+    inner: Arc<Inner>,
+    cache: CacheOf<T>,
+    key: String,
+    started: Instant,
+    tx: tokio::sync::watch::Sender<Option<Fetched<T>>>,
+    landed: bool,
+}
+
+impl<T: Clone> Landing<T> {
+    fn land(mut self, result: Fetched<T>) {
+        {
+            let mut c = (self.cache)(&self.inner).lock().unwrap();
+            c.flights.remove(&self.key);
+            c.store(&self.key, self.started, &result);
+        }
+        self.landed = true;
+        self.tx.send_replace(Some(result));
+    }
+}
+
+impl<T> Drop for Landing<T> {
+    fn drop(&mut self) {
+        if !self.landed {
+            if let Ok(mut c) = (self.cache)(&self.inner).lock() {
+                c.flights.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The engine's client for the Lab's internal API. Cheap to share: the
+/// state lives behind one `Arc`, which the detached flights also hold.
 pub struct LabClient {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     base: String,
     instance_id: String,
     secret: String,
     http: reqwest::Client,
     timing: Timing,
     permits: tokio::sync::Semaphore,
+    /// Background refreshes in the air: a quarter of `max_in_flight`, so
+    /// they never take every Lab slot from the requests that are waiting.
+    refresh_slots: Arc<tokio::sync::Semaphore>,
     identities: Mutex<Lookups<Identity>>,
     meili: Mutex<Lookups<MeiliTarget>>,
     ai: Mutex<Lookups<AiTarget>>,
@@ -375,17 +495,23 @@ impl LabClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
-        Self {
+        let inner = Inner {
             base: base_url.trim_end_matches('/').to_string(),
             instance_id: instance_id.to_string(),
             secret: instance_secret.to_string(),
             http,
             permits: tokio::sync::Semaphore::new(timing.max_in_flight.max(1)),
+            refresh_slots: Arc::new(tokio::sync::Semaphore::new(
+                (timing.max_in_flight / 4).max(1),
+            )),
             identities: Mutex::new(Lookups::new(&timing)),
             meili: Mutex::new(Lookups::new(&timing)),
             ai: Mutex::new(Lookups::new(&timing)),
             balances: Mutex::new(HashMap::new()),
             timing,
+        };
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
@@ -397,6 +523,90 @@ impl LabClient {
             .to_string()
     }
 
+    /// `GET /internal/instances/me`: confirms the instance credentials and
+    /// tells which deployment they belong to (checked once at boot).
+    pub async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
+        self.inner.instances_me().await
+    }
+
+    pub async fn introspect(
+        &self,
+        kind: CredentialKind,
+        credential: &str,
+        account_id: Option<&str>,
+    ) -> Result<Option<Identity>, LabError> {
+        self.inner.introspect(kind, credential, account_id).await
+    }
+
+    pub async fn account(&self, account_id: &str) -> Result<Option<Identity>, LabError> {
+        self.inner.account(account_id).await
+    }
+
+    /// Spendable credits as the Lab last reported them (from a fresh
+    /// snapshot, or a new one).
+    pub async fn available_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
+        self.inner.available_credits(account_id).await
+    }
+
+    /// Take a new balance snapshot now (directly, not through the identity
+    /// cache: the balance must be current). While the Lab is unavailable the
+    /// last snapshot is served for `stale_grace` past its expiry (unless it
+    /// came from a `cache_ttl: 0` answer), asking the Lab again at most
+    /// every `stale_retry`.
+    pub async fn refresh_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
+        self.inner.refresh_credits(account_id).await
+    }
+
+    pub async fn meilisearch(
+        &self,
+        account_id: &str,
+        url: Option<&str>,
+    ) -> Result<Option<MeiliTarget>, LabError> {
+        self.inner.meilisearch(account_id, url).await
+    }
+
+    /// `GET /internal/accounts/{id}/ai`: the Lumen target for this account's
+    /// LLM calls; `None` when the Lab has none for it (404). A
+    /// `rejected_key_id` (the key Lumen just refused) skips the cache, asks
+    /// the Lab for a replacement and makes that the cached answer.
+    pub async fn ai(
+        &self,
+        account_id: &str,
+        rejected_key_id: Option<&str>,
+    ) -> Result<Option<AiTarget>, LabError> {
+        self.inner.ai(account_id, rejected_key_id).await
+    }
+
+    #[cfg(test)]
+    pub fn debug_cache_keys(&self) -> Vec<String> {
+        let c = self.inner.identities.lock().unwrap();
+        c.positive
+            .map
+            .keys()
+            .chain(c.negative.map.keys())
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn cached_ttl_for_test(
+        &self,
+        kind: CredentialKind,
+        credential: &str,
+        account_id: Option<&str>,
+    ) -> Option<Duration> {
+        let key = hashed(&["i", kind.as_str(), credential, account_id.unwrap_or("")]);
+        self.inner
+            .identities
+            .lock()
+            .unwrap()
+            .positive
+            .get(&key)
+            .map(|e| e.ttl)
+    }
+}
+
+impl Inner {
     fn ttl_from(&self, secs: Option<i64>) -> Duration {
         match secs {
             None => self.timing.default_ttl,
@@ -496,68 +706,146 @@ impl LabClient {
     /// only a *positive* cached answer with a positive ttl is ever served
     /// stale (never a `cache_ttl: 0` one), and a key just served stale is
     /// not retried for `stale_retry`.
+    ///
+    /// Asking the Lab is single-flight per key: the first caller starts a
+    /// flight (a detached task, so a caller that goes away neither cancels
+    /// the call nor strands the others) and everyone asking for that key
+    /// meanwhile waits for its answer. Two exceptions keep "do not cache"
+    /// strict: a key whose last answer had `cache_ttl: 0` is asked by every
+    /// caller for itself, and a caller that joined a flight someone else
+    /// started does not use a `cache_ttl: 0` answer from it (the Lab may
+    /// have computed it before this caller asked) but asks again.
+    ///
+    /// A fresh entry past [`REFRESH_AHEAD`] of its ttl is returned at once
+    /// and refreshed by a background flight: at most one per entry, only on
+    /// access, and only while a refresh slot is free.
     async fn cached<T, F, Fut>(
-        &self,
+        self: &Arc<Self>,
         endpoint: &'static str,
-        cache: &Mutex<Lookups<T>>,
+        cache: CacheOf<T>,
         key: String,
         fetch: F,
     ) -> Result<Option<T>, LabError>
     where
-        T: Clone,
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(Option<T>, Duration), LabError>>,
+        T: Clone + Send + Sync + 'static,
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Fetched<T>> + Send + 'static,
     {
         let grace = self.timing.stale_grace;
-        let usable = |e: &Entry<T>| e.servable_stale(grace);
-        let hit = {
-            let c = cache.lock().unwrap();
-            if c.negative.get(&key).is_some_and(|e| e.fresh()) {
-                return Ok(None);
-            }
-            let hit = c.positive.get(&key);
-            if let Some(e) = &hit {
-                if e.fresh() {
-                    return Ok(Some(e.value.clone()));
+        // A flight that ends without an answer (it panicked, or the runtime
+        // is shutting down) is replaced once.
+        for _ in 0..2 {
+            let (hit, flight) = {
+                let mut c = cache(self).lock().unwrap();
+                if c.negative.get(&key).is_some_and(|e| e.fresh()) {
+                    return Ok(None);
                 }
-                if e.in_backoff() && usable(e) {
-                    count(endpoint, "stale");
-                    return Ok(Some(e.value.clone()));
-                }
-            }
-            hit
-        };
-        match fetch().await {
-            Ok((Some(value), ttl)) => {
-                let mut c = cache.lock().unwrap();
-                c.negative.remove(&key);
-                c.positive.put(key, value.clone(), ttl);
-                Ok(Some(value))
-            }
-            Ok((None, ttl)) => {
-                let mut c = cache.lock().unwrap();
-                c.positive.remove(&key);
-                c.negative.put(key, (), ttl);
-                Ok(None)
-            }
-            Err(LabError::Unavailable(m)) => match hit {
-                Some(e) if usable(&e) => {
-                    tracing::warn!(error = %m, "Lab unreachable; serving a cached answer");
-                    count(endpoint, "stale");
-                    let mut c = cache.lock().unwrap();
-                    if let Some(entry) = c.positive.map.get_mut(&key) {
-                        // Only the entry we served (not one refreshed meanwhile);
-                        // `fetched` is kept, so the stale window still ends on time.
-                        if entry.fetched == e.fetched {
-                            entry.retry_at = Some(Instant::now() + self.timing.stale_retry);
+                let hit = c.positive.get(&key);
+                if let Some(e) = &hit {
+                    if e.fresh() {
+                        if e.refresh_due() && !c.flights.contains_key(&key) {
+                            if let Ok(slot) = self.refresh_slots.clone().try_acquire_owned() {
+                                if let Some(entry) = c.positive.map.get_mut(&key) {
+                                    entry.refresh_started = true;
+                                }
+                                self.take_off(&mut c, cache, &key, fetch(), Some(slot));
+                            }
                         }
+                        return Ok(Some(e.value.clone()));
                     }
-                    Ok(Some(e.value))
+                    if e.in_backoff() && e.servable_stale(grace) {
+                        count(endpoint, "stale");
+                        return Ok(Some(e.value.clone()));
+                    }
                 }
-                _ => Err(LabError::Unavailable(m)),
-            },
-            Err(e) => Err(e),
+                let flight = if hit.as_ref().is_some_and(|e| e.ttl.is_zero()) {
+                    None
+                } else if let Some(rx) = c.flights.get(&key) {
+                    Some((rx.clone(), false))
+                } else {
+                    Some((self.take_off(&mut c, cache, &key, fetch(), None), true))
+                };
+                (hit, flight)
+            };
+            let shared = match flight {
+                None => None,
+                Some((mut rx, mine)) => {
+                    let landed = rx
+                        .wait_for(|answer| answer.is_some())
+                        .await
+                        .ok()
+                        .and_then(|answer| answer.clone());
+                    match landed {
+                        None => continue,
+                        Some(Ok((Some(_), ttl))) if !mine && ttl.is_zero() => None,
+                        Some(result) => Some(result),
+                    }
+                }
+            };
+            let result = match shared {
+                Some(result) => result,
+                None => {
+                    let started = Instant::now();
+                    let result = fetch().await;
+                    cache(self).lock().unwrap().store(&key, started, &result);
+                    result
+                }
+            };
+            return match result {
+                Ok((value, _)) => Ok(value),
+                Err(LabError::Unavailable(m)) => match hit {
+                    Some(e) if e.servable_stale(grace) => {
+                        tracing::warn!(error = %m, "Lab unreachable; serving a cached answer");
+                        count(endpoint, "stale");
+                        let mut c = cache(self).lock().unwrap();
+                        if let Some(entry) = c.positive.map.get_mut(&key) {
+                            // Only the entry we served (not one refreshed meanwhile);
+                            // `fetched` is kept, so the stale window still ends on time.
+                            if entry.fetched == e.fetched {
+                                entry.retry_at = Some(Instant::now() + self.timing.stale_retry);
+                            }
+                        }
+                        Ok(Some(e.value))
+                    }
+                    _ => Err(LabError::Unavailable(m)),
+                },
+                Err(e) => Err(e),
+            };
         }
+        Err(LabError::Unavailable("Lab lookup interrupted".into()))
+    }
+
+    /// Start the flight for `key` (the caller holds the cache lock and saw
+    /// none in the air). `slot` is a background refresh's slot, held until
+    /// it lands.
+    fn take_off<T, Fut>(
+        self: &Arc<Self>,
+        c: &mut Lookups<T>,
+        cache: CacheOf<T>,
+        key: &str,
+        fetch: Fut,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> FlightRx<T>
+    where
+        T: Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Fetched<T>> + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        c.flights.insert(key.to_string(), rx.clone());
+        let landing = Landing {
+            inner: self.clone(),
+            cache,
+            key: key.to_string(),
+            started: Instant::now(),
+            tx,
+            landed: false,
+        };
+        tokio::spawn(async move {
+            let _slot = slot;
+            let result = fetch.await;
+            landing.land(result);
+        });
+        rx
     }
 
     async fn to_identity(&self, endpoint: &'static str, a: Answer) -> (Option<Identity>, Duration) {
@@ -581,9 +869,7 @@ impl LabClient {
         )
     }
 
-    /// `GET /internal/instances/me`: confirms the instance credentials and
-    /// tells which deployment they belong to (checked once at boot).
-    pub async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
+    async fn instances_me(&self) -> Result<InstanceInfo, LabError> {
         let (status, body) = self
             .request(
                 "instances_me",
@@ -603,35 +889,48 @@ impl LabClient {
         Ok(me)
     }
 
-    pub async fn introspect(
-        &self,
+    async fn introspect(
+        self: &Arc<Self>,
         kind: CredentialKind,
         credential: &str,
         account_id: Option<&str>,
     ) -> Result<Option<Identity>, LabError> {
         let key = hashed(&["i", kind.as_str(), credential, account_id.unwrap_or("")]);
-        self.cached("introspect", &self.identities, key, || async {
-            let body = serde_json::json!({"kind": kind.as_str(), "credential": credential, "account_id": account_id});
-            let a = self.answer("introspect", self.http.post(format!("{}/internal/auth/introspect", self.base)).json(&body)).await?;
-            Ok(self.to_identity("introspect", a).await)
-        }).await
+        let body = serde_json::json!({"kind": kind.as_str(), "credential": credential, "account_id": account_id});
+        self.cached("introspect", identities, key, || {
+            let inner = self.clone();
+            let req = self
+                .http
+                .post(format!("{}/internal/auth/introspect", self.base))
+                .json(&body);
+            async move {
+                let a = inner.answer("introspect", req).await?;
+                Ok(inner.to_identity("introspect", a).await)
+            }
+        })
+        .await
     }
 
-    pub async fn account(&self, account_id: &str) -> Result<Option<Identity>, LabError> {
+    async fn account(self: &Arc<Self>, account_id: &str) -> Result<Option<Identity>, LabError> {
         let key = hashed(&["a", account_id]);
-        self.cached("account", &self.identities, key, || async {
-            let a = self
-                .answer(
-                    "account",
-                    self.http
-                        .get(format!("{}/internal/accounts/{account_id}", self.base)),
-                )
-                .await?;
-            let (identity, ttl) = self.to_identity("account", a).await;
-            if identity.is_none() {
-                self.forget_balance(account_id);
+        self.cached("account", identities, key, || {
+            let inner = self.clone();
+            let account_id = account_id.to_string();
+            async move {
+                let a = inner
+                    .answer(
+                        "account",
+                        inner
+                            .http
+                            .get(format!("{}/internal/accounts/{account_id}", inner.base)),
+                    )
+                    .await?;
+                let (identity, ttl) = inner.to_identity("account", a).await;
+                if identity.is_none() {
+                    inner.forget_balance(&account_id);
+                }
+                Ok((identity, ttl))
             }
-            Ok((identity, ttl))
         })
         .await
     }
@@ -641,9 +940,7 @@ impl LabClient {
         self.balances.lock().unwrap().remove(account_id);
     }
 
-    /// Spendable credits as the Lab last reported them (from a fresh
-    /// snapshot, or a new one).
-    pub async fn available_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
+    async fn available_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
         if let Some(b) = self.balances.lock().unwrap().get(account_id) {
             if b.fetched.elapsed() < b.ttl {
                 return Ok(Some(Available {
@@ -655,12 +952,7 @@ impl LabClient {
         self.refresh_credits(account_id).await
     }
 
-    /// Take a new balance snapshot now (directly, not through the identity
-    /// cache: the balance must be current). While the Lab is unavailable the
-    /// last snapshot is served for `stale_grace` past its expiry (unless it
-    /// came from a `cache_ttl: 0` answer), asking the Lab again at most
-    /// every `stale_retry`.
-    pub async fn refresh_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
+    async fn refresh_credits(&self, account_id: &str) -> Result<Option<Available>, LabError> {
         let stale = |b: &Balance| b.servable_stale(self.timing.stale_grace);
         let served = |credits| {
             Ok(Some(Available {
@@ -708,8 +1000,8 @@ impl LabClient {
         }
     }
 
-    pub async fn meilisearch(
-        &self,
+    async fn meilisearch(
+        self: &Arc<Self>,
         account_id: &str,
         url: Option<&str>,
     ) -> Result<Option<MeiliTarget>, LabError> {
@@ -720,7 +1012,8 @@ impl LabClient {
         ]);
         let meili_ttl = self.timing.meili_ttl;
         let negative_ttl = self.timing.negative_ttl;
-        self.cached("meilisearch", &self.meili, key, || async move {
+        self.cached("meilisearch", meili, key, || {
+            let inner = self.clone();
             let mut req = self.http.get(format!(
                 "{}/internal/accounts/{account_id}/meilisearch",
                 self.base
@@ -728,49 +1021,53 @@ impl LabClient {
             if let Some(u) = url {
                 req = req.query(&[("url", u)]);
             }
-            let (status, body) = self.request("meilisearch", req).await?;
-            if status == 404 {
-                // "No engine" is a negative answer: re-asked after 5 s, so
-                // an engine added in Settings is picked up quickly.
-                count("meilisearch", "inactive");
-                return Ok((None, negative_ttl));
+            async move {
+                let (status, body) = inner.request("meilisearch", req).await?;
+                if status == 404 {
+                    // "No engine" is a negative answer: re-asked after 5 s, so
+                    // an engine added in Settings is picked up quickly.
+                    count("meilisearch", "inactive");
+                    return Ok((None, negative_ttl));
+                }
+                if !(200..300).contains(&status) {
+                    count("meilisearch", "unavailable");
+                    return Err(LabError::Unavailable(format!("HTTP {status}")));
+                }
+                let m: MeiliAnswer = serde_json::from_slice(&body).map_err(|e| {
+                    count("meilisearch", "unavailable");
+                    LabError::Unavailable(format!("malformed: {e}"))
+                })?;
+                count("meilisearch", "ok");
+                Ok((
+                    Some(MeiliTarget {
+                        url: m.url.trim_end_matches('/').to_string(),
+                        api_key: m.api_key.filter(|k| !k.is_empty()),
+                    }),
+                    meili_ttl,
+                ))
             }
-            if !(200..300).contains(&status) {
-                count("meilisearch", "unavailable");
-                return Err(LabError::Unavailable(format!("HTTP {status}")));
-            }
-            let m: MeiliAnswer = serde_json::from_slice(&body).map_err(|e| {
-                count("meilisearch", "unavailable");
-                LabError::Unavailable(format!("malformed: {e}"))
-            })?;
-            count("meilisearch", "ok");
-            Ok((
-                Some(MeiliTarget {
-                    url: m.url.trim_end_matches('/').to_string(),
-                    api_key: m.api_key.filter(|k| !k.is_empty()),
-                }),
-                meili_ttl,
-            ))
         })
         .await
     }
 
-    /// `GET /internal/accounts/{id}/ai`: the Lumen target for this account's
-    /// LLM calls; `None` when the Lab has none for it (404). A
-    /// `rejected_key_id` (the key Lumen just refused) skips the cache, asks
-    /// the Lab for a replacement and makes that the cached answer.
-    pub async fn ai(
-        &self,
+    async fn ai(
+        self: &Arc<Self>,
         account_id: &str,
         rejected_key_id: Option<&str>,
     ) -> Result<Option<AiTarget>, LabError> {
         let key = hashed(&["ai", account_id]);
         let Some(rejected) = rejected_key_id else {
             return self
-                .cached("ai", &self.ai, key, || self.fetch_ai(account_id, None))
+                .cached("ai", ai, key, || {
+                    let inner = self.clone();
+                    let account_id = account_id.to_string();
+                    async move { inner.fetch_ai(&account_id, None).await }
+                })
                 .await;
         };
         // Never served stale: the cached entry is the key that was refused.
+        // Not a flight either: the answer depends on the refused key, and it
+        // replaces whatever a flight asked for earlier lands with.
         let (target, ttl) = self.fetch_ai(account_id, Some(rejected)).await?;
         let mut c = self.ai.lock().unwrap();
         match &target {
@@ -823,33 +1120,6 @@ impl LabClient {
             }),
             self.ttl_from(Some(a.cache_ttl)),
         ))
-    }
-
-    #[cfg(test)]
-    pub fn debug_cache_keys(&self) -> Vec<String> {
-        let c = self.identities.lock().unwrap();
-        c.positive
-            .map
-            .keys()
-            .chain(c.negative.map.keys())
-            .cloned()
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub fn cached_ttl_for_test(
-        &self,
-        kind: CredentialKind,
-        credential: &str,
-        account_id: Option<&str>,
-    ) -> Option<Duration> {
-        let key = hashed(&["i", kind.as_str(), credential, account_id.unwrap_or("")]);
-        self.identities
-            .lock()
-            .unwrap()
-            .positive
-            .get(&key)
-            .map(|e| e.ttl)
     }
 }
 
@@ -1899,6 +2169,449 @@ mod tests {
             Err(LabError::BadResponse(307))
         );
         assert_eq!(lab.calls(), 0, "the redirect target was never called");
+    }
+
+    // ---- single-flight and refresh-ahead (SCR-90) ----
+
+    fn slow(lab: &FakeLab, ms: usize) {
+        lab.state
+            .slow_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn flights_in_the_air(c: &LabClient) -> usize {
+        c.inner.identities.lock().unwrap().flights.len()
+    }
+
+    /// `n` concurrent introspections of the same key.
+    async fn herd(
+        c: &Arc<LabClient>,
+        kind: CredentialKind,
+        credential: &'static str,
+        n: usize,
+    ) -> Vec<Result<Option<Identity>, LabError>> {
+        let tasks: Vec<_> = (0..n)
+            .map(|_| {
+                let c = c.clone();
+                tokio::spawn(async move { c.introspect(kind, credential, None).await })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_of_a_cold_or_expired_key_share_one_lab_call() {
+        let (lab, c) = setup().await; // ttl 200 ms
+        let c = Arc::new(c);
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        slow(&lab, 50);
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_a", 20).await {
+            assert_eq!(answer.unwrap().unwrap().account_id, ACCT);
+        }
+        assert_eq!(lab.calls(), 1, "a cold key: one call for 20 callers");
+        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_a", 20).await {
+            assert!(answer.unwrap().is_some());
+        }
+        assert_eq!(lab.calls(), 2, "an expired key: one more");
+        // Negative answers are shared the same way.
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_unknown", 20).await {
+            assert_eq!(answer, Ok(None));
+        }
+        assert_eq!(lab.calls(), 3);
+        assert_eq!(flights_in_the_air(&c), 0, "no flight is left behind");
+    }
+
+    #[tokio::test]
+    async fn a_failed_flight_fails_its_waiters_and_the_key_stays_usable() {
+        let (lab, c) = setup().await;
+        let c = Arc::new(c);
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        lab.set_down(true);
+        slow(&lab, 50);
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_a", 10).await {
+            assert!(
+                matches!(answer, Err(LabError::Unavailable(_))),
+                "unknown credential while the Lab is down: {answer:?}"
+            );
+        }
+        assert_eq!(
+            lab.calls(),
+            1,
+            "the error is shared, not retried per caller"
+        );
+        assert_eq!(flights_in_the_air(&c), 0);
+        lab.set_down(false);
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(lab.calls(), 2, "the error was not cached");
+    }
+
+    /// A stale-servable entry is still served to every waiter of a failed
+    /// flight.
+    #[tokio::test]
+    async fn waiters_of_a_failed_flight_are_served_stale() {
+        let (lab, c) = setup().await; // ttl 200, grace 400 (ms)
+        let c = Arc::new(c);
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap();
+        lab.set_down(true);
+        slow(&lab, 30);
+        tokio::time::sleep(Duration::from_millis(250)).await; // past ttl, inside grace
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_a", 10).await {
+            assert!(answer.unwrap().is_some());
+        }
+        assert_eq!(lab.calls(), 2);
+    }
+
+    /// The caller that started a flight goes away (an HTTP client that
+    /// disconnected): the others still get the answer, from the same call.
+    #[tokio::test]
+    async fn a_dropped_first_caller_does_not_hang_the_others() {
+        let (lab, c) = setup().await; // request_timeout 300 ms
+        let c = Arc::new(c);
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        slow(&lab, 150);
+        let first = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let answer = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("the second caller is not left waiting")
+            .unwrap();
+        assert!(answer.unwrap().is_some());
+        assert_eq!(lab.calls(), 1);
+        assert_eq!(flights_in_the_air(&c), 0);
+
+        // Every caller gone: the call still completes and its answer is cached.
+        lab.set_credential("api_key", "sk_live_b", FakeLab::identity(ACCT, "pro", 50));
+        let only = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                c.introspect(CredentialKind::ApiKey, "sk_live_b", None)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        only.abort();
+        tokio::time::sleep(Duration::from_millis(180)).await; // the flight has landed
+        assert_eq!(flights_in_the_air(&c), 0);
+        slow(&lab, 0);
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_b", None)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(lab.calls(), 2, "served from the abandoned flight's answer");
+    }
+
+    fn some_identity() -> Identity {
+        Identity {
+            account_id: ACCT.into(),
+            tier: "pro".into(),
+            role: None,
+            api_key_id: None,
+            limits: None,
+        }
+    }
+
+    /// A flight that panics neither strands its waiters nor poisons the key:
+    /// they start a new one (once), then fail `Unavailable`.
+    #[tokio::test]
+    async fn a_panicking_flight_is_replaced_once_and_leaves_no_trace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_lab, c) = setup().await;
+        let inner = c.inner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup = |panics: usize| {
+            let (inner, calls) = (inner.clone(), calls.clone());
+            async move {
+                inner
+                    .cached("introspect", identities, "k".to_string(), || {
+                        let calls = calls.clone();
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            if calls.fetch_add(1, Ordering::SeqCst) < panics {
+                                panic!("flight down (expected in this test)");
+                            }
+                            Ok((Some(some_identity()), Duration::from_secs(60)))
+                        }
+                    })
+                    .await
+            }
+        };
+        let herd: Vec<_> = (0..5).map(|_| tokio::spawn(lookup(1))).collect();
+        for t in herd {
+            let answer = tokio::time::timeout(Duration::from_secs(1), t)
+                .await
+                .expect("no waiter hangs")
+                .unwrap();
+            assert_eq!(answer, Ok(Some(some_identity())));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the panicked flight and one replacement"
+        );
+        assert_eq!(flights_in_the_air(&c), 0);
+
+        // A lookup that keeps panicking is an error, not a hang or a loop.
+        c.inner.identities.lock().unwrap().positive.remove("k");
+        calls.store(0, Ordering::SeqCst);
+        assert_eq!(
+            lookup(usize::MAX).await,
+            Err(LabError::Unavailable("Lab lookup interrupted".into()))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(flights_in_the_air(&c), 0);
+        // And the key works again.
+        calls.store(0, Ordering::SeqCst);
+        assert_eq!(lookup(0).await, Ok(Some(some_identity())));
+    }
+
+    /// ttl 2 s: refresh-ahead from 1.6 s on.
+    async fn setup_refresh(stale_grace: Duration) -> (FakeLab, Arc<LabClient>) {
+        let lab = FakeLab::start().await;
+        let timing = Timing {
+            default_ttl: Duration::from_secs(2),
+            stale_grace,
+            request_timeout: Duration::from_secs(1),
+            ..fast()
+        };
+        let c = Arc::new(LabClient::with_timing(
+            &lab.url,
+            INSTANCE_ID,
+            SECRET,
+            timing,
+        ));
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "pro", 50));
+        c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        (lab, c)
+    }
+
+    #[tokio::test]
+    async fn an_entry_close_to_expiry_is_served_and_refreshed_in_the_background() {
+        let (lab, c) = setup_refresh(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(lab.calls(), 1, "halfway through its ttl: no refresh");
+
+        tokio::time::sleep(Duration::from_millis(600)).await; // 1.7 s: past 4/5
+        lab.set_credential("api_key", "sk_live_a", FakeLab::identity(ACCT, "free", 50));
+        slow(&lab, 300);
+        let started = Instant::now();
+        for answer in herd(&c, CredentialKind::ApiKey, "sk_live_a", 10).await {
+            assert_eq!(answer.unwrap().unwrap().tier, "pro", "the cached answer");
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "nobody waited for the Lab"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await; // 2.2 s: the refresh landed
+        assert_eq!(lab.calls(), 2, "exactly one background call");
+        assert_eq!(flights_in_the_air(&c), 0);
+        // Past the first answer's ttl, the refreshed one is served, without
+        // a Lab call on the request path.
+        let started = Instant::now();
+        let id = c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.tier, "free");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(lab.calls(), 2);
+    }
+
+    /// The Lab is asked on access only: an entry nobody reads is never
+    /// refreshed.
+    #[tokio::test]
+    async fn an_unused_entry_is_never_refreshed() {
+        let (lab, _c) = setup_refresh(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert_eq!(lab.calls(), 1);
+    }
+
+    /// A refresh that fails changes nothing: the entry is served until the
+    /// end of the ttl the Lab gave for it and not a moment longer, and the
+    /// failed refresh is not repeated.
+    #[tokio::test]
+    async fn a_failed_refresh_does_not_extend_the_entry() {
+        let (lab, c) = setup_refresh(Duration::ZERO).await; // no stale window
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        lab.set_down(true);
+        for _ in 0..3 {
+            assert!(c
+                .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                .await
+                .unwrap()
+                .is_some());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(lab.calls(), 2, "one refresh per entry, even when it fails");
+        tokio::time::sleep(Duration::from_millis(250)).await; // 2.1 s: past the ttl
+        assert!(
+            matches!(
+                c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                    .await,
+                Err(LabError::Unavailable(_))
+            ),
+            "the failed refresh did not prolong the entry"
+        );
+    }
+
+    /// With a stale window, the failed refresh leaves the stale rule as it
+    /// was: the window still ends `stale_grace` after the original expiry.
+    #[tokio::test]
+    async fn a_failed_refresh_leaves_the_stale_window_unchanged() {
+        let (lab, c) = setup_refresh(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        lab.set_down(true);
+        c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await; // 2.1 s: stale
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .is_some());
+        tokio::time::sleep(Duration::from_millis(400)).await; // 2.5 s: past ttl + grace
+        assert!(matches!(
+            c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                .await,
+            Err(LabError::Unavailable(_))
+        ));
+    }
+
+    /// A refresh that learns the credential was revoked stops serving it at
+    /// once, before the end of its ttl.
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_credential_revoked_drops_it_early() {
+        let (lab, c) = setup_refresh(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        lab.set_credential("api_key", "sk_live_a", json!({"active": false}));
+        assert!(c
+            .introspect(CredentialKind::ApiKey, "sk_live_a", None)
+            .await
+            .unwrap()
+            .is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await; // 1.75 s: refreshed
+        assert_eq!(
+            c.introspect(CredentialKind::ApiKey, "sk_live_a", None)
+                .await,
+            Ok(None),
+            "still inside the first answer's ttl"
+        );
+        assert_eq!(lab.calls(), 2);
+    }
+
+    /// Background refreshes are capped (a quarter of `max_in_flight`): past
+    /// the cap an entry is simply not refreshed ahead.
+    #[tokio::test]
+    async fn background_refreshes_are_capped() {
+        let lab = FakeLab::start().await;
+        let timing = Timing {
+            default_ttl: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(1),
+            capacity: 10,
+            max_in_flight: 8, // 2 refresh slots
+            ..fast()
+        };
+        let c = LabClient::with_timing(&lab.url, INSTANCE_ID, SECRET, timing);
+        let keys: Vec<String> = (0..5).map(|i| format!("sk_live_{i}")).collect();
+        for k in &keys {
+            lab.set_credential("api_key", k, FakeLab::identity(ACCT, "pro", 50));
+            c.introspect(CredentialKind::ApiKey, k, None).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        slow(&lab, 200);
+        for k in &keys {
+            assert!(c
+                .introspect(CredentialKind::ApiKey, k, None)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(flights_in_the_air(&c), 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(lab.calls(), 5 + 2, "two refreshes in the air, no more");
+    }
+
+    /// `cache_ttl: 0` ("do not cache": an expiring session or token) stays
+    /// strict under concurrency: a caller never gets an answer the Lab may
+    /// have computed before it asked.
+    #[tokio::test]
+    async fn a_cache_ttl_0_answer_is_fetched_by_every_caller() {
+        let (lab, c) = setup().await;
+        let c = Arc::new(c);
+        let mut v = FakeLab::identity(ACCT, "pro", 50);
+        v["cache_ttl"] = json!(0);
+        lab.set_credential("session", "jwt_expiring", v);
+        slow(&lab, 50);
+        // Cold: the callers wait for one flight (its ttl is not known yet),
+        // then all but the one that started it ask again for themselves.
+        for answer in herd(&c, CredentialKind::Session, "jwt_expiring", 5).await {
+            assert!(answer.unwrap().is_some());
+        }
+        assert_eq!(lab.calls(), 1 + 4);
+        // Known to be uncacheable: every caller asks, concurrent or not.
+        for answer in herd(&c, CredentialKind::Session, "jwt_expiring", 5).await {
+            assert!(answer.unwrap().is_some());
+        }
+        assert_eq!(lab.calls(), 5 + 5);
+        c.introspect(CredentialKind::Session, "jwt_expiring", None)
+            .await
+            .unwrap();
+        assert_eq!(lab.calls(), 11, "a later caller fetches again");
+        assert_eq!(flights_in_the_air(&c), 0);
+    }
+
+    /// A flight asked before the AI key was re-resolved lands after it: the
+    /// replacement key stays the cached answer.
+    #[test]
+    fn a_flight_never_overwrites_a_newer_answer() {
+        let mut cache: Lookups<u8> = Lookups::new(&fast());
+        let asked = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        cache.positive.put("k".into(), 2, Duration::from_secs(60));
+        cache.store("k", asked, &Ok((Some(1), Duration::from_secs(60))));
+        assert_eq!(cache.positive.get("k").unwrap().value, 2);
+        cache.store("k", Instant::now(), &Ok((Some(3), Duration::from_secs(60))));
+        assert_eq!(cache.positive.get("k").unwrap().value, 3);
+        cache.store("k", asked, &Ok((None, Duration::from_secs(60))));
+        assert!(cache.positive.get("k").is_none(), "a negative answer wins");
     }
 
     #[test]
