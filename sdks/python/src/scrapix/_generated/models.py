@@ -910,6 +910,12 @@ class MapResponse(BaseModel):
     Time taken in milliseconds
     """
     links: list[MapLink]
+    sitemaps: list[str]
+    """
+    The sitemaps the links were read from (as declared in robots.txt or
+    found at a usual location). Empty when the site has no sitemap, or
+    with `sitemap: false`: the links then come from the pages.
+    """
     success: bool
     total: int = Field(..., ge=0)
     """

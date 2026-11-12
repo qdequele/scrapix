@@ -5529,6 +5529,10 @@ struct MapResponse {
     links: Vec<MapLink>,
     /// Total number of links discovered
     total: usize,
+    /// The sitemaps the links were read from (as declared in robots.txt or
+    /// found at a usual location). Empty when the site has no sitemap, or
+    /// with `sitemap: false`: the links then come from the pages.
+    sitemaps: Vec<String>,
     /// Time taken in milliseconds
     duration_ms: u64,
 }
@@ -5554,7 +5558,8 @@ enum MapFetchOutcome {
 
 /// Links of an HTML document, relative ones resolved against its `<base
 /// href>` or else `page_url` (where the document was served). Only http(s)
-/// links on `domain` are kept, without their fragment.
+/// links on `domain` (with or without `www.`) are kept, without their
+/// fragment.
 fn extract_page_links(
     html: &str,
     page_url: &url::Url,
@@ -5577,7 +5582,7 @@ fn extract_page_links(
             continue;
         };
         if !matches!(resolved.scheme(), "http" | "https")
-            || resolved.host_str().unwrap_or("") != domain
+            || !scrapix_crawler::hosts_match_ignoring_www(resolved.host_str().unwrap_or(""), domain)
         {
             continue;
         }
@@ -5639,6 +5644,39 @@ fn head_title_and_description(html: &str) -> (Option<String>, Option<String>) {
         .and_then(|c| c.get(1))
         .and_then(|m| clean(m.as_str()));
     (title, description)
+}
+
+/// The sitemap URLs a map of `start` keeps, in the order it lists them.
+///
+/// Only pages of this site are kept. `example.com` and `www.example.com`
+/// are one site: the sitemap names the host the site answers on, not the
+/// one that was typed. When `start` points inside the site (`/docs/`), the
+/// URLs under that folder come first, so `limit` keeps them; the others
+/// follow. Sitemap order is kept within each group.
+fn sitemap_urls_for_map(
+    urls: Vec<scrapix_crawler::SitemapUrl>,
+    start: &url::Url,
+) -> Vec<scrapix_crawler::SitemapUrl> {
+    let host = start.host_str().unwrap_or("");
+    let section = scrapix_crawler::section_prefix(start);
+    let mut kept: Vec<(bool, scrapix_crawler::SitemapUrl)> = urls
+        .into_iter()
+        .filter(|su| !is_non_page_url(&su.loc))
+        .filter_map(|su| {
+            let parsed = url::Url::parse(&su.loc).ok()?;
+            if !scrapix_crawler::hosts_match_ignoring_www(parsed.host_str()?, host) {
+                return None;
+            }
+            let outside = section.as_deref().is_some_and(|section| {
+                !parsed.path().starts_with(section)
+                    && parsed.path() != section.trim_end_matches('/')
+            });
+            Some((outside, su))
+        })
+        .collect();
+    // Stable sort.
+    kept.sort_by_key(|(outside, _)| *outside);
+    kept.into_iter().map(|(_, su)| su).collect()
 }
 
 /// Wall-clock budget of one `/map` call, sitemap discovery included. What
@@ -5908,6 +5946,7 @@ async fn map_url(
     // Track visited URLs and collected results
     let mut visited = HashSet::new();
     let mut results: Vec<MapLink> = Vec::new();
+    let mut sitemaps: Vec<String> = Vec::new();
 
     let base_domain = parsed_url.host_str().unwrap_or("").to_string();
     let fetcher = state.fetcher.clone();
@@ -5945,23 +5984,17 @@ async fn map_url(
             allow_private_ips: fetcher.allows_private_ips(),
             ..Default::default()
         });
-        match tokio::time::timeout_at(deadline, sitemap_parser.discover_all_urls(&request.url))
-            .await
-        {
-            Ok(Ok(sitemap_urls)) => {
-                debug!(count = sitemap_urls.len(), "Discovered URLs from sitemaps");
-                for su in sitemap_urls {
+        match tokio::time::timeout_at(deadline, sitemap_parser.discover(&request.url)).await {
+            Ok(Ok(discovery)) => {
+                debug!(
+                    count = discovery.urls.len(),
+                    sitemaps = discovery.sitemaps.len(),
+                    "Discovered URLs from sitemaps"
+                );
+                sitemaps = discovery.sitemaps;
+                for su in sitemap_urls_for_map(discovery.urls, &parsed_url) {
                     if visited.len() >= limit {
                         break;
-                    }
-                    // Filter non-page URLs
-                    if is_non_page_url(&su.loc) {
-                        continue;
-                    }
-                    // Only same-domain URLs
-                    match url::Url::parse(&su.loc) {
-                        Ok(su_parsed) if su_parsed.host_str().unwrap_or("") == base_domain => {}
-                        _ => continue,
                     }
                     if visited.insert(su.loc.clone()) {
                         results.push(MapLink {
@@ -6204,6 +6237,7 @@ async fn map_url(
         success: true,
         links,
         total,
+        sitemaps,
         duration_ms,
     }))
 }
@@ -8286,6 +8320,55 @@ mod tests {
         // No </head>, multi-byte text across the 8 KiB cut: no panic.
         let long = format!("<title>t</title>{}", "é".repeat(5000));
         assert_eq!(head_title_and_description(&long).0.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn map_keeps_sitemap_urls_of_the_www_and_bare_host() {
+        let urls = [
+            "https://www.example.com/a",
+            "https://example.com/b",
+            "https://other.com/c",
+            "https://docs.example.com/d",
+            "not a url",
+        ]
+        .map(scrapix_crawler::SitemapUrl::new)
+        .to_vec();
+        let start = url::Url::parse("https://example.com").unwrap();
+        let kept: Vec<String> = sitemap_urls_for_map(urls, &start)
+            .into_iter()
+            .map(|u| u.loc)
+            .collect();
+        assert_eq!(kept, ["https://www.example.com/a", "https://example.com/b"]);
+    }
+
+    #[test]
+    fn map_lists_the_start_urls_section_first() {
+        let urls = [
+            "https://example.com/",
+            "https://example.com/docs/a",
+            "https://example.com/blog/x",
+            "https://example.com/docs",
+            "https://example.com/docsify",
+            "https://example.com/docs/b",
+        ]
+        .map(scrapix_crawler::SitemapUrl::new)
+        .to_vec();
+        let start = url::Url::parse("https://example.com/docs/intro.html").unwrap();
+        let kept: Vec<String> = sitemap_urls_for_map(urls, &start)
+            .into_iter()
+            .map(|u| u.loc)
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "https://example.com/docs/a",
+                "https://example.com/docs",
+                "https://example.com/docs/b",
+                "https://example.com/",
+                "https://example.com/blog/x",
+                "https://example.com/docsify",
+            ]
+        );
     }
 
     #[test]

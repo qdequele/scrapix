@@ -61,6 +61,7 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
     }
   ],
   "total": 247,
+  "sitemaps": ["https://docs.example.com/sitemap.xml"],
   "duration_ms": 3120
 }
 ```
@@ -77,15 +78,32 @@ Discover URLs on a website. Scrapix first attempts to find and parse the site's 
 | `links[].changefreq` | string | Change frequency from the sitemap |
 | `links[].priority` | float | Priority from the sitemap (0.0 - 1.0) |
 | `total` | integer | Number of URLs returned |
+| `sitemaps` | array | The sitemaps the URLs were read from. Empty when the site has none (the URLs then come from the pages) |
 | `duration_ms` | integer | Time the map took |
 
 Fields without a value are omitted.
 
 ### How a map runs
 
-1. **Sitemaps.** `robots.txt` is read for `Sitemap:` lines (else
-   `/sitemap.xml`). Sitemaps and the children of a sitemap index are fetched
-   8 at a time, and reading stops once about twice `limit` URLs are found.
+1. **Sitemaps.** `robots.txt` is read at the site root, whatever the path
+   of `url`, for its `Sitemap:` lines. Without any, the usual names are
+   tried at the root: `sitemap.xml`, `sitemap_index.xml`,
+   `sitemap-index.xml`, `sitemap.xml.gz`, `wp-sitemap.xml`. They are also
+   tried when the declared sitemaps give no URL. When `url` has a path,
+   `sitemap.xml` in its folder and in its first folder is read too
+   (`/docs/sitemap.xml` for `/docs/guide/`). A sitemap can be XML, gzipped,
+   a sitemap index, an RSS or Atom feed, or a text file with one URL per
+   line; an HTML page served in its place is ignored. Sitemaps and the
+   children of a sitemap index are fetched 8 at a time, and reading stops
+   once about twice `limit` URLs are found.
+
+   `example.com` and `www.example.com` are one site: when `robots.txt`
+   redirects from one to the other, the sitemaps are looked up on the host
+   the site answers on, and URLs on either host are kept. When the host
+   does not answer at all, the other one is tried.
+
+   When `url` has a path, the URLs under its folder come first, so `limit`
+   keeps them; the rest of the site follows.
 2. **Pages.** A page is fetched once at most: for its title and description,
    for its links (pages above `depth`), or both. When its links are not
    followed, only its `<head>` is kept and parsed. Pages start as soon as a
