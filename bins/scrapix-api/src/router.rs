@@ -7,6 +7,10 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use tower_http::compression::{
+    predicate::{NotForContentType, Predicate, SizeAbove},
+    CompressionLayer,
+};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -45,6 +49,35 @@ fn trace_layer() -> TraceLayer<
     TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
         tracing::info_span!("request", method = %req.method(), uri = %redact_query(req.uri()))
     })
+}
+
+/// Smallest response body worth compressing.
+const COMPRESSION_MIN_BYTES: u16 = 1024;
+
+/// Whether a response may be compressed: a body of at least
+/// [`COMPRESSION_MIN_BYTES`] that is not a stream of events (SSE must
+/// reach the client as each event is written), a WebSocket upgrade, an
+/// image or gRPC.
+fn compressible() -> impl Predicate {
+    SizeAbove::new(COMPRESSION_MIN_BYTES)
+        .and(NotForContentType::SSE)
+        .and(NotForContentType::IMAGES)
+        .and(NotForContentType::GRPC)
+        .and(
+            |status: axum::http::StatusCode,
+             _: axum::http::Version,
+             _: &axum::http::HeaderMap,
+             _: &axum::http::Extensions| {
+                status != axum::http::StatusCode::SWITCHING_PROTOCOLS
+            },
+        )
+}
+
+/// gzip for the responses [`compressible`] allows, when the client's
+/// `Accept-Encoding` asks for it. Scrape and results payloads are text
+/// (markdown, HTML, JSON) and shrink several times over.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().compress_when(compressible())
 }
 
 /// Apply `auth` to `routes`. `ws` routes additionally accept `?token=` (in
@@ -113,8 +146,8 @@ fn docs_routes() -> Router {
     routes
 }
 
-/// Every engine route with its auth guard, the request trace layer and the
-/// body-size limits. CORS is added by the caller.
+/// Every engine route with its auth guard, the request trace layer, the
+/// body-size limits and response compression. CORS is added by the caller.
 pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode) -> Router {
     // Public routes (no auth required)
     let public = Router::new()
@@ -207,6 +240,8 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode) -> Router {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(upload_limit));
     let parse = guard(parse, auth, false);
     app.merge(parse.layer(trace_layer()).with_state(state))
+        // Outermost, so it covers every route merged above.
+        .layer(compression_layer())
 }
 
 #[cfg(test)]
@@ -291,6 +326,94 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// `Content-Encoding` and body of a GET sent with `accept_encoding`.
+    async fn encoded(uri: &str, accept_encoding: Option<&str>) -> (Option<String>, Vec<u8>) {
+        let mut req = Request::get(uri);
+        if let Some(value) = accept_encoding {
+            req = req.header("Accept-Encoding", value);
+        }
+        let res = app(admin())
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{uri}");
+        let encoding = res
+            .headers()
+            .get("content-encoding")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(res.into_body(), 1 << 24)
+            .await
+            .unwrap();
+        (encoding, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn large_responses_are_gzipped_when_the_client_accepts_it() {
+        // The OpenAPI spec: a large JSON body.
+        let (encoding, plain) = encoded("/openapi.json", None).await;
+        assert_eq!(encoding, None);
+        assert!(plain.len() > usize::from(COMPRESSION_MIN_BYTES));
+        serde_json::from_slice::<serde_json::Value>(&plain).unwrap();
+
+        let (encoding, gzipped) = encoded("/openapi.json", Some("gzip")).await;
+        assert_eq!(encoding.as_deref(), Some("gzip"));
+        assert_eq!(&gzipped[..2], &[0x1f, 0x8b], "gzip magic bytes");
+        assert!(gzipped.len() < plain.len() / 2);
+
+        // An encoding the server does not produce: plain.
+        let (encoding, body) = encoded("/openapi.json", Some("zstd")).await;
+        assert_eq!(encoding, None);
+        assert_eq!(body, plain);
+    }
+
+    #[tokio::test]
+    async fn small_responses_are_not_compressed() {
+        let (encoding, body) = encoded("/health", Some("gzip")).await;
+        assert_eq!(encoding, None);
+        assert!(body.len() < usize::from(COMPRESSION_MIN_BYTES));
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_stay_readable_with_and_without_gzip() {
+        let (encoding, plain) = encoded("/metrics", None).await;
+        assert_eq!(encoding, None);
+        std::str::from_utf8(&plain).unwrap();
+        let (encoding, body) = encoded("/metrics", Some("gzip")).await;
+        match encoding.as_deref() {
+            Some("gzip") => assert_eq!(&body[..2], &[0x1f, 0x8b]),
+            None => assert!(body.len() < usize::from(COMPRESSION_MIN_BYTES)),
+            other => panic!("unexpected Content-Encoding {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_streams_and_upgrades_are_never_compressed() {
+        use axum::http::{Response, StatusCode};
+        let big = || Body::from(vec![b'x'; 4096]);
+        let predicate = compressible();
+        let json = Response::builder()
+            .header("content-type", "application/json")
+            .body(big())
+            .unwrap();
+        assert!(predicate.should_compress(&json));
+        let sse = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(big())
+            .unwrap();
+        assert!(!predicate.should_compress(&sse));
+        let upgrade = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .body(big())
+            .unwrap();
+        assert!(!predicate.should_compress(&upgrade));
+        let small = Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert!(!predicate.should_compress(&small));
     }
 
     #[tokio::test]
