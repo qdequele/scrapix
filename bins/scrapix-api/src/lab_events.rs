@@ -166,26 +166,36 @@ fn db(e: impl std::fmt::Display) -> StoreError {
     StoreError::Other(e.to_string())
 }
 
+async fn pg_insert<'e, E: sqlx::PgExecutor<'e>>(ex: E, e: &LabEvent) -> Result<(), StoreError> {
+    let account: Uuid = e
+        .account_id
+        .parse()
+        .map_err(|_| db(format!("invalid account_id {}", e.account_id)))?;
+    sqlx::query(
+        "INSERT INTO lab_events (id, type, account_id, payload) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(e.id)
+    .bind(&e.kind)
+    .bind(account)
+    .bind(serde_json::to_value(e).map_err(db)?)
+    .execute(ex)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl LabOutbox for PgOutbox {
     async fn enqueue(&self, events: &[LabEvent]) -> Result<(), StoreError> {
+        // One event (every /scrape, /map and /search) is one auto-commit
+        // statement: atomic by itself, one round trip instead of three.
+        if let [e] = events {
+            return pg_insert(&self.pool, e).await;
+        }
         let mut tx = self.pool.begin().await.map_err(db)?;
         for e in events {
-            let account: Uuid = e
-                .account_id
-                .parse()
-                .map_err(|_| db(format!("invalid account_id {}", e.account_id)))?;
-            sqlx::query(
-                "INSERT INTO lab_events (id, type, account_id, payload) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(e.id)
-            .bind(&e.kind)
-            .bind(account)
-            .bind(serde_json::to_value(e).map_err(db)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+            pg_insert(&mut *tx, e).await?;
         }
         tx.commit().await.map_err(db)
     }
@@ -291,29 +301,42 @@ fn sqlite_ts(t: DateTime<Utc>) -> String {
     crate::job_store::sqlite::ts(Some(t)).unwrap_or_default()
 }
 
+async fn sqlite_insert<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    e: &LabEvent,
+    now: &str,
+) -> Result<(), StoreError> {
+    let account: Uuid = e
+        .account_id
+        .parse()
+        .map_err(|_| db(format!("invalid account_id {}", e.account_id)))?;
+    sqlx::query(
+        "INSERT INTO lab_events (id, type, account_id, payload, created_at, next_attempt_at) \
+         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(e.id.to_string())
+    .bind(&e.kind)
+    .bind(account.to_string())
+    .bind(serde_json::to_string(e).map_err(db)?)
+    .bind(now)
+    .bind(now)
+    .execute(ex)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl LabOutbox for SqliteOutbox {
     async fn enqueue(&self, events: &[LabEvent]) -> Result<(), StoreError> {
         let now = sqlite_ts(Utc::now());
+        // As in `PgOutbox`: one event is one auto-commit statement.
+        if let [e] = events {
+            return sqlite_insert(&self.pool, e, &now).await;
+        }
         let mut tx = self.pool.begin().await.map_err(db)?;
         for e in events {
-            let account: Uuid = e
-                .account_id
-                .parse()
-                .map_err(|_| db(format!("invalid account_id {}", e.account_id)))?;
-            sqlx::query(
-                "INSERT INTO lab_events (id, type, account_id, payload, created_at, next_attempt_at) \
-                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(e.id.to_string())
-            .bind(&e.kind)
-            .bind(account.to_string())
-            .bind(serde_json::to_string(e).map_err(db)?)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+            sqlite_insert(&mut *tx, e, &now).await?;
         }
         tx.commit().await.map_err(db)
     }
@@ -885,6 +908,39 @@ mod tests {
         let e = LabEvent::usage("acc", None, "map", 2, json!({}), "m".into(), None);
         assert!(o.enqueue(&[e]).await.is_err());
         assert_eq!(o.pending_stats().await.unwrap().0, 0);
+    }
+
+    /// A single event is one auto-commit insert; several stay one
+    /// transaction: a bad event anywhere in the batch stores none of it.
+    async fn several_events_are_all_or_nothing(o: &dyn LabOutbox) {
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let good = LabEvent::usage(acct, None, "map", 2, json!({}), "m".into(), None);
+        let bad = LabEvent::usage("acc", None, "map", 2, json!({}), "m".into(), None);
+        assert!(o.enqueue(&[good.clone(), bad]).await.is_err());
+        assert_eq!(
+            o.pending_stats().await.unwrap().0,
+            0,
+            "the valid event of a failed batch is rolled back"
+        );
+        o.enqueue(std::slice::from_ref(&good)).await.unwrap();
+        o.enqueue(std::slice::from_ref(&good)).await.unwrap();
+        assert_eq!(o.due(10).await.unwrap(), vec![good.clone()]);
+        o.abandon(&[good.id]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_keeps_several_events_atomic() {
+        let (_dir, pool) = crate::job_store::sqlite::test_sqlite_pool().await;
+        several_events_are_all_or_nothing(&SqliteOutbox::new(pool)).await;
+    }
+
+    #[tokio::test]
+    async fn pg_outbox_keeps_several_events_atomic() {
+        let Some(pool) = crate::job_store::postgres::test_pg_pool().await else {
+            eprintln!("skipped");
+            return;
+        };
+        several_events_are_all_or_nothing(&PgOutbox::new(pool)).await;
     }
 
     #[tokio::test]
