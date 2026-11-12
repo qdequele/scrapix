@@ -9,6 +9,31 @@ pub fn detect_language(text: &str) -> Option<String> {
     detect_language_with_threshold(text, 0.8)
 }
 
+/// How much of a text [`detect_language_sampled`] reads. Detection cost
+/// grows with the text (about 6 µs per KB on top of a fixed 15 µs in the
+/// parser benchmark), and a few KB already settle the language of a page.
+pub const LANGUAGE_SAMPLE_BYTES: usize = 8 * 1024;
+
+/// [`detect_language`] on the first [`LANGUAGE_SAMPLE_BYTES`] of `text`
+/// (cut on a character boundary). Same result as `detect_language` for a
+/// text no longer than the sample; for a longer one, the language of its
+/// beginning.
+pub fn detect_language_sampled(text: &str) -> Option<String> {
+    detect_language(language_sample(text))
+}
+
+/// The first [`LANGUAGE_SAMPLE_BYTES`] of `text`, cut on a char boundary.
+fn language_sample(text: &str) -> &str {
+    if text.len() <= LANGUAGE_SAMPLE_BYTES {
+        return text;
+    }
+    let mut end = LANGUAGE_SAMPLE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Detect language with custom confidence threshold
 pub fn detect_language_with_threshold(text: &str, threshold: f64) -> Option<String> {
     // Need enough text for reliable detection
@@ -219,5 +244,34 @@ mod tests {
         assert_eq!(info.code, "en");
         assert_eq!(info.name, "English");
         assert!(info.confidence > 0.5);
+    }
+
+    #[test]
+    fn sampled_detection_matches_full_detection() {
+        let english = "The quick brown fox jumps over the lazy dog while the crawler indexes \
+            every page of the documentation into the search engine. ";
+        let french = "Le robot parcourt toutes les pages de la documentation et les indexe \
+            dans le moteur de recherche pour que chacun puisse les retrouver. ";
+        let japanese = "これは日本語で書かれた文章です。検索エンジンはすべてのページを索引します。";
+        for text in [english, french, japanese] {
+            // Short texts are read whole.
+            assert_eq!(detect_language_sampled(text), detect_language(text));
+            // Long texts: the sample gives the same answer as the whole text.
+            let long = text.repeat(400);
+            assert!(long.len() > LANGUAGE_SAMPLE_BYTES);
+            assert_eq!(detect_language_sampled(&long), detect_language(&long));
+            assert!(detect_language_sampled(&long).is_some());
+        }
+    }
+
+    #[test]
+    fn sample_is_cut_on_a_char_boundary() {
+        // 3-byte characters: the cut cannot fall at exactly 8192 bytes.
+        let text = "日本語".repeat(2000);
+        let sample = language_sample(&text);
+        assert!(sample.len() <= LANGUAGE_SAMPLE_BYTES);
+        assert!(sample.len() > LANGUAGE_SAMPLE_BYTES - 4);
+        assert!(text.starts_with(sample));
+        assert_eq!(language_sample("short"), "short");
     }
 }

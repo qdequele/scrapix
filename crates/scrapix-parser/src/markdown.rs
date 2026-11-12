@@ -2,6 +2,7 @@
 
 use html2md::parse_html;
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// Configuration for markdown conversion
@@ -52,7 +53,7 @@ pub fn html_to_markdown_with_config(html: &str, config: &MarkdownConfig) -> Stri
 
     // Optionally strip boilerplate sections
     if config.only_main_content {
-        cleaned_html = strip_boilerplate_tags(&cleaned_html);
+        cleaned_html = strip_boilerplate_tags(cleaned_html);
     }
 
     // Use html2md for the basic conversion
@@ -212,7 +213,7 @@ fn rewrite_links(line: &str, base: &url::Url) -> String {
 }
 
 /// Strip script, style, noscript, svg, and head tags (and their content) from HTML.
-fn strip_non_content_tags(html: &str) -> String {
+fn strip_non_content_tags(html: &str) -> Cow<'_, str> {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         ["script", "style", "noscript", "svg", "head"]
@@ -220,16 +221,11 @@ fn strip_non_content_tags(html: &str) -> String {
             .map(|tag| Regex::new(&format!(r"(?si)<{tag}[\s>].*?</{tag}\s*>")).unwrap())
             .collect()
     });
-
-    let mut result = html.to_string();
-    for re in patterns {
-        result = re.replace_all(&result, "").into_owned();
-    }
-    result
+    strip_matches(Cow::Borrowed(html), patterns)
 }
 
 /// Strip boilerplate HTML sections: nav, header, footer, aside.
-fn strip_boilerplate_tags(html: &str) -> String {
+fn strip_boilerplate_tags(html: Cow<'_, str>) -> Cow<'_, str> {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| {
         ["nav", "footer", "header", "aside"]
@@ -237,12 +233,23 @@ fn strip_boilerplate_tags(html: &str) -> String {
             .map(|tag| Regex::new(&format!(r"(?si)<{tag}[\s>].*?</{tag}\s*>")).unwrap())
             .collect()
     });
+    strip_matches(html, patterns)
+}
 
-    let mut result = html.to_string();
+/// Remove every match of each pattern, one pattern after the other (a
+/// later pattern sees the text without the earlier ones' matches). The text
+/// is only copied by a pattern that matches.
+fn strip_matches<'a>(mut text: Cow<'a, str>, patterns: &[Regex]) -> Cow<'a, str> {
     for re in patterns {
-        result = re.replace_all(&result, "").into_owned();
+        let stripped = match re.replace_all(&text, "") {
+            Cow::Owned(stripped) => Some(stripped),
+            Cow::Borrowed(_) => None,
+        };
+        if let Some(stripped) = stripped {
+            text = Cow::Owned(stripped);
+        }
     }
-    result
+    text
 }
 
 /// Strip any remaining HTML tags from markdown output.
@@ -647,5 +654,53 @@ mod tests {
 
         // Should have at most one blank line between content
         assert!(!cleaned.contains("\n\n\n"));
+    }
+
+    /// The previous implementation: every pattern copies the whole text.
+    fn strip_copying(html: &str, tags: &[&str]) -> String {
+        let mut result = html.to_string();
+        for tag in tags {
+            let re = Regex::new(&format!(r"(?si)<{tag}[\s>].*?</{tag}\s*>")).unwrap();
+            result = re.replace_all(&result, "").into_owned();
+        }
+        result
+    }
+
+    #[test]
+    fn stripping_tags_matches_the_copying_implementation() {
+        let non_content = ["script", "style", "noscript", "svg", "head"];
+        let boilerplate = ["nav", "footer", "header", "aside"];
+        let pages = [
+            "<p>plain paragraph, nothing to strip</p>",
+            "<html><head><title>t</title><style>a{}</style></head><body><p>x</p></body></html>",
+            "<body><SCRIPT type='a'>var s = '</style>';</SCRIPT><p>kept</p><style>p{}</style></body>",
+            "<style>a{} <script>b</style> c</script><p>interleaved</p>",
+            "<nav>menu</nav><header><h1>T</h1></header><main>body</main><aside>x</aside><footer>f</footer>",
+            "<nav><svg><path d=''/></svg></nav><p>text</p><noscript><img src='p.gif'></noscript>",
+            "<script>unclosed <p>text</p>",
+            "<navigation>not a nav</navigation><headers>nor a header</headers>",
+            "",
+        ];
+        for page in pages {
+            let stripped = strip_non_content_tags(page);
+            assert_eq!(stripped, strip_copying(page, &non_content), "{page}");
+            let main_only = strip_boilerplate_tags(stripped.clone());
+            assert_eq!(
+                main_only,
+                strip_copying(&strip_copying(page, &non_content), &boilerplate),
+                "{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn stripping_does_not_copy_a_page_with_nothing_to_strip() {
+        let page = "<body><main><p>plain paragraph</p></main></body>";
+        let stripped = strip_boilerplate_tags(strip_non_content_tags(page));
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+        assert!(matches!(
+            strip_non_content_tags("<p>a</p><script>b</script>"),
+            Cow::Owned(_)
+        ));
     }
 }
