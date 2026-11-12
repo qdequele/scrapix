@@ -22,8 +22,8 @@ use axum::{
     extract::{Extension, State},
     Json,
 };
-use futures::StreamExt;
-use serde::Serialize;
+use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
@@ -387,7 +387,9 @@ pub(crate) async fn scrape_one(
                     );
                 }
             }
-            let item: JobResultItem = serde_json::from_value(payload.clone()).unwrap_or_default();
+            // Read from the payload in place: only the fields the item
+            // has are copied, not the whole result.
+            let item = JobResultItem::deserialize(&payload).unwrap_or_default();
             UrlOutcome {
                 index,
                 source_url: url.to_string(),
@@ -396,6 +398,132 @@ pub(crate) async fn scrape_one(
                 duration_ms,
                 out_of_credits: false,
             }
+        }
+    }
+}
+
+/// The scrapes of an engine-run job (batch scrape, extract): every URL goes
+/// through [`scrape_one`] on its own task, at most `concurrency` at a time,
+/// and [`ScrapeTasks::next`] hands the outcomes back as they finish.
+///
+/// The scrapes keep running while the caller is busy with an outcome
+/// (storing it), which futures polled by the caller's own task would not.
+/// A URL's task is spawned when a slot frees up and checks the job's gate
+/// first: cancelling the job stops the URLs not started yet, pausing holds
+/// them, and the scrapes in flight finish. Dropping this aborts them.
+pub(crate) struct ScrapeTasks {
+    state: Arc<AppState>,
+    account_ctx: Arc<Option<AccountContext>>,
+    options: Arc<Map<String, Value>>,
+    job_id: String,
+    pending: std::vec::IntoIter<(usize, String)>,
+    concurrency: usize,
+    /// Once a URL fails for lack of credits, fail the ones not started yet
+    /// without scraping them (`None`: scrape them all).
+    out_of_credits: Option<Arc<AtomicBool>>,
+    /// The caller's AI usage tally, carried into the tasks.
+    tally: Option<Arc<scrapix_ai::AiUsageTally>>,
+    tasks: tokio::task::JoinSet<Option<UrlOutcome>>,
+}
+
+impl ScrapeTasks {
+    /// Scrape `urls` (each with its index in the submitted list) with the
+    /// shared `options`. `skip_when_out_of_credits`: see `out_of_credits`.
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        account_ctx: Arc<Option<AccountContext>>,
+        options: Arc<Map<String, Value>>,
+        job_id: String,
+        urls: Vec<(usize, String)>,
+        concurrency: usize,
+        skip_when_out_of_credits: bool,
+    ) -> Self {
+        Self {
+            state,
+            account_ctx,
+            options,
+            job_id,
+            pending: urls.into_iter(),
+            concurrency: concurrency.max(1),
+            out_of_credits: skip_when_out_of_credits.then(|| Arc::new(AtomicBool::new(false))),
+            // A spawned task is outside the caller's task-local scope.
+            tally: scrapix_ai::AI_USAGE_TALLY.try_with(Arc::clone).ok(),
+            tasks: tokio::task::JoinSet::new(),
+        }
+    }
+
+    /// Start URLs until `concurrency` scrapes are in flight.
+    fn fill(&mut self) {
+        while self.tasks.len() < self.concurrency {
+            let Some((index, url)) = self.pending.next() else {
+                return;
+            };
+            let state = self.state.clone();
+            let account_ctx = self.account_ctx.clone();
+            let options = self.options.clone();
+            let job_id = self.job_id.clone();
+            let out_of_credits = self.out_of_credits.clone();
+            let scrape = async move {
+                // Checked when the URL's turn comes: cancel stops the rest,
+                // pause holds it.
+                if engine_jobs::gate(&state, &job_id).await == Gate::Stop {
+                    return None;
+                }
+                if out_of_credits.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Some(error_outcome(
+                        index,
+                        &url,
+                        "insufficient_credits",
+                        "Skipped: the account ran out of credits during the batch".to_string(),
+                    ));
+                }
+                // A panic fails this URL, not the job.
+                let outcome = std::panic::AssertUnwindSafe(scrape_one(
+                    &state,
+                    &account_ctx,
+                    &options,
+                    index,
+                    &url,
+                ))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(job_id = %job_id, url = %url, "A scrape task panicked");
+                    error_outcome(
+                        index,
+                        &url,
+                        "internal_error",
+                        "The scrape failed unexpectedly".to_string(),
+                    )
+                });
+                Some(outcome)
+            };
+            match self.tally.clone() {
+                Some(tally) => self
+                    .tasks
+                    .spawn(scrapix_ai::AI_USAGE_TALLY.scope(tally, scrape)),
+                None => self.tasks.spawn(scrape),
+            };
+        }
+    }
+
+    /// The next finished URL, in completion order; `None` once every URL
+    /// is done (or was stopped by the job's gate).
+    pub(crate) async fn next(&mut self) -> Option<UrlOutcome> {
+        loop {
+            self.fill();
+            let joined = self.tasks.join_next().await?;
+            // A task only ends without an outcome when its URL was stopped
+            // (or the runtime is shutting down).
+            let Ok(Some(outcome)) = joined else { continue };
+            if outcome.out_of_credits {
+                if let Some(flag) = &self.out_of_credits {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            // Refill before the caller handles (stores) this outcome.
+            self.fill();
+            return Some(outcome);
         }
     }
 }
@@ -410,43 +538,20 @@ async fn run_batch(
     concurrency: usize,
 ) {
     let started = std::time::Instant::now();
-    let account_ctx = Arc::new(account_ctx);
-    let options = Arc::new(options);
-    let out_of_credits = Arc::new(AtomicBool::new(false));
-    let account_id = account_ctx.as_ref().as_ref().map(|c| c.account_id.clone());
+    let account_id = account_ctx.as_ref().map(|c| c.account_id.clone());
 
-    let mut outcomes = futures::stream::iter(urls.into_iter().enumerate())
-        .map(|(index, url)| {
-            let state = state.clone();
-            let account_ctx = account_ctx.clone();
-            let options = options.clone();
-            let job_id = job_id.clone();
-            let out_of_credits = out_of_credits.clone();
-            async move {
-                // Checked when the URL's turn comes: cancel stops the rest,
-                // pause holds it.
-                if engine_jobs::gate(&state, &job_id).await == Gate::Stop {
-                    return None;
-                }
-                if out_of_credits.load(Ordering::Relaxed) {
-                    return Some(error_outcome(
-                        index,
-                        &url,
-                        "insufficient_credits",
-                        "Skipped: the account ran out of credits during the batch".to_string(),
-                    ));
-                }
-                Some(scrape_one(&state, &account_ctx, &options, index, &url).await)
-            }
-        })
-        .buffer_unordered(concurrency.max(1));
+    let mut outcomes = ScrapeTasks::new(
+        state.clone(),
+        Arc::new(account_ctx),
+        Arc::new(options),
+        job_id.clone(),
+        urls.into_iter().enumerate().collect(),
+        concurrency,
+        true,
+    );
 
     let (mut seq, mut succeeded, mut failed) = (0u64, 0u64, 0u64);
     while let Some(outcome) = outcomes.next().await {
-        let Some(outcome) = outcome else { continue };
-        if outcome.out_of_credits {
-            out_of_credits.store(true, Ordering::Relaxed);
-        }
         seq += 1;
         crate::results::store_page(
             &state,

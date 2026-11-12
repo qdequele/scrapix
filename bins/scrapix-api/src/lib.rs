@@ -78,6 +78,8 @@ mod map_tests;
 #[cfg(test)]
 mod scrape_browser_tests;
 #[cfg(test)]
+mod scrape_pipeline_tests;
+#[cfg(test)]
 mod scrape_tests;
 
 use axum::{
@@ -120,8 +122,8 @@ use scrapix_extractor::{
     SelectorExtractor,
 };
 use scrapix_parser::{
-    detect_language_info, extract_content, html_to_main_content_markdown,
-    html_to_main_content_minihtml, html_to_markdown, html_to_minihtml,
+    detect_language_info, html_to_main_content_markdown, html_to_main_content_minihtml,
+    html_to_markdown, html_to_minihtml,
 };
 use scrapix_queue::{
     topic_names, Ack, AnyConsumer, AnyProducer, ConsumerBuilder, CrawlEvent, EventPosition,
@@ -360,6 +362,11 @@ struct AppState {
     analytics: AnalyticsState,
     /// Shared HTTP fetcher for /scrape endpoint (connection pooling, retries, DNS cache)
     fetcher: Arc<HttpFetcher>,
+    /// What the one-off fetchers of `/scrape` requests with cookies share
+    /// (built on first use): everything but the cookie store.
+    cookie_fetch: CookieFetchShared,
+    /// Pooled client for the `/search` proxy to Meilisearch.
+    search_client: reqwest::Client,
     /// Optional browser renderer for JS rendering in /scrape and /map
     browser_renderer: Option<Arc<CdpRenderer>>,
     /// Optional AI service for /scrape enrichment (standalone; hosted
@@ -411,6 +418,51 @@ struct AppState {
     /// Whether the crawler workers have a browser (`None`: unknown), see
     /// [`Args::crawl_browser_available`].
     pub(crate) crawl_browser: Option<bool>,
+}
+
+/// The parts a `/scrape` request with cookies reuses from one request to
+/// the next. Its fetcher (and so its HTTP client and cookie store) is built
+/// per request; the DNS cache and the robots cache (which never fetches:
+/// `/scrape` does not consult robots.txt) are not.
+#[derive(Default)]
+struct CookieFetchShared {
+    robots: std::sync::OnceLock<Arc<RobotsCache>>,
+    dns: std::sync::OnceLock<Arc<scrapix_crawler::CachingDnsResolver>>,
+}
+
+impl CookieFetchShared {
+    fn robots(&self) -> scrapix_core::Result<Arc<RobotsCache>> {
+        if let Some(robots) = self.robots.get() {
+            return Ok(robots.clone());
+        }
+        let robots = Arc::new(RobotsCache::new(RobotsConfig {
+            respect_robots: false,
+            ..Default::default()
+        })?);
+        Ok(self.robots.get_or_init(|| robots).clone())
+    }
+
+    fn dns(&self) -> scrapix_core::Result<Arc<scrapix_crawler::CachingDnsResolver>> {
+        if let Some(dns) = self.dns.get() {
+            return Ok(dns.clone());
+        }
+        let dns = Arc::new(scrapix_crawler::CachingDnsResolver::with_defaults()?);
+        Ok(self.dns.get_or_init(|| dns).clone())
+    }
+}
+
+/// Connect and whole-request timeouts of the `/search` proxy.
+const SEARCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client `/search` proxies through: one connection pool for every
+/// request, bounded by [`SEARCH_CONNECT_TIMEOUT`] / [`SEARCH_REQUEST_TIMEOUT`].
+fn search_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(SEARCH_CONNECT_TIMEOUT)
+        .timeout(SEARCH_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +543,8 @@ impl AppState {
                 page_event_batcher,
             },
             fetcher,
+            cookie_fetch: CookieFetchShared::default(),
+            search_client: search_http_client(),
             browser_renderer,
             ai_service,
             hosted_ai: scrapix_lab::HostedAiClients::default(),
@@ -3433,30 +3487,63 @@ async fn health_services(State(state): State<Arc<AppState>>) -> Json<ServiceHeal
     })
 }
 
-/// `/scrape` accepts PDFs and office documents (up to
-/// `DOCUMENT_MAX_SIZE_MB`) on top of HTML and markdown.
-fn document_fetch_options() -> scrapix_crawler::FetchOptions {
-    scrapix_crawler::FetchOptions::with_all_documents(Some(documents::max_document_bytes()))
+/// Retries of a `/scrape` fetch (429, 5xx, transport errors). The caller is
+/// waiting on the answer: one retry, not the crawler's three (which cost
+/// four fetches and 3.5 s of backoff before the error came back).
+const SCRAPE_MAX_RETRIES: u32 = 1;
+
+/// Fetch options of `/scrape`: PDFs and office documents (up to
+/// `DOCUMENT_MAX_SIZE_MB`) on top of HTML and markdown, `extra_headers` on
+/// top of the fetcher's, and at most [`SCRAPE_MAX_RETRIES`] retries.
+fn scrape_fetch_options(extra_headers: Vec<(String, String)>) -> scrapix_crawler::FetchOptions {
+    scrapix_crawler::FetchOptions {
+        extra_headers,
+        max_retries: Some(SCRAPE_MAX_RETRIES),
+        ..scrapix_crawler::FetchOptions::with_all_documents(Some(documents::max_document_bytes()))
+    }
 }
 
 /// Preprocess HTML by applying include/exclude CSS selectors.
 /// - `include_selectors`: if non-empty, only keep HTML from matching elements
 /// - `exclude_selectors`: if non-empty, remove matching elements from the HTML
-fn preprocess_html(
-    html: &str,
+#[cfg(test)]
+fn preprocess_html<'a>(
+    html: &'a str,
     include_selectors: &[String],
     exclude_selectors: &[String],
-) -> String {
-    use scraper::{Html, Selector};
-
+) -> std::borrow::Cow<'a, str> {
     if include_selectors.is_empty() && exclude_selectors.is_empty() {
-        return html.to_string();
+        return std::borrow::Cow::Borrowed(html);
     }
+    let document = scraper::Html::parse_document(html);
+    preprocess_document(html, document, include_selectors, exclude_selectors).0
+}
 
-    let document = Html::parse_document(html);
+/// Apply the include/exclude CSS selectors to `html`, of which `document`
+/// is the parse. Returns the resulting HTML (`html` itself when nothing
+/// changed) and, when it is at hand, the parse of that result.
+///
+/// The document is parsed once per stage, not once per selector. Excluded
+/// elements are cut out of the source text, which keeps every other byte
+/// of the page as it was sent. That only works for an element whose
+/// serialization is its source text (quoted attributes, explicit closing
+/// tags, ...): when one is not found, the elements are detached from the
+/// tree and the tree is serialized instead, so the element is removed
+/// (and the rest of the page comes out normalized by the HTML parser)
+/// rather than silently kept.
+fn preprocess_document<'a>(
+    html: &'a str,
+    document: scraper::Html,
+    include_selectors: &[String],
+    exclude_selectors: &[String],
+) -> (std::borrow::Cow<'a, str>, Option<scraper::Html>) {
+    use scraper::{ElementRef, Html, Selector};
+    use std::borrow::Cow;
 
     // Step 1: If include_selectors are specified, collect matching elements' HTML
-    let working_html = if !include_selectors.is_empty() {
+    let (working, mut document) = if include_selectors.is_empty() {
+        (Cow::Borrowed(html), document)
+    } else {
         let mut parts = Vec::new();
         for sel_str in include_selectors {
             match Selector::parse(sel_str) {
@@ -3471,33 +3558,284 @@ fn preprocess_html(
             }
         }
         if parts.is_empty() {
-            return html.to_string();
+            return (Cow::Borrowed(html), Some(document));
         }
-        format!("<html><body>{}</body></html>", parts.join(""))
-    } else {
-        html.to_string()
+        let included = format!("<html><body>{}</body></html>", parts.join(""));
+        if exclude_selectors.is_empty() {
+            return (Cow::Owned(included), None);
+        }
+        let document = Html::parse_document(&included);
+        (Cow::Owned(included), document)
     };
 
     // Step 2: If exclude_selectors are specified, remove matching elements
-    if !exclude_selectors.is_empty() {
-        let mut result = working_html;
-        for sel_str in exclude_selectors {
-            match Selector::parse(sel_str) {
-                Ok(selector) => {
-                    let doc = Html::parse_document(&result);
-                    for element in doc.select(&selector) {
-                        let outer = element.html();
-                        result = result.replacen(&outer, "", 1);
+    if exclude_selectors.is_empty() {
+        return (working, Some(document));
+    }
+    let mut matched = HashSet::new();
+    let mut targets = Vec::new();
+    for sel_str in exclude_selectors {
+        match Selector::parse(sel_str) {
+            Ok(selector) => {
+                for element in document.select(&selector) {
+                    if matched.insert(element.id()) {
+                        targets.push(element.id());
                     }
                 }
-                Err(e) => {
-                    warn!(selector = %sel_str, error = ?e, "Invalid exclude CSS selector, skipping");
-                }
+            }
+            Err(e) => {
+                warn!(selector = %sel_str, error = ?e, "Invalid exclude CSS selector, skipping");
             }
         }
-        result
+    }
+    // An element inside another excluded element goes with it.
+    targets.retain(|id| {
+        document
+            .tree
+            .get(*id)
+            .is_some_and(|node| !node.ancestors().any(|a| matched.contains(&a.id())))
+    });
+    if targets.is_empty() {
+        return (working, Some(document));
+    }
+
+    let mut result = working.into_owned();
+    let mut all_found = true;
+    for id in &targets {
+        let Some(outer) = document
+            .tree
+            .get(*id)
+            .and_then(ElementRef::wrap)
+            .map(|element| element.html())
+        else {
+            continue;
+        };
+        match result.find(&outer) {
+            Some(at) => result.replace_range(at..at + outer.len(), ""),
+            None => {
+                all_found = false;
+                break;
+            }
+        }
+    }
+    if all_found {
+        return (Cow::Owned(result), None);
+    }
+
+    for id in &targets {
+        if let Some(mut node) = document.tree.get_mut(*id) {
+            node.detach();
+        }
+    }
+    (Cow::Owned(document.html()), None)
+}
+
+/// What the CPU-bound stage of `/scrape` needs: the fetched page and the
+/// request's options. Owned, so the stage can run off the async runtime.
+struct HtmlStageInput {
+    html: String,
+    final_url: String,
+    formats: Vec<ScrapeFormat>,
+    include_selectors: Vec<String>,
+    exclude_selectors: Vec<String>,
+    /// Custom selector extraction (`extract`), field name to definition.
+    selectors: HashMap<String, SelectorDefinition>,
+    only_main_content: bool,
+    include_links: bool,
+    /// AI enrichment was requested: it needs the page's text even when
+    /// neither `content` nor `markdown` is.
+    ai_wants_text: bool,
+}
+
+/// Every format of a `/scrape` response derived from the page's HTML.
+struct HtmlStageOutput {
+    markdown: Option<String>,
+    html: Option<String>,
+    raw_html: Option<String>,
+    content: Option<String>,
+    metadata: Option<ScrapeMetadata>,
+    links: Option<Vec<String>>,
+    language: Option<String>,
+    schema: Option<ExtractedSchema>,
+    blocks: Option<Vec<ContentBlock>>,
+    extract: Option<HashMap<String, serde_json::Value>>,
+    /// The page's text for the AI when no requested format carries it.
+    ai_only_text: Option<String>,
+}
+
+/// The HTML pipeline of `/scrape`: selectors, extraction, markdown, text,
+/// MiniHTML, links, language. Synchronous CPU work (run it with
+/// `spawn_blocking`).
+///
+/// The page is parsed into a DOM at most once (twice with include/exclude
+/// selectors that change it: the original for metadata and schema, the
+/// processed one for the content), and its markdown converted at most once.
+fn run_html_stage(input: HtmlStageInput) -> HtmlStageOutput {
+    use scraper::Html;
+    use std::borrow::Cow;
+
+    let formats = &input.formats;
+    let wants = |format: ScrapeFormat| formats.contains(&format);
+    let only_main_content = input.only_main_content;
+
+    let has_selectors = !input.include_selectors.is_empty() || !input.exclude_selectors.is_empty();
+    let wants_page_extraction = wants(ScrapeFormat::Metadata) || wants(ScrapeFormat::Schema);
+    let wants_content_extraction = wants(ScrapeFormat::Blocks) || !input.selectors.is_empty();
+    let wants_links = wants(ScrapeFormat::Links) || input.include_links;
+    // What reads the processed page as a DOM (markdown and MiniHTML take
+    // its text).
+    let wants_content_dom = wants_content_extraction
+        || wants_links
+        || (wants(ScrapeFormat::Content) && only_main_content);
+
+    let original_dom = (has_selectors || wants_page_extraction || wants_content_dom)
+        .then(|| Html::parse_document(&input.html));
+
+    // Metadata and schema.org data describe the whole page (its <head>,
+    // its JSON-LD scripts), so they come from the original HTML: the
+    // include/exclude selectors only shape the content.
+    let page_extraction = original_dom
+        .as_ref()
+        .filter(|_| wants_page_extraction)
+        .and_then(|dom| {
+            let mut extractor = Extractor::new();
+            if wants(ScrapeFormat::Metadata) {
+                extractor = extractor.with_metadata();
+            }
+            if wants(ScrapeFormat::Schema) {
+                extractor = extractor.with_schema();
+            }
+            extractor.extract_from_dom(dom).ok()
+        });
+    let (metadata, schema) = match page_extraction {
+        Some(result) => (result.metadata.map(ScrapeMetadata::from), result.schema),
+        None => (None, None),
+    };
+
+    // (b) Preprocess HTML with include/exclude selectors
+    let (processed_html, processed_dom): (Cow<'_, str>, Option<Html>) = match original_dom {
+        Some(dom) if has_selectors => preprocess_document(
+            &input.html,
+            dom,
+            &input.include_selectors,
+            &input.exclude_selectors,
+        ),
+        dom => (Cow::Borrowed(input.html.as_str()), dom),
+    };
+    let processed_dom = if wants_content_dom {
+        Some(processed_dom.unwrap_or_else(|| Html::parse_document(&processed_html)))
     } else {
-        working_html
+        None
+    };
+
+    // (c) Run extractor for blocks and custom selectors
+    let extraction_result = processed_dom
+        .as_ref()
+        .filter(|_| wants_content_extraction)
+        .and_then(|dom| {
+            let mut extractor = Extractor::new();
+            if wants(ScrapeFormat::Blocks) {
+                extractor = extractor.with_blocks();
+            }
+            if !input.selectors.is_empty() {
+                extractor = extractor
+                    .with_selectors(SelectorExtractor::with_definitions(input.selectors.clone()));
+            }
+            extractor.extract_from_dom(dom).ok()
+        });
+    let (blocks, extract) = match extraction_result {
+        Some(result) => (
+            result.blocks.map(|b| b.blocks),
+            result.custom.map(|c| c.values),
+        ),
+        None => (None, None),
+    };
+
+    // (d) Run parser functions on processed HTML
+    // The page's markdown, converted once for everything that reads it:
+    // the `markdown` format, `content` when it is the whole page's text,
+    // and the AI when it has neither.
+    let ai_only =
+        input.ai_wants_text && !wants(ScrapeFormat::Content) && !wants(ScrapeFormat::Markdown);
+    let page_markdown = (wants(ScrapeFormat::Markdown)
+        || (wants(ScrapeFormat::Content) && !only_main_content)
+        || ai_only)
+        .then(|| {
+            if only_main_content {
+                html_to_main_content_markdown(&processed_html)
+            } else {
+                html_to_markdown(&processed_html)
+            }
+        });
+
+    // `content` is plain text in both modes (it was the page's markdown
+    // when `only_main_content` was false).
+    let content = if !wants(ScrapeFormat::Content) {
+        None
+    } else if only_main_content {
+        processed_dom.as_ref().map(|dom| {
+            scrapix_parser::extract_content_from_dom(
+                dom,
+                &scrapix_parser::ReadabilityConfig::default(),
+            )
+        })
+    } else {
+        page_markdown
+            .as_deref()
+            .map(scrapix_parser::markdown_to_text)
+    };
+
+    // Markdown links point at absolute URLs, resolved against the page's
+    // `<base href>` (read from the original HTML: preprocessing may drop
+    // `<head>`) or its final URL.
+    let (markdown, ai_only_text) = if wants(ScrapeFormat::Markdown) {
+        let page_base = scrapix_parser::document_base_url(&input.html, &input.final_url);
+        let markdown = page_markdown.map(|md| match &page_base {
+            Some(base) => scrapix_parser::absolutize_markdown_links(&md, base),
+            None => md,
+        });
+        (markdown, None)
+    } else if ai_only {
+        (None, page_markdown)
+    } else {
+        (None, None)
+    };
+
+    let html = wants(ScrapeFormat::Html).then(|| {
+        if only_main_content {
+            html_to_main_content_minihtml(&processed_html)
+        } else {
+            html_to_minihtml(&processed_html)
+        }
+    });
+
+    let links = processed_dom
+        .as_ref()
+        .filter(|_| wants_links)
+        .map(|dom| extract_links_from_dom(dom, &input.final_url));
+
+    // Detect language from content
+    let language = content
+        .as_ref()
+        .or(markdown.as_ref())
+        .and_then(|text| detect_language_info(text))
+        .map(|info| info.code);
+
+    let wants_raw_html = wants(ScrapeFormat::RawHtml);
+    drop(processed_dom);
+    drop(processed_html);
+    HtmlStageOutput {
+        markdown,
+        html,
+        raw_html: wants_raw_html.then_some(input.html),
+        content,
+        metadata,
+        links,
+        language,
+        schema,
+        blocks,
+        extract,
+        ai_only_text,
     }
 }
 
@@ -3675,6 +4013,21 @@ fn forwardable_headers(headers: &HashMap<String, String>) -> Vec<(String, String
     out
 }
 
+/// `headers` (sorted, as [`forwardable_headers`] returns them) with one
+/// entry per header name, whatever its case: the last one. A fetcher built
+/// with these as its default headers keeps one value per name; sent per
+/// request they would otherwise all go out.
+fn one_per_header_name(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        match out.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            Some(entry) => *entry = (name, value),
+            None => out.push((name, value)),
+        }
+    }
+    out
+}
+
 /// The full /scrape pipeline for one URL: balance and plan pre-check, fetch
 /// (HTTP or browser), extraction, AI enrichment, analytics and usage report.
 ///
@@ -3838,67 +4191,86 @@ pub(crate) async fn perform_scrape(
             });
         }
         CdpRenderer::raw_page(&crawl_url, rendered)
-    } else if request.headers.is_empty() && request.cookies.is_empty() {
-        // Use the shared fetcher (connection pooling, DNS cache, retries).
-        // It has no cookie store, so nothing carries over between requests.
-        // Its own timeout is the server's, so the request's `timeout_ms`
-        // bounds the whole fetch here.
-        tokio::time::timeout(
-            Duration::from_millis(request.timeout_ms),
-            state
-                .fetcher
-                .fetch_with_options(&crawl_url, document_fetch_options()),
-        )
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                format!(
-                    "Fetching the URL took longer than {} ms",
-                    request.timeout_ms
-                ),
-                "timeout",
-            )
-        })?
-        .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
     } else {
-        // Build a one-off fetcher with custom headers and/or cookies
-        let robots_config = RobotsConfig {
-            respect_robots: false,
-            ..Default::default()
+        let headers = forwardable_headers(&request.headers);
+        // A cookie store has to live and die with its request (session
+        // cookies set along a redirect or login flow are kept within the
+        // fetch and never shared), so cookies get a one-off fetcher. A
+        // `Cookie` header goes the same way: it is sent as that fetcher's
+        // default header. Everything else uses the shared fetcher
+        // (connection pool, DNS cache), which has no cookie store, so
+        // nothing carries over between requests.
+        let needs_cookie_store = !request.cookies.is_empty()
+            || headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
+        let fetch = async {
+            if !needs_cookie_store {
+                // Per-request headers replace the fetcher's defaults of the
+                // same name, as a one-off fetcher's default headers did.
+                return state
+                    .fetcher
+                    .fetch_with_options(
+                        &crawl_url,
+                        scrape_fetch_options(one_per_header_name(headers)),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error")
+                    });
+            }
+
+            let mut config = scrapix_crawler::FetcherConfig {
+                timeout: Duration::from_millis(request.timeout_ms),
+                allow_private_ips: state.fetcher.allows_private_ips(),
+                cookie_store: true,
+                ..Default::default()
+            };
+            for cookie in &request.cookies {
+                config
+                    .initial_cookies
+                    .push((cookie.to_set_cookie_string(), parsed_url.clone()));
+            }
+            for (key, value) in headers {
+                config.custom_headers.insert(key, value);
+            }
+            let robots = state.cookie_fetch.robots().map_err(|e| {
+                ApiError::new(
+                    format!("Failed to create robots cache: {}", e),
+                    "internal_error",
+                )
+            })?;
+            let dns = state.cookie_fetch.dns().map_err(|e| {
+                ApiError::new(
+                    format!("Failed to create HTTP client: {}", e),
+                    "internal_error",
+                )
+            })?;
+            let fetcher = HttpFetcher::new_with_dns(config, robots, Some(dns)).map_err(|e| {
+                ApiError::new(
+                    format!("Failed to create HTTP client: {}", e),
+                    "internal_error",
+                )
+            })?;
+            fetcher
+                .fetch_with_options(&crawl_url, scrape_fetch_options(Vec::new()))
+                .await
+                .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))
         };
-        let robots_cache = Arc::new(RobotsCache::new(robots_config).map_err(|e| {
-            ApiError::new(
-                format!("Failed to create robots cache: {}", e),
-                "internal_error",
-            )
-        })?);
-
-        // Its cookie store (seeded with the request's cookies) lives only
-        // for this request, so session cookies set along a redirect or login
-        // flow are kept within the fetch and never shared.
-        let mut builder = HttpFetcherBuilder::new()
-            .timeout(Duration::from_millis(request.timeout_ms))
-            .allow_private_ips(state.fetcher.allows_private_ips())
-            .cookie_store(true);
-        for cookie in &request.cookies {
-            builder = builder.cookie(cookie.to_set_cookie_string(), parsed_url.clone());
-        }
-
-        for (key, value) in forwardable_headers(&request.headers) {
-            builder = builder.header(&key, &value);
-        }
-
-        let fetcher = builder.build(robots_cache).map_err(|e| {
-            ApiError::new(
-                format!("Failed to create HTTP client: {}", e),
-                "internal_error",
-            )
-        })?;
-
-        fetcher
-            .fetch_with_options(&crawl_url, document_fetch_options())
+        // A fetcher's own timeout is per attempt (the server's for the
+        // shared one), so the request's `timeout_ms` bounds the whole fetch
+        // here, retry included.
+        tokio::time::timeout(Duration::from_millis(request.timeout_ms), fetch)
             .await
-            .map_err(|e| ApiError::new(format!("Failed to fetch URL: {}", e), "fetch_error"))?
+            .map_err(|_| {
+                ApiError::new(
+                    format!(
+                        "Fetching the URL took longer than {} ms",
+                        request.timeout_ms
+                    ),
+                    "timeout",
+                )
+            })??
     };
     let js_rendered = raw_page.js_rendered;
 
@@ -3997,159 +4369,58 @@ pub(crate) async fn perform_scrape(
     let original_html = raw_page.html;
     let original_html_len = original_html.len() as u64;
 
-    // (b) Preprocess HTML with include/exclude selectors
-    let processed_html = preprocess_html(
-        &original_html,
-        &request.include_selectors,
-        &request.exclude_selectors,
-    );
-
-    // Determine which formats to return (default: markdown + content + metadata)
-    let formats = if request.formats.is_empty() {
-        vec![
-            ScrapeFormat::Markdown,
-            ScrapeFormat::Content,
-            ScrapeFormat::Metadata,
-        ]
-    } else {
-        request.formats.clone()
-    };
-
-    // (c) Run extractor for metadata, schema, blocks, and custom selectors
-    let needs_extraction = formats.contains(&ScrapeFormat::Blocks) || !request.extract.is_empty();
-
-    let extraction_result = if needs_extraction {
-        let mut extractor = Extractor::new();
-
-        if formats.contains(&ScrapeFormat::Blocks) {
-            extractor = extractor.with_blocks();
-        }
-        if !request.extract.is_empty() {
-            let sel_extractor = SelectorExtractor::with_definitions(
-                request
-                    .extract
-                    .iter()
-                    .map(|(field, sel)| (field.clone(), sel.to_definition()))
-                    .collect(),
-            );
-            extractor = extractor.with_selectors(sel_extractor);
-        }
-
-        extractor.extract(&processed_html).ok()
-    } else {
-        None
-    };
-
-    // Metadata and schema.org data describe the whole page (its <head>,
-    // its JSON-LD scripts), so they come from the original HTML: the
-    // include/exclude selectors only shape the content.
-    let page_extraction =
-        if formats.contains(&ScrapeFormat::Metadata) || formats.contains(&ScrapeFormat::Schema) {
-            let mut extractor = Extractor::new();
-            if formats.contains(&ScrapeFormat::Metadata) {
-                extractor = extractor.with_metadata();
-            }
-            if formats.contains(&ScrapeFormat::Schema) {
-                extractor = extractor.with_schema();
-            }
-            extractor.extract(&original_html).ok()
+    // (b)-(d) Selectors, extraction and format conversion: CPU-bound, so
+    // off the async runtime.
+    let stage_input = HtmlStageInput {
+        html: original_html,
+        final_url: final_url.clone(),
+        // Which formats to return (default: markdown + content + metadata)
+        formats: if request.formats.is_empty() {
+            vec![
+                ScrapeFormat::Markdown,
+                ScrapeFormat::Content,
+                ScrapeFormat::Metadata,
+            ]
         } else {
-            None
-        };
-
-    // Pull out extraction results
-    let metadata = page_extraction
-        .as_ref()
-        .and_then(|r| r.metadata.clone())
-        .map(ScrapeMetadata::from);
-
-    let schema = page_extraction.as_ref().and_then(|r| r.schema.clone());
-
-    let blocks = extraction_result
-        .as_ref()
-        .and_then(|r| r.blocks.clone())
-        .map(|b| b.blocks);
-
-    let custom_extract = extraction_result
-        .as_ref()
-        .and_then(|r| r.custom.clone())
-        .map(|c| c.values);
-
-    // (d) Run parser functions on processed HTML
-    // Markdown links point at absolute URLs, resolved against the page's
-    // `<base href>` (read from the original HTML: preprocessing may drop
-    // `<head>`) or its final URL.
-    let page_base = scrapix_parser::document_base_url(&original_html, &final_url);
-    let markdown = if formats.contains(&ScrapeFormat::Markdown) {
-        let md = if request.only_main_content {
-            html_to_main_content_markdown(&processed_html)
-        } else {
-            html_to_markdown(&processed_html)
-        };
-        Some(match &page_base {
-            Some(base) => scrapix_parser::absolutize_markdown_links(&md, base),
-            None => md,
-        })
-    } else {
-        None
+            request.formats.clone()
+        },
+        include_selectors: request.include_selectors.clone(),
+        exclude_selectors: request.exclude_selectors.clone(),
+        selectors: request
+            .extract
+            .iter()
+            .map(|(field, sel)| (field.clone(), sel.to_definition()))
+            .collect(),
+        only_main_content: request.only_main_content,
+        include_links: request.include_links,
+        ai_wants_text: request
+            .ai
+            .as_ref()
+            .is_some_and(|options| options.wants_summary() || options.wants_extraction()),
     };
-
-    // `content` is plain text in both modes (it was the page's markdown
-    // when `only_main_content` was false).
-    let content = if formats.contains(&ScrapeFormat::Content) {
-        if request.only_main_content {
-            Some(extract_content(&processed_html))
-        } else {
-            Some(scrapix_parser::markdown_to_text(&html_to_markdown(
-                &processed_html,
-            )))
-        }
-    } else {
-        None
-    };
-
-    let html_output = if formats.contains(&ScrapeFormat::Html) {
-        if request.only_main_content {
-            Some(html_to_main_content_minihtml(&processed_html))
-        } else {
-            Some(html_to_minihtml(&processed_html))
-        }
-    } else {
-        None
-    };
-
-    let return_raw_html = if formats.contains(&ScrapeFormat::RawHtml) {
-        Some(original_html)
-    } else {
-        None
-    };
-
-    let links = if formats.contains(&ScrapeFormat::Links) || request.include_links {
-        Some(extract_links_from_html(&processed_html, &final_url))
-    } else {
-        None
-    };
-
-    // Detect language from content
-    let language = content
-        .as_ref()
-        .or(markdown.as_ref())
-        .and_then(|text| detect_language_info(text))
-        .map(|info| info.code);
+    let span = tracing::Span::current();
+    let HtmlStageOutput {
+        markdown,
+        html: html_output,
+        raw_html: return_raw_html,
+        content,
+        metadata,
+        links,
+        language,
+        schema,
+        blocks,
+        extract: custom_extract,
+        ai_only_text,
+    } = tokio::task::spawn_blocking(move || span.in_scope(|| run_html_stage(stage_input)))
+        .await
+        .map_err(|e| {
+            error!(error = %e, "The HTML stage of a scrape failed");
+            ApiError::new("Failed to process the page", "internal_error")
+        })?;
 
     // (e) AI enrichment (optional). It reads the page's text whatever the
     // requested formats: without `content` or `markdown`, the main content
     // is converted for the AI only.
-    let ai_only_text = match (&request.ai, &content, &markdown) {
-        (Some(options), None, None) if options.wants_summary() || options.wants_extraction() => {
-            Some(if request.only_main_content {
-                html_to_main_content_markdown(&processed_html)
-            } else {
-                html_to_markdown(&processed_html)
-            })
-        }
-        _ => None,
-    };
     let ai_text = content
         .as_deref()
         .or(markdown.as_deref())
@@ -4510,15 +4781,14 @@ fn log_scrape_request(
     });
 }
 
-/// Extract links from HTML
-fn extract_links_from_html(html: &str, base_url: &str) -> Vec<String> {
-    use scraper::{Html, Selector};
+/// Extract links from a parsed page
+fn extract_links_from_dom(document: &scraper::Html, base_url: &str) -> Vec<String> {
+    use scraper::Selector;
 
     let Ok(base) = url::Url::parse(base_url) else {
         return vec![];
     };
 
-    let document = Html::parse_document(html);
     let Ok(selector) = Selector::parse("a[href]") else {
         return vec![];
     };
@@ -5370,6 +5640,12 @@ const MAP_RENDER_CONCURRENCY: usize = 50;
 /// At most one halving per this interval, so a burst of failures from the
 /// fetches already in flight counts as one signal.
 const MAP_BACKOFF_COOLDOWN: Duration = Duration::from_secs(1);
+/// A page at least this large is parsed for its links on the blocking pool
+/// instead of the async runtime.
+const MAP_BLOCKING_PARSE_BYTES: usize = 128 * 1024;
+/// Index reported by the start page's early fetch, started before the
+/// sitemaps said where (or whether) that page is in the results.
+const MAP_SEED_PENDING: usize = usize::MAX;
 
 /// Additive-increase / multiplicative-decrease cap on a `/map` call's
 /// concurrent page fetches.
@@ -5465,23 +5741,34 @@ async fn map_fetch(
         _ => return MapFetchOutcome::Failed,
     };
 
-    let (title, description) = head_title_and_description(&page.html);
-    let child_links = if head_only {
-        Vec::new()
-    } else {
-        // Relative links resolve against where the page was served.
-        let page_url = url::Url::parse(&page.final_url)
-            .or_else(|_| url::Url::parse(&url))
-            .ok();
-        page_url
-            .map(|page_url| extract_page_links(&page.html, &page_url, &domain))
-            .unwrap_or_default()
+    // Parsing a large page for its links is CPU work: off the runtime.
+    let off_runtime = !head_only && page.html.len() >= MAP_BLOCKING_PARSE_BYTES;
+    let parse = move || {
+        let (title, description) = head_title_and_description(&page.html);
+        let child_links = if head_only {
+            Vec::new()
+        } else {
+            // Relative links resolve against where the page was served.
+            let page_url = url::Url::parse(&page.final_url)
+                .or_else(|_| url::Url::parse(&url))
+                .ok();
+            page_url
+                .map(|page_url| extract_page_links(&page.html, &page_url, &domain))
+                .unwrap_or_default()
+        };
+        MapFetchResult {
+            title,
+            description,
+            child_links,
+        }
     };
-    MapFetchOutcome::Page(MapFetchResult {
-        title,
-        description,
-        child_links,
-    })
+    if !off_runtime {
+        return MapFetchOutcome::Page(parse());
+    }
+    match tokio::task::spawn_blocking(parse).await {
+        Ok(page) => MapFetchOutcome::Page(page),
+        Err(_) => MapFetchOutcome::Failed,
+    }
 }
 
 /// Fetch a single URL in full and extract title, description, and child
@@ -5581,6 +5868,24 @@ async fn map_url(
         None
     };
 
+    let mut tasks: tokio::task::JoinSet<(usize, u32, MapFetchOutcome)> =
+        tokio::task::JoinSet::new();
+
+    // With links to follow, fetch the start page while the sitemaps are
+    // read instead of after: it is the first page needed when the site has
+    // no sitemap or lists it there. (If the sitemaps do not list it, the
+    // fetch is dropped.)
+    let seed_fetch = (request.sitemap && max_depth > 0 && limit > 0).then(|| {
+        let fetcher = fetcher.clone();
+        let browser = browser.clone();
+        let url = request.url.clone();
+        let domain = base_domain.clone();
+        tasks.spawn(async move {
+            let outcome = map_fetch(fetcher, browser, url, domain, false).await;
+            (MAP_SEED_PENDING, 0, outcome)
+        })
+    });
+
     // ── Step 1: Sitemap discovery (primary source) ────────────────────────
 
     if request.sitemap {
@@ -5656,8 +5961,19 @@ async fn map_url(
     // their depth.
 
     let mut queue: VecDeque<(usize, u32)> = (0..results.len()).map(|i| (i, 0)).collect();
-    let mut tasks: tokio::task::JoinSet<(usize, u32, MapFetchOutcome)> =
-        tokio::task::JoinSet::new();
+    // The start page's early fetch stands for its entry in the queue, when
+    // it has one whose links are followed.
+    let mut seed_index = None;
+    if let Some(seed_fetch) = seed_fetch {
+        seed_index = results
+            .iter()
+            .position(|link| link.url == request.url)
+            .filter(|_| visited.len() < limit);
+        match seed_index {
+            Some(index) => queue.retain(|(i, _)| *i != index),
+            None => seed_fetch.abort(),
+        }
+    }
     let mut concurrency = if browser.is_some() {
         MapConcurrency::fixed(MAP_RENDER_CONCURRENCY)
     } else {
@@ -5695,6 +6011,14 @@ async fn map_url(
         };
         let Ok((index, depth, outcome)) = joined else {
             continue;
+        };
+        let index = if index == MAP_SEED_PENDING {
+            match seed_index {
+                Some(index) => index,
+                None => continue,
+            }
+        } else {
+            index
         };
         match outcome {
             MapFetchOutcome::Page(page) => {
@@ -5851,6 +6175,17 @@ struct SearchRequest {
     sort: Option<Vec<String>>,
 }
 
+/// Meilisearch did not answer a `/search` within the proxy's timeouts.
+fn search_timeout() -> ApiError {
+    ApiError::new(
+        format!(
+            "Meilisearch did not answer within {} s",
+            SEARCH_REQUEST_TIMEOUT.as_secs()
+        ),
+        "timeout",
+    )
+}
+
 /// Proxy search to the account's default Meilisearch engine.
 #[utoipa::path(post, path = "/search", tag = "search", request_body = SearchRequest, responses((status = 200, description = "Meilisearch search results"), (status = 400, body = ApiError)), security(("api_key" = [])))]
 async fn search_url(
@@ -5925,8 +6260,7 @@ async fn search_url(
     }
 
     // Proxy to Meilisearch
-    let client = reqwest::Client::new();
-    let mut req = client.post(format!(
+    let mut req = state.search_client.post(format!(
         "{}/indexes/{}/search",
         engine_url.trim_end_matches('/'),
         index_uid
@@ -5937,6 +6271,9 @@ async fn search_url(
     req = req.json(&search_body);
 
     let resp = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            return search_timeout();
+        }
         ApiError::new(
             format!("Failed to connect to Meilisearch: {e}"),
             "bad_request",
@@ -5953,6 +6290,9 @@ async fn search_url(
     }
 
     let result: serde_json::Value = resp.json().await.map_err(|e| {
+        if e.is_timeout() {
+            return search_timeout();
+        }
         ApiError::new(
             format!("Failed to parse Meilisearch response: {e}"),
             "internal_error",

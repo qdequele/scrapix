@@ -46,7 +46,7 @@ use scrapix_crawler::{is_non_page_url, SitemapParser};
 
 use crate::ai_access::{resolve_ai, with_key_retry, ResolvedAi, NO_AI_MESSAGE};
 use crate::auth::AuthenticatedAccount;
-use crate::engine_jobs::{self, Gate};
+use crate::engine_jobs;
 use crate::job_kind::JobKind;
 use crate::results::{self, find_owned_job, status_str};
 use crate::{
@@ -831,27 +831,19 @@ impl ExtractRunner {
             .enumerate()
             .map(|(i, s)| (i, s.url.clone()))
             .collect();
-        let mut outcomes = futures::stream::iter(urls)
-            .map(|(index, url)| {
-                let state = self.state.clone();
-                let account_ctx = self.account_ctx.clone();
-                let options = self.options.clone();
-                let job_id = self.job_id.clone();
-                async move {
-                    if engine_jobs::gate(&state, &job_id).await == Gate::Stop {
-                        return None;
-                    }
-                    Some(
-                        crate::batch::scrape_one(&state, &account_ctx, &options, index, &url).await,
-                    )
-                }
-            })
-            .buffer_unordered(FETCH_CONCURRENCY);
+        let mut outcomes = crate::batch::ScrapeTasks::new(
+            self.state.clone(),
+            self.account_ctx.clone(),
+            self.options.clone(),
+            self.job_id.clone(),
+            urls,
+            FETCH_CONCURRENCY,
+            false,
+        );
 
         let mut pages = Vec::new();
         let mut seq = 0u64;
         while let Some(outcome) = outcomes.next().await {
-            let Some(outcome) = outcome else { continue };
             seq += 1;
             let error = outcome
                 .item
