@@ -13,7 +13,10 @@ use std::collections::HashMap;
 use chrono::Utc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use scrapix_core::RawPage;
-use scrapix_parser::{detect_language, extract_content, html_to_markdown, HtmlParserBuilder};
+use scrapix_parser::{
+    detect_language, extract_content, html_to_main_content_markdown, html_to_markdown,
+    html_to_markdown_for_page, HtmlParserBuilder,
+};
 
 // =============================================================================
 // TEST HTML CONTENT
@@ -146,6 +149,86 @@ fn generate_large_html(paragraphs: usize, links: usize) -> String {
 "#,
     );
 
+    html
+}
+
+/// A page shaped like a real site's: inline scripts and styles, an SVG logo,
+/// a navigation bar, a sidebar and a footer around an article with links,
+/// images, a table and code. The other inputs have no script or style, which
+/// is where the tag stripping of the Markdown conversion works.
+fn generate_realistic_html(sections: usize) -> String {
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Realistic Page</title>
+    <base href="/docs/">
+    <link rel="stylesheet" href="/assets/site.css">
+    <style>body{margin:0;font-family:system-ui}.nav a{padding:4px 8px}.hero>h1{font-size:2rem}</style>
+    <script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}</script>
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"Realistic Page"}</script>
+</head>
+<body class="docs">
+    <header class="site-header">
+        <a href="/" class="logo"><svg viewBox="0 0 24 24" width="24" height="24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/></svg></a>
+        <nav class="nav">
+            <a href="/">Home</a><a href="/docs">Docs</a><a href="/blog">Blog</a>
+            <a href="/pricing">Pricing</a><a href="https://github.com/example/repo">GitHub</a>
+        </nav>
+    </header>
+    <aside class="sidebar"><ul>
+"#,
+    );
+    for i in 0..sections {
+        html.push_str(&format!(
+            "        <li><a href=\"#section-{i}\">Section {i}</a></li>\n"
+        ));
+    }
+    html.push_str("    </ul></aside>\n    <main>\n        <article>\n            <h1>Realistic Page Title</h1>\n");
+    for i in 0..sections {
+        html.push_str(&format!(
+            r#"            <h2 id="section-{i}">Section {i}</h2>
+            <p>Paragraph {i} explains a <a href="guide/topic-{i}">relative topic</a>, an
+               <a href="https://example.org/ref/{i}">external reference</a> and some
+               <strong>bold</strong>, <em>italic</em> and <code>inline_code({i})</code> text.
+               Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+               tempor incididunt ut labore et dolore magna aliqua.</p>
+            <img src="img/figure-{i}.png" alt="Figure {i}">
+"#
+        ));
+        if i % 4 == 0 {
+            html.push_str(&format!(
+                r#"            <pre><code class="language-js">const x{i} = await fetch("/api/items?page={i}&amp;size=10");
+if (x{i}.status &lt; 400) {{ console.log("ok"); }}</code></pre>
+            <table>
+                <tr><th>Option</th><th>Default</th><th>Description</th></tr>
+                <tr><td>retries</td><td>{i}</td><td>How many times to retry</td></tr>
+                <tr><td>timeout</td><td>30000</td><td>Request timeout in ms</td></tr>
+            </table>
+            <ul><li>First point of {i}</li><li>Second point with a <a href="/faq#q{i}">link</a></li></ul>
+"#
+            ));
+        }
+        if i % 10 == 0 {
+            html.push_str(&format!(
+                "            <script>document.querySelectorAll('#section-{i} a').forEach(function(a){{a.dataset.s='{i}';}});</script>\n            <noscript><img src=\"/pixel.gif?s={i}\" alt=\"\"></noscript>\n"
+            ));
+        }
+    }
+    html.push_str(
+        r#"        </article>
+    </main>
+    <footer class="site-footer">
+        <p>Copyright 2026 Example Inc.</p>
+        <a href="/privacy">Privacy</a> <a href="/terms">Terms</a>
+    </footer>
+    <script src="/assets/app.js" defer></script>
+    <script>(function(){var s=document.createElement('script');s.src='https://cdn.example.com/a.js';document.head.appendChild(s);})();</script>
+</body>
+</html>
+"#,
+    );
     html
 }
 
@@ -312,6 +395,57 @@ fn bench_markdown_conversion(c: &mut Criterion) {
         },
     );
 
+    // A page with scripts, styles, navigation and links
+    let realistic_html = generate_realistic_html(60);
+    group.throughput(Throughput::Bytes(realistic_html.len() as u64));
+    group.bench_with_input(
+        BenchmarkId::new("realistic_html", "60s"),
+        &realistic_html,
+        |b, html| {
+            b.iter(|| {
+                black_box(html_to_markdown(html));
+            });
+        },
+    );
+
+    group.finish();
+}
+
+/// The conversions the crawl and `/scrape` run: main content only, and main
+/// content with links resolved against the page URL.
+fn bench_markdown_for_page(c: &mut Criterion) {
+    let large_html = generate_large_html(100, 500);
+    let realistic_html = generate_realistic_html(60);
+    let inputs: [(&str, &str); 3] = [
+        ("medium_html", MEDIUM_HTML),
+        ("large_html_100p", &large_html),
+        ("realistic_html_60s", &realistic_html),
+    ];
+
+    let mut group = c.benchmark_group("markdown_main_content");
+    for (name, html) in inputs {
+        group.throughput(Throughput::Bytes(html.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(html_to_main_content_markdown(html));
+            });
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("markdown_for_page");
+    for (name, html) in inputs {
+        group.throughput(Throughput::Bytes(html.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(html_to_markdown_for_page(
+                    html,
+                    "https://example.com/docs/guide/page",
+                    true,
+                ));
+            });
+        });
+    }
     group.finish();
 }
 
@@ -438,6 +572,7 @@ criterion_group!(
 criterion_group!(
     conversion_benches,
     bench_markdown_conversion,
+    bench_markdown_for_page,
     bench_content_extraction,
     bench_language_detection,
 );

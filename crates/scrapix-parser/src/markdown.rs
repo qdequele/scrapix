@@ -48,13 +48,14 @@ pub fn html_to_main_content_markdown(html: &str) -> String {
 
 /// Convert HTML to Markdown with custom configuration
 pub fn html_to_markdown_with_config(html: &str, config: &MarkdownConfig) -> String {
-    // Strip non-content tags (script, style, etc.)
-    let mut cleaned_html = strip_non_content_tags(html);
-
-    // Optionally strip boilerplate sections
-    if config.only_main_content {
-        cleaned_html = strip_boilerplate_tags(cleaned_html);
-    }
+    // Strip non-content tags (script, style, etc.) and, optionally, the
+    // boilerplate sections
+    let stripped_tags = if config.only_main_content {
+        STRIPPED_TAGS.len()
+    } else {
+        NON_CONTENT_TAGS
+    };
+    let cleaned_html = strip_tags(Cow::Borrowed(html), 0..stripped_tags);
 
     // Use html2md for the basic conversion
     let markdown = parse_html(&cleaned_html);
@@ -154,7 +155,8 @@ pub fn absolutize_markdown_links(markdown: &str, base: &url::Url) -> String {
             }
             _ => {}
         }
-        if fence.is_some() {
+        // A link or an image has a `](`: a line without one is kept as it is.
+        if fence.is_some() || !line.contains("](") {
             out.push_str(line);
             continue;
         }
@@ -164,8 +166,8 @@ pub fn absolutize_markdown_links(markdown: &str, base: &url::Url) -> String {
             if j > 0 {
                 out.push('`');
             }
-            if j % 2 == 0 {
-                out.push_str(&rewrite_links(segment, base));
+            if j % 2 == 0 && segment.contains("](") {
+                push_rewritten_links(&mut out, segment, base);
             } else {
                 out.push_str(segment);
             }
@@ -174,89 +176,401 @@ pub fn absolutize_markdown_links(markdown: &str, base: &url::Url) -> String {
     out
 }
 
-/// Rewrite the links and images of one line of markdown (no code in it).
-fn rewrite_links(line: &str, base: &url::Url) -> String {
+/// The pattern of a link or an image: (!?) image marker, [text] (which may
+/// hold an image), (target "title").
+fn link_regex() -> &'static Regex {
     static LINK_RE: OnceLock<Regex> = OnceLock::new();
-    // (!?) image marker, [text] (which may hold an image), (target "title")
-    let link_re = LINK_RE.get_or_init(|| {
+    LINK_RE.get_or_init(|| {
         Regex::new(
             r#"(!?)\[((?:!\[[^\]]*\]\([^)]*\)|[^\]])*)\]\(\s*([^)\s]*)((?:\s+"[^"]*")?)\s*\)"#,
         )
         .unwrap()
-    });
-    link_re
+    })
+}
+
+/// Append one line of markdown (no code in it) to `out`, its links and
+/// images rewritten.
+///
+/// What is a link is decided by [`link_regex`], and the capture search of
+/// the regex engine was a quarter of the conversion of a page with hundreds
+/// of links. On a plain line the same matches are found by hand
+/// ([`push_rewritten_plain_links`]); every other line goes through the
+/// regex.
+///
+/// A line is plain when it has no `"` (no link title) and either no `![`
+/// (no image) or a single `[`. Then a link text cannot hold an image or a
+/// `]`, and a target cannot hold a quoted `)`: each `[` has at most one way
+/// to be a link, ending at the first `)` after its `](`, so there is one
+/// set of matches whatever the order they are searched in. That matters:
+/// on the other lines the regex engine (regex 1.12) does not always return
+/// the leftmost match (in `[![](a [b](c)d](e)` it finds `[b](c)`), and the
+/// Markdown has to stay what it was.
+fn push_rewritten_links(out: &mut String, line: &str, base: &url::Url) {
+    let plain = !line.contains('"')
+        && (!line.contains("![") || line.bytes().filter(|&b| b == b'[').count() == 1);
+    if plain {
+        push_rewritten_plain_links(out, line, base);
+    } else {
+        out.push_str(&rewrite_links_with_regex(line, base));
+    }
+}
+
+/// [`push_rewritten_links`] for a plain line: `!?[text](target)`, where
+/// the text runs to the first `]` and the target, with whitespace allowed
+/// around it, to the `)`.
+fn push_rewritten_plain_links(out: &mut String, line: &str, base: &url::Url) {
+    let bytes = line.as_bytes();
+    let find = |byte: u8, from: usize| {
+        bytes[from..]
+            .iter()
+            .position(|&b| b == byte)
+            .map(|offset| from + offset)
+    };
+    // Up to here the line is in `out`.
+    let mut copied = 0;
+    let mut at = 0;
+    // Where a target that was not followed by `)` ended: a later target
+    // reaching it ends the same way.
+    let mut dead_target_end = 0;
+    while let Some(open) = find(b'[', at) {
+        // The text of a link at `open`, and of every `[` inside it, ends
+        // at the first `]`: they all are links or none is.
+        let Some(close) = find(b']', open + 1) else {
+            break;
+        };
+        at = close + 1;
+        if bytes.get(close + 1) != Some(&b'(') {
+            continue;
+        }
+        let target_start = skip_whitespace(line, close + 2);
+        if target_start < dead_target_end {
+            continue;
+        }
+        let rest = &line[target_start..];
+        let target_end = target_start
+            + rest
+                .find(|c: char| c == ')' || c.is_whitespace())
+                .unwrap_or(rest.len());
+        let closing = skip_whitespace(line, target_end);
+        if bytes.get(closing) != Some(&b')') {
+            dead_target_end = target_end;
+            continue;
+        }
+
+        let is_image = open > copied && bytes[open - 1] == b'!';
+        let start = open - usize::from(is_image);
+        let text = &line[open + 1..close];
+        let target = &line[target_start..target_end];
+        out.push_str(&line[copied..start]);
+        if !target.is_empty() {
+            out.push_str(&line[start..=open]);
+            out.push_str(text);
+            out.push_str("](");
+            push_resolved_target(out, target, base);
+            out.push(')');
+        } else if !is_image {
+            // A link with no target is replaced by its text, an image
+            // with none is removed.
+            out.push_str(text);
+        }
+        copied = closing + 1;
+        at = copied;
+    }
+    out.push_str(&line[copied..]);
+}
+
+/// The offset after the whitespace at `at`.
+fn skip_whitespace(line: &str, at: usize) -> usize {
+    line.len() - line[at..].trim_start().len()
+}
+
+/// Append `target` to `out`, resolved against `base` unless it is absolute
+/// or a fragment.
+fn push_resolved_target(out: &mut String, target: &str, base: &url::Url) {
+    // An absolute URL has a scheme, so a `:`: without one the target is
+    // relative and parsing it alone can only fail.
+    let is_absolute =
+        target.starts_with('#') || (target.contains(':') && url::Url::parse(target).is_ok());
+    if is_absolute {
+        out.push_str(target);
+        return;
+    }
+    // `//cdn/x.png` is relative to the scheme: `join` handles it.
+    match base.join(target) {
+        Ok(resolved) => out.push_str(resolved.as_str()),
+        Err(_) => out.push_str(target),
+    }
+}
+
+/// Rewrite the links and images of one line of markdown (no code in it)
+/// with [`link_regex`].
+fn rewrite_links_with_regex(line: &str, base: &url::Url) -> String {
+    link_regex()
         .replace_all(line, |caps: &regex::Captures| {
             let is_image = !caps[1].is_empty();
             // The text of a link may be an image: rewrite it too.
-            let text = if is_image {
+            let text = if is_image || !caps[2].contains("](") {
                 caps[2].to_string()
             } else {
-                rewrite_links(&caps[2], base)
+                rewrite_links_with_regex(&caps[2], base)
             };
             let target = &caps[3];
             let title = &caps[4];
             if target.is_empty() {
                 return if is_image { String::new() } else { text };
             }
-            // `//cdn/x.png` is relative to the scheme: `join` handles it.
-            let is_absolute = target.starts_with('#') || url::Url::parse(target).is_ok();
-            let resolved = if is_absolute {
-                target.to_string()
-            } else {
-                base.join(target)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|_| target.to_string())
-            };
+            let mut resolved = String::new();
+            push_resolved_target(&mut resolved, target, base);
             format!("{}[{}]({}{})", &caps[1], text, resolved, title)
         })
         .into_owned()
 }
 
+/// Tags removed with their content, in the order they are removed: the
+/// first [`NON_CONTENT_TAGS`] from every page, the rest (nav, footer,
+/// header, aside) when only the main content is wanted.
+const STRIPPED_TAGS: [&str; 9] = [
+    "script", "style", "noscript", "svg", "head", "nav", "footer", "header", "aside",
+];
+/// How many of [`STRIPPED_TAGS`] are removed from every page.
+const NON_CONTENT_TAGS: usize = 5;
+
 /// Strip script, style, noscript, svg, and head tags (and their content) from HTML.
+#[cfg(test)]
 fn strip_non_content_tags(html: &str) -> Cow<'_, str> {
-    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        ["script", "style", "noscript", "svg", "head"]
-            .iter()
-            .map(|tag| Regex::new(&format!(r"(?si)<{tag}[\s>].*?</{tag}\s*>")).unwrap())
-            .collect()
-    });
-    strip_matches(Cow::Borrowed(html), patterns)
+    strip_tags(Cow::Borrowed(html), 0..NON_CONTENT_TAGS)
 }
 
 /// Strip boilerplate HTML sections: nav, header, footer, aside.
+#[cfg(test)]
 fn strip_boilerplate_tags(html: Cow<'_, str>) -> Cow<'_, str> {
+    strip_tags(html, NON_CONTENT_TAGS..STRIPPED_TAGS.len())
+}
+
+/// The regex a tag's blocks are defined by.
+fn tag_block_regex(tag: usize) -> &'static Regex {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        ["nav", "footer", "header", "aside"]
+    &PATTERNS.get_or_init(|| {
+        STRIPPED_TAGS
             .iter()
             .map(|tag| Regex::new(&format!(r"(?si)<{tag}[\s>].*?</{tag}\s*>")).unwrap())
             .collect()
-    });
-    strip_matches(html, patterns)
+    })[tag]
 }
 
-/// Remove every match of each pattern, one pattern after the other (a
-/// later pattern sees the text without the earlier ones' matches). The text
-/// is only copied by a pattern that matches.
-fn strip_matches<'a>(mut text: Cow<'a, str>, patterns: &[Regex]) -> Cow<'a, str> {
-    for re in patterns {
-        let stripped = match re.replace_all(&text, "") {
-            Cow::Owned(stripped) => Some(stripped),
-            Cow::Borrowed(_) => None,
-        };
-        if let Some(stripped) = stripped {
+/// Remove every `<tag …>…</tag>` block of the tags `STRIPPED_TAGS[tags]`,
+/// one tag after the other: a later tag sees the text without the earlier
+/// ones' blocks, which is what makes `<style>a <script>b</style> c</script>`
+/// come out as it does. The text is only copied by a tag that has a block.
+///
+/// A block is what the regex `(?si)<tag[\s>].*?</tag\s*>` matches. Running
+/// nine such regexes over the page was a fifth of the conversion, so the
+/// page is scanned once for the places where one of the nine names follows
+/// a `<` or a `</`, and each tag then walks that short list instead of the
+/// page. The one thing the scanner does not reproduce is Unicode case
+/// folding, where `ſ` (U+017F) equals `s`: a page holding that character
+/// goes through the regexes.
+fn strip_tags(mut text: Cow<'_, str>, tags: std::ops::Range<usize>) -> Cow<'_, str> {
+    if text.contains('\u{17f}') {
+        for tag in tags {
+            let stripped = match tag_block_regex(tag).replace_all(&text, "") {
+                Cow::Owned(stripped) => Some(stripped),
+                Cow::Borrowed(_) => None,
+            };
+            if let Some(stripped) = stripped {
+                text = Cow::Owned(stripped);
+            }
+        }
+        return text;
+    }
+
+    let mut marks = tag_marks(text.as_bytes());
+    let mut blocks = Vec::new();
+    for tag in tags {
+        if marks.is_empty() {
+            break;
+        }
+        blocks.clear();
+        find_tag_blocks(&text, &marks, tag, &mut blocks);
+        if !blocks.is_empty() {
+            let stripped = remove_blocks(&text, &blocks);
+            remap_marks(&mut marks, &blocks, stripped.as_bytes());
+            debug_assert_eq!(marks, tag_marks(stripped.as_bytes()));
             text = Cow::Owned(stripped);
         }
     }
     text
 }
 
+/// A `<` or `</` followed by the name of a stripped tag, in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TagMark {
+    /// Byte offset of the `<`.
+    lt: usize,
+    /// `</name` rather than `<name`.
+    closing: bool,
+    /// Bit `i` is set when the name starts with `STRIPPED_TAGS[i]`
+    /// (`<header` has both `head` and `header`).
+    tags: u16,
+}
+
+/// The longest thing a [`TagMark`] is read from, minus one: `</noscript`.
+/// A `<` further than this before a point cannot see past it.
+const TAG_MARK_REACH: usize = 9;
+
+/// The mark of the `<` at `lt`, if a stripped tag's name follows it.
+fn tag_mark(bytes: &[u8], lt: usize) -> Option<TagMark> {
+    let closing = bytes.get(lt + 1) == Some(&b'/');
+    let name = lt + 1 + usize::from(closing);
+    // Every stripped tag starts with one of these letters.
+    if !matches!(
+        bytes.get(name).map(u8::to_ascii_lowercase),
+        Some(b's' | b'n' | b'h' | b'f' | b'a')
+    ) {
+        return None;
+    }
+    let mut tags = 0u16;
+    for (i, tag) in STRIPPED_TAGS.iter().enumerate() {
+        let named = bytes
+            .get(name..name + tag.len())
+            .is_some_and(|found| found.eq_ignore_ascii_case(tag.as_bytes()));
+        if named {
+            tags |= 1 << i;
+        }
+    }
+    (tags != 0).then_some(TagMark { lt, closing, tags })
+}
+
+/// The marks of a text, in order.
+fn tag_marks(bytes: &[u8]) -> Vec<TagMark> {
+    let mut marks = Vec::new();
+    for_each_byte(bytes, b'<', |lt| marks.extend(tag_mark(bytes, lt)));
+    marks
+}
+
+/// Call `found` with the offset of every `byte` of `bytes`, in order.
+/// Eight bytes at a time: a page has a `<` every few dozen bytes, where a
+/// search restarted after each one spends its time starting.
+fn for_each_byte(bytes: &[u8], byte: u8, mut found: impl FnMut(usize)) {
+    const LOW_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let pattern = u64::from_ne_bytes([byte; 8]);
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    let mut offset = 0;
+    for chunk in chunks {
+        // Little-endian, so the lowest byte of the word is the first one.
+        let word = u64::from_le_bytes(*chunk) ^ pattern;
+        // The high bit of each byte of `word` that is zero, exactly.
+        let mut zeros = !(((word & LOW_BITS) + LOW_BITS) | word | LOW_BITS);
+        while zeros != 0 {
+            found(offset + (zeros.trailing_zeros() / 8) as usize);
+            zeros &= zeros - 1;
+        }
+        offset += 8;
+    }
+    for (i, &b) in remainder.iter().enumerate() {
+        if b == byte {
+            found(offset + i);
+        }
+    }
+}
+
+/// The blocks of `STRIPPED_TAGS[tag]` in `text`, as the regex
+/// `(?si)<tag[\s>].*?</tag\s*>` finds them one after the other: the
+/// leftmost `<tag` followed by whitespace or `>`, up to the first `</tag`,
+/// optional whitespace, `>` after it, then again from there. With no
+/// closing tag after an opening one there is none after a later one
+/// either, so the search is over.
+fn find_tag_blocks(text: &str, marks: &[TagMark], tag: usize, blocks: &mut Vec<(usize, usize)>) {
+    let name_len = STRIPPED_TAGS[tag].len();
+    let bit = 1u16 << tag;
+    let mut marks = marks.iter().filter(|mark| mark.tags & bit != 0);
+    let mut from = 0;
+    loop {
+        let Some(start) = marks.by_ref().find_map(|mark| {
+            let opens = !mark.closing
+                && mark.lt >= from
+                && text[mark.lt + 1 + name_len..]
+                    .starts_with(|c: char| c == '>' || c.is_whitespace());
+            opens.then_some(mark.lt)
+        }) else {
+            return;
+        };
+        // No `<` sits between an opening tag's `<` and the end of its
+        // name and delimiter, so every later mark is after them.
+        let Some(end) = marks.by_ref().find_map(|mark| {
+            if !mark.closing {
+                return None;
+            }
+            let after_name = text[mark.lt + 2 + name_len..].trim_start();
+            after_name
+                .starts_with('>')
+                .then(|| text.len() - after_name.len() + 1)
+        }) else {
+            return;
+        };
+        blocks.push((start, end));
+        from = end;
+    }
+}
+
+/// `text` without `blocks` (sorted, not overlapping, not empty).
+fn remove_blocks(text: &str, blocks: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut kept_from = 0;
+    for &(start, end) in blocks {
+        out.push_str(&text[kept_from..start]);
+        kept_from = end;
+    }
+    out.push_str(&text[kept_from..]);
+    out
+}
+
+/// Bring `marks` from a text to that text without `blocks`, whose bytes are
+/// `stripped`: the marks inside a block go, the ones after it move, and the
+/// `<` just before the place a block was are read again, because the text
+/// that now follows them can complete a name (`<na<script></script>v>`).
+fn remap_marks(marks: &mut Vec<TagMark>, blocks: &[(usize, usize)], stripped: &[u8]) {
+    let mut remapped = Vec::with_capacity(marks.len());
+    let mut old = marks.iter().peekable();
+    let mut removed = 0;
+    // Where the previous block was, in `stripped`.
+    let mut reread_from = 0;
+    for &(start, end) in blocks {
+        let seam = start - removed;
+        let window = seam.saturating_sub(TAG_MARK_REACH).max(reread_from);
+        // Marks before the window are untouched by this block.
+        while let Some(mark) = old.next_if(|mark| mark.lt < start) {
+            let lt = mark.lt - removed;
+            if lt < window {
+                remapped.push(TagMark { lt, ..*mark });
+            }
+        }
+        for lt in window..seam {
+            if stripped[lt] == b'<' {
+                remapped.extend(tag_mark(stripped, lt));
+            }
+        }
+        while old.next_if(|mark| mark.lt < end).is_some() {}
+        removed += end - start;
+        reread_from = seam;
+    }
+    remapped.extend(old.map(|mark| TagMark {
+        lt: mark.lt - removed,
+        ..*mark
+    }));
+    *marks = remapped;
+}
+
 /// Strip any remaining HTML tags from markdown output.
 ///
 /// Converts `<img>` tags to `![alt](src)` before stripping, so image info is preserved.
 /// All other HTML tags are removed, keeping only their text content.
-fn strip_remaining_html(markdown: &str) -> String {
+fn strip_remaining_html(markdown: &str) -> Cow<'_, str> {
+    // Both patterns need a `<` and a `>`: most Markdown has neither.
+    if !markdown.contains('<') || !markdown.contains('>') {
+        return Cow::Borrowed(markdown);
+    }
+
     // Convert <img> tags to markdown images: ![alt](src)
     static IMG_RE: OnceLock<Regex> = OnceLock::new();
     let img_re = IMG_RE.get_or_init(|| Regex::new(r#"(?i)<img\s[^>]*?>"#).unwrap());
@@ -288,37 +602,72 @@ fn strip_remaining_html(markdown: &str) -> String {
     static TAG_RE: OnceLock<Regex> = OnceLock::new();
     let tag_re = TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
 
-    tag_re.replace_all(&result, "").into_owned()
+    let stripped = match tag_re.replace_all(&result, "") {
+        Cow::Owned(stripped) => Some(stripped),
+        Cow::Borrowed(_) => None,
+    };
+    match stripped {
+        Some(stripped) => Cow::Owned(stripped),
+        None => result,
+    }
+}
+
+/// Whether some `[` is directly followed by whitespace, which a link text
+/// spread over several lines starts with.
+fn has_bracket_then_whitespace(markdown: &str) -> bool {
+    let mut pos = 0;
+    while let Some(offset) = markdown[pos..].find('[') {
+        pos += offset + 1;
+        if markdown[pos..].starts_with(char::is_whitespace) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Clean up the markdown output
 fn clean_markdown(markdown: &str) -> String {
-    // First pass: clean up multiline link/image syntax
-    // [\n\nText\n\n](url) → [Text](url)
-    // ![\n\nAlt\n\n](url) → ![Alt](url)
-    static MULTILINE_LINK_RE: OnceLock<Regex> = OnceLock::new();
-    let multiline_link_re = MULTILINE_LINK_RE
-        .get_or_init(|| Regex::new(r"(!?\[)\s*\n\s*(.*?)\s*\n\s*\]\(([^)]*)\)").unwrap());
-    let markdown = multiline_link_re.replace_all(markdown, "$1$2]($3)");
+    let mut markdown = Cow::Borrowed(markdown);
 
-    // Remove empty links: [](url)
-    static EMPTY_LINK_RE: OnceLock<Regex> = OnceLock::new();
-    let empty_link_re = EMPTY_LINK_RE.get_or_init(|| Regex::new(r"\[]\([^)]*\)").unwrap());
-    let markdown = empty_link_re.replace_all(&markdown, "");
+    // First pass: fix up links and images. Each of the four patterns needs
+    // a `](`, and each is skipped when the text it would see cannot match.
+    if markdown.contains("](") {
+        // Clean up multiline link/image syntax
+        // [\n\nText\n\n](url) → [Text](url)
+        // ![\n\nAlt\n\n](url) → ![Alt](url)
+        static MULTILINE_LINK_RE: OnceLock<Regex> = OnceLock::new();
+        if has_bracket_then_whitespace(&markdown) {
+            let multiline_link_re = MULTILINE_LINK_RE
+                .get_or_init(|| Regex::new(r"(!?\[)\s*\n\s*(.*?)\s*\n\s*\]\(([^)]*)\)").unwrap());
+            replace_in_place(&mut markdown, multiline_link_re, "$1$2]($3)");
+        }
 
-    // Remove images with relative/asset URLs (decorative)
-    static DECORATIVE_IMG_RE: OnceLock<Regex> = OnceLock::new();
-    let decorative_img_re =
-        DECORATIVE_IMG_RE.get_or_init(|| Regex::new(r"!\[[^\]]*\]\(/_next/[^)]*\)").unwrap());
-    let markdown = decorative_img_re.replace_all(&markdown, "");
+        // Remove empty links: [](url)
+        static EMPTY_LINK_RE: OnceLock<Regex> = OnceLock::new();
+        if markdown.contains("[](") {
+            let empty_link_re = EMPTY_LINK_RE.get_or_init(|| Regex::new(r"\[]\([^)]*\)").unwrap());
+            replace_in_place(&mut markdown, empty_link_re, "");
+        }
 
-    // Remove images with no alt text
-    static NO_ALT_IMG_RE: OnceLock<Regex> = OnceLock::new();
-    let no_alt_img_re = NO_ALT_IMG_RE.get_or_init(|| Regex::new(r"!\[\]\([^)]*\)").unwrap());
-    let markdown = no_alt_img_re.replace_all(&markdown, "");
+        // Remove images with relative/asset URLs (decorative)
+        static DECORATIVE_IMG_RE: OnceLock<Regex> = OnceLock::new();
+        if markdown.contains("](/_next/") {
+            let decorative_img_re = DECORATIVE_IMG_RE
+                .get_or_init(|| Regex::new(r"!\[[^\]]*\]\(/_next/[^)]*\)").unwrap());
+            replace_in_place(&mut markdown, decorative_img_re, "");
+        }
+
+        // Remove images with no alt text
+        static NO_ALT_IMG_RE: OnceLock<Regex> = OnceLock::new();
+        if markdown.contains("![](") {
+            let no_alt_img_re =
+                NO_ALT_IMG_RE.get_or_init(|| Regex::new(r"!\[\]\([^)]*\)").unwrap());
+            replace_in_place(&mut markdown, no_alt_img_re, "");
+        }
+    }
 
     // Second pass: line-by-line cleanup
-    let mut result = String::new();
+    let mut result = String::with_capacity(markdown.len());
     let mut prev_blank = false;
     let mut in_code_block = false;
 
@@ -350,43 +699,46 @@ fn clean_markdown(markdown: &str) -> String {
         prev_blank = false;
 
         // Clean up the line
-        let cleaned = clean_line(trimmed);
-        if !cleaned.is_empty() {
-            result.push_str(&cleaned);
-            result.push('\n');
-        }
+        push_clean_line(&mut result, trimmed);
+        result.push('\n');
     }
 
     // Trim trailing whitespace
-    result.trim_end().to_string()
+    let trimmed_len = result.trim_end().len();
+    result.truncate(trimmed_len);
+    result
 }
 
-/// Clean a single line of markdown
-fn clean_line(line: &str) -> String {
-    // Collapse consecutive spaces in a single pass - O(n) with one allocation
-    let mut result = String::with_capacity(line.len());
-    let mut prev_space = false;
-    for ch in line.chars() {
-        if ch == ' ' {
-            if !prev_space {
-                result.push(' ');
-            }
-            prev_space = true;
-        } else {
-            result.push(ch);
-            prev_space = false;
-        }
+/// Replace every match of `re` in `text`, copying it only when one matches.
+fn replace_in_place(text: &mut Cow<'_, str>, re: &Regex, replacement: &str) {
+    let replaced = match re.replace_all(text, replacement) {
+        Cow::Owned(replaced) => Some(replaced),
+        Cow::Borrowed(_) => None,
+    };
+    if let Some(replaced) = replaced {
+        *text = Cow::Owned(replaced);
     }
+}
 
+/// Append one cleaned line of markdown to `out`: runs of spaces collapsed
+/// to one, and a space after the `#`s of a heading that lacks it. `line` is
+/// trimmed and not empty.
+fn push_clean_line(out: &mut String, line: &str) {
     // Fix heading spacing
-    if result.starts_with('#') {
-        let hash_end = result.find(|c: char| c != '#').unwrap_or(result.len());
-        if hash_end < result.len() && !result[hash_end..].starts_with(' ') {
-            result.insert(hash_end, ' ');
-        }
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    let mut rest = line;
+    if hashes > 0 && hashes < line.len() && line.as_bytes()[hashes] != b' ' {
+        out.push_str(&line[..hashes]);
+        out.push(' ');
+        rest = &line[hashes..];
     }
 
-    result
+    // Collapse consecutive spaces
+    while let Some(i) = rest.find("  ") {
+        out.push_str(&rest[..=i]);
+        rest = rest[i + 1..].trim_start_matches(' ');
+    }
+    out.push_str(rest);
 }
 
 /// Extract plain text from markdown (strip all formatting)
@@ -465,6 +817,11 @@ pub fn markdown_to_text(markdown: &str) -> String {
 
     result
 }
+
+#[cfg(test)]
+mod differential;
+#[cfg(test)]
+mod legacy;
 
 #[cfg(test)]
 mod tests {
