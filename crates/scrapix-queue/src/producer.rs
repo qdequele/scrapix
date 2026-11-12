@@ -9,9 +9,54 @@ use rdkafka::{
     util::Timeout,
 };
 use serde::Serialize;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 
 use scrapix_core::{Result, ScrapixError};
+
+/// Environment variable setting the linger of every Kafka producer (ms).
+/// Raise it (e.g. `5`) to trade send latency for fewer produce requests.
+pub const LINGER_MS_ENV: &str = "KAFKA_LINGER_MS";
+
+/// Default producer linger (ms). Measured with `examples/linger_bench.rs`
+/// against a local single-node Redpanda (`acks=all`, idempotent, lz4,
+/// 1.5 KB messages, 1-partition topic), linger 0 / 5 / 20 ms:
+/// one awaited send p50 0.13 / 6.6 / 22.4 ms; 100 sends awaited together
+/// 0.9 / 7.3 / 23 ms in 4 / 3 / 3 produce requests; 20,000 messages with
+/// 256 in flight: same throughput and 436 / 435 / 435 requests (batches
+/// fill by size, and librdkafka batches what queues up while a request is
+/// in flight); 64 slots each awaiting its sends: 150k / 120k / 85k msg/s.
+/// The linger only bought fewer requests at moderate rates (2,000 msg/s:
+/// 1,170 / 183 / 48 requests/s), at 0.4 / 3.1 / 10.9 ms per send.
+pub const DEFAULT_LINGER_MS: u64 = 0;
+
+/// Highest accepted `KAFKA_LINGER_MS`.
+pub const MAX_LINGER_MS: u64 = 1000;
+
+/// Parse a `KAFKA_LINGER_MS` value: an integer in `0..=MAX_LINGER_MS`.
+/// Unset or blank means [`DEFAULT_LINGER_MS`]; anything else is an error,
+/// so a typo stops the service at startup instead of being ignored.
+pub fn parse_linger_ms(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_LINGER_MS);
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms <= MAX_LINGER_MS => Ok(ms),
+        _ => Err(ScrapixError::Queue(format!(
+            "Invalid {LINGER_MS_ENV}={raw:?}: expected an integer between 0 and {MAX_LINGER_MS} (milliseconds)"
+        ))),
+    }
+}
+
+/// The producer linger from `KAFKA_LINGER_MS` (see [`parse_linger_ms`]).
+pub fn linger_ms_from_env() -> Result<u64> {
+    match std::env::var(LINGER_MS_ENV) {
+        Ok(raw) => parse_linger_ms(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_linger_ms(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ScrapixError::Queue(format!(
+            "Invalid {LINGER_MS_ENV}: not valid UTF-8"
+        ))),
+    }
+}
 
 /// Producer configuration
 #[derive(Debug, Clone)]
@@ -30,7 +75,10 @@ pub struct ProducerConfig {
     pub compression: String,
     /// Batch size
     pub batch_size: usize,
-    /// Linger time (ms) - how long to wait before sending a batch
+    /// Linger time (ms): how long a message waits for others before its
+    /// batch is sent. `send` awaits the delivery report, so every awaited
+    /// publish stage costs at least one linger. [`ProducerBuilder`] and
+    /// [`KafkaProducer::with_brokers`] take it from `KAFKA_LINGER_MS`.
     pub linger_ms: u64,
     /// Acks required (0, 1, all)
     pub acks: String,
@@ -48,7 +96,7 @@ impl Default for ProducerConfig {
             idempotent: true,
             compression: "lz4".to_string(),
             batch_size: 65536,
-            linger_ms: 20,
+            linger_ms: DEFAULT_LINGER_MS,
             acks: "all".to_string(),
             max_message_bytes: 10 * 1024 * 1024, // 10MB
         }
@@ -91,13 +139,21 @@ impl KafkaProducer {
             .create()
             .map_err(|e| ScrapixError::Queue(format!("Failed to create producer: {}", e)))?;
 
+        info!(
+            client_id = %config.client_id,
+            linger_ms = config.linger_ms,
+            "Kafka producer created"
+        );
+
         Ok(Self { producer, config })
     }
 
-    /// Create a producer with default configuration
+    /// Create a producer with default configuration (linger from
+    /// `KAFKA_LINGER_MS`)
     pub fn with_brokers(brokers: impl Into<String>) -> Result<Self> {
         Self::new(ProducerConfig {
             brokers: brokers.into(),
+            linger_ms: linger_ms_from_env()?,
             ..Default::default()
         })
     }
@@ -235,6 +291,8 @@ impl KafkaProducer {
 /// Builder for KafkaProducer
 pub struct ProducerBuilder {
     config: ProducerConfig,
+    /// `linger_ms()` was called: `KAFKA_LINGER_MS` is not read.
+    linger_set: bool,
 }
 
 impl ProducerBuilder {
@@ -244,6 +302,7 @@ impl ProducerBuilder {
                 brokers: brokers.into(),
                 ..Default::default()
             },
+            linger_set: false,
         }
     }
 
@@ -267,8 +326,10 @@ impl ProducerBuilder {
         self
     }
 
+    /// Set the linger explicitly, overriding `KAFKA_LINGER_MS`.
     pub fn linger_ms(mut self, ms: u64) -> Self {
         self.config.linger_ms = ms;
+        self.linger_set = true;
         self
     }
 
@@ -282,7 +343,12 @@ impl ProducerBuilder {
         self
     }
 
-    pub fn build(self) -> Result<KafkaProducer> {
+    /// Build the producer. Unless `linger_ms()` was called, the linger
+    /// comes from `KAFKA_LINGER_MS`; an invalid value is an error.
+    pub fn build(mut self) -> Result<KafkaProducer> {
+        if !self.linger_set {
+            self.config.linger_ms = linger_ms_from_env()?;
+        }
         KafkaProducer::new(self.config)
     }
 }
@@ -335,5 +401,30 @@ mod tests {
         assert_eq!(builder.config.client_id, "test-producer");
         assert_eq!(builder.config.compression, "gzip");
         assert_eq!(builder.config.batch_size, 32768);
+        assert!(!builder.linger_set);
+        assert!(builder.linger_ms(0).linger_set);
+    }
+
+    #[test]
+    fn linger_ms_defaults_when_unset_or_blank() {
+        assert_eq!(parse_linger_ms(None).unwrap(), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("")).unwrap(), DEFAULT_LINGER_MS);
+        assert_eq!(parse_linger_ms(Some("  ")).unwrap(), DEFAULT_LINGER_MS);
+        assert_eq!(ProducerConfig::default().linger_ms, DEFAULT_LINGER_MS);
+    }
+
+    #[test]
+    fn linger_ms_accepts_the_range() {
+        assert_eq!(parse_linger_ms(Some("0")).unwrap(), 0);
+        assert_eq!(parse_linger_ms(Some(" 20 ")).unwrap(), 20);
+        assert_eq!(parse_linger_ms(Some("1000")).unwrap(), 1000);
+    }
+
+    #[test]
+    fn linger_ms_rejects_invalid_values() {
+        for bad in ["1001", "-1", "5ms", "2.5", "abc"] {
+            let err = parse_linger_ms(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("KAFKA_LINGER_MS"), "{bad}: {err}");
+        }
     }
 }

@@ -65,7 +65,10 @@ pub use accounting::{EventPosition, FrontierSnapshot, JobAccounting};
 pub use consumer::{ConsumerBuilder, ConsumerConfig, KafkaConsumer, MessageMetadata};
 pub use control::{control_group_id, CancelledJobs, CANCELLED_JOBS_CAP};
 pub use offsets::OffsetTracker;
-pub use producer::{KafkaProducer, ProducerBuilder, ProducerConfig};
+pub use producer::{
+    linger_ms_from_env, parse_linger_ms, KafkaProducer, ProducerBuilder, ProducerConfig,
+    DEFAULT_LINGER_MS, LINGER_MS_ENV, MAX_LINGER_MS,
+};
 pub use scrapix_core::Ack;
 pub use topics::{
     names as topic_names, CrawlEvent, CrawlHistoryMessage, DlqMessage, DocumentMessage,
