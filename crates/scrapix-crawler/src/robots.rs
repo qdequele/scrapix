@@ -5,10 +5,12 @@
 //! across worker instances.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use futures::future::{BoxFuture, FutureExt, Shared, WeakShared};
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use robotstxt::DefaultMatcher;
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,8 @@ use tracing::{debug, instrument, warn};
 use url::Url;
 
 use scrapix_core::{Result, ScrapixError};
+
+use crate::dns::CachingDnsResolver;
 
 /// Cache key for a robots.txt entry: `scheme://host:port` of `url`.
 ///
@@ -72,37 +76,168 @@ impl Default for RobotsConfig {
     }
 }
 
+/// Largest robots.txt body kept, in bytes (500 KiB, the limit Google
+/// applies). A longer body is truncated at the last complete line before
+/// the limit; the rest is never read.
+pub const MAX_ROBOTS_BODY_BYTES: usize = 500 * 1024;
+
+/// Most origins [`RobotsCache`] keeps. Past it, expired entries go first,
+/// then arbitrary ones.
+const MAX_CACHED_ORIGINS: usize = 100_000;
+
+/// How often an insert also drops the expired entries.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Cached robots.txt entry
 struct CachedRobots {
-    /// Raw robots.txt content
-    content: String,
+    /// Raw robots.txt content, shared with every check (never copied).
+    content: Arc<str>,
     /// When this entry was cached
     cached_at: Instant,
     /// Crawl delay from robots.txt (in milliseconds)
     crawl_delay_ms: Option<u64>,
 }
 
-/// Cache for robots.txt files
-pub struct RobotsCache {
+/// The cached origins and when expired ones were last dropped.
+struct CacheState {
+    entries: HashMap<String, CachedRobots>,
+    last_sweep: Instant,
+}
+
+impl CacheState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+
+    /// Insert `entry`, keeping at most `max` origins: expired entries are
+    /// dropped when the cache is full (and every [`SWEEP_INTERVAL`]), then
+    /// arbitrary ones (about 1% at a time, so a full cache does not scan on
+    /// every insert).
+    fn insert_bounded(&mut self, key: String, entry: CachedRobots, ttl: Duration, max: usize) {
+        let full = self.entries.len() >= max && !self.entries.contains_key(&key);
+        if full || self.last_sweep.elapsed() >= SWEEP_INTERVAL {
+            self.entries.retain(|_, e| e.cached_at.elapsed() < ttl);
+            self.last_sweep = Instant::now();
+        }
+        if self.entries.len() >= max && !self.entries.contains_key(&key) {
+            let excess = self.entries.len() + 1 - max;
+            let victims: Vec<String> = self
+                .entries
+                .keys()
+                .take(excess.max(max / 100))
+                .cloned()
+                .collect();
+            for victim in victims {
+                self.entries.remove(&victim);
+            }
+        }
+        self.entries.insert(key, entry);
+    }
+}
+
+/// One robots.txt fetch, shared by every caller waiting for that origin.
+type RobotsFetch = Shared<BoxFuture<'static, Arc<str>>>;
+
+/// A [`RobotsFetch`] that does not keep the fetch alive.
+type WeakRobotsFetch = WeakShared<BoxFuture<'static, Arc<str>>>;
+
+/// State shared by the cache and its in-flight fetches.
+struct RobotsShared {
     config: RobotsConfig,
     client: Client,
-    cache: RwLock<HashMap<String, CachedRobots>>,
+    cache: RwLock<CacheState>,
+    /// The fetch in progress for an origin (cache key), with its id. Held
+    /// weakly: the fetch lives as long as one caller awaits it, and removes
+    /// its entry when it completes or is dropped ([`FlightGuard`]).
+    in_flight: Mutex<HashMap<String, (u64, WeakRobotsFetch)>>,
+    next_flight_id: AtomicU64,
+}
+
+impl RobotsShared {
+    /// The cached content of `key`, unless missing or expired.
+    fn fresh(&self, key: &str) -> Option<Arc<str>> {
+        let cache = self.cache.read();
+        let entry = cache.entries.get(key)?;
+        (entry.cached_at.elapsed() < self.config.cache_ttl).then(|| entry.content.clone())
+    }
+}
+
+/// Removes an in-flight entry when its fetch ends, however it ends:
+/// completion, or every waiting caller dropped (cancelled) before that.
+struct FlightGuard {
+    shared: Arc<RobotsShared>,
+    key: String,
+    id: u64,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.shared.in_flight.lock();
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            in_flight.remove(&self.key);
+        }
+    }
+}
+
+/// Cache for robots.txt files
+pub struct RobotsCache {
+    shared: Arc<RobotsShared>,
 }
 
 impl RobotsCache {
-    /// Create a new robots.txt cache
+    /// Create a new robots.txt cache with its own HTTP client (own
+    /// connection pool, system DNS).
     pub fn new(config: RobotsConfig) -> Result<Self> {
-        let client = crate::safe_client::safe_client_builder(None, config.allow_private_ips)
+        Self::with_dns(config, None)
+    }
+
+    /// Create a robots.txt cache whose client resolves hosts through
+    /// `dns_cache` (the page fetcher's resolver), so a new origin is
+    /// resolved once for robots.txt and its pages. Same SSRF policy as
+    /// [`Self::new`].
+    pub fn with_dns_cache(
+        config: RobotsConfig,
+        dns_cache: Arc<CachingDnsResolver>,
+    ) -> Result<Self> {
+        Self::with_dns(config, Some(dns_cache))
+    }
+
+    fn with_dns(config: RobotsConfig, dns_cache: Option<Arc<CachingDnsResolver>>) -> Result<Self> {
+        let client = crate::safe_client::safe_client_builder(dns_cache, config.allow_private_ips)
             .timeout(config.fetch_timeout)
             .user_agent(&config.user_agent)
             .build()
             .map_err(|e| ScrapixError::Crawl(format!("Failed to build robots client: {}", e)))?;
+        Ok(Self::from_parts(config, client))
+    }
 
-        Ok(Self {
-            config,
-            client,
-            cache: RwLock::new(HashMap::new()),
-        })
+    /// Create a robots.txt cache that fetches through `client`, sharing its
+    /// connection pool and resolver. The caller guarantees `client` comes
+    /// from [`crate::safe_client::safe_client_builder`] with
+    /// `config.allow_private_ips` and the default redirect policy (see
+    /// `HttpFetcherBuilder::build_with_robots`, the only caller).
+    pub(crate) fn with_client(config: RobotsConfig, client: Client) -> Result<Self> {
+        reqwest::header::HeaderValue::from_str(&config.user_agent)
+            .map_err(|e| ScrapixError::Crawl(format!("Failed to build robots client: {}", e)))?;
+        Ok(Self::from_parts(config, client))
+    }
+
+    fn from_parts(config: RobotsConfig, client: Client) -> Self {
+        Self {
+            shared: Arc::new(RobotsShared {
+                config,
+                client,
+                cache: RwLock::new(CacheState::new()),
+                in_flight: Mutex::new(HashMap::new()),
+                next_flight_id: AtomicU64::new(0),
+            }),
+        }
     }
 
     /// Create a new robots.txt cache with default configuration
@@ -113,7 +248,8 @@ impl RobotsCache {
     /// Check if a URL is allowed by robots.txt
     #[instrument(skip(self))]
     pub async fn is_allowed(&self, url: &str) -> Result<bool> {
-        if !self.config.respect_robots {
+        let config = &self.shared.config;
+        if !config.respect_robots {
             return Ok(true);
         }
 
@@ -124,10 +260,11 @@ impl RobotsCache {
         let robots_content = self.get_robots(domain, &parsed).await?;
         let path = parsed.path();
 
-        // Use robotstxt crate to check if allowed
+        // The robotstxt crate has no parsed form to keep: it matches while
+        // it parses, so each check re-reads the (shared, uncopied) body.
         let mut matcher = DefaultMatcher::default();
         let allowed =
-            matcher.one_agent_allowed_by_robots(&robots_content, &self.config.user_agent, path);
+            matcher.one_agent_allowed_by_robots(&robots_content, &config.user_agent, path);
 
         debug!(url, allowed, "Robots.txt check");
         Ok(allowed)
@@ -140,21 +277,22 @@ impl RobotsCache {
     pub fn cached_crawl_delay(&self, url: &str) -> Option<Option<u64>> {
         let parsed = Url::parse(url).ok()?;
         let key = robots_cache_key(&parsed).ok()?;
-        let cache = self.cache.read();
-        let entry = cache.get(&key)?;
-        (entry.cached_at.elapsed() < self.config.cache_ttl).then_some(entry.crawl_delay_ms)
+        let cache = self.shared.cache.read();
+        let entry = cache.entries.get(&key)?;
+        (entry.cached_at.elapsed() < self.shared.config.cache_ttl).then_some(entry.crawl_delay_ms)
     }
 
     /// Get crawl delay for a domain
     pub async fn get_crawl_delay(&self, domain: &str) -> Result<Option<u64>> {
+        let config = &self.shared.config;
         let (robots_url, key) = domain_robots_url(domain)?;
         let domain = key.as_str();
         // Check cache first
         {
-            let cache = self.cache.read();
-            if let Some(entry) = cache.get(domain) {
-                if entry.cached_at.elapsed() < self.config.cache_ttl {
-                    return Ok(entry.crawl_delay_ms.or(self.config.default_crawl_delay_ms));
+            let cache = self.shared.cache.read();
+            if let Some(entry) = cache.entries.get(domain) {
+                if entry.cached_at.elapsed() < config.cache_ttl {
+                    return Ok(entry.crawl_delay_ms.or(config.default_crawl_delay_ms));
                 }
             }
         }
@@ -162,137 +300,240 @@ impl RobotsCache {
         let _ = self.get_robots(domain, &robots_url).await?;
 
         // Now check cache again
-        let cache = self.cache.read();
-        if let Some(entry) = cache.get(domain) {
-            return Ok(entry.crawl_delay_ms.or(self.config.default_crawl_delay_ms));
+        let cache = self.shared.cache.read();
+        if let Some(entry) = cache.entries.get(domain) {
+            return Ok(entry.crawl_delay_ms.or(config.default_crawl_delay_ms));
         }
 
-        Ok(self.config.default_crawl_delay_ms)
+        Ok(config.default_crawl_delay_ms)
     }
 
     /// Get robots.txt content for an origin, fetching if needed. `domain`
     /// is the cache key from [`robots_cache_key`].
-    async fn get_robots(&self, domain: &str, url: &Url) -> Result<String> {
-        // Check cache first
-        {
-            let cache = self.cache.read();
-            if let Some(entry) = cache.get(domain) {
-                if entry.cached_at.elapsed() < self.config.cache_ttl {
-                    return Ok(entry.content.clone());
-                }
-            }
+    ///
+    /// Callers that miss the cache for the same origin at the same time
+    /// share one fetch: the first starts it, the others await its result.
+    /// The fetch is not tied to the caller that started it: it runs as long
+    /// as one caller awaits it, and is dropped when the last one is.
+    async fn get_robots(&self, domain: &str, url: &Url) -> Result<Arc<str>> {
+        let shared = &self.shared;
+        if let Some(content) = shared.fresh(domain) {
+            return Ok(content);
         }
 
-        // Fetch robots.txt
-        let content = self.fetch_robots(url).await?;
-
-        // Parse crawl delay
-        let crawl_delay_ms = self.parse_crawl_delay(&content);
-
-        // Cache the result
-        {
-            let mut cache = self.cache.write();
-            cache.insert(
-                domain.to_string(),
-                CachedRobots {
-                    content: content.clone(),
-                    cached_at: Instant::now(),
-                    crawl_delay_ms,
-                },
-            );
-        }
-
-        Ok(content)
-    }
-
-    /// Fetch robots.txt from a URL
-    async fn fetch_robots(&self, url: &Url) -> Result<String> {
         // Raw-IP hosts bypass `SafeResolver` entirely (reqwest never calls
         // the DNS resolver for a URL whose host is already an address), so
         // they must be refused explicitly here too, exactly like raw-IP
         // seed URLs in `HttpFetcher::fetch_inner`.
         crate::safe_client::reject_ip_host(url)?;
+        let robots_url = robots_txt_url(url);
 
-        // Keep a non-default port: robots.txt lives on the same authority as
-        // the page (RFC 9309 §2.3).
-        let robots_url = format!(
-            "{}://{}{}/robots.txt",
-            url.scheme(),
-            url.host_str().unwrap_or(""),
-            url.port().map(|p| format!(":{p}")).unwrap_or_default()
-        );
-
-        debug!(robots_url, "Fetching robots.txt");
-
-        match self.client.get(&robots_url).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let content = response.text().await.unwrap_or_else(|_| String::new());
-                    Ok(content)
-                } else if response.status().as_u16() == 404 {
-                    // No robots.txt means everything is allowed
-                    debug!(robots_url, "No robots.txt found (404)");
-                    Ok(String::new())
-                } else {
-                    warn!(
-                        robots_url,
-                        status = response.status().as_u16(),
-                        "Failed to fetch robots.txt"
-                    );
-                    // On error, be permissive
-                    Ok(String::new())
+        let fetch: RobotsFetch = {
+            let mut in_flight = shared.in_flight.lock();
+            // A fetch stores its result before leaving `in_flight`, so with
+            // the lock held an origin is cached, in flight, or neither.
+            if let Some(content) = shared.fresh(domain) {
+                return Ok(content);
+            }
+            match in_flight.get(domain).and_then(|(_, fetch)| fetch.upgrade()) {
+                Some(fetch) => fetch,
+                None => {
+                    let id = shared.next_flight_id.fetch_add(1, Ordering::Relaxed);
+                    let fetch = fetch_and_cache(shared.clone(), domain.to_string(), robots_url, id)
+                        .boxed()
+                        .shared();
+                    if let Some(weak) = fetch.downgrade() {
+                        in_flight.insert(domain.to_string(), (id, weak));
+                    }
+                    fetch
                 }
             }
-            Err(e) => {
-                warn!(robots_url, error = %e, "Error fetching robots.txt");
-                // On network error, be permissive
-                Ok(String::new())
-            }
-        }
+        };
+
+        Ok(fetch.await)
     }
 
     /// Parse crawl delay from robots.txt content
+    #[cfg(test)]
     fn parse_crawl_delay(&self, content: &str) -> Option<u64> {
-        let mut in_user_agent_section = false;
-        let user_agent_lower = self.config.user_agent.to_lowercase();
-
-        for line in content.lines() {
-            let line = line.trim().to_lowercase();
-
-            if line.starts_with("user-agent:") {
-                let agent = line.trim_start_matches("user-agent:").trim();
-                in_user_agent_section = agent == "*" || agent == user_agent_lower;
-            } else if in_user_agent_section && line.starts_with("crawl-delay:") {
-                let delay_str = line.trim_start_matches("crawl-delay:").trim();
-                if let Ok(delay) = delay_str.parse::<f64>() {
-                    if delay < 0.0 || delay.is_nan() || delay.is_infinite() {
-                        return None;
-                    }
-                    // Convert seconds to milliseconds
-                    return Some((delay * 1000.0) as u64);
-                }
-            }
-        }
-
-        None
+        parse_crawl_delay(&self.shared.config.user_agent, content)
     }
 
     /// Clear the cache
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.write();
-        cache.clear();
+        let mut cache = self.shared.cache.write();
+        cache.entries.clear();
     }
 
     /// Get cache stats
     pub fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.cache.read();
-        let total = cache.len();
+        let cache = self.shared.cache.read();
+        let total = cache.entries.len();
         let expired = cache
+            .entries
             .values()
-            .filter(|e| e.cached_at.elapsed() >= self.config.cache_ttl)
+            .filter(|e| e.cached_at.elapsed() >= self.shared.config.cache_ttl)
             .count();
         (total, total - expired)
     }
+}
+
+/// The robots.txt URL of `url`'s origin. Keeps a non-default port:
+/// robots.txt lives on the same authority as the page (RFC 9309 §2.3).
+fn robots_txt_url(url: &Url) -> String {
+    format!(
+        "{}://{}{}/robots.txt",
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        url.port().map(|p| format!(":{p}")).unwrap_or_default()
+    )
+}
+
+/// Fetch `robots_url`, cache the result under `key` and leave the in-flight
+/// map. Owns everything it needs, so it outlives the caller that started it.
+async fn fetch_and_cache(
+    shared: Arc<RobotsShared>,
+    key: String,
+    robots_url: String,
+    id: u64,
+) -> Arc<str> {
+    let _guard = FlightGuard {
+        shared: shared.clone(),
+        key: key.clone(),
+        id,
+    };
+    let content: Arc<str> = fetch_robots_body(&shared.client, &shared.config, &robots_url)
+        .await
+        .into();
+    let crawl_delay_ms = parse_crawl_delay(&shared.config.user_agent, &content);
+    shared.cache.write().insert_bounded(
+        key,
+        CachedRobots {
+            content: content.clone(),
+            cached_at: Instant::now(),
+            crawl_delay_ms,
+        },
+        shared.config.cache_ttl,
+        MAX_CACHED_ORIGINS,
+    );
+    content
+}
+
+/// Fetch a robots.txt. Never fails: a 404, another non-2xx status, a
+/// network error or an unreadable body all mean "no rules" (permissive).
+async fn fetch_robots_body(client: &Client, config: &RobotsConfig, robots_url: &str) -> String {
+    debug!(robots_url, "Fetching robots.txt");
+
+    // Set per request, so a client shared with the page fetcher (other
+    // defaults) sends the same request as a dedicated one.
+    let request = client
+        .get(robots_url)
+        .timeout(config.fetch_timeout)
+        .header(reqwest::header::USER_AGENT, &config.user_agent)
+        .header(reqwest::header::ACCEPT, "*/*");
+
+    match request.send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                read_capped_text(response).await
+            } else if response.status().as_u16() == 404 {
+                // No robots.txt means everything is allowed
+                debug!(robots_url, "No robots.txt found (404)");
+                String::new()
+            } else {
+                warn!(
+                    robots_url,
+                    status = response.status().as_u16(),
+                    "Failed to fetch robots.txt"
+                );
+                // On error, be permissive
+                String::new()
+            }
+        }
+        Err(e) => {
+            warn!(robots_url, error = %e, "Error fetching robots.txt");
+            // On network error, be permissive
+            String::new()
+        }
+    }
+}
+
+/// Read a robots.txt body as text, streamed, keeping at most
+/// [`MAX_ROBOTS_BODY_BYTES`]: a longer (or endless) body is cut at the last
+/// complete line before the limit and the rest is not read. A read error
+/// gives an empty body, as before. Decoding is `Response::text`'s (the
+/// `Content-Type` charset, UTF-8 by default).
+async fn read_capped_text(mut response: reqwest::Response) -> String {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .cloned();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ROBOTS_BODY_BYTES - bytes.len();
+                if chunk.len() > room {
+                    bytes.extend_from_slice(&chunk[..room]);
+                    truncated = true;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return String::new(),
+        }
+    }
+    if truncated {
+        // Half a line could be a different rule (`Disallow: /` cut from
+        // `Disallow: /private`): keep whole lines only.
+        let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(keep);
+        warn!(
+            url = %response.url(),
+            kept_bytes = bytes.len(),
+            "robots.txt is over the size limit; the rest is ignored"
+        );
+    }
+    drop(response);
+
+    let mut decoded = hyper::Response::new(reqwest::Body::from(bytes));
+    if let Some(content_type) = content_type {
+        decoded
+            .headers_mut()
+            .insert(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    reqwest::Response::from(decoded)
+        .text()
+        .await
+        .unwrap_or_default()
+}
+
+/// Parse the crawl delay `user_agent` gets from robots.txt content
+fn parse_crawl_delay(user_agent: &str, content: &str) -> Option<u64> {
+    let mut in_user_agent_section = false;
+    let user_agent_lower = user_agent.to_lowercase();
+
+    for line in content.lines() {
+        let line = line.trim().to_lowercase();
+
+        if line.starts_with("user-agent:") {
+            let agent = line.trim_start_matches("user-agent:").trim();
+            in_user_agent_section = agent == "*" || agent == user_agent_lower;
+        } else if in_user_agent_section && line.starts_with("crawl-delay:") {
+            let delay_str = line.trim_start_matches("crawl-delay:").trim();
+            if let Ok(delay) = delay_str.parse::<f64>() {
+                if delay < 0.0 || delay.is_nan() || delay.is_infinite() {
+                    return None;
+                }
+                // Convert seconds to milliseconds
+                return Some((delay * 1000.0) as u64);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -380,6 +621,277 @@ mod tests {
         let cache = RobotsCache::new(RobotsConfig::default()).unwrap();
         let content = "User-agent: *\nCrawl-delay: 0.5";
         assert_eq!(cache.parse_crawl_delay(content), Some(500));
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn config() -> RobotsConfig {
+        RobotsConfig {
+            allow_private_ips: true,
+            ..Default::default()
+        }
+    }
+
+    /// wiremock binds 127.0.0.1 and raw-IP hosts are refused: use localhost.
+    fn page(server: &MockServer, p: &str) -> String {
+        format!("{}{}", server.uri().replace("127.0.0.1", "localhost"), p)
+    }
+
+    async fn robots_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/robots.txt")
+            .count()
+    }
+
+    async fn slow_robots(delay: Duration) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("User-agent: *\nDisallow: /private\nCrawl-delay: 2\n")
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_of_a_new_origin_share_one_fetch() {
+        let server = slow_robots(Duration::from_millis(200)).await;
+        let cache = Arc::new(RobotsCache::new(config()).unwrap());
+
+        let checks: Vec<_> = (0..16)
+            .map(|i| {
+                let cache = cache.clone();
+                let url = if i % 2 == 0 {
+                    page(&server, "/private/x")
+                } else {
+                    page(&server, &format!("/public/{i}"))
+                };
+                tokio::spawn(async move { cache.is_allowed(&url).await.unwrap() })
+            })
+            .collect();
+        for (i, check) in checks.into_iter().enumerate() {
+            assert_eq!(check.await.unwrap(), i % 2 == 1, "check {i}");
+        }
+
+        assert_eq!(robots_requests(&server).await, 1);
+        assert!(cache.shared.in_flight.lock().is_empty());
+        assert_eq!(
+            cache.cached_crawl_delay(&page(&server, "/")),
+            Some(Some(2000))
+        );
+        // Cached from now on.
+        assert!(!cache.is_allowed(&page(&server, "/private")).await.unwrap());
+        assert_eq!(robots_requests(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_first_caller_does_not_strand_the_others() {
+        let server = slow_robots(Duration::from_millis(300)).await;
+        let cache = Arc::new(RobotsCache::new(config()).unwrap());
+        let url = page(&server, "/private/x");
+
+        let leader = {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.is_allowed(&url).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let follower = {
+            let (cache, url) = (cache.clone(), url.clone());
+            tokio::spawn(async move { cache.is_allowed(&url).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+
+        let allowed = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("the follower finishes the shared fetch")
+            .unwrap();
+        assert!(!allowed);
+        assert_eq!(robots_requests(&server).await, 1);
+        assert!(cache.shared.in_flight.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fetch_nobody_awaits_is_dropped_and_started_again() {
+        let server = slow_robots(Duration::from_millis(300)).await;
+        let cache = Arc::new(RobotsCache::new(config()).unwrap());
+        let url = page(&server, "/private/x");
+
+        let callers: Vec<_> = (0..3)
+            .map(|_| {
+                let (cache, url) = (cache.clone(), url.clone());
+                tokio::spawn(async move { cache.is_allowed(&url).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.shared.in_flight.lock().len(), 1);
+        for caller in &callers {
+            caller.abort();
+        }
+        for caller in callers {
+            let _ = caller.await;
+        }
+        // Nothing left behind, nothing cached from the abandoned fetch.
+        assert!(cache.shared.in_flight.lock().is_empty());
+        assert_eq!(cache.cache_stats(), (0, 0));
+
+        assert!(!cache.is_allowed(&url).await.unwrap());
+        assert!(cache.shared.in_flight.lock().is_empty());
+        assert_eq!(cache.cache_stats(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn status_and_error_handling_is_permissive() {
+        for status in [404, 403, 500, 503] {
+            let server = MockServer::start().await;
+            Mock::given(path("/robots.txt"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("Disallow: /"))
+                .mount(&server)
+                .await;
+            let cache = RobotsCache::new(config()).unwrap();
+            assert!(
+                cache.is_allowed(&page(&server, "/x")).await.unwrap(),
+                "{status}"
+            );
+            assert_eq!(
+                cache.cached_crawl_delay(&page(&server, "/x")),
+                Some(None),
+                "{status} is cached as no rules"
+            );
+        }
+
+        // Nothing listens there: a network error allows, and is cached.
+        let cache = RobotsCache::new(config()).unwrap();
+        assert!(cache.is_allowed("http://localhost:1/x").await.unwrap());
+        assert_eq!(cache.cache_stats(), (1, 1));
+
+        // Raw-IP hosts are refused, private addresses too without the opt-in.
+        assert!(matches!(
+            cache.is_allowed("http://127.0.0.1:1/x").await,
+            Err(ScrapixError::Refused(_))
+        ));
+        let server = slow_robots(Duration::ZERO).await;
+        let strict = RobotsCache::new(RobotsConfig::default()).unwrap();
+        assert!(strict
+            .is_allowed(&page(&server, "/private/x"))
+            .await
+            .unwrap());
+        assert_eq!(robots_requests(&server).await, 0);
+
+        // `respect_robots: false` never fetches.
+        let off = RobotsCache::new(RobotsConfig {
+            respect_robots: false,
+            ..config()
+        })
+        .unwrap();
+        assert!(off.is_allowed(&page(&server, "/private/x")).await.unwrap());
+        assert_eq!(robots_requests(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_cut_at_a_line_before_the_limit() {
+        let mut body = String::from("User-agent: *\nDisallow: /early\n");
+        let mut i = 0;
+        while body.len() < MAX_ROBOTS_BODY_BYTES + 200_000 {
+            body.push_str(&format!("Disallow: /filler/{i:08}/\n"));
+            i += 1;
+        }
+        body.push_str("Disallow: /late\n");
+        let server = MockServer::start().await;
+        Mock::given(path("/robots.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+
+        let cache = RobotsCache::new(config()).unwrap();
+        assert!(!cache.is_allowed(&page(&server, "/early")).await.unwrap());
+        assert!(!cache
+            .is_allowed(&page(&server, "/filler/00000001/x"))
+            .await
+            .unwrap());
+        assert!(cache.is_allowed(&page(&server, "/late")).await.unwrap());
+
+        let key = robots_cache_key(&Url::parse(&page(&server, "/")).unwrap()).unwrap();
+        let kept = cache.shared.fresh(&key).unwrap();
+        assert!(kept.len() <= MAX_ROBOTS_BODY_BYTES);
+        assert!(kept.len() > MAX_ROBOTS_BODY_BYTES - 64);
+        assert!(kept.ends_with("/\n"), "cut at a line end");
+        assert!(body.starts_with(&*kept));
+    }
+
+    #[tokio::test]
+    async fn the_body_is_decoded_with_its_charset() {
+        let server = MockServer::start().await;
+        // "Disallow: /caf\xe9" in ISO-8859-1, and a UTF-8 BOM case below.
+        Mock::given(path("/robots.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"User-agent: *\nDisallow: /caf\xe9\n".to_vec(),
+                "text/plain; charset=iso-8859-1",
+            ))
+            .mount(&server)
+            .await;
+        let cache = RobotsCache::new(config()).unwrap();
+        cache.is_allowed(&page(&server, "/x")).await.unwrap();
+        let key = robots_cache_key(&Url::parse(&page(&server, "/")).unwrap()).unwrap();
+        assert_eq!(
+            &*cache.shared.fresh(&key).unwrap(),
+            "User-agent: *\nDisallow: /caf\u{e9}\n"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_bounded() {
+        let ttl = Duration::from_secs(60);
+        let entry = |age: Duration| CachedRobots {
+            content: Arc::from(""),
+            cached_at: Instant::now() - age,
+            crawl_delay_ms: None,
+        };
+        let mut state = CacheState::new();
+        for i in 0..10 {
+            state.insert_bounded(format!("old{i}"), entry(ttl * 2), ttl, 20);
+        }
+        for i in 0..10 {
+            state.insert_bounded(format!("new{i}"), entry(Duration::ZERO), ttl, 20);
+        }
+        assert_eq!(state.entries.len(), 20);
+
+        // Full: the expired entries go first.
+        state.insert_bounded("x".into(), entry(Duration::ZERO), ttl, 20);
+        assert_eq!(state.entries.len(), 11);
+        assert!(state.entries.keys().all(|k| !k.starts_with("old")));
+
+        // Full of live entries: some are evicted, the new one is kept.
+        for i in 0..100 {
+            state.insert_bounded(format!("more{i}"), entry(Duration::ZERO), ttl, 20);
+            assert!(state.entries.len() <= 20);
+            assert!(state.entries.contains_key(&format!("more{i}")));
+        }
+        // Replacing a cached origin evicts nothing.
+        let before = state.entries.len();
+        state.insert_bounded("more99".into(), entry(Duration::ZERO), ttl, 20);
+        assert_eq!(state.entries.len(), before);
+
+        // Expired entries are dropped on a later insert even when not full.
+        let mut state = CacheState::new();
+        state.insert_bounded("old".into(), entry(ttl * 2), ttl, 20);
+        state.last_sweep = Instant::now() - SWEEP_INTERVAL;
+        state.insert_bounded("new".into(), entry(Duration::ZERO), ttl, 20);
+        assert_eq!(state.entries.len(), 1);
     }
 }
 
@@ -721,40 +1233,10 @@ impl PersistentRobotsCache {
 
     /// Fetch robots.txt from URL
     async fn fetch_robots(&self, url: &Url) -> Result<String> {
-        // See the identical comment in `RobotsCache::fetch_robots`: raw-IP
+        // See the identical comment in `RobotsCache::get_robots`: raw-IP
         // hosts bypass `SafeResolver` entirely and must be refused here too.
         crate::safe_client::reject_ip_host(url)?;
-
-        let robots_url = format!(
-            "{}://{}{}/robots.txt",
-            url.scheme(),
-            url.host_str().unwrap_or(""),
-            url.port().map(|p| format!(":{p}")).unwrap_or_default()
-        );
-
-        debug!(robots_url, "Fetching robots.txt");
-
-        match self.client.get(&robots_url).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    Ok(response.text().await.unwrap_or_default())
-                } else if response.status().as_u16() == 404 {
-                    debug!(robots_url, "No robots.txt found (404)");
-                    Ok(String::new())
-                } else {
-                    warn!(
-                        robots_url,
-                        status = response.status().as_u16(),
-                        "Failed to fetch robots.txt"
-                    );
-                    Ok(String::new())
-                }
-            }
-            Err(e) => {
-                warn!(robots_url, error = %e, "Error fetching robots.txt");
-                Ok(String::new())
-            }
-        }
+        Ok(fetch_robots_body(&self.client, &self.config, &robots_txt_url(url)).await)
     }
 
     /// Parse crawl delay from robots.txt

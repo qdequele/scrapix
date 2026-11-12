@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 use scrapix_core::{CrawlUrl, UrlPatterns};
 use scrapix_crawler::{
     is_non_page_url_for, url_allowed, ExtractorConfig, HttpFetcher, HttpFetcherBuilder,
-    RobotsCache, RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
+    RobotsConfig, SitemapConfig, SitemapParser, UrlExtractor,
 };
 #[cfg(feature = "browser")]
 use scrapix_crawler::{CdpRenderer, CdpRendererBuilder, LightpandaConfig, LightpandaRenderer};
@@ -562,9 +562,6 @@ impl CrawlerWorker {
             allow_private_ips: args.allow_private_ips,
         };
 
-        // Create simple in-memory robots cache for the HTTP fetcher
-        let fetcher_robots_cache = Arc::new(RobotsCache::new(robots_config.clone())?);
-
         // Create sitemap parser if enabled
         let sitemap_parser = if args.sitemap_discovery {
             info!("Sitemap discovery enabled");
@@ -602,7 +599,12 @@ impl CrawlerWorker {
             info!(ttl_secs = args.dns_cache_ttl, "DNS caching enabled");
         }
 
-        let fetcher = fetcher_builder.build(fetcher_robots_cache.clone())?;
+        // The robots.txt cache is built with the fetcher: robots.txt goes
+        // through the fetcher's DNS cache and connection pool, so a new
+        // origin costs one lookup and one handshake, not two.
+        let fetcher = fetcher_builder.build_with_robots(robots_config)?;
+        #[cfg(feature = "browser")]
+        let fetcher_robots_cache = fetcher.robots_cache();
 
         // Create URL extractor
         let extractor_config = ExtractorConfig {

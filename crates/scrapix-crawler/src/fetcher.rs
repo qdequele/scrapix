@@ -151,7 +151,7 @@ impl FetchOptions {
 }
 
 use crate::dns::{CachingDnsResolver, DnsCacheStats, DnsConfig};
-use crate::robots::RobotsCache;
+use crate::robots::{RobotsCache, RobotsConfig};
 use crate::safe_client::{reject_ip_host, safe_client_builder, safe_redirect_policy};
 use crate::safe_dns::{validate_proxy_url, NonPublicAddress};
 
@@ -329,13 +329,7 @@ impl HttpFetcher {
         robots_cache: Arc<RobotsCache>,
         dns_resolver: Option<Arc<CachingDnsResolver>>,
     ) -> Result<Self> {
-        let cookie_jar = (config.cookie_store || !config.initial_cookies.is_empty()).then(|| {
-            let jar = reqwest::cookie::Jar::default();
-            for (cookie, url) in &config.initial_cookies {
-                jar.add_cookie_str(cookie, url);
-            }
-            Arc::new(jar)
-        });
+        let cookie_jar = Self::cookie_jar(&config);
         let client = Self::build_client(&config, dns_resolver.clone(), None, cookie_jar.clone())?;
 
         Ok(Self {
@@ -345,6 +339,74 @@ impl HttpFetcher {
             dns_resolver,
             proxy_clients: dashmap::DashMap::new(),
             cookie_jar,
+        })
+    }
+
+    /// Create a fetcher together with its robots.txt cache, so robots.txt
+    /// is fetched through the fetcher's DNS cache and, when both would
+    /// build the same kind of client, through the fetcher's own client: the
+    /// connection opened for an origin's robots.txt is then reused for its
+    /// pages (one DNS lookup and one TCP+TLS handshake per new origin
+    /// instead of two).
+    ///
+    /// The client is shared only when it applies the robots client's policy
+    /// exactly (see [`Self::robots_can_share_client`]); otherwise the cache
+    /// gets its own client, as with [`RobotsCache::new`], resolving through
+    /// the fetcher's DNS cache when there is one.
+    pub fn new_with_robots(
+        config: FetcherConfig,
+        robots_config: RobotsConfig,
+        dns_resolver: Option<Arc<CachingDnsResolver>>,
+    ) -> Result<Self> {
+        let cookie_jar = Self::cookie_jar(&config);
+        let client = Self::build_client(&config, dns_resolver.clone(), None, cookie_jar.clone())?;
+        let robots_cache = if Self::robots_can_share_client(&config, &robots_config) {
+            RobotsCache::with_client(robots_config, client.clone())?
+        } else if let Some(ref dns) = dns_resolver {
+            RobotsCache::with_dns_cache(robots_config, dns.clone())?
+        } else {
+            RobotsCache::new(robots_config)?
+        };
+
+        Ok(Self {
+            client,
+            config,
+            robots_cache: Arc::new(robots_cache),
+            dns_resolver,
+            proxy_clients: dashmap::DashMap::new(),
+            cookie_jar,
+        })
+    }
+
+    /// Whether a robots.txt request sent through this fetcher's default
+    /// client is the request a dedicated robots client would send: same
+    /// SSRF policy (`allow_private_ips`), same redirect policy (followed,
+    /// same cap), certificates verified, and nothing of the fetcher's added
+    /// to it (custom headers, cookies). The robots request sets its own
+    /// timeout, `User-Agent` and `Accept`; the fetcher's `Accept-Language`
+    /// is the one header it gains.
+    fn robots_can_share_client(config: &FetcherConfig, robots_config: &RobotsConfig) -> bool {
+        config.allow_private_ips == robots_config.allow_private_ips
+            && config.follow_redirects
+            && config.max_redirects == crate::safe_client::DEFAULT_MAX_REDIRECTS
+            && !config.accept_invalid_certs
+            && config.custom_headers.is_empty()
+            && !config.cookie_store
+            && config.initial_cookies.is_empty()
+    }
+
+    /// The robots.txt cache this fetcher checks.
+    pub fn robots_cache(&self) -> Arc<RobotsCache> {
+        self.robots_cache.clone()
+    }
+
+    fn cookie_jar(config: &FetcherConfig) -> Option<Arc<reqwest::cookie::Jar>> {
+        (config.cookie_store || !config.initial_cookies.is_empty()).then(|| {
+            let jar = reqwest::cookie::Jar::default();
+            for (cookie, url) in &config.initial_cookies {
+                jar.add_cookie_str(cookie, url);
+            }
+            Arc::new(jar)
         })
     }
 
@@ -1152,6 +1214,19 @@ impl HttpFetcherBuilder {
             None
         };
         HttpFetcher::new_with_dns(self.config, robots_cache, dns_resolver)
+    }
+
+    /// Build the fetcher and its robots.txt cache together (see
+    /// [`HttpFetcher::new_with_robots`]): robots.txt goes through the
+    /// fetcher's DNS cache and, when possible, its connection pool. The
+    /// cache is [`HttpFetcher::robots_cache`].
+    pub fn build_with_robots(self, robots_config: RobotsConfig) -> Result<HttpFetcher> {
+        let dns_resolver = if let Some(dns_config) = self.dns_config {
+            Some(Arc::new(CachingDnsResolver::new(dns_config)?))
+        } else {
+            None
+        };
+        HttpFetcher::new_with_robots(self.config, robots_config, dns_resolver)
     }
 }
 

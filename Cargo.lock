@@ -5670,6 +5670,7 @@ dependencies = [
  "flate2",
  "futures",
  "hickory-resolver",
+ "hyper 1.8.1",
  "parking_lot",
  "quick-xml 0.37.5",
  "reqwest 0.12.28",
