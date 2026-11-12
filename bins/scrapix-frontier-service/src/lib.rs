@@ -15,7 +15,10 @@
 //! 3. Dispatch ready URLs to the processing topic, per job, only while this
 //!    instance holds the job's dispatch lease, honoring per-domain
 //!    politeness and the job's rate limits (URLs that may not be fetched yet
-//!    go back via `requeue`).
+//!    go back via `requeue`). One dispatcher pass handles the jobs
+//!    concurrently, each job at most once, and passes never overlap. Jobs
+//!    with nothing to dispatch (idle, paused, leased by another instance)
+//!    are polled every 100-200 ms instead of on every tick.
 //! 4. Consume the crawler's `FetchFeedback` and release the politeness slot
 //!    taken at dispatch (spec R7): a domain slot is held until the fetch
 //!    finished, not until the URL reached the bus. robots.txt `Crawl-delay`
@@ -44,7 +47,7 @@
 //!                                  FETCH_FEEDBACK (crawler) ┘
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,6 +110,36 @@ const EARLY_CONTROL_TTL: Duration = Duration::from_secs(600);
 const EARLY_CONTROL_CAP: usize = 10_000;
 /// Capped backoff for a job control message the store failed to apply.
 const CONTROL_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// How many jobs one dispatcher tick dispatches at once. Jobs are
+/// independent (own queue, own lease; politeness is atomic in its store),
+/// and each one awaits its batch's bus sends, so dispatching them one after
+/// another made every running job add a send round trip to the cycle.
+const DISPATCH_JOB_CONCURRENCY: usize = 32;
+/// How many politeness slots (one per distinct domain) a batch asks for at
+/// once.
+const ACQUIRE_CONCURRENCY: usize = 32;
+/// How many jobs the progress publisher reads and publishes at once.
+const PROGRESS_CONCURRENCY: usize = 32;
+/// Pops that found nothing, in a row, before an idle job is polled less
+/// often.
+const IDLE_POPS_BEFORE_BACKOFF: u32 = 3;
+/// Polling interval of an idle job (running, nothing ready). It bounds how
+/// late a URL this instance was not told about (admitted by another
+/// instance, or a crawler retry coming due) is dispatched.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+/// URLs parked for at most this long are never dispatched later because of
+/// the idle backoff (a domain's delay, a busy domain or job). Longer parks
+/// (error retries, `Retry-After`, long crawl delays) may go out up to
+/// `IDLE_POLL` late.
+const SHORT_PARK: Duration = Duration::from_secs(1);
+/// Polling interval of a job this instance cannot dispatch: not running
+/// (paused), or leased by another instance. Well under `LEASE_TTL`, so a
+/// held lease is still renewed in time. A Resume applied by this instance
+/// ends the wait at once.
+const STANDBY_POLL: Duration = Duration::from_millis(200);
+/// How often the tracked-domain gauge is refreshed (it can scan every
+/// tracked domain under the politeness lock).
+const DOMAIN_COUNT_EVERY: Duration = Duration::from_secs(1);
 
 /// Scrapix Frontier Service
 #[derive(Parser, Debug)]
@@ -425,6 +458,40 @@ struct MetricsSnapshot {
     history_updates: u64,
 }
 
+/// How the dispatcher polls one job (see `FrontierService::polls`).
+#[derive(Debug, Clone, Copy, Default)]
+struct JobPoll {
+    /// Pops in a row that returned nothing.
+    empty_pops: u32,
+    /// The job is not dispatched before this.
+    skip_until: Option<std::time::Instant>,
+    /// Whether `skip_until` is an idle backoff (ended by a new admission)
+    /// rather than a standby one.
+    idle: bool,
+    /// Earliest `not_before_ms` this instance parked a URL of the job
+    /// until, as of the last batch that parked any.
+    next_due_ms: i64,
+    /// Latest `not_before_ms` this instance parked a URL of the job until,
+    /// among those parked for at most `SHORT_PARK`.
+    parked_until_ms: i64,
+}
+
+/// One domain's URLs of a dispatch batch, in pop order.
+type DomainUrls = (String, VecDeque<CrawlUrl>);
+
+/// Removes the job from `FrontierService::dispatching` when its dispatch
+/// ends (or is dropped).
+struct DispatchGuard<'a> {
+    dispatching: &'a Mutex<HashSet<String>>,
+    job_id: &'a str,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.dispatching.lock().remove(self.job_id);
+    }
+}
+
 struct FrontierService {
     consumer: Arc<AnyConsumer>,
     links_consumer: Option<Arc<AnyConsumer>>,
@@ -443,6 +510,14 @@ struct FrontierService {
     held_leases: Mutex<HashSet<String>>,
     /// Per-job adaptive pop size (see `dispatch_job`).
     pop_sizes: Mutex<HashMap<String, usize>>,
+    /// Jobs with a `dispatch_job` in flight: a job is never dispatched by
+    /// two calls at once.
+    dispatching: Mutex<HashSet<String>>,
+    /// Per-job polling state: idle, paused and not-leased jobs are not
+    /// asked about on every tick (see `dispatch_job`).
+    polls: Mutex<HashMap<String, JobPoll>>,
+    /// When the tracked-domain gauge was last refreshed.
+    domain_count_at: Mutex<Option<std::time::Instant>>,
     /// Popped URLs whose `requeue` failed, retried first on the next tick.
     unrequeued: Mutex<HashMap<String, Vec<CrawlUrl>>>,
     /// Pauses received before the job's first URL (the control overtook
@@ -729,6 +804,9 @@ impl FrontierService {
             initialized: BoundedCache::new(JOB_CACHE_CAP),
             held_leases: Mutex::new(HashSet::new()),
             pop_sizes: Mutex::new(HashMap::new()),
+            dispatching: Mutex::new(HashSet::new()),
+            polls: Mutex::new(HashMap::new()),
+            domain_count_at: Mutex::new(None),
             unrequeued: Mutex::new(HashMap::new()),
             early_controls: Mutex::new(HashMap::new()),
             politeness,
@@ -950,6 +1028,7 @@ impl FrontierService {
                             .with_label_values(&["admitted"])
                             .inc();
                         debug!(url = %url.url, job_id = %msg.job_id, "URL admitted");
+                        self.wake_job(&msg.job_id);
                     } else {
                         self.metrics.urls_duplicate.fetch_add(1, Ordering::Relaxed);
                         scrapix_core::metrics::frontier_admissions_total()
@@ -1107,6 +1186,9 @@ impl FrontierService {
                 return Ok(());
             }
             self.store.set_state(job_id, JobRunState::Running).await?;
+            // The dispatcher may have seen the job between `ensure_job`
+            // (created `Paused`) and here, and put it on standby.
+            self.polls.lock().remove(job_id);
             info!(
                 job_id = %job_id,
                 index_uid = %msg.index_uid,
@@ -1190,6 +1272,11 @@ impl FrontierService {
     }
 
     /// One dispatcher pass over every active job this instance can lease.
+    ///
+    /// Jobs are dispatched concurrently (`DISPATCH_JOB_CONCURRENCY` at a
+    /// time), each job at most once per pass, and the pass ends only when
+    /// every job's dispatch has returned: the dispatcher runs one pass at a
+    /// time, so two passes never overlap.
     async fn dispatch_tick(&self) {
         let jobs = match self.store.active_jobs().await {
             Ok(jobs) => jobs,
@@ -1208,28 +1295,147 @@ impl FrontierService {
         {
             let active: HashSet<&String> = jobs.iter().collect();
             self.pop_sizes.lock().retain(|job, _| active.contains(job));
+            self.polls.lock().retain(|job, _| active.contains(job));
         }
 
+        // Jobs in a polling backoff are left alone this tick; one whose
+        // lease this instance holds keeps it (the backoffs are far shorter
+        // than `LEASE_TTL`).
         let mut held = HashSet::new();
-        for job_id in jobs {
-            if self.shutdown.load(Ordering::Relaxed) {
-                // Pop nothing more once shutting down.
-                break;
-            }
-            match self.dispatch_job(&job_id).await {
-                Ok(true) => {
-                    held.insert(job_id);
+        let mut due = Vec::with_capacity(jobs.len());
+        {
+            let now = std::time::Instant::now();
+            let previously_held = self.held_leases.lock();
+            let polls = self.polls.lock();
+            for job_id in jobs {
+                match polls.get(&job_id).and_then(|p| p.skip_until) {
+                    Some(until) if now < until => {
+                        if previously_held.contains(&job_id) {
+                            held.insert(job_id);
+                        }
+                    }
+                    _ => due.push(job_id),
                 }
-                Ok(false) => {}
-                Err(e) => warn!(job_id = %job_id, error = %e, "Dispatch failed"),
             }
         }
-        *self.held_leases.lock() = held;
 
+        let held = Mutex::new(held);
+        futures::stream::iter(due)
+            .for_each_concurrent(DISPATCH_JOB_CONCURRENCY, |job_id| {
+                let held = &held;
+                async move {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        // Pop nothing more once shutting down.
+                        return;
+                    }
+                    match self.dispatch_job(&job_id).await {
+                        Ok(true) => {
+                            held.lock().insert(job_id);
+                        }
+                        Ok(false) => {}
+                        Err(e) => warn!(job_id = %job_id, error = %e, "Dispatch failed"),
+                    }
+                }
+            })
+            .await;
+        *self.held_leases.lock() = held.into_inner();
+
+        self.refresh_domain_count();
+    }
+
+    /// Refresh the tracked-domain gauge, at most once per
+    /// `DOMAIN_COUNT_EVERY`.
+    fn refresh_domain_count(&self) {
+        {
+            let mut at = self.domain_count_at.lock();
+            if at.is_some_and(|t| t.elapsed() < DOMAIN_COUNT_EVERY) {
+                return;
+            }
+            *at = Some(std::time::Instant::now());
+        }
         let domain_count = self.politeness.tracked_domain_count() as u64;
         self.metrics
             .active_domains
             .store(domain_count, Ordering::Relaxed);
+    }
+
+    /// Leave `job_id` alone for `wait` (a job this instance cannot dispatch
+    /// right now: not running, or leased by another instance).
+    fn standby(&self, job_id: &str, wait: Duration) {
+        let mut polls = self.polls.lock();
+        let poll = polls.entry(job_id.to_string()).or_default();
+        poll.empty_pops = 0;
+        poll.idle = false;
+        poll.skip_until = Some(std::time::Instant::now() + wait);
+    }
+
+    /// A pop of `job_id` returned nothing at `now` (ms): decide when to pop
+    /// next.
+    ///
+    /// - The earliest URL this instance parked is known and not due yet:
+    ///   wait for it (at most `IDLE_POLL`).
+    /// - It is not known, but URLs parked for a short time may still be
+    ///   waiting: pop on every tick, so none of them goes out late.
+    /// - Otherwise, after `IDLE_POPS_BEFORE_BACKOFF` empty pops the job is
+    ///   polled every `IDLE_POLL`.
+    ///
+    /// An admission on this instance ends the wait (`wake_job`).
+    fn note_empty_pop(&self, job_id: &str, now: i64) {
+        let mut polls = self.polls.lock();
+        let poll = polls.entry(job_id.to_string()).or_default();
+        poll.empty_pops = poll.empty_pops.saturating_add(1);
+        let wait = if poll.next_due_ms > now {
+            Some(Duration::from_millis((poll.next_due_ms - now) as u64).min(IDLE_POLL))
+        } else if now <= poll.parked_until_ms {
+            None
+        } else {
+            (poll.empty_pops >= IDLE_POPS_BEFORE_BACKOFF).then_some(IDLE_POLL)
+        };
+        poll.idle = wait.is_some();
+        poll.skip_until = wait.map(|w| std::time::Instant::now() + w);
+    }
+
+    /// A pop of `job_id` returned URLs: poll it on every tick again.
+    fn note_work(&self, job_id: &str) {
+        if let Some(poll) = self.polls.lock().get_mut(job_id) {
+            poll.empty_pops = 0;
+            poll.idle = false;
+            poll.skip_until = None;
+        }
+    }
+
+    /// Remember until when the URLs put back at `now` (ms) are parked.
+    fn note_parked(&self, job_id: &str, now: i64, parked: &[CrawlUrl]) {
+        let (mut earliest, mut latest_short) = (i64::MAX, i64::MIN);
+        for ms in parked.iter().filter_map(|u| u.not_before_ms) {
+            earliest = earliest.min(ms);
+            if ms - now <= SHORT_PARK.as_millis() as i64 {
+                latest_short = latest_short.max(ms);
+            }
+        }
+        if earliest == i64::MAX {
+            return;
+        }
+        let mut polls = self.polls.lock();
+        let poll = polls.entry(job_id.to_string()).or_default();
+        poll.next_due_ms = if poll.next_due_ms > now {
+            poll.next_due_ms.min(earliest)
+        } else {
+            earliest
+        };
+        poll.parked_until_ms = poll.parked_until_ms.max(latest_short);
+    }
+
+    /// A URL of `job_id` was admitted by this instance: end its idle
+    /// backoff, so the URL is dispatched on the next tick.
+    fn wake_job(&self, job_id: &str) {
+        if let Some(poll) = self.polls.lock().get_mut(job_id) {
+            if poll.idle {
+                poll.empty_pops = 0;
+                poll.idle = false;
+                poll.skip_until = None;
+            }
+        }
     }
 
     /// Pop a batch of ready URLs for `job_id` and dispatch those politeness
@@ -1237,17 +1443,36 @@ impl FrontierService {
     /// pop in the counters, so nothing is counted twice). Returns whether
     /// this instance holds the job's dispatch lease.
     ///
-    /// Politeness slots are taken one URL at a time, in pop order, but the
-    /// granted URLs' bus sends all run at once and are awaited together at
-    /// the end of the batch: one send waits for the producer's linger and
-    /// the broker's ack, so sending them one after another capped the
-    /// frontier at a few dozen URLs per second.
+    /// Politeness slots are asked for one URL per domain at a time, in pop
+    /// order, `ACQUIRE_CONCURRENCY` domains at once (the store checks the
+    /// domain and job caps atomically, so asking concurrently cannot grant
+    /// more than serially). A domain that was granted a slot with a
+    /// non-zero delay cannot be granted another one before that delay, so
+    /// its other URLs of the batch are parked for it without asking; with a
+    /// zero delay they ask in the next round. The granted URLs' bus sends
+    /// all run at once and are awaited together at the end of the batch: one
+    /// send waits for the producer's linger and the broker's ack, so sending
+    /// them one after another capped the frontier at a few dozen URLs per
+    /// second.
     ///
     /// The pop size adapts per job (`2 × dispatched last time + 1`, capped
     /// at `dispatch_batch_size`), so a job throttled by politeness pops only
     /// a little more than it can send instead of churning a full batch
     /// through `requeue` on every tick.
+    ///
+    /// A job that cannot be dispatched (not running, leased elsewhere) or
+    /// has nothing ready is polled less often: see `standby` and
+    /// `note_empty_pop`.
     async fn dispatch_job(&self, job_id: &str) -> scrapix_core::Result<bool> {
+        if !self.dispatching.lock().insert(job_id.to_string()) {
+            // Already being dispatched (cannot happen from the dispatcher,
+            // which runs one pass at a time over distinct jobs).
+            return Ok(self.held_leases.lock().contains(job_id));
+        }
+        let _dispatching = DispatchGuard {
+            dispatching: &self.dispatching,
+            job_id,
+        };
         if self.unrequeued.lock().contains_key(job_id) {
             // Popped URLs still waiting to go back: don't pop more on top.
             return Ok(false);
@@ -1263,9 +1488,11 @@ impl FrontierService {
             .try_lease(job_id, &self.instance_id, LEASE_TTL)
             .await?
         {
+            self.standby(job_id, STANDBY_POLL);
             return Ok(false);
         }
         let Some(template) = template else {
+            self.standby(job_id, STANDBY_POLL);
             return Ok(true);
         };
 
@@ -1276,8 +1503,10 @@ impl FrontierService {
         let now = now_ms();
         let urls = self.store.pop_ready(job_id, pop_size, now).await?;
         if urls.is_empty() {
+            self.note_empty_pop(job_id, now);
             return Ok(true);
         }
+        self.note_work(job_id);
 
         let limits = job_limits(&template);
         let popped = urls.len();
@@ -1285,125 +1514,187 @@ impl FrontierService {
         let mut dispatched = 0usize;
         // URLs bounced because their domain (or the job) was not ready.
         let mut politeness_bounced = 0usize;
-        // Domains found busy/waiting in this batch: their remaining URLs are
-        // parked without asking the politeness store again.
-        let mut not_ready: HashMap<String, Duration> = HashMap::new();
         let mut lease_held = true;
         let mut last_renew = std::time::Instant::now();
         let hard_stop = self.hard_stop.subscribe();
         let mut sends = FuturesUnordered::new();
-        let mut urls = urls.into_iter();
-        while let Some(url) = urls.next() {
-            if self.shutdown.load(Ordering::Relaxed) {
-                // Graceful shutdown: send nothing more, put the rest back.
-                info!(job_id = %job_id, count = urls.len() + 1, "Shutting down mid-batch; requeuing unsent URLs");
-                bounced.push(url);
-                bounced.extend(urls.by_ref());
-                break;
-            }
-            if last_renew.elapsed() >= LEASE_RENEW_EVERY {
-                match self
-                    .store
-                    .try_lease(job_id, &self.instance_id, LEASE_TTL)
-                    .await
-                {
-                    Ok(true) => last_renew = std::time::Instant::now(),
-                    held => {
-                        warn!(job_id = %job_id, result = ?held.map(|_| ()), "Lost dispatch lease mid-batch; requeuing the rest");
-                        bounced.push(url);
-                        bounced.extend(urls.by_ref());
-                        lease_held = false;
-                        break;
+        let park = |mut url: CrawlUrl, wait: Duration| {
+            url.not_before_ms = (!wait.is_zero()).then(|| now + wait.as_millis() as i64);
+            url
+        };
+        // The batch's URLs by domain, domains and URLs in pop order.
+        let mut domains: Vec<DomainUrls> = Vec::new();
+        {
+            let mut index: HashMap<String, usize> = HashMap::new();
+            for url in urls {
+                let domain = extract_domain(&url.url);
+                match index.get(&domain) {
+                    Some(&i) => domains[i].1.push_back(url),
+                    None => {
+                        index.insert(domain.clone(), domains.len());
+                        domains.push((domain, VecDeque::from([url])));
                     }
                 }
             }
+        }
+        // Every URL not asked for yet, to put back as it is.
+        fn unasked(
+            chunk: Vec<DomainUrls>,
+            round: &mut std::vec::IntoIter<DomainUrls>,
+            next_round: &mut Vec<DomainUrls>,
+        ) -> Vec<CrawlUrl> {
+            chunk
+                .into_iter()
+                .chain(round)
+                .chain(next_round.drain(..))
+                .flat_map(|(_, urls)| urls)
+                .collect()
+        }
+        // Each round asks for one slot per domain, for the domain's first
+        // URL. A domain that then cannot take another URL of this batch
+        // (busy, waiting, or granted a slot with a delay) has its other URLs
+        // parked without asking again; one granted with no delay asks for
+        // its next URL in the next round.
+        'batch: while !domains.is_empty() {
+            let mut next_round: Vec<DomainUrls> = Vec::new();
+            let mut round = domains.into_iter();
+            loop {
+                let chunk: Vec<DomainUrls> = round.by_ref().take(ACQUIRE_CONCURRENCY).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                if self.shutdown.load(Ordering::Relaxed) {
+                    // Graceful shutdown: send nothing more, put the rest back.
+                    let rest = unasked(chunk, &mut round, &mut next_round);
+                    info!(job_id = %job_id, count = rest.len(), "Shutting down mid-batch; requeuing unsent URLs");
+                    bounced.extend(rest);
+                    break 'batch;
+                }
+                if last_renew.elapsed() >= LEASE_RENEW_EVERY {
+                    match self
+                        .store
+                        .try_lease(job_id, &self.instance_id, LEASE_TTL)
+                        .await
+                    {
+                        Ok(true) => last_renew = std::time::Instant::now(),
+                        held => {
+                            warn!(job_id = %job_id, result = ?held.map(|_| ()), "Lost dispatch lease mid-batch; requeuing the rest");
+                            bounced.extend(unasked(chunk, &mut round, &mut next_round));
+                            lease_held = false;
+                            break 'batch;
+                        }
+                    }
+                }
 
-            let domain = extract_domain(&url.url);
-            if let Some(wait) = not_ready.get(&domain) {
-                self.metrics.urls_delayed.fetch_add(1, Ordering::Relaxed);
-                politeness_bounced += 1;
-                let mut url = url;
-                url.not_before_ms = Some(now + wait.as_millis() as i64);
-                bounced.push(url);
-                continue;
-            }
-            // The slot token becomes the dispatched message's id, which the
-            // crawler echoes back in its FetchFeedback.
-            let token = uuid::Uuid::new_v4().to_string();
-            let slot = SlotRequest {
-                domain: &domain,
-                job_id,
-                token: &token,
-                limits,
-            };
-            // Park a URL that may not be fetched yet until it is expected to
-            // be, so the next ticks don't pop and requeue it over and over.
-            let acquired =
-                tokio::time::timeout(STORE_CALL_TIMEOUT, self.politeness.try_acquire(&slot))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(scrapix_core::ScrapixError::Timeout(
-                            "politeness try_acquire timed out".to_string(),
-                        ))
-                    });
-            let wait = match acquired {
-                Ok(Acquire::Granted) => None,
-                Ok(Acquire::Wait(wait)) => {
-                    not_ready.insert(domain.clone(), wait);
-                    politeness_bounced += 1;
-                    Some(wait)
-                }
-                Ok(Acquire::DomainBusy) => {
-                    not_ready.insert(domain.clone(), BUSY_RETRY);
-                    politeness_bounced += 1;
-                    Some(BUSY_RETRY)
-                }
-                Ok(Acquire::JobBusy) => {
-                    // Every other URL of the job would be refused too.
-                    let until = Some(now + BUSY_RETRY.as_millis() as i64);
-                    let mut rest: Vec<CrawlUrl> =
-                        std::iter::once(url).chain(urls.by_ref()).collect();
-                    for u in &mut rest {
-                        u.not_before_ms = until;
+                // The slot token becomes the dispatched message's id, which
+                // the crawler echoes back in its FetchFeedback.
+                let acquired = futures::future::join_all(chunk.iter().map(|(domain, _)| {
+                    let token = uuid::Uuid::new_v4().to_string();
+                    async move {
+                        let slot = SlotRequest {
+                            domain,
+                            job_id,
+                            token: &token,
+                            limits,
+                        };
+                        let acquired = tokio::time::timeout(
+                            STORE_CALL_TIMEOUT,
+                            self.politeness.try_acquire_spaced(&slot),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(scrapix_core::ScrapixError::Timeout(
+                                "politeness try_acquire timed out".to_string(),
+                            ))
+                        });
+                        (token, acquired)
                     }
+                }))
+                .await;
+
+                let mut job_busy = false;
+                for ((domain, mut urls), (token, acquired)) in chunk.into_iter().zip(acquired) {
+                    let Some(url) = urls.pop_front() else {
+                        continue;
+                    };
+                    // `granted`: the URL is sent. `wait`: how long the
+                    // domain's other URLs (and this one, when not granted)
+                    // are parked, so the next ticks don't pop and requeue
+                    // them over and over; `None`: the domain may be granted
+                    // again right away (zero delay). `by_politeness`: the
+                    // wait is the domain's or the job's, not an error.
+                    let (granted, wait, by_politeness) = match acquired {
+                        Ok((Acquire::Granted, spacing)) => {
+                            (true, (!spacing.is_zero()).then_some(spacing), true)
+                        }
+                        Ok((Acquire::Wait(wait), _)) => (false, Some(wait), true),
+                        Ok((Acquire::DomainBusy, _)) => (false, Some(BUSY_RETRY), true),
+                        Ok((Acquire::JobBusy, _)) => {
+                            job_busy = true;
+                            (false, Some(BUSY_RETRY), true)
+                        }
+                        Err(e) => {
+                            warn!(job_id = %job_id, domain = %domain, error = %e, "Politeness check failed");
+                            (false, Some(ERROR_RETRY), false)
+                        }
+                    };
+                    let mut parked = 0;
+                    match wait {
+                        Some(wait) => {
+                            parked = urls.len();
+                            bounced.extend(urls.into_iter().map(|u| park(u, wait)));
+                        }
+                        None if !urls.is_empty() => next_round.push((domain.clone(), urls)),
+                        None => {}
+                    }
+                    let url = if granted {
+                        Some(url)
+                    } else {
+                        parked += 1;
+                        bounced.push(park(url, wait.unwrap_or_default()));
+                        None
+                    };
+                    self.metrics
+                        .urls_delayed
+                        .fetch_add(parked as u64, Ordering::Relaxed);
+                    if by_politeness {
+                        politeness_bounced += parked;
+                    }
+                    let Some(url) = url else {
+                        continue;
+                    };
+
+                    let mut msg = template.child(url);
+                    msg.message_id = token;
+                    let mut hard_stop = hard_stop.clone();
+                    sends.push(async move {
+                        let key = msg.partition_key();
+                        let send = self
+                            .producer
+                            .send(topic_names::URL_PROCESSING, Some(&key), &msg);
+                        // Raced only against the shutdown hard stop (see
+                        // `drain_dispatcher`); normally the send runs to completion.
+                        let sent = tokio::select! {
+                            r = send => r,
+                            _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
+                                "send abandoned at shutdown".to_string(),
+                            )),
+                        };
+                        (domain, msg, sent)
+                    });
+                }
+                if job_busy {
+                    // Every other URL of the job would be refused too.
+                    let rest = unasked(Vec::new(), &mut round, &mut next_round);
                     self.metrics
                         .urls_delayed
                         .fetch_add(rest.len() as u64, Ordering::Relaxed);
                     politeness_bounced += rest.len();
-                    bounced.extend(rest);
-                    break;
+                    bounced.extend(rest.into_iter().map(|url| park(url, BUSY_RETRY)));
+                    break 'batch;
                 }
-                Err(e) => {
-                    warn!(job_id = %job_id, domain = %domain, error = %e, "Politeness check failed");
-                    Some(ERROR_RETRY)
-                }
-            };
-            if let Some(wait) = wait {
-                self.metrics.urls_delayed.fetch_add(1, Ordering::Relaxed);
-                let mut url = url;
-                url.not_before_ms = (!wait.is_zero()).then(|| now + wait.as_millis() as i64);
-                bounced.push(url);
-                continue;
             }
-
-            let mut msg = template.child(url);
-            msg.message_id = token;
-            let mut hard_stop = hard_stop.clone();
-            sends.push(async move {
-                let key = msg.partition_key();
-                let send = self
-                    .producer
-                    .send(topic_names::URL_PROCESSING, Some(&key), &msg);
-                // Raced only against the shutdown hard stop (see
-                // `drain_dispatcher`); normally the send runs to completion.
-                let sent = tokio::select! {
-                    r = send => r,
-                    _ = hard_stop.wait_for(|stop| *stop) => Err(scrapix_core::ScrapixError::Queue(
-                        "send abandoned at shutdown".to_string(),
-                    )),
-                };
-                (domain, msg, sent)
-            });
+            domains = next_round;
         }
 
         // Every granted URL's send is in flight: collect the outcomes.
@@ -1439,6 +1730,7 @@ impl FrontierService {
 
         // Put the URLs back before anything else: at shutdown the grace may
         // run out, and popped URLs must not be lost.
+        self.note_parked(job_id, now, &bounced);
         self.requeue_or_stash(job_id, bounced).await;
 
         // A bus outage is not the domain's fault: free the failed sends'
@@ -1521,16 +1813,27 @@ impl FrontierService {
     async fn publish_progress(&self, last: &mut HashMap<String, (JobCounters, u64)>) {
         let held: Vec<String> = self.held_leases.lock().iter().cloned().collect();
         last.retain(|job, _| held.contains(job));
+        // One read of the counters and the queue depth per job, the jobs
+        // read concurrently: a serial pass (and one awaited send per changed
+        // job) outlasted `PROGRESS_INTERVAL` with a few dozen active jobs.
+        let read: Vec<_> = futures::stream::iter(held)
+            .map(|job_id| async move {
+                let (counters, queued) =
+                    tokio::join!(self.store.counters(&job_id), self.store.queued(&job_id));
+                (job_id, counters, queued)
+            })
+            .buffer_unordered(PROGRESS_CONCURRENCY)
+            .collect()
+            .await;
+
         // Collected regardless of whether a job's counters changed this
         // tick, so the top-50 gauge (scrapix_frontier_queued) reflects
         // every held job's current queue depth, not just the ones that
         // happened to publish a FrontierProgress event this round.
-        let mut queued_by_job: Vec<(String, u64)> = Vec::with_capacity(held.len());
-        for job_id in &held {
-            if let Ok(q) = self.store.queued(job_id).await {
-                queued_by_job.push((job_id.clone(), q));
-            }
-        }
+        let queued_by_job: Vec<(String, u64)> = read
+            .iter()
+            .filter_map(|(job_id, _, queued)| Some((job_id.clone(), *queued.as_ref().ok()?)))
+            .collect();
         {
             let mut labels = self.queued_gauge_labels.lock();
             scrapix_core::metrics::update_top_n_gauge(
@@ -1541,37 +1844,47 @@ impl FrontierService {
             );
         }
 
-        for job_id in held {
-            let snapshot = match (
-                self.store.counters(&job_id).await,
-                self.store.queued(&job_id).await,
-            ) {
+        let mut changed = Vec::new();
+        for (job_id, counters, queued) in read {
+            let snapshot = match (counters, queued) {
                 (Ok(c), Ok(q)) => (c, q),
                 (Err(e), _) | (_, Err(e)) => {
                     debug!(job_id = %job_id, error = %e, "Failed to read frontier counters");
                     continue;
                 }
             };
-            if last.get(&job_id) == Some(&snapshot) {
-                continue;
+            if last.get(&job_id) != Some(&snapshot) {
+                changed.push((job_id, snapshot));
             }
-            let (c, queued) = &snapshot;
-            let event = CrawlEvent::FrontierProgress {
-                job_id: job_id.clone(),
-                instance_id: self.instance_id.clone(),
-                received: c.received,
-                admitted: c.admitted,
-                dispatched: c.dispatched,
-                rejected: c.rejected,
-                dropped: c.dropped,
-                queued: *queued,
-                timestamp: now_ms(),
-            };
-            match self
-                .producer
-                .send(topic_names::EVENTS, Some(&job_id), &event)
-                .await
-            {
+        }
+
+        // One event per job (keyed by job id, so a job's events stay in
+        // order), all sent at once.
+        let published: Vec<_> = futures::stream::iter(changed)
+            .map(|(job_id, snapshot)| async move {
+                let (c, queued) = &snapshot;
+                let event = CrawlEvent::FrontierProgress {
+                    job_id: job_id.clone(),
+                    instance_id: self.instance_id.clone(),
+                    received: c.received,
+                    admitted: c.admitted,
+                    dispatched: c.dispatched,
+                    rejected: c.rejected,
+                    dropped: c.dropped,
+                    queued: *queued,
+                    timestamp: now_ms(),
+                };
+                let sent = self
+                    .producer
+                    .send(topic_names::EVENTS, Some(&job_id), &event)
+                    .await;
+                (job_id, snapshot, sent)
+            })
+            .buffer_unordered(PROGRESS_CONCURRENCY)
+            .collect()
+            .await;
+        for (job_id, snapshot, sent) in published {
+            match sent {
                 Ok(_) => {
                     last.insert(job_id, snapshot);
                 }
@@ -1725,6 +2038,7 @@ impl FrontierService {
                 self.early_controls.lock().remove(job_id);
                 self.templates.remove(job_id);
                 self.pop_sizes.lock().remove(job_id);
+                self.polls.lock().remove(job_id);
                 info!(job_id = %job_id, action = ?control.action, "Frontier job stopped and released");
             }
             JobAction::Pause => match current {
@@ -1740,6 +2054,9 @@ impl FrontierService {
             },
             JobAction::Resume => {
                 self.early_controls.lock().remove(job_id);
+                // Dispatch again on the next tick, not after the standby
+                // (also when another instance already flipped the state).
+                self.polls.lock().remove(job_id);
                 if current == Some(JobRunState::Paused) {
                     self.store.set_state(job_id, JobRunState::Running).await?;
                     info!(job_id = %job_id, "Frontier job resumed");
@@ -1995,6 +2312,14 @@ mod tests {
         args: &Args,
         store: Arc<dyn FrontierStore>,
     ) -> Arc<FrontierService> {
+        Arc::new(build_service(bus, args, store).await)
+    }
+
+    async fn build_service(
+        bus: &ChannelBus,
+        args: &Args,
+        store: Arc<dyn FrontierStore>,
+    ) -> FrontierService {
         let producer = Arc::new(AnyProducer::channel(bus.producer()));
         let consumer = Arc::new(AnyConsumer::channel(bus.consumer()));
         consumer.subscribe(&[topic_names::URL_FRONTIER]).unwrap();
@@ -2004,20 +2329,18 @@ mod tests {
             bus.consumer_in_group(format!("frontier-control-{}", uuid::Uuid::new_v4())),
         ));
         control.subscribe(&[topic_names::JOB_STATUS]).unwrap();
-        Arc::new(
-            FrontierService::with_bus(
-                args,
-                producer,
-                consumer,
-                None,
-                None,
-                Some(feedback),
-                Some(control),
-                store,
-            )
-            .await
-            .unwrap(),
+        FrontierService::with_bus(
+            args,
+            producer,
+            consumer,
+            None,
+            None,
+            Some(feedback),
+            Some(control),
+            store,
         )
+        .await
+        .unwrap()
     }
 
     /// Wraps a `MemoryFrontierStore`, counting calls and failing `admit` /
@@ -2029,6 +2352,18 @@ mod tests {
         requeue_failures: AtomicU64,
         admit_calls: AtomicU64,
         requeued_urls: AtomicU64,
+        /// `try_lease` calls (one per job the dispatcher looks at).
+        lease_calls: AtomicU64,
+        /// `pop_ready` calls.
+        pop_calls: AtomicU64,
+        /// How long every `pop_ready` takes (ms), to make dispatches overlap.
+        pop_delay_ms: AtomicU64,
+        /// `pop_ready` calls in flight, per job.
+        pops_in_flight: Mutex<HashMap<String, u64>>,
+        /// Most `pop_ready` calls ever in flight at once: for one job, and
+        /// over all jobs.
+        max_pops_per_job: AtomicU64,
+        max_pops_total: AtomicU64,
     }
 
     fn flaky(msg: &str) -> scrapix_core::ScrapixError {
@@ -2080,7 +2415,24 @@ mod tests {
             n: usize,
             now_ms: i64,
         ) -> scrapix_core::Result<Vec<CrawlUrl>> {
-            self.inner.pop_ready(job_id, n, now_ms).await
+            self.pop_calls.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut in_flight = self.pops_in_flight.lock();
+                let mine = in_flight.entry(job_id.to_string()).or_default();
+                *mine += 1;
+                self.max_pops_per_job.fetch_max(*mine, Ordering::SeqCst);
+                let total = in_flight.values().sum();
+                self.max_pops_total.fetch_max(total, Ordering::SeqCst);
+            }
+            let delay = self.pop_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let popped = self.inner.pop_ready(job_id, n, now_ms).await;
+            if let Some(mine) = self.pops_in_flight.lock().get_mut(job_id) {
+                *mine -= 1;
+            }
+            popped
         }
         async fn requeue(&self, job_id: &str, urls: Vec<CrawlUrl>) -> scrapix_core::Result<()> {
             if take_failure(&self.requeue_failures) {
@@ -2114,12 +2466,23 @@ mod tests {
             owner: &str,
             ttl: Duration,
         ) -> scrapix_core::Result<bool> {
+            self.lease_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.try_lease(job_id, owner, ttl).await
         }
     }
 
     /// Create a running job with `n` queued URLs on one domain.
     async fn seed_store(store: &dyn FrontierStore, job_id: &str, n: usize) -> UrlMessage {
+        seed_store_on(store, job_id, "one.test", n).await
+    }
+
+    /// Create a running job with `n` queued URLs on `domain`.
+    async fn seed_store_on(
+        store: &dyn FrontierStore,
+        job_id: &str,
+        domain: &str,
+        n: usize,
+    ) -> UrlMessage {
         let seed = seed_message(job_id, None);
         store
             .ensure_job(job_id, &serde_json::to_string(&seed).unwrap(), None, None)
@@ -2127,7 +2490,7 @@ mod tests {
             .unwrap();
         store.set_state(job_id, JobRunState::Running).await.unwrap();
         for i in 0..n {
-            let url = CrawlUrl::new(format!("https://one.test/{i}"), 1);
+            let url = CrawlUrl::new(format!("https://{domain}/{i}"), 1);
             assert_eq!(
                 store.admit(job_id, &url, 1_000_000).await.unwrap(),
                 Admission::Admitted
@@ -3272,6 +3635,281 @@ mod tests {
             h.service.metrics.urls_dispatched.load(Ordering::Relaxed),
             sent
         );
+    }
+
+    /// SCR-89: one tick dispatches several jobs at once, and a job is never
+    /// dispatched by two calls at the same time, even if two passes ran
+    /// together.
+    #[tokio::test]
+    async fn a_tick_dispatches_jobs_concurrently_and_never_one_job_twice_at_once() {
+        const JOBS: usize = 8;
+        let store = Arc::new(FlakyStore::default());
+        for j in 0..JOBS {
+            seed_store_on(&*store, &format!("job-par-{j}"), &format!("d{j}.test"), 1).await;
+        }
+        store.pop_delay_ms.store(50, Ordering::SeqCst);
+        let bus = ChannelBus::new();
+        let service = spawn_service(&bus, &test_args(), store.clone()).await;
+        let processing = AnyConsumer::channel(bus.consumer());
+        processing
+            .subscribe(&[topic_names::URL_PROCESSING])
+            .unwrap();
+
+        let started = Instant::now();
+        tokio::join!(service.dispatch_tick(), service.dispatch_tick());
+        let took = started.elapsed();
+
+        assert!(
+            store.max_pops_total.load(Ordering::SeqCst) >= 2,
+            "jobs are dispatched concurrently"
+        );
+        assert_eq!(
+            store.max_pops_per_job.load(Ordering::SeqCst),
+            1,
+            "a job is never dispatched twice at once"
+        );
+        assert!(
+            took < Duration::from_millis(50 * JOBS as u64),
+            "{JOBS} jobs took {took:?}: dispatched one after another"
+        );
+        assert_eq!(drain_count(&processing).await, JOBS as u64);
+        assert_eq!(service.held_leases.lock().len(), JOBS);
+        assert!(service.dispatching.lock().is_empty());
+        for j in 0..JOBS {
+            let c = store.counters(&format!("job-par-{j}")).await.unwrap();
+            assert_eq!(c.dispatched, 1, "job-par-{j} dispatched once");
+        }
+    }
+
+    /// SCR-89: a graceful shutdown while several jobs are mid-batch puts
+    /// every popped-but-unsent URL of every job back.
+    #[tokio::test]
+    async fn graceful_shutdown_mid_tick_requeues_every_jobs_unsent_urls() {
+        const JOBS: u64 = 4;
+        const N: u64 = 20;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        for j in 0..JOBS {
+            seed_store_on(
+                &*store,
+                &format!("job-drain-{j}"),
+                &format!("d{j}.test"),
+                N as usize,
+            )
+            .await;
+        }
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 10_000;
+        args.dispatch_batch_size = 5;
+        // One-slot topics: every send waits for the slow reader below.
+        let h = Harness::start_on(ChannelBus::with_capacity(1), args, store.clone()).await;
+        let reader = Arc::new(h.consumer(topic_names::URL_PROCESSING));
+        let received = Arc::new(AtomicU64::new(0));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let reader_task = {
+            let (reader, received, stop) = (reader.clone(), received.clone(), stop_reader.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    if reader
+                        .poll_one::<UrlMessage>(Duration::from_millis(20))
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                    }
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(received.load(Ordering::SeqCst) >= 3, "dispatch started");
+
+        h.service.shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), h.handle)
+            .await
+            .expect("run() returns within the grace")
+            .unwrap()
+            .unwrap();
+        stop_reader.store(true, Ordering::SeqCst);
+        reader_task.await.unwrap();
+        let sent = received.load(Ordering::SeqCst) + drain_count(&reader).await;
+
+        assert!(sent < JOBS * N, "shutdown landed mid-tick (sent {sent})");
+        let mut dispatched = 0;
+        for j in 0..JOBS {
+            let job = format!("job-drain-{j}");
+            let c = store.counters(&job).await.unwrap();
+            assert_eq!(
+                c.dispatched + store.queued(&job).await.unwrap(),
+                N,
+                "{job}: every popped-but-unsent URL is back in the store"
+            );
+            dispatched += c.dispatched;
+        }
+        assert_eq!(dispatched, sent, "`dispatched` counts only URLs sent");
+        assert_eq!(
+            h.service.metrics.urls_dispatched.load(Ordering::Relaxed),
+            sent
+        );
+        assert!(h.service.dispatching.lock().is_empty());
+    }
+
+    /// Counts the slots asked of an in-memory politeness scheduler.
+    struct CountingPoliteness {
+        inner: PolitenessScheduler,
+        asks: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl PolitenessStore for CountingPoliteness {
+        async fn try_acquire(&self, req: &SlotRequest<'_>) -> scrapix_core::Result<Acquire> {
+            Ok(self.try_acquire_spaced(req).await?.0)
+        }
+        async fn try_acquire_spaced(
+            &self,
+            req: &SlotRequest<'_>,
+        ) -> scrapix_core::Result<(Acquire, Duration)> {
+            self.asks.fetch_add(1, Ordering::SeqCst);
+            self.inner.try_acquire_spaced(req).await
+        }
+        async fn release(
+            &self,
+            domain: &str,
+            job_id: &str,
+            token: &str,
+        ) -> scrapix_core::Result<()> {
+            self.inner.release(domain, job_id, token).await
+        }
+        async fn report(&self, report: &FetchReport<'_>) -> scrapix_core::Result<()> {
+            self.inner.report(report).await
+        }
+        fn is_shared(&self) -> bool {
+            false
+        }
+    }
+
+    /// One dispatcher pass over a job with `urls` URLs on one domain:
+    /// (slots asked, URLs dispatched, URLs back in the store).
+    async fn one_pass_on_one_domain(args: Args, urls: usize) -> (u64, u64, u64) {
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        seed_store(&*store, "job-asks", urls).await;
+        let politeness = Arc::new(CountingPoliteness {
+            inner: PolitenessScheduler::new(politeness_config(&args)),
+            asks: AtomicU64::new(0),
+        });
+        let bus = ChannelBus::new();
+        let mut service = build_service(&bus, &args, store.clone()).await;
+        service.politeness = politeness.clone();
+        service.dispatch_tick().await;
+        (
+            politeness.asks.load(Ordering::SeqCst),
+            service.metrics.urls_dispatched.load(Ordering::Relaxed),
+            store.queued("job-asks").await.unwrap(),
+        )
+    }
+
+    /// SCR-89: after a grant, the domain's other URLs of the batch are
+    /// parked without asking the politeness store (they could only be told
+    /// to wait).
+    #[tokio::test]
+    async fn granted_domain_is_not_asked_again_in_the_same_batch() {
+        let mut args = test_args();
+        args.domain_delay_ms = 50;
+        args.concurrent_per_domain = 8;
+        assert_eq!(one_pass_on_one_domain(args, 10).await, (1, 1, 9));
+    }
+
+    /// With a zero delay a domain can be granted again right away, up to
+    /// its concurrency: its URLs keep asking until the domain is busy.
+    #[tokio::test]
+    async fn zero_delay_domain_keeps_asking_until_busy() {
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        args.concurrent_per_domain = 3;
+        // Three grants, then one `DomainBusy` parks the other six.
+        assert_eq!(one_pass_on_one_domain(args, 10).await, (4, 3, 7));
+    }
+
+    /// SCR-89: a job with nothing ready and a paused job are not asked
+    /// about on every tick, and a new URL still goes out at once.
+    #[tokio::test]
+    async fn idle_and_paused_jobs_are_polled_less_often() {
+        let store = Arc::new(FlakyStore::default());
+        seed_store(&*store, "job-idle", 0).await;
+        seed_store(&*store, "job-paused", 3).await;
+        store
+            .set_state("job-paused", JobRunState::Paused)
+            .await
+            .unwrap();
+        let mut args = test_args();
+        args.domain_delay_ms = 0;
+        let h = Harness::start_with(args, store.clone()).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let ticks = 1_000 / h.service.dispatch_interval.as_millis() as u64;
+        let (leases, pops) = (
+            store.lease_calls.load(Ordering::SeqCst),
+            store.pop_calls.load(Ordering::SeqCst),
+        );
+        // Every tick would be `ticks` pops and `2 × ticks` lease renewals.
+        assert!(pops >= 3, "the idle job is still polled ({pops} pops)");
+        assert!(pops <= ticks / 2, "{pops} pops in {ticks} ticks");
+        assert!(leases <= ticks, "{leases} lease calls in {ticks} ticks");
+        assert_eq!(
+            h.service.held_leases.lock().len(),
+            2,
+            "both leases stay held between polls"
+        );
+
+        // A URL admitted by this instance ends the idle backoff.
+        let seed = seed_message("job-idle", None);
+        h.publish(&seed.child(CrawlUrl::new("https://example.com/new", 1)))
+            .await;
+        let got = h.collect_dispatched(Duration::from_millis(300)).await;
+        assert_eq!(got.len(), 1, "the new URL is dispatched");
+
+        // Resume ends the paused job's standby.
+        h.control("job-paused", JobAction::Resume).await;
+        h.wait_state("job-paused", JobRunState::Running).await;
+        let resumed = h.collect_dispatched(Duration::from_millis(500)).await;
+        h.stop();
+        assert_eq!(resumed.len(), 3, "dispatch restarts after Resume");
+    }
+
+    /// SCR-89: the idle backoff never holds back URLs the dispatcher parked
+    /// itself: a throttled job whose whole queue is parked is popped again
+    /// as soon as the first URL is due.
+    #[tokio::test]
+    async fn parked_urls_are_dispatched_when_due_despite_the_idle_backoff() {
+        const N: usize = 10;
+        let store: Arc<dyn FrontierStore> = Arc::new(MemoryFrontierStore::default());
+        seed_store(&*store, "job-due", N).await;
+        let mut args = test_args();
+        args.domain_delay_ms = 30;
+        // No crawler sends feedback here: don't let held slots cap the test.
+        args.concurrent_per_domain = 10_000;
+        let h = Harness::start_with(args, store.clone()).await;
+        let c = h.consumer(topic_names::URL_PROCESSING);
+        let started = Instant::now();
+        let mut got = 0;
+        while got < N && started.elapsed() < Duration::from_secs(3) {
+            if c.poll_one::<UrlMessage>(Duration::from_millis(20))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                got += 1;
+            }
+        }
+        let took = started.elapsed();
+        h.stop();
+        assert_eq!(got, N);
+        // 9 delays of 30 ms, each rounded up to a 20 ms tick: about 400 ms.
+        // Waiting out an idle poll per URL would take over 900 ms.
+        assert!(took < Duration::from_millis(750), "took {took:?}");
     }
 
     /// Final review fix 1: a send that never completes (bus stuck) does not
