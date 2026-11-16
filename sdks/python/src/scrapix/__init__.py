@@ -13,6 +13,7 @@ from ._base import (
     TERMINAL_STATUSES,
     ExtractJobResult,
     JobResult,
+    SuggestJobResult,
 )
 from ._client import Scrapix
 from ._errors import (
@@ -51,6 +52,10 @@ from ._generated.models import (
     ScrapeRequest,
     ScrapeResponse,
     SearchRequest,
+    SiteProfile,
+    SiteType,
+    SuggestRequest,
+    SuggestStatusResponse,
 )
 from ._version import __version__
 
@@ -63,6 +68,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "JobResult",
     "ExtractJobResult",
+    "SuggestJobResult",
     # errors
     "ScrapixError",
     "APIConnectionError",
@@ -98,4 +104,8 @@ __all__ = [
     "ScrapeRequest",
     "ScrapeResponse",
     "SearchRequest",
+    "SiteProfile",
+    "SiteType",
+    "SuggestRequest",
+    "SuggestStatusResponse",
 ]

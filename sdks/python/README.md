@@ -71,6 +71,8 @@ plain `dict` as the first argument.
 | `batch_scrape(urls, **options)` | `POST /batch/scrape` |
 | `extract(urls, prompt=..., schema=..., **options)` | `POST /extract` |
 | `get_extract(job_id)` | `GET /extract/{id}` |
+| `suggest_config(url, **options)` | `POST /crawl/suggest` |
+| `get_suggestion(job_id)` | `GET /crawl/suggest/{id}` |
 | `get_job(job_id)` | `GET /job/{id}/status` |
 | `list_jobs(limit=, offset=)` | `GET /jobs` |
 | `cancel_job` / `pause_job` / `resume_job` | `DELETE /job/{id}`, `POST /job/{id}/pause`, `POST /job/{id}/resume` |
@@ -78,7 +80,7 @@ plain `dict` as the first argument.
 | `iter_job_results(job_id, wait=False)` | every result, following the cursor |
 | `wait_for_job(job_id, poll_interval=2, timeout=None, on_progress=None)` | polls until terminal |
 | `iter_job_status(job_id)` | yields each polled status |
-| `crawl_and_wait` / `batch_scrape_and_wait` / `extract_and_wait` | create + wait + collect results |
+| `crawl_and_wait` / `batch_scrape_and_wait` / `extract_and_wait` / `suggest_config_and_wait` | create + wait + collect results |
 | `health()` | `GET /health` |
 
 ### Jobs
@@ -115,6 +117,18 @@ result = client.extract_and_wait(
 )
 print(result.data)          # the extraction
 print(result.extract.sources)
+```
+
+Not sure which crawl features a site needs? Let the API propose a config
+(site type, JavaScript rendering, sections to skip, features per section),
+then crawl with it:
+
+```python
+suggestion = client.suggest_config_and_wait("https://shop.example.com")
+print(suggestion.suggestion.profile.site_type.value)  # e.g. "ecommerce"
+for reason in suggestion.suggestion.reasons:
+    print(reason.field, "-", reason.reason)
+crawl = client.crawl(suggestion.config)
 ```
 
 ### Async

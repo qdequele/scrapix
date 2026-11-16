@@ -122,3 +122,78 @@ async def test_default_client_is_closed_by_context_manager() -> None:
     async with AsyncScrapix(base_url="https://api.test") as client:
         http = client._http
     assert http.is_closed
+
+
+async def test_suggest_config_and_wait(api: MockAPI) -> None:
+    api.add(
+        "POST", "/crawl/suggest", httpx.Response(200, json={"job_id": "sg-1", "status": "running"})
+    )
+    api.add(
+        "GET",
+        "/job/sg-1/status",
+        httpx.Response(200, json=job_status("sg-1", "completed", job_type="crawl_suggest")),
+    )
+    api.add(
+        "GET",
+        "/job/sg-1/results",
+        httpx.Response(
+            200,
+            json=results_page(
+                ["https://shop.test/"], None, job_id="sg-1", job_type="crawl_suggest"
+            ),
+        ),
+    )
+    api.add(
+        "GET",
+        "/crawl/suggest/sg-1",
+        httpx.Response(
+            200,
+            json={
+                "job_id": "sg-1",
+                "status": "completed",
+                "config": {
+                    "start_urls": ["https://shop.test/"],
+                    "index_uid": "shop-test",
+                    "crawler_type": "browser",
+                },
+                "profile": {
+                    "url": "https://shop.test/",
+                    "site_type": "ecommerce",
+                    "confidence": 0.8,
+                    "because": "80% of the pages are ecommerce",
+                    "ai_classified": True,
+                    "languages": [],
+                    "sections": [
+                        {
+                            "key": "/products/",
+                            "pages": 40,
+                            "kind": "product",
+                            "because": "pages carry schema.org `Product`",
+                            "avg_words": 120,
+                            "avg_headings": 1,
+                            "sampled": 2,
+                        }
+                    ],
+                },
+                "reasons": [{"field": "crawler_type", "reason": "pages need JavaScript"}],
+                "estimate": {
+                    "pages_found": 50,
+                    "pages_to_crawl": 40,
+                    "js_rendering": True,
+                    "ai_summary_pages": 0,
+                    "ai_extraction_pages": 0,
+                },
+                "samples": [{"url": "https://shop.test/", "section": "/", "success": True}],
+                "warnings": [],
+            },
+        ),
+    )
+    result = await api.async_client().suggest_config_and_wait(
+        {"url": "https://shop.test", "ai": False}
+    )
+    assert body(api.calls("POST", "/crawl/suggest")[0]) == {"url": "https://shop.test", "ai": False}
+    assert result.config is not None
+    assert result.config.start_urls == ["https://shop.test/"]
+    assert result.suggestion is not None
+    assert result.suggestion.estimate is not None
+    assert result.suggestion.estimate.js_rendering is True
