@@ -24,6 +24,17 @@ export type BatchScrapeResponse = Schemas["BatchScrapeResponse"];
 export type ExtractRequest = Schemas["ExtractRequest"];
 export type CreateExtractResponse = Schemas["CreateExtractResponse"];
 export type ExtractStatusResponse = Schemas["ExtractStatusResponse"];
+export type SuggestRequest = Schemas["SuggestRequest"];
+export type CreateSuggestResponse = Schemas["CreateSuggestResponse"];
+export type SuggestStatusResponse = Schemas["SuggestStatusResponse"];
+export type SiteProfile = Schemas["SiteProfile"];
+export type SiteSection = Schemas["SiteSection"];
+export type SiteType = Schemas["SiteType"];
+export type SectionKind = Schemas["SectionKind"];
+export type SitePlatform = Schemas["SitePlatform"];
+export type SuggestReason = Schemas["SuggestReason"];
+export type SuggestEstimate = Schemas["SuggestEstimate"];
+export type SuggestSample = Schemas["SuggestSample"];
 export type JobStatus = Schemas["JobStatus"];
 export type JobKind = Schemas["JobKind"];
 export type JobStatusResponse = Schemas["JobStatusResponse"];
@@ -59,4 +70,12 @@ export interface JobResult {
 /** Outcome of `extractAndWait`: `extract.data` holds the extraction. */
 export interface ExtractJobResult extends JobResult {
   extract: ExtractStatusResponse;
+}
+
+/**
+ * Outcome of `suggestConfigAndWait`: `suggestion.config` holds the proposed
+ * crawl config, `suggestion.reasons` why; `documents` are the pages sampled.
+ */
+export interface SuggestJobResult extends JobResult {
+  suggestion: SuggestStatusResponse;
 }

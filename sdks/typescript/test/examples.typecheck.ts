@@ -53,6 +53,10 @@ export async function examples(): Promise<void> {
   });
   console.log(result.extract.data);
 
+  const { suggestion } = await scrapix.suggestConfigAndWait({ url: "https://example.com" });
+  console.log(suggestion.profile?.site_type, suggestion.reasons.map((r) => r.reason));
+  if (suggestion.config) await scrapix.crawl(suggestion.config);
+
   try {
     await scrapix.getJob("unknown");
   } catch (error) {

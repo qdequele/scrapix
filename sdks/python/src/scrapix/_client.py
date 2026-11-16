@@ -18,6 +18,7 @@ from ._base import (
     Body,
     ExtractJobResult,
     JobResult,
+    SuggestJobResult,
     build_body,
     decode_json,
     extract_path,
@@ -29,6 +30,7 @@ from ._base import (
     retry_delay,
     should_retry,
     split_first,
+    suggest_path,
 )
 from ._errors import APIConnectionError, APITimeoutError, JobTimeoutError, error_from_response
 from ._generated.models import (
@@ -36,6 +38,7 @@ from ._generated.models import (
     CrawlSyncResponse,
     CreateCrawlResponse,
     CreateExtractResponse,
+    CreateSuggestResponse,
     ExtractStatusResponse,
     HealthResponse,
     JobResultItem,
@@ -43,6 +46,7 @@ from ._generated.models import (
     JobStatusResponse,
     MapResponse,
     ScrapeResponse,
+    SuggestStatusResponse,
 )
 
 __all__ = ["Scrapix"]
@@ -320,6 +324,37 @@ class Scrapix:
         data = self._request("GET", extract_path(job_id))
         return parse_model(ExtractStatusResponse, data)
 
+    def suggest_config(
+        self,
+        url: Union[str, Body],
+        *,
+        request_timeout: Any = NOT_GIVEN,
+        **options: Any,
+    ) -> CreateSuggestResponse:
+        """Start proposing a crawl config for a website (``POST /crawl/suggest``).
+
+        The site is mapped, a few pages are sampled and classified, and a
+        config comes back with a reason for each choice.
+
+        Args:
+            url: the website (a path keeps the crawl under it), or a full
+                ``SuggestRequest`` model / dict.
+            options: ``SuggestRequest`` fields (``max_samples``, ``ai``,
+                ``model``, ``check_js``, ``webhooks``).
+        """
+        base, fields = split_first(url, "url")
+        body = build_body(base, options, **fields)
+        data = self._request(
+            "POST", "/crawl/suggest", json=body, timeout=request_timeout, idempotent=False
+        )
+        return parse_model(CreateSuggestResponse, data)
+
+    def get_suggestion(self, job_id: str) -> SuggestStatusResponse:
+        """``GET /crawl/suggest/{id}``: status and (once completed) ``config``,
+        ``profile``, ``reasons``, ``estimate`` and ``warnings``."""
+        data = self._request("GET", suggest_path(job_id))
+        return parse_model(SuggestStatusResponse, data)
+
     # ------------------------------------------------------------------
     # Jobs: status and control
     # ------------------------------------------------------------------
@@ -533,3 +568,23 @@ class Scrapix:
         collected = self._collect(created.job_id, poll_interval, timeout, on_progress, page_size)
         extract = self.get_extract(created.job_id)
         return ExtractJobResult(job=collected.job, documents=collected.documents, extract=extract)
+
+    def suggest_config_and_wait(
+        self,
+        url: Union[str, Body],
+        *,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
+        timeout: Optional[float] = None,
+        on_progress: Optional[ProgressCallback] = None,
+        page_size: int = DEFAULT_RESULTS_PAGE_SIZE,
+        **options: Any,
+    ) -> SuggestJobResult:
+        """Propose a crawl config for a website, wait for it, and return the
+        suggestion (``result.config``, ``result.suggestion.reasons``, ...) and
+        the pages it sampled (``documents``)."""
+        created = self.suggest_config(url, **options)
+        collected = self._collect(created.job_id, poll_interval, timeout, on_progress, page_size)
+        suggestion = self.get_suggestion(created.job_id)
+        return SuggestJobResult(
+            job=collected.job, documents=collected.documents, suggestion=suggestion
+        )

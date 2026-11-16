@@ -574,3 +574,116 @@ def test_context_manager_closes_owned_client() -> None:
     with Scrapix(base_url=BASE) as client:
         http = client._http
     assert http.is_closed
+
+
+def test_suggest_config_and_wait(api: MockAPI) -> None:
+    api.add(
+        "POST", "/crawl/suggest", httpx.Response(200, json={"job_id": "sg-1", "status": "running"})
+    )
+    api.add(
+        "GET",
+        "/job/sg-1/status",
+        httpx.Response(200, json=job_status("sg-1", "completed", job_type="crawl_suggest")),
+    )
+    api.add(
+        "GET",
+        "/job/sg-1/results",
+        httpx.Response(
+            200,
+            json=results_page(
+                ["https://shop.test/"], None, job_id="sg-1", job_type="crawl_suggest"
+            ),
+        ),
+    )
+    api.add(
+        "GET",
+        "/crawl/suggest/sg-1",
+        httpx.Response(
+            200,
+            json={
+                "job_id": "sg-1",
+                "status": "completed",
+                "config": {
+                    "start_urls": ["https://shop.test/"],
+                    "index_uid": "shop-test",
+                    "crawler_type": "browser",
+                },
+                "profile": {
+                    "url": "https://shop.test/",
+                    "site_type": "ecommerce",
+                    "confidence": 0.8,
+                    "because": "80% of the pages are ecommerce",
+                    "ai_classified": True,
+                    "languages": [],
+                    "sections": [
+                        {
+                            "key": "/products/",
+                            "pages": 40,
+                            "kind": "product",
+                            "because": "pages carry schema.org `Product`",
+                            "avg_words": 120,
+                            "avg_headings": 1,
+                            "sampled": 2,
+                        }
+                    ],
+                },
+                "reasons": [{"field": "crawler_type", "reason": "pages need JavaScript"}],
+                "estimate": {
+                    "pages_found": 50,
+                    "pages_to_crawl": 40,
+                    "js_rendering": True,
+                    "ai_summary_pages": 0,
+                    "ai_extraction_pages": 0,
+                },
+                "samples": [{"url": "https://shop.test/", "section": "/", "success": True}],
+                "warnings": [],
+            },
+        ),
+    )
+    client = api.sync_client()
+    result = client.suggest_config_and_wait("https://shop.test", max_samples=4)
+    assert body(api.calls("POST", "/crawl/suggest")[0]) == {
+        "url": "https://shop.test",
+        "max_samples": 4,
+    }
+    assert result.suggestion is not None
+    assert result.suggestion.profile is not None
+    assert result.suggestion.profile.site_type.value == "ecommerce"
+    assert result.suggestion.reasons[0].field == "crawler_type"
+    assert result.config is not None
+    assert result.config.index_uid == "shop-test"
+    assert [d.url for d in result.documents] == ["https://shop.test/"]
+
+    # The proposed config goes back to POST /crawl as is.
+    api.add(
+        "POST",
+        "/crawl",
+        httpx.Response(
+            200,
+            json={"job_id": "c-1", "status": "running", "message": "ok", "index_uid": "shop-test"},
+        ),
+    )
+    client.crawl(result.config)
+    sent = body(api.calls("POST", "/crawl")[0])
+    assert sent["start_urls"] == ["https://shop.test/"]
+    assert sent["crawler_type"] == "browser"
+
+
+def test_get_suggestion_escapes_the_job_id(api: MockAPI) -> None:
+    api.add(
+        "GET",
+        "/crawl/suggest/a/b",
+        httpx.Response(
+            200,
+            json={
+                "job_id": "a/b",
+                "status": "running",
+                "reasons": [],
+                "samples": [],
+                "warnings": [],
+            },
+        ),
+    )
+    suggestion = api.sync_client().get_suggestion("a/b")
+    assert suggestion.config is None
+    assert api.requests[0].url.raw_path == b"/crawl/suggest/a%2Fb"

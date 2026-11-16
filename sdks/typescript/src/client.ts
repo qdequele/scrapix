@@ -17,6 +17,10 @@ import {
   type ExtractJobResult,
   type ExtractRequest,
   type ExtractStatusResponse,
+  type CreateSuggestResponse,
+  type SuggestJobResult,
+  type SuggestRequest,
+  type SuggestStatusResponse,
   type HealthResponse,
   type JobResult,
   type JobResultItem,
@@ -385,6 +389,26 @@ export class Scrapix {
     return this.request({ method: "GET", path: `/extract/${encodeURIComponent(jobId)}` }, options);
   }
 
+  /**
+   * Start proposing a crawl config for a website (`POST /crawl/suggest`):
+   * the site is mapped, a few pages are sampled and classified, and a
+   * config comes back with a reason for each choice.
+   */
+  suggestConfig(request: SuggestRequest, options?: RequestOptions): Promise<CreateSuggestResponse> {
+    return this.request(
+      { method: "POST", path: "/crawl/suggest", body: request, idempotent: false },
+      options,
+    );
+  }
+
+  /**
+   * `GET /crawl/suggest/{id}`: status and (once completed) `config`,
+   * `profile`, `reasons`, `estimate` and `warnings`.
+   */
+  getSuggestion(jobId: string, options?: RequestOptions): Promise<SuggestStatusResponse> {
+    return this.request({ method: "GET", path: `/crawl/suggest/${encodeURIComponent(jobId)}` }, options);
+  }
+
   // ------------------------------------------------------------------
   // Jobs: status and control
   // ------------------------------------------------------------------
@@ -546,5 +570,17 @@ export class Scrapix {
     const collected = await this.collect(created.job_id, opts);
     const extract = await this.getExtract(created.job_id, { signal: opts.signal });
     return { ...collected, extract };
+  }
+
+  /**
+   * Propose a crawl config for a website, wait for it, and resolve with the
+   * suggestion (`suggestion.config`, `suggestion.reasons`, …) and the pages
+   * it sampled. Pass `suggestion.config` to `crawl` as is, or edit it first.
+   */
+  async suggestConfigAndWait(request: SuggestRequest, opts: WaitAndCollectOptions = {}): Promise<SuggestJobResult> {
+    const created = await this.suggestConfig(request, { signal: opts.signal });
+    const collected = await this.collect(created.job_id, opts);
+    const suggestion = await this.getSuggestion(created.job_id, { signal: opts.signal });
+    return { ...collected, suggestion };
   }
 }

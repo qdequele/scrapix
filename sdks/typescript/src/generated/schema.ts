@@ -1533,6 +1533,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/crawl/suggest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suggest a crawl config for a website
+         * @description Starts a job that maps the site, samples a few pages, checks whether it
+         *     needs JavaScript rendering, classifies it (ecommerce, blog, docs,
+         *     marketing, support or mixed; confirmed by the AI provider when there is
+         *     one) and proposes a crawl config: rendering, URL patterns, page cap,
+         *     Markdown, block splitting, schema.org, AI summary and extraction, PDFs
+         *     and office documents, each scoped to the sections it suits, with a
+         *     reason for every choice. Poll `GET /crawl/suggest/{id}` for the result.
+         *     Billed as one or two `/map`s and one `/scrape` per sampled page.
+         */
+        post: operations["create_suggest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/crawl/suggest/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a config suggestion's status and result */
+        get: operations["get_suggest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2121,7 +2165,7 @@ export interface components {
          * @description The kind of a job.
          * @enum {string}
          */
-        JobKind: "crawl" | "batch_scrape" | "extract";
+        JobKind: "crawl" | "batch_scrape" | "extract" | "crawl_suggest";
         /** @description Error of a failed result item */
         JobResultError: {
             /** @description Machine-readable code (`fetch_error`, `http_error`, `validation_error`, ...) */
@@ -2991,6 +3035,158 @@ export interface components {
              * @default 0
              */
             prompt_tokens: number;
+        };
+        /** @description Response of `POST /crawl/suggest` */
+        CreateSuggestResponse: {
+            job_id: string;
+            status: string;
+        };
+        /**
+         * @description What the pages of one section are.
+         * @enum {string}
+         */
+        SectionKind: "product" | "listing" | "article" | "docs" | "support" | "marketing" | "archive" | "legal" | "account";
+        /**
+         * @description The site builder or framework a page was made with.
+         * @enum {string}
+         */
+        SitePlatform: "shopify" | "woocommerce" | "magento" | "prestashop" | "bigcommerce" | "salesforce_commerce" | "docusaurus" | "mintlify" | "gitbook" | "readthedocs" | "mkdocs" | "vitepress" | "nextra" | "ghost" | "zendesk" | "discourse" | "webflow" | "framer" | "wix" | "squarespace" | "wordpress";
+        /** @description What the site is. */
+        SiteProfile: {
+            /** @description Whether the AI pass confirmed or corrected the classification */
+            ai_classified: boolean;
+            /** @description Why the site got this type */
+            because: string;
+            /**
+             * Format: float
+             * @description How sure the analysis is, from 0 to 1
+             */
+            confidence: number;
+            /** @description One sentence about the site (AI pass only) */
+            description?: string | null;
+            /** @description Language path segments found (`fr`, `en-us`) */
+            languages: string[];
+            platform?: null | components["schemas"]["SitePlatform"];
+            /** @description The site's sections, largest first */
+            sections: components["schemas"]["SiteSection"][];
+            site_type: components["schemas"]["SiteType"];
+            /** @description The URL analyzed (after redirects) */
+            url: string;
+        };
+        /** @description A section, classified. */
+        SiteSection: {
+            /** @description Average Markdown headings of its sampled pages. */
+            avg_headings?: number | null;
+            /** @description Average words of its sampled pages (`null` when none was sampled). */
+            avg_words?: number | null;
+            /** @description Why it got this kind. */
+            because: string;
+            key: string;
+            kind: components["schemas"]["SectionKind"];
+            pages: number;
+            /** @description Pages of it that were sampled. */
+            sampled: number;
+            /** @description The useful schema.org types its sampled pages carry. */
+            schema_types?: string[];
+            titles?: string[];
+        };
+        /**
+         * @description What a whole site is.
+         * @enum {string}
+         */
+        SiteType: "ecommerce" | "blog" | "docs" | "marketing" | "support" | "mixed";
+        /** @description What crawling with the config is expected to cost. */
+        SuggestEstimate: {
+            /** @description Pages that get an AI extraction (one LLM call each). */
+            ai_extraction_pages: number;
+            /** @description Pages that get an AI summary (one LLM call each). */
+            ai_summary_pages: number;
+            /** @description Whether pages are rendered with a browser (slower, billed higher). */
+            js_rendering: boolean;
+            /** @description Pages the map found. */
+            pages_found: number;
+            /**
+             * @description Pages the config crawls (`null` when the number of pages is not
+             *     known: the sitemaps do not list them, or the site has more pages
+             *     than a map lists).
+             */
+            pages_to_crawl?: number | null;
+        };
+        /** @description Why the config holds a value. */
+        SuggestReason: {
+            /** @description The config field (dotted path), e.g. `features.block_split`. */
+            field: string;
+            reason: string;
+        };
+        /** @description Request body for `POST /crawl/suggest` */
+        SuggestRequest: {
+            /**
+             * @description Confirm the classification with the AI provider (default true).
+             *     Without one (or with `false`), the deterministic analysis decides.
+             */
+            ai?: boolean;
+            /**
+             * @description Render up to two pages that look like JavaScript app shells with a
+             *     browser to confirm the crawl needs one (default true; needs
+             *     Chrome/Chromium on the server and JS rendering on the plan).
+             */
+            check_js?: boolean;
+            /**
+             * @description Pages sampled to analyze the site (default 8, max 20). Each is
+             *     billed as a `/scrape`.
+             */
+            max_samples?: number | null;
+            /**
+             * @description Model of the AI pass, from the team's Gateway; the default model
+             *     when absent
+             * @example openai/gpt-4o-mini
+             */
+            model?: string | null;
+            /**
+             * @description The website. A path (`https://example.com/docs`) keeps the crawl
+             *     under it.
+             * @example https://example.com
+             */
+            url: string;
+            /** @description Webhook subscriptions (same as a crawl's `webhooks`) */
+            webhooks?: components["schemas"]["WebhookConfig"][];
+        };
+        /** @description A page the analysis scraped. */
+        SuggestSample: {
+            /** @description Why it could not be */
+            error?: string | null;
+            /** @description Words once rendered with a browser (JavaScript check only) */
+            rendered_words?: number | null;
+            /** @description Its section key */
+            section: string;
+            /** @description Whether the page was fetched */
+            success: boolean;
+            url: string;
+            /** @description Words of its main content */
+            words?: number | null;
+        };
+        /** @description `GET /crawl/suggest/{id}` response */
+        SuggestStatusResponse: {
+            /**
+             * @description The AI pass's LLM call and the provider cost the hosted AI gateway
+             *     reported for it, in micro-USD (billed by the gateway, not in the
+             *     job's credits). Omitted when no AI call was made.
+             */
+            ai_usage?: components["schemas"]["AiUsage"];
+            config?: null | components["schemas"]["CrawlConfig"];
+            /** @description Why the job failed */
+            error?: string | null;
+            estimate?: null | components["schemas"]["SuggestEstimate"];
+            job_id: string;
+            profile?: null | components["schemas"]["SiteProfile"];
+            /** @description Why the config holds each value */
+            reasons: components["schemas"]["SuggestReason"][];
+            /** @description The pages the analysis scraped */
+            samples: components["schemas"]["SuggestSample"][];
+            /** @description `running`, `completed`, `failed`, `cancelled` or `paused` */
+            status: components["schemas"]["JobStatus"];
+            /** @description Things to check before crawling */
+            warnings: string[];
         };
     };
     responses: never;
@@ -4713,6 +4909,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExtractStatusResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    create_suggest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SuggestRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateSuggestResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Not enough credits */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    get_suggest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Suggest job ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuggestStatusResponse"];
                 };
             };
             404: {

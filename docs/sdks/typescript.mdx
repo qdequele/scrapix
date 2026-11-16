@@ -58,7 +58,7 @@ await scrapix.search("https://docs.example.com", "rate limits", { limit: 5 });
 
 ## Jobs
 
-`crawl`, `batchScrape` and `extract` start a job and resolve with its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
+`crawl`, `batchScrape`, `extract` and `suggestConfig` start a job and resolve with its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
 
 | Helper | What it does |
 |--------|--------------|
@@ -66,7 +66,7 @@ await scrapix.search("https://docs.example.com", "rate limits", { limit: 5 });
 | `watchJob(jobId, { pollIntervalMs })` | async iterator over every polled status, ending with the terminal one |
 | `waitForJob(jobId, { pollIntervalMs, timeoutMs, onProgress })` | resolves with the final status |
 | `iterJobResults(jobId, { pageSize, wait })` | async iterator over every result, following the `next` cursor |
-| `crawlAndWait`, `batchScrapeAndWait`, `extractAndWait` | start + wait + read all results |
+| `crawlAndWait`, `batchScrapeAndWait`, `extractAndWait`, `suggestConfigAndWait` | start + wait + read all results |
 | `cancelJob`, `pauseJob`, `resumeJob`, `listJobs` | job control |
 
 ```ts
@@ -80,6 +80,11 @@ const extraction = await scrapix.extractAndWait({
   prompt: "The title and author of each post",
 });
 console.log(extraction.extract.data);
+
+// Propose a crawl config for a site (see /api-reference/crawl-suggest), then crawl with it
+const { suggestion } = await scrapix.suggestConfigAndWait({ url: "https://shop.example.com" });
+for (const { field, reason } of suggestion.reasons) console.log(field, "-", reason);
+if (suggestion.config) await scrapix.crawl(suggestion.config);
 ```
 
 Failed or cancelled jobs resolve (they do not reject): check `job.status`. With `timeoutMs`, waiting rejects with `JobTimeoutError` (the job keeps running). `iterJobResults` on a running job stops once caught up; `{ wait: true }` keeps polling until the job ends.

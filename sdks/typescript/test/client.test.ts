@@ -390,4 +390,41 @@ describe("job watcher", () => {
     expect(result.documents.map((d) => d.url)).toEqual(["p"]);
     expect(api.calls("POST", "/extract")[0]?.body).toEqual({ urls: ["https://p.test"], prompt: "title" });
   });
+
+  it("suggestConfigAndWait returns the proposed config", async () => {
+    const config = { start_urls: ["https://shop.test/"], index_uid: "shop-test", features: { markdown: { enabled: true } } };
+    const api = new MockAPI()
+      .add("POST", "/crawl/suggest", json(200, { job_id: "sg-1", status: "running" }))
+      .add("GET", "/job/sg-1/status", json(200, jobStatus("sg-1", "completed", { job_type: "crawl_suggest" })))
+      .add("GET", "/job/sg-1/results", json(200, resultsPage(["https://shop.test/"], null, "completed", "sg-1")))
+      .add(
+        "GET",
+        "/crawl/suggest/sg-1",
+        json(200, {
+          job_id: "sg-1",
+          status: "completed",
+          config,
+          profile: null,
+          reasons: [{ field: "features.markdown", reason: "every page is indexed as Markdown" }],
+          estimate: null,
+          samples: [{ url: "https://shop.test/", section: "/", success: true, words: 120 }],
+          warnings: [],
+        }),
+      );
+    const result = await api.client().suggestConfigAndWait({ url: "https://shop.test", max_samples: 4 });
+    expect(result.suggestion.config).toEqual(config);
+    expect(result.suggestion.reasons[0]?.field).toBe("features.markdown");
+    expect(result.documents.map((d) => d.url)).toEqual(["https://shop.test/"]);
+    expect(api.calls("POST", "/crawl/suggest")[0]?.body).toEqual({ url: "https://shop.test", max_samples: 4 });
+  });
+
+  it("getSuggestion escapes the job id", async () => {
+    const api = new MockAPI().add(
+      "GET",
+      "/crawl/suggest/a%2Fb",
+      json(200, { job_id: "a/b", status: "running", config: null, profile: null, reasons: [], estimate: null, samples: [], warnings: [] }),
+    );
+    const suggestion = await api.client().getSuggestion("a/b");
+    expect(suggestion.status).toBe("running");
+  });
 });

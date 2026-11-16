@@ -62,6 +62,7 @@ Request bodies use the API's field names (snake_case) and are fully typed.
 | `crawlSync(config, { include_results, results_limit })` | `POST /crawl/sync` (blocks) |
 | `batchScrape(request)` | `POST /batch/scrape` |
 | `extract(request)` / `getExtract(jobId)` | `POST /extract`, `GET /extract/{id}` |
+| `suggestConfig(request)` / `getSuggestion(jobId)` | `POST /crawl/suggest`, `GET /crawl/suggest/{id}` |
 | `getJob(jobId)` | `GET /job/{id}/status` |
 | `listJobs({ limit, offset })` | `GET /jobs` |
 | `cancelJob` / `pauseJob` / `resumeJob` | `DELETE /job/{id}`, `POST /job/{id}/pause`, `POST /job/{id}/resume` |
@@ -69,7 +70,7 @@ Request bodies use the API's field names (snake_case) and are fully typed.
 | `iterJobResults(jobId, { wait })` | async iterator over every result |
 | `watchJob(jobId)` | async iterator over each polled status |
 | `waitForJob(jobId, { pollIntervalMs, timeoutMs, onProgress })` | resolves when terminal |
-| `crawlAndWait` / `batchScrapeAndWait` / `extractAndWait` | create + wait + collect results |
+| `crawlAndWait` / `batchScrapeAndWait` / `extractAndWait` / `suggestConfigAndWait` | create + wait + collect results |
 | `health()` | `GET /health` |
 
 ### Jobs
@@ -106,6 +107,17 @@ const result = await scrapix.extractAndWait({
   prompt: "The title and author of each post",
 });
 console.log(result.extract.data);
+```
+
+Not sure which crawl features a site needs? Let the API propose a config
+(site type, JavaScript rendering, sections to skip, features per section),
+then crawl with it:
+
+```ts
+const { suggestion } = await scrapix.suggestConfigAndWait({ url: "https://shop.example.com" });
+console.log(suggestion.profile?.site_type); // e.g. "ecommerce"
+for (const { field, reason } of suggestion.reasons) console.log(field, "-", reason);
+if (suggestion.config) await scrapix.crawl(suggestion.config);
 ```
 
 ## Errors

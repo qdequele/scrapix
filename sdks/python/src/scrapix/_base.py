@@ -16,7 +16,13 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from ._generated.models import ExtractStatusResponse, JobResultItem, JobStatusResponse
+from ._generated.models import (
+    CrawlConfig,
+    ExtractStatusResponse,
+    JobResultItem,
+    JobStatusResponse,
+    SuggestStatusResponse,
+)
 from ._version import __version__
 
 logger = logging.getLogger("scrapix")
@@ -107,6 +113,10 @@ def job_path(job_id: str, suffix: str = "") -> str:
 
 def extract_path(job_id: str) -> str:
     return f"/extract/{quote(job_id, safe='')}"
+
+
+def suggest_path(job_id: str) -> str:
+    return f"/crawl/suggest/{quote(job_id, safe='')}"
 
 
 def is_terminal(status: Any) -> bool:
@@ -282,3 +292,18 @@ class ExtractJobResult(JobResult):
     @property
     def data(self) -> Any:
         return self.extract.data if self.extract is not None else None
+
+
+@dataclass
+class SuggestJobResult(JobResult):
+    """Outcome of :meth:`Scrapix.suggest_config_and_wait`: ``suggestion`` is
+    the ``GET /crawl/suggest/{id}`` response; ``documents`` are the pages it
+    sampled."""
+
+    suggestion: Optional[SuggestStatusResponse] = None
+
+    @property
+    def config(self) -> Optional[CrawlConfig]:
+        """The proposed crawl config, ``None`` unless completed. Pass it to
+        :meth:`Scrapix.crawl` as is, or edit it first."""
+        return self.suggestion.config if self.suggestion is not None else None

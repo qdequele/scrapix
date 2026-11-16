@@ -701,6 +701,7 @@ class JobKind(str, Enum):
     crawl = "crawl"
     batch_scrape = "batch_scrape"
     extract = "extract"
+    crawl_suggest = "crawl_suggest"
 
 
 class JobResultError(BaseModel):
@@ -1887,6 +1888,192 @@ class AiUsage(BaseModel):
     prompt_tokens: Optional[int] = Field(0, ge=0)
 
 
+class CreateSuggestResponse(BaseModel):
+    """
+    Response of `POST /crawl/suggest`
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    job_id: str
+    status: str
+
+
+class SectionKind(str, Enum):
+    """
+    What the pages of one section are.
+    """
+
+    product = "product"
+    listing = "listing"
+    article = "article"
+    docs = "docs"
+    support = "support"
+    marketing = "marketing"
+    archive = "archive"
+    legal = "legal"
+    account = "account"
+
+
+class SitePlatform(str, Enum):
+    """
+    The site builder or framework a page was made with.
+    """
+
+    shopify = "shopify"
+    woocommerce = "woocommerce"
+    magento = "magento"
+    prestashop = "prestashop"
+    bigcommerce = "bigcommerce"
+    salesforce_commerce = "salesforce_commerce"
+    docusaurus = "docusaurus"
+    mintlify = "mintlify"
+    gitbook = "gitbook"
+    readthedocs = "readthedocs"
+    mkdocs = "mkdocs"
+    vitepress = "vitepress"
+    nextra = "nextra"
+    ghost = "ghost"
+    zendesk = "zendesk"
+    discourse = "discourse"
+    webflow = "webflow"
+    framer = "framer"
+    wix = "wix"
+    squarespace = "squarespace"
+    wordpress = "wordpress"
+
+
+class SiteSection(BaseModel):
+    """
+    A section, classified.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    avg_headings: Optional[int] = Field(None, ge=0)
+    """
+    Average Markdown headings of its sampled pages.
+    """
+    avg_words: Optional[int] = Field(None, ge=0)
+    """
+    Average words of its sampled pages (`null` when none was sampled).
+    """
+    because: str
+    """
+    Why it got this kind.
+    """
+    key: str
+    kind: SectionKind
+    pages: int = Field(..., ge=0)
+    sampled: int = Field(..., ge=0)
+    """
+    Pages of it that were sampled.
+    """
+    schema_types: Optional[list[str]] = None
+    """
+    The useful schema.org types its sampled pages carry.
+    """
+    titles: Optional[list[str]] = None
+
+
+class SiteType(str, Enum):
+    """
+    What a whole site is.
+    """
+
+    ecommerce = "ecommerce"
+    blog = "blog"
+    docs = "docs"
+    marketing = "marketing"
+    support = "support"
+    mixed = "mixed"
+
+
+class SuggestEstimate(BaseModel):
+    """
+    What crawling with the config is expected to cost.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ai_extraction_pages: int = Field(..., ge=0)
+    """
+    Pages that get an AI extraction (one LLM call each).
+    """
+    ai_summary_pages: int = Field(..., ge=0)
+    """
+    Pages that get an AI summary (one LLM call each).
+    """
+    js_rendering: bool
+    """
+    Whether pages are rendered with a browser (slower, billed higher).
+    """
+    pages_found: int = Field(..., ge=0)
+    """
+    Pages the map found.
+    """
+    pages_to_crawl: Optional[int] = Field(None, ge=0)
+    """
+    Pages the config crawls (`null` when the number of pages is not
+    known: the sitemaps do not list them, or the site has more pages
+    than a map lists).
+    """
+
+
+class SuggestReason(BaseModel):
+    """
+    Why the config holds a value.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    field: str
+    """
+    The config field (dotted path), e.g. `features.block_split`.
+    """
+    reason: str
+
+
+class SuggestSample(BaseModel):
+    """
+    A page the analysis scraped.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    error: Optional[str] = None
+    """
+    Why it could not be
+    """
+    rendered_words: Optional[int] = Field(None, ge=0)
+    """
+    Words once rendered with a browser (JavaScript check only)
+    """
+    section: str
+    """
+    Its section key
+    """
+    success: bool
+    """
+    Whether the page was fetched
+    """
+    url: str
+    words: Optional[int] = Field(None, ge=0)
+    """
+    Words of its main content
+    """
+
+
 class Action3(BaseModel):
     """
     Scroll the page by `amount` viewport heights (default 1).
@@ -2382,6 +2569,88 @@ class ScrapeSelector(RootModel[Union[str, list[str], SelectorDefinition]]):
     """
 
 
+class SiteProfile(BaseModel):
+    """
+    What the site is.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ai_classified: bool
+    """
+    Whether the AI pass confirmed or corrected the classification
+    """
+    because: str
+    """
+    Why the site got this type
+    """
+    confidence: float
+    """
+    How sure the analysis is, from 0 to 1
+    """
+    description: Optional[str] = None
+    """
+    One sentence about the site (AI pass only)
+    """
+    languages: list[str]
+    """
+    Language path segments found (`fr`, `en-us`)
+    """
+    platform: Optional[SitePlatform] = None
+    sections: list[SiteSection]
+    """
+    The site's sections, largest first
+    """
+    site_type: SiteType
+    url: str
+    """
+    The URL analyzed (after redirects)
+    """
+
+
+class SuggestRequest(BaseModel):
+    """
+    Request body for `POST /crawl/suggest`
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ai: Optional[bool] = None
+    """
+    Confirm the classification with the AI provider (default true).
+    Without one (or with `false`), the deterministic analysis decides.
+    """
+    check_js: Optional[bool] = None
+    """
+    Render up to two pages that look like JavaScript app shells with a
+    browser to confirm the crawl needs one (default true; needs
+    Chrome/Chromium on the server and JS rendering on the plan).
+    """
+    max_samples: Optional[int] = Field(None, ge=0)
+    """
+    Pages sampled to analyze the site (default 8, max 20). Each is
+    billed as a `/scrape`.
+    """
+    model: Optional[str] = Field(None, examples=["openai/gpt-4o-mini"])
+    """
+    Model of the AI pass, from the team's Gateway; the default model
+    when absent
+    """
+    url: str = Field(..., examples=["https://example.com"])
+    """
+    The website. A path (`https://example.com/docs`) keeps the crawl
+    under it.
+    """
+    webhooks: Optional[list[WebhookConfig]] = None
+    """
+    Webhook subscriptions (same as a crawl's `webhooks`)
+    """
+
+
 class BatchScrapeRequest(BaseModel):
     """
     Request body for `POST /batch/scrape`. Every field besides `urls`,
@@ -2800,3 +3069,44 @@ class UpdateConfigRequest(BaseModel):
     cron_expression: Optional[str] = None
     description: Optional[str] = None
     name: Optional[str] = None
+
+
+class SuggestStatusResponse(BaseModel):
+    """
+    `GET /crawl/suggest/{id}` response
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    ai_usage: Optional[AiUsage] = None
+    """
+    The AI pass's LLM call and the provider cost the hosted AI gateway
+    reported for it, in micro-USD (billed by the gateway, not in the
+    job's credits). Omitted when no AI call was made.
+    """
+    config: Optional[CrawlConfig] = None
+    error: Optional[str] = None
+    """
+    Why the job failed
+    """
+    estimate: Optional[SuggestEstimate] = None
+    job_id: str
+    profile: Optional[SiteProfile] = None
+    reasons: list[SuggestReason]
+    """
+    Why the config holds each value
+    """
+    samples: list[SuggestSample]
+    """
+    The pages the analysis scraped
+    """
+    status: JobStatus
+    """
+    `running`, `completed`, `failed`, `cancelled` or `paused`
+    """
+    warnings: list[str]
+    """
+    Things to check before crawling
+    """

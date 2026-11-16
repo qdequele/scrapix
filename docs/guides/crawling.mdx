@@ -7,6 +7,10 @@ description: Crawl entire websites, discover links, and index all content to Mei
 
 Crawl jobs discover and follow links across multiple pages, extracting content and indexing it to Meilisearch. This guide covers common crawling patterns.
 
+## Start From a Suggested Config
+
+Not sure which features a site needs? [`POST /crawl/suggest`](/api-reference/crawl-suggest) maps the site, samples a few pages and proposes a config: JavaScript rendering or not, sections to skip, and Markdown, block splitting, schema.org, AI summary, PDFs and office documents scoped to the pages they suit, with a reason for each choice. Pass its `config` to `POST /crawl` as is, or edit it first.
+
 ## Your First Crawl
 
 ```bash

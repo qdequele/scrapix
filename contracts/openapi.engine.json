@@ -1033,6 +1033,110 @@
         ]
       }
     },
+    "/crawl/suggest": {
+      "post": {
+        "tags": [
+          "crawl"
+        ],
+        "summary": "Suggest a crawl config for a website",
+        "description": "Starts a job that maps the site, samples a few pages, checks whether it\nneeds JavaScript rendering, classifies it (ecommerce, blog, docs,\nmarketing, support or mixed; confirmed by the AI provider when there is\none) and proposes a crawl config: rendering, URL patterns, page cap,\nMarkdown, block splitting, schema.org, AI summary and extraction, PDFs\nand office documents, each scoped to the sections it suits, with a\nreason for every choice. Poll `GET /crawl/suggest/{id}` for the result.\nBilled as one or two `/map`s and one `/scrape` per sampled page.",
+        "operationId": "create_suggest",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SuggestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSuggestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Not enough credits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/crawl/suggest/{id}": {
+      "get": {
+        "tags": [
+          "crawl"
+        ],
+        "summary": "Get a config suggestion's status and result",
+        "operationId": "get_suggest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Suggest job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/crawl/sync": {
       "post": {
         "tags": [
@@ -2859,6 +2963,22 @@
           }
         }
       },
+      "CreateSuggestResponse": {
+        "type": "object",
+        "description": "Response of `POST /crawl/suggest`",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "CustomSelectorsConfig": {
         "type": "object",
         "description": "Custom CSS selector extraction",
@@ -3643,7 +3763,8 @@
         "enum": [
           "crawl",
           "batch_scrape",
-          "extract"
+          "extract",
+          "crawl_suggest"
         ]
       },
       "JobResultError": {
@@ -5226,6 +5347,21 @@
           }
         }
       },
+      "SectionKind": {
+        "type": "string",
+        "description": "What the pages of one section are.",
+        "enum": [
+          "product",
+          "listing",
+          "article",
+          "docs",
+          "support",
+          "marketing",
+          "archive",
+          "legal",
+          "account"
+        ]
+      },
       "SelectorDef": {
         "oneOf": [
           {
@@ -5369,6 +5505,174 @@
           }
         }
       },
+      "SitePlatform": {
+        "type": "string",
+        "description": "The site builder or framework a page was made with.",
+        "enum": [
+          "shopify",
+          "woocommerce",
+          "magento",
+          "prestashop",
+          "bigcommerce",
+          "salesforce_commerce",
+          "docusaurus",
+          "mintlify",
+          "gitbook",
+          "readthedocs",
+          "mkdocs",
+          "vitepress",
+          "nextra",
+          "ghost",
+          "zendesk",
+          "discourse",
+          "webflow",
+          "framer",
+          "wix",
+          "squarespace",
+          "wordpress"
+        ]
+      },
+      "SiteProfile": {
+        "type": "object",
+        "description": "What the site is.",
+        "required": [
+          "url",
+          "site_type",
+          "confidence",
+          "because",
+          "ai_classified",
+          "languages",
+          "sections"
+        ],
+        "properties": {
+          "ai_classified": {
+            "type": "boolean",
+            "description": "Whether the AI pass confirmed or corrected the classification"
+          },
+          "because": {
+            "type": "string",
+            "description": "Why the site got this type"
+          },
+          "confidence": {
+            "type": "number",
+            "format": "float",
+            "description": "How sure the analysis is, from 0 to 1"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One sentence about the site (AI pass only)"
+          },
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Language path segments found (`fr`, `en-us`)"
+          },
+          "platform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SitePlatform",
+                "description": "The site builder or framework, when recognized"
+              }
+            ]
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SiteSection"
+            },
+            "description": "The site's sections, largest first"
+          },
+          "site_type": {
+            "$ref": "#/components/schemas/SiteType"
+          },
+          "url": {
+            "type": "string",
+            "description": "The URL analyzed (after redirects)"
+          }
+        }
+      },
+      "SiteSection": {
+        "type": "object",
+        "description": "A section, classified.",
+        "required": [
+          "key",
+          "pages",
+          "kind",
+          "because",
+          "sampled"
+        ],
+        "properties": {
+          "avg_headings": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Average Markdown headings of its sampled pages.",
+            "minimum": 0
+          },
+          "avg_words": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Average words of its sampled pages (`null` when none was sampled).",
+            "minimum": 0
+          },
+          "because": {
+            "type": "string",
+            "description": "Why it got this kind."
+          },
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SectionKind"
+          },
+          "pages": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sampled": {
+            "type": "integer",
+            "description": "Pages of it that were sampled.",
+            "minimum": 0
+          },
+          "schema_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The useful schema.org types its sampled pages carry.",
+            "uniqueItems": true
+          },
+          "titles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SiteType": {
+        "type": "string",
+        "description": "What a whole site is.",
+        "enum": [
+          "ecommerce",
+          "blog",
+          "docs",
+          "marketing",
+          "support",
+          "mixed"
+        ]
+      },
       "SitemapConfig": {
         "type": "object",
         "description": "Sitemap discovery settings",
@@ -5384,6 +5688,237 @@
               "type": "string"
             },
             "description": "Explicit sitemap URLs to use"
+          }
+        }
+      },
+      "SuggestEstimate": {
+        "type": "object",
+        "description": "What crawling with the config is expected to cost.",
+        "required": [
+          "pages_found",
+          "js_rendering",
+          "ai_summary_pages",
+          "ai_extraction_pages"
+        ],
+        "properties": {
+          "ai_extraction_pages": {
+            "type": "integer",
+            "description": "Pages that get an AI extraction (one LLM call each).",
+            "minimum": 0
+          },
+          "ai_summary_pages": {
+            "type": "integer",
+            "description": "Pages that get an AI summary (one LLM call each).",
+            "minimum": 0
+          },
+          "js_rendering": {
+            "type": "boolean",
+            "description": "Whether pages are rendered with a browser (slower, billed higher)."
+          },
+          "pages_found": {
+            "type": "integer",
+            "description": "Pages the map found.",
+            "minimum": 0
+          },
+          "pages_to_crawl": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Pages the config crawls (`null` when the number of pages is not\nknown: the sitemaps do not list them, or the site has more pages\nthan a map lists).",
+            "minimum": 0
+          }
+        }
+      },
+      "SuggestReason": {
+        "type": "object",
+        "description": "Why the config holds a value.",
+        "required": [
+          "field",
+          "reason"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "The config field (dotted path), e.g. `features.block_split`."
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "SuggestRequest": {
+        "type": "object",
+        "description": "Request body for `POST /crawl/suggest`",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "ai": {
+            "type": "boolean",
+            "description": "Confirm the classification with the AI provider (default true).\nWithout one (or with `false`), the deterministic analysis decides."
+          },
+          "check_js": {
+            "type": "boolean",
+            "description": "Render up to two pages that look like JavaScript app shells with a\nbrowser to confirm the crawl needs one (default true; needs\nChrome/Chromium on the server and JS rendering on the plan)."
+          },
+          "max_samples": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Pages sampled to analyze the site (default 8, max 20). Each is\nbilled as a `/scrape`.",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model of the AI pass, from the team's Gateway; the default model\nwhen absent",
+            "example": "openai/gpt-4o-mini"
+          },
+          "url": {
+            "type": "string",
+            "description": "The website. A path (`https://example.com/docs`) keeps the crawl\nunder it.",
+            "example": "https://example.com"
+          },
+          "webhooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookConfig"
+            },
+            "description": "Webhook subscriptions (same as a crawl's `webhooks`)"
+          }
+        }
+      },
+      "SuggestSample": {
+        "type": "object",
+        "description": "A page the analysis scraped.",
+        "required": [
+          "url",
+          "section",
+          "success"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it could not be"
+          },
+          "rendered_words": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Words once rendered with a browser (JavaScript check only)",
+            "minimum": 0
+          },
+          "section": {
+            "type": "string",
+            "description": "Its section key"
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Whether the page was fetched"
+          },
+          "url": {
+            "type": "string"
+          },
+          "words": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Words of its main content",
+            "minimum": 0
+          }
+        }
+      },
+      "SuggestStatusResponse": {
+        "type": "object",
+        "description": "`GET /crawl/suggest/{id}` response",
+        "required": [
+          "job_id",
+          "status",
+          "reasons",
+          "samples",
+          "warnings"
+        ],
+        "properties": {
+          "ai_usage": {
+            "$ref": "#/components/schemas/AiUsage",
+            "description": "The AI pass's LLM call and the provider cost the hosted AI gateway\nreported for it, in micro-USD (billed by the gateway, not in the\njob's credits). Omitted when no AI call was made."
+          },
+          "config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CrawlConfig",
+                "description": "The proposed crawl config (`null` until the job completed): only\nthe fields it sets, every other field takes its default. Pass it\nto `POST /crawl` as is, or edit it first."
+              }
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job failed"
+          },
+          "estimate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SuggestEstimate",
+                "description": "What crawling with the config is expected to cost"
+              }
+            ]
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "profile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SiteProfile",
+                "description": "What the site is (`null` until the job completed)"
+              }
+            ]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SuggestReason"
+            },
+            "description": "Why the config holds each value"
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SuggestSample"
+            },
+            "description": "The pages the analysis scraped"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "`running`, `completed`, `failed`, `cancelled` or `paused`"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Things to check before crawling"
           }
         }
       },

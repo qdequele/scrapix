@@ -1,7 +1,7 @@
-//! What produced a job: a distributed crawl, a batch scrape (SCR-74) or an
-//! extraction (SCR-73).
+//! What produced a job: a distributed crawl, a batch scrape (SCR-74), an
+//! extraction (SCR-73) or a crawl config suggestion (SCR-95).
 //!
-//! All three share the job lifecycle (`JobState` in memory + the `jobs`
+//! All four share the job lifecycle (`JobState` in memory + the `jobs`
 //! table, `GET /job/{id}/status`, `/jobs`, SSE/WebSocket events, webhooks,
 //! `DELETE /job/{id}`), but only crawl jobs run through the Kafka pipeline
 //! and its work accounting. The kind is stored in the job's `config` blob
@@ -27,6 +27,9 @@ pub(crate) enum JobKind {
     /// `POST /extract`: pages are scraped by the API and one structured
     /// extraction is produced over all of them.
     Extract,
+    /// `POST /crawl/suggest`: a few pages are scraped by the API and a
+    /// crawl config is proposed for the site.
+    CrawlSuggest,
 }
 
 impl JobKind {
@@ -35,6 +38,7 @@ impl JobKind {
             JobKind::Crawl => "crawl",
             JobKind::BatchScrape => "batch_scrape",
             JobKind::Extract => "extract",
+            JobKind::CrawlSuggest => "crawl_suggest",
         }
     }
 
@@ -43,6 +47,7 @@ impl JobKind {
             "crawl" => Some(JobKind::Crawl),
             "batch_scrape" => Some(JobKind::BatchScrape),
             "extract" => Some(JobKind::Extract),
+            "crawl_suggest" => Some(JobKind::CrawlSuggest),
             _ => None,
         }
     }
@@ -80,7 +85,12 @@ mod tests {
 
     #[test]
     fn kind_round_trips_through_config() {
-        for kind in [JobKind::Crawl, JobKind::BatchScrape, JobKind::Extract] {
+        for kind in [
+            JobKind::Crawl,
+            JobKind::BatchScrape,
+            JobKind::Extract,
+            JobKind::CrawlSuggest,
+        ] {
             let mut job = JobState::new("j", "");
             let name = serde_json::to_value(kind).unwrap();
             job.config = Some(serde_json::json!({ JOB_TYPE_KEY: name }));
@@ -90,5 +100,6 @@ mod tests {
         assert!(JobKind::Crawl.is_pipeline());
         assert!(!JobKind::BatchScrape.is_pipeline());
         assert!(!JobKind::Extract.is_pipeline());
+        assert!(!JobKind::CrawlSuggest.is_pipeline());
     }
 }

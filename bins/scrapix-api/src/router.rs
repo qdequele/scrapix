@@ -186,7 +186,9 @@ pub(crate) fn build_router(state: Arc<AppState>, auth: &AuthMode) -> Router {
         .route("/search", post(search_url))
         .route("/crawl", post(create_crawl))
         .route("/crawl/sync", post(create_crawl_sync))
-        .route("/crawl/bulk", post(create_crawl_bulk));
+        .route("/crawl/bulk", post(create_crawl_bulk))
+        .route("/crawl/suggest", post(suggest::create_suggest))
+        .route("/crawl/suggest/{id}", get(suggest::get_suggest));
 
     // Management routes — job monitoring and configuration
     let management = Router::new()

@@ -10,6 +10,25 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **Suggest a crawl config from a URL (`POST /crawl/suggest`).** A job
+  scrapes the start page, maps the site, samples a few pages (8 by default)
+  and proposes a crawl config, polled with `GET /crawl/suggest/{id}`. It
+  groups the pages into sections, classifies each (product, listing,
+  article, docs, support, marketing, or archive, legal and account pages,
+  which are left out) and the site (ecommerce, blog, docs, marketing,
+  support or mixed) from schema.org types, dated URLs, section names and
+  the platform (Shopify, WooCommerce, Docusaurus, Mintlify, WordPress, …).
+  It renders up to two pages that look like JavaScript app shells to
+  decide on `crawler_type: browser`. The server's AI provider (hosted: the
+  team's AI gateway) confirms or corrects the classification when there is
+  one. The config scopes each feature to the sections it suits with
+  `include_pages`: schema.org on products, block splitting on long pages
+  with headings, AI summary on long articles and docs, AI extraction on
+  products without markup, PDFs and office documents when pages link to
+  them. It comes with a reason for each choice, an estimate (pages, browser
+  rendering, LLM calls) and warnings. Billed as one or two `/map`s and one
+  `/scrape` per sampled page. New job type `crawl_suggest`.
+
 - **Microdata in crawled documents.** The `schema` field of a crawled
   document now also carries the page's schema.org Microdata items
   (`itemscope` / `itemprop`), after its JSON-LD: until now only `/scrape`
@@ -265,6 +284,14 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   them at about twice its `limit` instead of 100,000 URLs.
 
 ### Fixed
+
+- **Sitemaps with images or videos lost their pages.** In a sitemap whose
+  `<url>` entries carry an `<image:image>` or `<video:video>` (every Shopify
+  store, among others), the image's `<image:loc>` replaced the page's
+  `<loc>`: crawls and `/map` got the images' CDN URLs instead of the product
+  pages. Only the `<url>`'s own `<loc>`, `<lastmod>`, `<changefreq>` and
+  `<priority>` are read now, and the same for `<sitemap>` entries of an
+  index.
 
 - **Microdata extraction** (`/scrape` `schema.microdata`, crawled
   documents). An item inside another item without `itemprop` is read as

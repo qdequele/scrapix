@@ -63,7 +63,7 @@ Responses are pydantic models (`ScrapeResponse`, `JobStatusResponse`, ...). All 
 
 ## Jobs
 
-`crawl`, `batch_scrape` and `extract` start a job and return its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
+`crawl`, `batch_scrape`, `extract` and `suggest_config` start a job and return its id immediately. A job ends in `completed`, `failed` or `cancelled` (`paused` is not terminal).
 
 | Helper | What it does |
 |--------|--------------|
@@ -71,7 +71,7 @@ Responses are pydantic models (`ScrapeResponse`, `JobStatusResponse`, ...). All 
 | `iter_job_status(job_id, poll_interval=2)` | yields every polled status, ending with the terminal one |
 | `wait_for_job(job_id, poll_interval=2, timeout=None, on_progress=None)` | blocks until terminal, returns the final status |
 | `iter_job_results(job_id, page_size=100, wait=False)` | every result, following the `next` cursor |
-| `crawl_and_wait(...)`, `batch_scrape_and_wait(...)`, `extract_and_wait(...)` | start + wait + read all results |
+| `crawl_and_wait(...)`, `batch_scrape_and_wait(...)`, `extract_and_wait(...)`, `suggest_config_and_wait(...)` | start + wait + read all results |
 | `cancel_job`, `pause_job`, `resume_job`, `list_jobs` | job control |
 
 ```python
@@ -84,6 +84,12 @@ extraction = client.extract_and_wait(
     ["https://example.com/blog/*"], prompt="The title and author of each post"
 )
 print(extraction.data)
+
+# Propose a crawl config for a site (see /api-reference/crawl-suggest), then crawl with it
+suggestion = client.suggest_config_and_wait("https://shop.example.com")
+for reason in suggestion.suggestion.reasons:
+    print(reason.field, "-", reason.reason)
+client.crawl(suggestion.config)
 ```
 
 A failed or cancelled job is returned, not raised: check `result.succeeded`. `iter_job_results` on a running job stops once it caught up with the results so far; `wait=True` keeps polling until the job ends.
