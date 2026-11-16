@@ -347,7 +347,7 @@ pub(crate) async fn results_page(
     // result was written before the read started, so `next: null` is safe.
     let slice = match kind {
         JobKind::Crawl => crawl_results(state, job, start, limit).await?,
-        JobKind::BatchScrape | JobKind::Extract => {
+        JobKind::BatchScrape | JobKind::Extract | JobKind::CrawlSuggest => {
             stored_results(state, &job.job_id, start, limit).await?
         }
     };

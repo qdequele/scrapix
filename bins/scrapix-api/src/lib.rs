@@ -70,6 +70,7 @@ pub mod openapi;
 pub(crate) mod results;
 pub(crate) mod router;
 pub mod settings;
+pub(crate) mod suggest;
 pub(crate) mod usage_units;
 pub mod webhooks;
 
@@ -5866,6 +5867,17 @@ async fn map_url(
         )?;
     }
 
+    run_map(&state, &account_ctx, request).await.map(Json)
+}
+
+/// The map itself, after the caller's pre-flight: validation, discovery,
+/// the request event and the map's usage (`POST /map`, and the discovery
+/// step of `POST /crawl/suggest`).
+pub(crate) async fn run_map(
+    state: &Arc<AppState>,
+    account_ctx: &Option<AccountContext>,
+    request: MapRequest,
+) -> Result<MapResponse, ApiError> {
     let start_time = std::time::Instant::now();
 
     // Validate URL
@@ -6197,15 +6209,15 @@ async fn map_url(
 
     // Report the charge for a successful map to the Lab.
     if let Some(ref ctx) = account_ctx {
-        record_map_usage(&state, ctx, &request.url, total).await;
+        record_map_usage(state, ctx, &request.url, total).await;
     }
 
-    Ok(Json(MapResponse {
+    Ok(MapResponse {
         success: true,
         links,
         total,
         duration_ms,
-    }))
+    })
 }
 
 // ============================================================================

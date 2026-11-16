@@ -1,0 +1,158 @@
+---
+title: Suggest a crawl config
+description: Propose a ready-to-run crawl config for a website from its URL
+---
+
+# Suggest a crawl config
+
+`POST /crawl/suggest` looks at a website and proposes a [crawl config](/api-reference/crawl) for it: what kind of site it is (ecommerce, blog, docs, marketing, support or mixed), whether it needs JavaScript rendering, which sections to skip, and which features suit which pages (Markdown, block splitting, schema.org, AI summary, AI extraction, PDFs, office documents). Every choice comes with a reason.
+
+It runs as a job: `POST /crawl/suggest` returns a `job_id`, and you poll `GET /crawl/suggest/{id}` for the result, usually within a minute. The job shows up in `GET /jobs`, streams events, delivers webhooks and can be cancelled with `DELETE /job/{id}`. The pages it sampled are available from [`GET /job/{id}/results`](/api-reference/jobs#get-job-id-results).
+
+## How it works
+
+1. **Start page.** The URL is scraped first, so a redirect (`example.com` → `www.example.com/en/`) is followed.
+2. **Map.** The site's URLs are listed like [`/map`](/api-reference/map) does, from its sitemaps, up to 2,000 URLs. When they list fewer than 20 pages under the URL's path (no sitemap, or one filled with other parts of the site), the start page's links are followed one level deep too. The pages under the URL's path are grouped into **sections** by their first path segment, after a language segment (`/fr/blog/x` is in `/blog/`; a lone two-letter segment such as `/uk/` counts as a language only next to other languages, a region form such as `/es-us/` always does). Top-level pages make the `/` section; past 15 sections, the smallest merge into `*`. The page count is known when the sitemaps list the pages and the map did not stop at its limit; otherwise `max_pages` is left unset and AI features are left off (each costs one LLM call per page), with a warning.
+3. **Samples.** A few pages (8 by default) are scraped across the largest sections. Each page reports its length, headings, schema.org types (JSON-LD and Microdata), the platform it was built with (Shopify, WooCommerce, Docusaurus, Mintlify, WordPress, …), the PDFs and office documents it links to, and whether its HTTP response looks like a JavaScript app shell.
+4. **JavaScript check.** Up to two pages that look like app shells are rendered with a browser. If one shows much more text once rendered, the config uses `crawler_type: browser`. When pages cannot be rendered (no browser on the server, a plan without JS rendering, or `check_js: false`), a majority of app shells is enough, and a warning says the choice was not verified.
+5. **Classification.** Each section gets a kind from, in order: `Product` markup; the platform its own pages were built with (a Zendesk help center, Docusaurus docs, a Ghost blog); article, docs and Q&A markup (FAQ markup only where nothing else says what the pages are, since landing pages carry it too); dated URLs (`/2024/05/…`); its name. The kinds are `product`, `listing`, `article`, `docs`, `support`, `marketing`, or one of the kinds left out of the crawl: `archive` (tag, author, pagination, and older versions of versioned docs such as `/3.8.1/` next to the current ones), `legal`, `account` (login, cart, checkout, search). `/products/` or `/category/` pages count as products and listings only on a shop (a shop platform or `Product` markup), otherwise as marketing pages and archives. The site's type follows from the share of pages of each kind; a platform decides it only when two thirds of the sampled pages were built with it. When an AI provider is available, one LLM call reads the sections, their titles and page excerpts, and confirms or corrects the kinds.
+6. **Proposal.** The config, its reasons, an estimate and warnings.
+
+| Section kind | What the config does |
+|---|---|
+| `product` | schema.org on (`Product`, `Offer`, …). Without `Product` markup, an AI extraction of price, brand and availability (up to 2,000 pages, otherwise a warning suggests custom selectors). No block splitting: one document per product |
+| `listing` | Crawled for discovery. On a shop, URLs with a query string (filters, sorting) are skipped when the site's own URLs don't use them |
+| `article`, `docs`, `support`, `marketing` | Block splitting for long pages with headings (300+ words). AI summary for long articles and docs (800+ words, up to 2,000 pages, when the page count is known) unless the AI pass advises against it. schema.org with dates as timestamps when pages carry `Article`, `Event`, … |
+| `archive`, `legal`, `account` | Left out with `url_patterns.exclude` |
+
+PDFs and office documents are turned on when the sampled pages link to them on two pages at least, or to three documents (a single download link, such as a docs site's EPUB, does not count).
+
+Each feature is scoped to its sections with `include_pages` (or `exclude_pages`), so one config serves a mixed site: product schema on `/products/**`, block splitting on `/docs/**` and `/blog/**`.
+
+<Note>
+  AI is optional. Standalone, the server's AI provider is used when `AI_PROVIDER` is set; hosted, your team's AI gateway (see [AI enrichment](/guides/ai-enrichment)). Without one, or with `"ai": false`, the deterministic classification decides and a warning says so.
+</Note>
+
+## POST /crawl/suggest
+
+### Request Body
+
+```json
+{
+  "url": "https://shop.example.com",
+  "max_samples": 8
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | **required** | The website. A path (`https://example.com/docs`) keeps the crawl under it |
+| `max_samples` | integer | `8` | Pages sampled, 1 to 20. Each is billed as a `/scrape` |
+| `ai` | boolean | `true` | Confirm the classification with the AI provider |
+| `model` | string | — | Model of the AI pass. Hosted: a model id from the team's AI gateway, as `provider/model`. Standalone: a model of the server's provider |
+| `check_js` | boolean | `true` | Render up to two suspected app-shell pages with a browser to confirm the site needs one |
+| `webhooks` | object[] | `[]` | Webhook subscriptions, same format as a crawl's |
+
+### Response
+
+```json
+{ "job_id": "7c1e9a52-0b8e-4c4f-9b0a-5d3c1f2e8a77", "status": "running" }
+```
+
+## GET /crawl/suggest/{id}
+
+```json
+{
+  "job_id": "7c1e9a52-0b8e-4c4f-9b0a-5d3c1f2e8a77",
+  "status": "completed",
+  "config": {
+    "start_urls": ["https://shop.example.com/"],
+    "index_uid": "shop-example-com",
+    "url_patterns": {
+      "allowed_domains": ["shop.example.com"],
+      "exclude": [
+        "*://shop.example.com/account", "*://shop.example.com/account/**", "*://shop.example.com/account?**",
+        "*://shop.example.com/**?**"
+      ]
+    },
+    "max_pages": 1074,
+    "features": {
+      "metadata": { "enabled": true },
+      "markdown": { "enabled": true },
+      "block_split": {
+        "enabled": true,
+        "include_pages": ["*://shop.example.com/blog", "*://shop.example.com/blog/**", "*://shop.example.com/blog?**"]
+      },
+      "schema": {
+        "enabled": true,
+        "include_pages": ["*://shop.example.com/products", "*://shop.example.com/products/**", "*://shop.example.com/products?**"],
+        "only_types": ["AggregateRating", "BreadcrumbList", "Offer", "Product"]
+      },
+      "pdf": { "enabled": true }
+    }
+  },
+  "profile": {
+    "url": "https://shop.example.com/",
+    "site_type": "ecommerce",
+    "confidence": 0.7,
+    "because": "built with shopify, 91% of the pages are ecommerce",
+    "platform": "shopify",
+    "description": "An online shoe shop.",
+    "ai_classified": true,
+    "languages": [],
+    "sections": [
+      { "key": "/products/", "pages": 880, "kind": "product", "because": "pages carry schema.org `Product`", "schema_types": ["Offer", "Product"], "avg_words": 140, "avg_headings": 1, "sampled": 3, "titles": ["Trail Runner 2"] },
+      { "key": "/blog/", "pages": 64, "kind": "article", "because": "`/blog/` pages are usually article", "avg_words": 1120, "avg_headings": 6, "sampled": 2 },
+      { "key": "/account/", "pages": 12, "kind": "account", "because": "`/account/` pages are account", "avg_words": null, "avg_headings": null, "sampled": 0 }
+    ]
+  },
+  "reasons": [
+    { "field": "crawler_type", "reason": "HTTP is enough: sampled pages carry their text without JavaScript" },
+    { "field": "url_patterns.exclude", "reason": "skips pages not worth searching: `/account/` (account) (12 pages)" },
+    { "field": "features.schema", "reason": "`/products/` carry schema.org `Offer`, `Product`: indexed as fields to filter and facet on" }
+  ],
+  "estimate": {
+    "pages_found": 980,
+    "pages_to_crawl": 968,
+    "js_rendering": false,
+    "ai_summary_pages": 0,
+    "ai_extraction_pages": 0
+  },
+  "samples": [
+    { "url": "https://shop.example.com/", "section": "/", "success": true, "words": 220 }
+  ],
+  "warnings": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status` | `running`, `completed`, `failed`, `cancelled` or `paused` |
+| `config` | The proposed crawl config, `null` until the job completed. Only the fields it sets; every other field takes its default. Pass it to [`POST /crawl`](/api-reference/crawl) as is, or edit it first |
+| `profile` | What the site is: `site_type`, `confidence` (0 to 1), `because`, `platform`, `description` (AI pass only), `ai_classified`, `languages` and the classified `sections` |
+| `reasons` | `{ field, reason }` for every decision, `field` being the config path (`features.block_split`) |
+| `estimate` | `pages_found`, `pages_to_crawl` (`null` when the number of pages is not known), `js_rendering`, and the pages that get an AI summary or extraction (one LLM call each) |
+| `samples` | The pages scraped, with their words (and `rendered_words` for those the JavaScript check rendered) |
+| `warnings` | Things to check before crawling: an unverified browser choice, no AI provider, AI features left off for cost, a redirect |
+| `error` | Why the job failed (e.g. the start page could not be fetched) |
+| `ai_usage` | The AI pass's LLM call and its gateway cost, when one was made |
+
+## Billing
+
+A suggestion costs what its steps cost: one `/map` (two when the map follows the start page's links), and one `/scrape` per sampled page, plus a JS-rendered scrape per page the JavaScript check renders. Hosted, the AI pass is billed by your team's AI gateway.
+
+## Example
+
+```bash
+JOB=$(curl -s -X POST "$SCRAPIX_URL/crawl/suggest" \
+  -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://docs.example.com"}' | jq -r .job_id)
+
+# Poll until completed, then start the crawl with the proposed config
+curl -s "$SCRAPIX_URL/crawl/suggest/$JOB" -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+  | jq '.config' \
+  | curl -s -X POST "$SCRAPIX_URL/crawl" \
+      -H "Authorization: Bearer $SCRAPIX_API_KEY" \
+      -H "Content-Type: application/json" -d @-
+```
