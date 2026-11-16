@@ -431,16 +431,25 @@ impl SitemapParser {
 
         let mut current_url: Option<SitemapUrl> = None;
         let mut current_tag = String::new();
+        // Element depth, and that of the open `<url>`: only its direct
+        // children are read, so an extension's `<image:loc>` or
+        // `<video:loc>` (same local name) never replaces the page's `<loc>`.
+        let mut depth = 0usize;
+        let mut url_depth = None;
 
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
+                    depth += 1;
                     let name = e.name();
                     let local = String::from_utf8_lossy(name.local_name().as_ref()).to_string();
                     current_tag = local.clone();
 
-                    if local == "url" {
+                    if local == "url" && url_depth.is_none() {
                         current_url = Some(SitemapUrl::new(""));
+                        url_depth = Some(depth);
+                    } else if url_depth.is_some_and(|d| depth != d + 1) {
+                        current_tag.clear();
                     }
                 }
                 Ok(Event::Text(e)) => {
@@ -464,13 +473,15 @@ impl SitemapParser {
                 Ok(Event::End(e)) => {
                     let name = e.name();
                     let local = String::from_utf8_lossy(name.local_name().as_ref()).to_string();
-                    if local == "url" {
+                    if local == "url" && url_depth == Some(depth) {
                         if let Some(url) = current_url.take() {
                             if !url.loc.is_empty() {
                                 urls.push(url);
                             }
                         }
+                        url_depth = None;
                     }
+                    depth = depth.saturating_sub(1);
                     current_tag.clear();
                 }
                 Ok(Event::Eof) => break,
@@ -493,19 +504,26 @@ impl SitemapParser {
 
         let mut current_entry: Option<SitemapEntry> = None;
         let mut current_tag = String::new();
+        // As in `parse_urlset`: only the direct children of `<sitemap>`.
+        let mut depth = 0usize;
+        let mut entry_depth = None;
 
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
+                    depth += 1;
                     let name = e.name();
                     let local = String::from_utf8_lossy(name.local_name().as_ref()).to_string();
                     current_tag = local.clone();
 
-                    if local == "sitemap" {
+                    if local == "sitemap" && entry_depth.is_none() {
                         current_entry = Some(SitemapEntry {
                             loc: String::new(),
                             lastmod: None,
                         });
+                        entry_depth = Some(depth);
+                    } else if entry_depth.is_some_and(|d| depth != d + 1) {
+                        current_tag.clear();
                     }
                 }
                 Ok(Event::Text(e)) => {
@@ -523,13 +541,15 @@ impl SitemapParser {
                 Ok(Event::End(e)) => {
                     let name = e.name();
                     let local = String::from_utf8_lossy(name.local_name().as_ref()).to_string();
-                    if local == "sitemap" {
+                    if local == "sitemap" && entry_depth == Some(depth) {
                         if let Some(entry) = current_entry.take() {
                             if !entry.loc.is_empty() {
                                 entries.push(entry);
                             }
                         }
+                        entry_depth = None;
                     }
+                    depth = depth.saturating_sub(1);
                     current_tag.clear();
                 }
                 Ok(Event::Eof) => break,
@@ -645,6 +665,60 @@ mod tests {
             }
             _ => panic!("Expected UrlSet"),
         }
+    }
+
+    /// Shopify (and image / video sitemaps in general) put an
+    /// `<image:loc>` inside each `<url>`: it must not replace the page's
+    /// `<loc>`.
+    #[test]
+    fn test_parse_urlset_ignores_extension_locs() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+                xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"
+                xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+            <url>
+                <loc>https://shop.test/products/shoe</loc>
+                <lastmod>2024-01-15</lastmod>
+                <image:image>
+                    <image:loc>https://cdn.test/shoe.png</image:loc>
+                    <image:title>Shoe</image:title>
+                </image:image>
+            </url>
+            <url>
+                <image:image><image:loc>https://cdn.test/first.png</image:loc></image:image>
+                <loc>https://shop.test/products/boot</loc>
+                <video:video><video:content_loc>https://cdn.test/v.mp4</video:content_loc></video:video>
+            </url>
+        </urlset>"#;
+
+        let parser = SitemapParser::with_defaults();
+        let result = parser.parse_xml(xml).unwrap();
+        let SitemapContent::UrlSet(urls) = result else {
+            panic!("Expected UrlSet");
+        };
+        let locs: Vec<&str> = urls.iter().map(|u| u.loc.as_str()).collect();
+        assert_eq!(
+            locs,
+            [
+                "https://shop.test/products/shoe",
+                "https://shop.test/products/boot"
+            ]
+        );
+        assert!(urls[0].lastmod.is_some());
+    }
+
+    /// A sitemap whose own namespace has a prefix still parses.
+    #[test]
+    fn test_parse_prefixed_urlset() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <sm:urlset xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <sm:url><sm:loc>https://example.com/a</sm:loc></sm:url>
+        </sm:urlset>"#;
+        let SitemapContent::UrlSet(urls) = SitemapParser::with_defaults().parse_xml(xml).unwrap()
+        else {
+            panic!("Expected UrlSet");
+        };
+        assert_eq!(urls[0].loc, "https://example.com/a");
     }
 
     #[test]
