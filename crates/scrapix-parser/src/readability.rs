@@ -146,12 +146,19 @@ fn find_main_content(document: &Html, config: &ReadabilityConfig) -> Option<Stri
         ".post-content",
     ];
 
+    // The first semantic element with some text, kept when nothing scores
+    // better: a short `<main>` is still the page's content, the whole body
+    // (skip links, menus) is not.
+    let mut short_semantic: Option<String> = None;
     for selector_str in &semantic_selectors {
         if let Ok(selector) = Selector::parse(selector_str) {
             if let Some(element) = document.select(&selector).next() {
                 let content = extract_element_content(&element, config);
                 if content.len() > 200 {
                     return Some(content);
+                }
+                if short_semantic.is_none() && !content.trim().is_empty() {
+                    short_semantic = Some(content);
                 }
             }
         }
@@ -175,7 +182,7 @@ fn find_main_content(document: &Html, config: &ReadabilityConfig) -> Option<Stri
         }
     }
 
-    None
+    short_semantic
 }
 
 /// Score an element based on content likelihood
@@ -185,18 +192,18 @@ fn score_element(element: &ElementRef, config: &ReadabilityConfig) -> f64 {
     // Get class and id attributes
     let class = element.value().attr("class").unwrap_or("");
     let id = element.value().attr("id").unwrap_or("");
-    let combined = format!("{} {}", class, id).to_lowercase();
+    let combined = format!("{} {}", class, id);
 
     // Negative indicators
     for neg in &config.negative_classes {
-        if combined.contains(neg) {
+        if names_any(&combined, std::slice::from_ref(neg)) {
             score -= 25.0;
         }
     }
 
     // Positive indicators
     for pos in &config.positive_classes {
-        if combined.contains(pos) {
+        if names_any(&combined, std::slice::from_ref(pos)) {
             score += 25.0;
         }
     }
@@ -237,9 +244,168 @@ fn extract_element_content(element: &ElementRef, config: &ReadabilityConfig) -> 
     // Build list of tags to skip
     let skip_tags: Vec<&str> = config.remove_tags.iter().map(|s| s.as_str()).collect();
 
-    extract_text_recursive(element, &skip_tags, config, &mut parts);
+    // The element was chosen as the page's content (`<main>`, `<article>`,
+    // the best-scored block): its own classes do not veto it, only its
+    // descendants' do. `<main class="… group-data-[menu=opened]/body:hidden">`
+    // is the content, not a menu.
+    extract_text_inner(element, &skip_tags, config, &mut parts);
 
     parts.join("\n\n")
+}
+
+/// Whether a `class` (or `id`) attribute names one of `keywords`, word by
+/// word: `ad-banner`, `main-nav`, `navbar`, `sidebar-left` and `megamenu`
+/// do, `address`, `shadow-md`, `downloads` and `navy` do not. A word names a
+/// keyword when it is the keyword, its plural, or a compound starting with
+/// it (`navbar`) or, for keywords of four letters or more, ending with it
+/// (`megamenu`).
+///
+/// Tokens with a `:` are left out: a Tailwind variant (`md:hidden`,
+/// `group-data-[menu=opened]/body:hidden`) styles the element in some state,
+/// it does not say what the element is.
+fn names_any(attr: &str, keywords: &[String]) -> bool {
+    attr.split_whitespace()
+        .filter(|token| !token.contains(':'))
+        .flat_map(|token| token.split(|c: char| !c.is_ascii_alphanumeric()))
+        .flat_map(camel_words)
+        .any(|word| {
+            let word = word.to_ascii_lowercase();
+            keywords.iter().any(|keyword| names(&word, keyword))
+        })
+}
+
+/// `mainNav` -> `main`, `Nav`; `sidebar` -> `sidebar`.
+fn camel_words(word: &str) -> Vec<&str> {
+    let bytes = word.as_bytes();
+    let mut words = Vec::new();
+    let mut start = 0;
+    for i in 1..bytes.len() {
+        if bytes[i].is_ascii_uppercase() && bytes[i - 1].is_ascii_lowercase() {
+            words.push(&word[start..i]);
+            start = i;
+        }
+    }
+    if start < bytes.len() {
+        words.push(&word[start..]);
+    }
+    words
+}
+
+fn names(word: &str, keyword: &str) -> bool {
+    word == keyword
+        || word.strip_suffix('s') == Some(keyword)
+        || (keyword.len() >= 3 && word.len() >= keyword.len() + 3 && word.starts_with(keyword))
+        || (keyword.len() >= 4 && word.len() >= keyword.len() + 3 && word.ends_with(keyword))
+}
+
+/// Whether the element's own classes name a non-content block (sidebar,
+/// navigation, ads, ...).
+fn is_negative(element: &ElementRef, config: &ReadabilityConfig) -> bool {
+    element
+        .value()
+        .attr("class")
+        .is_some_and(|class| names_any(class, &config.negative_classes))
+}
+
+/// The display utilities a responsive variant can show a hidden element
+/// with (`hidden md:block`, Bootstrap's `d-none d-md-flex`).
+const SHOWN_AS: &[&str] = &[
+    "block",
+    "flex",
+    "grid",
+    "inline",
+    "inline-block",
+    "inline-flex",
+    "inline-grid",
+    "table",
+    "contents",
+    "flow-root",
+];
+
+/// Whether the element is not shown: the `hidden` attribute,
+/// `aria-hidden="true"`, an inline `display: none`, or a `hidden` /
+/// `d-none` / `sr-only` / `visually-hidden` class that no responsive
+/// variant turns back on.
+fn is_hidden(element: &ElementRef) -> bool {
+    let el = element.value();
+    if el.attr("hidden").is_some() || el.attr("aria-hidden") == Some("true") {
+        return true;
+    }
+    if let Some(style) = el.attr("style") {
+        let style: String = style
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if style.contains("display:none") || style.contains("visibility:hidden") {
+            return true;
+        }
+    }
+    let Some(class) = el.attr("class") else {
+        return false;
+    };
+    let mut hidden = false;
+    for token in class.split_whitespace() {
+        match token {
+            "hidden" | "d-none" | "sr-only" | "visually-hidden" | "screen-reader-text" => {
+                hidden = true
+            }
+            _ => {
+                // `md:block`, `d-md-block`: shown on some screens (printing
+                // is not one).
+                let shown = match token.rsplit_once(':') {
+                    Some((variant, utility)) => {
+                        !variant.contains("print") && SHOWN_AS.contains(&utility)
+                    }
+                    None => token.strip_prefix("d-").is_some_and(|rest| {
+                        rest.split_once('-').is_some_and(|(breakpoint, display)| {
+                            breakpoint != "print" && SHOWN_AS.contains(&display)
+                        })
+                    }),
+                };
+                if shown {
+                    return false;
+                }
+            }
+        }
+    }
+    hidden
+}
+
+/// Elements whose text is a block of its own: their text is set apart from
+/// the text around them (`<dt>About</dt><dd>The hotel…</dd>` reads
+/// "About The hotel…", not "AboutThe hotel…").
+fn is_block(tag: &str) -> bool {
+    matches!(
+        tag,
+        "address"
+            | "article"
+            | "blockquote"
+            | "br"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "figcaption"
+            | "figure"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "hr"
+            | "li"
+            | "main"
+            | "ol"
+            | "p"
+            | "section"
+            | "table"
+            | "td"
+            | "th"
+            | "tr"
+            | "ul"
+    )
 }
 
 /// Collect visible text from an element, skipping unwanted child tags.
@@ -249,16 +415,37 @@ fn extract_element_content(element: &ElementRef, config: &ReadabilityConfig) -> 
 /// collect text inside `<script>`, `<style>`, etc.
 fn filtered_text(element: &ElementRef, skip_tags: &[&str]) -> String {
     let mut buf = String::new();
-    filtered_text_recursive(element, skip_tags, &mut buf);
+    filtered_text_recursive(element, skip_tags, false, &mut buf);
     buf
 }
 
-fn filtered_text_recursive(element: &ElementRef, skip_tags: &[&str], buf: &mut String) {
+/// [`filtered_text`] for prose: hidden elements left out, blocks set apart,
+/// whitespace collapsed.
+fn block_text(element: &ElementRef, skip_tags: &[&str]) -> String {
+    let mut buf = String::new();
+    filtered_text_recursive(element, skip_tags, true, &mut buf);
+    buf.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn filtered_text_recursive(
+    element: &ElementRef,
+    skip_tags: &[&str],
+    prose: bool,
+    buf: &mut String,
+) {
     for child in element.children() {
         if let Some(child_element) = ElementRef::wrap(child) {
             let tag = child_element.value().name();
-            if !skip_tags.contains(&tag) {
-                filtered_text_recursive(&child_element, skip_tags, buf);
+            if skip_tags.contains(&tag) || (prose && is_hidden(&child_element)) {
+                continue;
+            }
+            let block = prose && is_block(tag);
+            if block {
+                buf.push(' ');
+            }
+            filtered_text_recursive(&child_element, skip_tags, prose, buf);
+            if block {
+                buf.push(' ');
             }
         } else if let Some(text) = child.value().as_text() {
             buf.push_str(text);
@@ -275,46 +462,48 @@ fn extract_text_recursive(
 ) {
     let tag_name = element.value().name();
 
-    // Skip unwanted tags
-    if skip_tags.contains(&tag_name) {
+    // Skip unwanted tags, hidden elements and non-content blocks
+    if skip_tags.contains(&tag_name) || is_hidden(element) || is_negative(element, config) {
         return;
     }
 
-    // Check for negative classes
-    if let Some(class) = element.value().attr("class") {
-        let class_lower = class.to_lowercase();
-        for neg in &config.negative_classes {
-            if class_lower.contains(neg) {
-                return;
-            }
-        }
-    }
+    extract_text_inner(element, skip_tags, config, parts);
+}
+
+/// [`extract_text_recursive`] once the element itself is kept.
+fn extract_text_inner(
+    element: &ElementRef,
+    skip_tags: &[&str],
+    config: &ReadabilityConfig,
+    parts: &mut Vec<String>,
+) {
+    let tag_name = element.value().name();
 
     // Handle block-level elements
     match tag_name {
         "p" | "div" | "section" | "article" | "blockquote" | "li" => {
-            let text = filtered_text(element, skip_tags);
-            let text = text.trim();
+            let text = block_text(element, skip_tags);
             if text.len() >= config.min_paragraph_length {
-                parts.push(text.to_string());
+                parts.push(text);
             }
         }
         // Plain text: no markdown markers (`#`, `- `, fences). The output
         // is the documents' `content`, documented as plain text; `markdown`
         // is built from the HTML separately.
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-            let text = filtered_text(element, skip_tags);
-            let text = text.trim();
+            let text = block_text(element, skip_tags);
             if !text.is_empty() {
-                parts.push(text.to_string());
+                parts.push(text);
             }
         }
         "ul" | "ol" => {
             for li in element.select(li_selector()) {
-                let text = filtered_text(&li, skip_tags);
-                let text = text.trim();
+                if is_hidden(&li) {
+                    continue;
+                }
+                let text = block_text(&li, skip_tags);
                 if !text.is_empty() {
-                    parts.push(text.to_string());
+                    parts.push(text);
                 }
             }
         }
@@ -346,17 +535,8 @@ fn collect_filtered_text(
 ) {
     let tag_name = element.value().name();
 
-    if skip_tags.contains(&tag_name) {
+    if skip_tags.contains(&tag_name) || is_hidden(element) || is_negative(element, config) {
         return;
-    }
-
-    if let Some(class) = element.value().attr("class") {
-        let class_lower = class.to_lowercase();
-        for neg in &config.negative_classes {
-            if class_lower.contains(neg) {
-                return;
-            }
-        }
     }
 
     for child in element.children() {
@@ -599,11 +779,110 @@ mod tests {
             </html>
         "#;
         let content = extract_content(html);
-        // Known issue: "address" gets penalized because "ad" substring matches.
-        // This test documents the behavior. If the content is empty, it means
-        // the false positive is affecting extraction.
-        // For now, we just document this — a fix would use word-boundary matching.
-        let _ = content; // Document that this is a known design issue
+        assert!(content.contains("123 Main Street"), "{content}");
+    }
+
+    #[test]
+    fn classes_are_matched_word_by_word() {
+        let negative = ReadabilityConfig::default().negative_classes;
+        for class in [
+            "ad-banner",
+            "ads",
+            "main-nav",
+            "navbar",
+            "sidebar-left",
+            "site_footer",
+            "megamenu",
+            "breadcrumbs",
+            "mainNav",
+        ] {
+            assert!(names_any(class, &negative), "{class}");
+        }
+        for class in [
+            "address",
+            "shadow-md",
+            "rounded-lg loading",
+            "downloads",
+            "threads",
+            "bg-navy-500",
+            "md:hidden",
+            "group-data-[menu=opened]/body:hidden",
+            "gradient",
+        ] {
+            assert!(!names_any(class, &negative), "{class}");
+        }
+    }
+
+    /// A Next.js + Tailwind page (nous-larochelle.fr): skip links before a
+    /// `<main>` whose class hides it while the menu is open. The class used
+    /// to veto the whole `<main>` ("menu"), leaving "Skip to main content".
+    #[test]
+    fn tailwind_main_hidden_while_the_menu_is_open_is_the_content() {
+        let html = r##"
+            <html><body class="group/body" data-menu="closed">
+              <ul>
+                <li><a class="fixed -translate-y-full focus:translate-y-0" href="#main-content">Skip to main content</a></li>
+                <li><a class="fixed -translate-y-full focus:translate-y-0" href="#footer">Skip to footer</a></li>
+              </ul>
+              <header><nav><a href="/en">Home</a><a href="/en/inspiration">Inspiration</a></nav></header>
+              <main id="main-content" class="group-data-[menu=opened]/body:hidden" role="main">
+                <div class="shadow-md rounded-lg">
+                  <h1>Hôtel de la Paix</h1>
+                  <figure><img src="a.jpg"><figcaption><p class="text-ellipsis hidden">bjc</p></figcaption></figure>
+                  <dl><dt>About</dt><dd>The 2-star Hotel de La Paix is located in La Rochelle, close to the Musée du Nouveau Monde, a short walk from the Old Port and its towers.</dd></dl>
+                  <p class="hidden md:block">Public parking is available nearby, 100 meters from the hotel entrance.</p>
+                </div>
+              </main>
+              <footer>Newsletter</footer>
+            </body></html>
+        "##;
+        let content = extract_content(html);
+        assert!(content.contains("Hôtel de la Paix"), "{content}");
+        assert!(content.contains("About The 2-star Hotel"), "{content}");
+        assert!(content.contains("Public parking"), "{content}");
+        assert!(!content.contains("Skip to"), "{content}");
+        assert!(!content.contains("bjc"), "{content}");
+        assert!(!content.contains("Newsletter"), "{content}");
+    }
+
+    /// A short `<main>` beats the whole body, skip links and menus included.
+    #[test]
+    fn a_short_main_is_preferred_over_the_body() {
+        let html = r##"
+            <html><body>
+              <ul><li><a href="#main">Skip to main content</a></li></ul>
+              <div class="menu-panel"><a href="/a">Stay</a><a href="/b">Eat</a></div>
+              <main id="main"><div><h1>Athome Spa</h1><p>33, Avenue du Docteur Daniel Planet, La Rochelle</p></div></main>
+            </body></html>
+        "##;
+        let content = extract_content(html);
+        assert!(content.contains("Athome Spa"), "{content}");
+        assert!(!content.contains("Skip to"), "{content}");
+    }
+
+    #[test]
+    fn hidden_elements_are_left_out() {
+        let html = r#"
+            <html><body><article>
+              <p>The visible paragraph of the article, long enough to be kept by the extractor.</p>
+              <p hidden>A paragraph with the hidden attribute, long enough to be kept otherwise.</p>
+              <p aria-hidden="true">A decorative paragraph hidden from screen readers and readers.</p>
+              <p style="display: none">A paragraph hidden by its inline style, long enough too.</p>
+              <p class="d-none d-print-block">A paragraph shown only when the page is printed out.</p>
+              <p class="d-none d-md-block">A paragraph shown from medium screens up, with Bootstrap.</p>
+            </article></body></html>
+        "#;
+        let content = extract_content(html);
+        assert!(content.contains("The visible paragraph"), "{content}");
+        assert!(content.contains("from medium screens up"), "{content}");
+        for hidden in [
+            "hidden attribute",
+            "decorative",
+            "inline style",
+            "printed out",
+        ] {
+            assert!(!content.contains(hidden), "{hidden}: {content}");
+        }
     }
 
     #[test]

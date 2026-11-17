@@ -285,6 +285,28 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **Pages of Tailwind sites lost their main content.** Content extraction
+  matched its non-content class names (`menu`, `nav`, `ad`, …) anywhere in
+  a `class` attribute, so `<main class="group-data-[menu=opened]/body:hidden">`
+  was dropped as a menu, and `shadow-md`, `loading` or `address` as ads. The
+  page's `content` fell back to whatever was left, often only its skip links
+  ("Skip to main content"), and with near-duplicate detection on, every such
+  page was skipped as a copy of the first: a crawl of nous-larochelle.fr
+  indexed 36 of its 700 pages. Class names are now matched word by word
+  (`ad-banner`, `main-nav`, `navbar` still are), Tailwind variants
+  (`md:hidden`) are ignored, and the element chosen as the content
+  (`<main>`, `<article>`) is never dropped for its own classes. A short
+  `<main>` is kept rather than the whole body. Hidden elements (`hidden`,
+  `aria-hidden="true"`, `display: none`, the `hidden` / `d-none` / `sr-only`
+  classes unless a responsive variant shows them) are left out, and blocks
+  are set apart in the text (`About The hotel…`, not `AboutThe hotel…`).
+
+- **`POST /crawl/suggest` from a language root kept one language.**
+  Suggested from `https://site/en` on a site also in `/fr` and `/de`, the
+  config only crawled `/en/**`. The crawl now covers every language (a
+  warning says so), and the profile's new `base_path` gives the path the
+  crawl stays under (`/` here).
+
 - **Sitemaps with images or videos lost their pages.** In a sitemap whose
   `<url>` entries carry an `<image:image>` or `<video:video>` (every Shopify
   store, among others), the image's `<image:loc>` replaced the page's
