@@ -493,6 +493,97 @@
           }
         }
       }
+    },
+    "/internal/deploys/claim": {
+      "post": {
+        "operationId": "claimDeployRequests",
+        "summary": "Collect the deploys staff asked for on Admin > Deploys (qdq-server autodeploy)",
+        "description": "Called by qdq-server's autodeploy on each tick, signed like POST /internal/deploys (the body is `{}`). Answers the deploys a staff member asked for with Deploy now that the box has not taken yet, at most one per product, oldest first, and marks them taken: each is returned once. Requests older than 2 hours are never returned. The box deploys each one as `--force` would (a paused product stays paused) and answers it with the deploy reports it sends, carrying `trigger: lab` and the request's id.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Lab-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Lab-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The requests to run now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "requests"
+                  ],
+                  "properties": {
+                    "requests": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "product"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "product": {
+                            "type": "string",
+                            "enum": [
+                              "lab",
+                              "scrapix",
+                              "gateway",
+                              "pipelines"
+                            ]
+                          },
+                          "requested_by": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "description": "The staff member's name, else email: for the box's log"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "LAB_DEPLOYS_SECRET is not set"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -906,8 +997,10 @@
               "timer",
               "force",
               "drill",
+              "lab",
               "backfill"
-            ]
+            ],
+            "description": "What started it: the autodeploy timer, an operator's --force or --force --drill-fail, a staff member's Deploy now on Admin > Deploys (`lab`, with `request_id`), or the one-time import of what was already deployed"
           },
           "message": {
             "type": [
@@ -922,6 +1015,14 @@
               "null"
             ],
             "maxLength": 255
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "With `trigger: lab`: the id of the request it answers, from POST /internal/deploys/claim. A request the box could not start (CI not green, product paused) is answered with a `cancelled` report"
           },
           "started_at": {
             "type": [
