@@ -322,6 +322,25 @@ fn segments_under<'a>(path: &'a str, base_path: &str) -> Option<Vec<&'a str>> {
     Some(rest.split('/').filter(|s| !s.is_empty()).collect())
 }
 
+/// The parent of a language root with other languages next to it: `/en/`
+/// gives `/` (and `/docs/fr-ca/` gives `/docs/`) when `pages` has pages
+/// under another language of that parent (`/fr/…`, `/de/…`), the same site
+/// in several languages rather than a part of it. `None` otherwise.
+pub(crate) fn language_root_parent(base_path: &str, pages: &[MappedPage]) -> Option<String> {
+    let (parent, last) = base_path.trim_end_matches('/').rsplit_once('/')?;
+    if !is_language(last) {
+        return None;
+    }
+    let parent = format!("{parent}/");
+    let language = normalize_language(last);
+    pages
+        .iter()
+        .filter_map(|p| url::Url::parse(&p.url).ok())
+        .filter_map(|u| section_of(u.path(), &parent).and_then(|(l, _)| l))
+        .any(|other| other != language)
+        .then_some(parent)
+}
+
 /// The language segment of a path (lowercased) and its section key.
 pub(crate) fn section_of(path: &str, base_path: &str) -> Option<(Option<String>, String)> {
     section_with(path, base_path, is_language)
@@ -1097,6 +1116,41 @@ mod tests {
         let keys: Vec<&str> = sections.iter().map(|s| s.key.as_str()).collect();
         assert_eq!(keys, ["/uk/", "/world/"]);
         assert!(languages.is_empty());
+    }
+
+    /// `/en` of a site also in `/fr` and `/de` (nous-larochelle.fr) is the
+    /// whole site in one of its languages: the crawl takes its parent.
+    #[test]
+    fn a_language_root_next_to_other_languages_widens_to_its_parent() {
+        let site = [
+            "https://a.test/fr",
+            "https://a.test/fr/information-touristique/hotel/la-paix",
+            "https://a.test/en/turistic-information/hotel/la-paix-en",
+            "https://a.test/de/touristen-information/hotel/la-paix-de",
+        ]
+        .map(page);
+        assert_eq!(language_root_parent("/en/", &site).as_deref(), Some("/"));
+        assert_eq!(language_root_parent("/fr/", &site).as_deref(), Some("/"));
+
+        let docs = [
+            "https://a.test/docs/fr-ca/start",
+            "https://a.test/docs/en-us/start",
+        ]
+        .map(page);
+        assert_eq!(
+            language_root_parent("/docs/en-us/", &docs).as_deref(),
+            Some("/docs/")
+        );
+
+        // Only English pages: nothing next to it.
+        let english = ["https://a.test/en/a", "https://a.test/en/b"].map(page);
+        assert_eq!(language_root_parent("/en/", &english), None);
+        // Not a language root.
+        assert_eq!(language_root_parent("/blog/", &site), None);
+        assert_eq!(language_root_parent("/", &site), None);
+        // `/news/uk/` next to `/news/world/` is a section, not a language.
+        let news = ["https://a.test/news/uk/a", "https://a.test/news/world/b"].map(page);
+        assert_eq!(language_root_parent("/news/uk/", &news), None);
     }
 
     #[test]

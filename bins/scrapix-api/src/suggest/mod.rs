@@ -124,6 +124,11 @@ pub(crate) struct CreateSuggestResponse {
 pub(crate) struct SiteProfile {
     /// The URL analyzed (after redirects)
     pub url: String,
+    /// The path the crawl stays under (`/` for the whole site): the URL's
+    /// own, or its parent when the URL is one language of a site in several
+    /// (`/en` of a site also in `/fr` and `/de` gives `/`)
+    #[serde(default)]
+    pub base_path: String,
     pub site_type: SiteType,
     /// How sure the analysis is, from 0 to 1
     pub confidence: f32,
@@ -646,7 +651,7 @@ impl SuggestRunner {
         // The path asked for bounds the crawl when the redirect stays under
         // it (`/docs` → `/docs/getting-started/overview`); otherwise the
         // redirect target's (`/blog/` → `/resources/`).
-        let base_path = {
+        let mut base_path = {
             let asked = base_path(&start);
             if site.host_str() == start.host_str()
                 && analysis::section_of(site.path(), &asked).is_some()
@@ -655,12 +660,6 @@ impl SuggestRunner {
             } else {
                 base_path(&site)
             }
-        };
-        let is_under = |url: &str| {
-            url::Url::parse(url).is_ok_and(|u| {
-                u.host_str() == Some(host.as_str())
-                    && analysis::section_of(u.path(), &base_path).is_some()
-            })
         };
 
         // 2. Map.
@@ -671,6 +670,26 @@ impl SuggestRunner {
                     .fail(&summary, &format!("Mapping the site failed: {e}"))
                     .await
             }
+        };
+        // A language root (`/en`) of a site in several languages is the
+        // whole site in one language: the crawl covers every language, and
+        // each page's `language` tells them apart.
+        let language_root = {
+            let on_host: Vec<MappedPage> = mapped
+                .iter()
+                .filter(|p| {
+                    url::Url::parse(&p.url).is_ok_and(|u| u.host_str() == Some(host.as_str()))
+                })
+                .cloned()
+                .collect();
+            analysis::language_root_parent(&base_path, &on_host)
+                .map(|parent| std::mem::replace(&mut base_path, parent))
+        };
+        let is_under = |url: &str| {
+            url::Url::parse(url).is_ok_and(|u| {
+                u.host_str() == Some(host.as_str())
+                    && analysis::section_of(u.path(), &base_path).is_some()
+            })
         };
         let truncated = mapped.len() >= MAP_LIMIT;
         let mut under: Vec<MappedPage> = mapped.into_iter().filter(|p| is_under(&p.url)).collect();
@@ -706,6 +725,15 @@ impl SuggestRunner {
             with_query as f32 / under.len() as f32
         };
         let (mut sections, languages) = group_sections(&under, &base_path);
+        if let Some(asked) = &language_root {
+            let list: Vec<&str> = languages.iter().map(String::as_str).collect();
+            summary.warnings.push(format!(
+                "`{asked}` is one language of a site in {} ({}): the crawl covers all of them \
+                 under `{base_path}`, and each page's `language` tells them apart",
+                list.len(),
+                list.join(", ")
+            ));
+        }
         if sections.is_empty() {
             sections.push(analysis::Section {
                 key: analysis::HOME_KEY.to_string(),
@@ -947,6 +975,7 @@ impl SuggestRunner {
         summary.warnings.extend(proposal.warnings);
         summary.profile = Some(SiteProfile {
             url: site.to_string(),
+            base_path: base_path.clone(),
             site_type,
             confidence: (confidence * 100.0).round() / 100.0,
             because,
@@ -1465,6 +1494,74 @@ mod tests {
             .iter()
             .any(|w| w.contains("deterministic")));
         assert!(response.config.is_some());
+    }
+
+    /// A tourism site in French, English and German with translated
+    /// section slugs (nous-larochelle.fr), suggested from its English root:
+    /// the crawl covers every language, not `/en/**` only.
+    #[tokio::test]
+    async fn a_language_root_of_a_multilingual_site_covers_every_language() {
+        let server = MockServer::start().await;
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        let mut paths: Vec<String> = vec!["/fr".into(), "/en".into(), "/de".into()];
+        for (language, section) in [
+            ("fr", "information-touristique"),
+            ("en", "turistic-information"),
+            ("de", "touristen-information"),
+        ] {
+            paths.extend((1..=4).map(|i| format!("/{language}/{section}/hotel-{i}")));
+        }
+        let urls: String = paths
+            .iter()
+            .map(|p| format!("<url><loc>{base}{p}</loc></url>"))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/sitemap.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>"#
+            )))
+            .mount(&server)
+            .await;
+        let words = |n: usize| -> String { (0..n).map(|i| format!("word{i} ")).collect() };
+        for p in &paths {
+            Mock::given(method("GET"))
+                .and(path(p.as_str()))
+                .respond_with(html(p, "", &format!("<p>{}</p>", words(120))))
+                .mount(&server)
+                .await;
+        }
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state_with_ai(&bus, None);
+
+        let response = suggest(
+            &state,
+            serde_json::json!({ "url": format!("{base}/en"), "max_samples": 3 }),
+        )
+        .await;
+
+        let profile = response.profile.as_ref().unwrap();
+        assert_eq!(profile.base_path, "/");
+        assert_eq!(profile.languages, ["de", "en", "fr"]);
+        let keys: Vec<&str> = profile.sections.iter().map(|s| s.key.as_str()).collect();
+        assert!(keys.contains(&"/information-touristique/"), "{keys:?}");
+        assert!(keys.contains(&"/touristen-information/"), "{keys:?}");
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|w| w.contains("`/en/` is one language of a site in 3 (de, en, fr)")),
+            "{:?}",
+            response.warnings
+        );
+        let config: CrawlConfig = serde_json::from_value(response.config.clone().unwrap()).unwrap();
+        assert!(
+            config.url_patterns.include.is_empty(),
+            "{:?}",
+            config.url_patterns.include
+        );
+        assert_eq!(config.start_urls, [format!("{base}/en")]);
+        // Every language's pages are counted for the page cap.
+        assert!(config.max_pages.unwrap() >= paths.len() as u64);
     }
 
     /// A JavaScript app with no browser on the server: the shells are

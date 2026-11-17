@@ -3055,6 +3055,12 @@ export interface components {
         SiteProfile: {
             /** @description Whether the AI pass confirmed or corrected the classification */
             ai_classified: boolean;
+            /**
+             * @description The path the crawl stays under (`/` for the whole site): the URL's
+             *     own, or its parent when the URL is one language of a site in several
+             *     (`/en` of a site also in `/fr` and `/de` gives `/`)
+             */
+            base_path?: string;
             /** @description Why the site got this type */
             because: string;
             /**

@@ -2582,6 +2582,12 @@ class SiteProfile(BaseModel):
     """
     Whether the AI pass confirmed or corrected the classification
     """
+    base_path: Optional[str] = None
+    """
+    The path the crawl stays under (`/` for the whole site): the URL's
+    own, or its parent when the URL is one language of a site in several
+    (`/en` of a site also in `/fr` and `/de` gives `/`)
+    """
     because: str
     """
     Why the site got this type

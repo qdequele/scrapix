@@ -5549,6 +5549,10 @@
             "type": "boolean",
             "description": "Whether the AI pass confirmed or corrected the classification"
           },
+          "base_path": {
+            "type": "string",
+            "description": "The path the crawl stays under (`/` for the whole site): the URL's\nown, or its parent when the URL is one language of a site in several\n(`/en` of a site also in `/fr` and `/de` gives `/`)"
+          },
           "because": {
             "type": "string",
             "description": "Why the site got this type"
