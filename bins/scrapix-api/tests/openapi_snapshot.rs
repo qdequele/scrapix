@@ -98,3 +98,46 @@ fn arbitrary_json_fields_accept_any_value() {
         }
     }
 }
+
+/// The hosted engine refuses a team viewer every method that is not a read
+/// (`auth::middleware::admit`), so both specs document that 403 on every
+/// engine operation that is not a `GET`, and on no `GET`.
+#[test]
+fn every_write_documents_the_viewer_403() {
+    let engine: serde_json::Value = serde_json::from_str(
+        &scrapix_api::openapi::ScrapixApi::openapi()
+            .to_json()
+            .expect("OpenAPI spec serializes to JSON"),
+    )
+    .expect("engine spec is JSON");
+    let platform: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/openapi.json"),
+        )
+        .expect("read contracts/openapi.json"),
+    )
+    .expect("contracts/openapi.json is JSON");
+    let mut writes = 0;
+    for (path, ops) in engine["paths"].as_object().unwrap() {
+        for method in ops.as_object().unwrap().keys() {
+            let write = method != "get";
+            writes += usize::from(write);
+            for (name, spec) in [("engine", &engine), ("contracts/openapi.json", &platform)] {
+                let responses = &spec["paths"][path][method]["responses"];
+                // The platform spec leaves some reads out (the analytics
+                // pipes), never a write.
+                if !responses.is_object() && !write && name != "engine" {
+                    continue;
+                }
+                assert!(responses.is_object(), "{name}: {method} {path} is missing");
+                assert_eq!(
+                    responses.get("403").is_some(),
+                    write,
+                    "{name}: {method} {path} {} the viewer 403",
+                    if write { "lacks" } else { "documents" }
+                );
+            }
+        }
+    }
+    assert_eq!(writes, 13);
+}

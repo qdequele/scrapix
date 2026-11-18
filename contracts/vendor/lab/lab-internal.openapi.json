@@ -107,7 +107,7 @@
       "get": {
         "operationId": "getAccountMeilisearch",
         "summary": "The account's Meilisearch target (decrypted key)",
-        "description": "With `url`, the account's engine whose URL matches (trailing slash ignored); without it, the default engine. `api_key` is the decrypted key, `\"\"` when none is set. 404 `{\"error\":\"not_found\"}` when nothing matches or the account id is not a UUID.",
+        "description": "Only the hosted Scrapix engine may call it (any other product gets 403 `{\"error\":\"forbidden\"}`). With `url`, the account's engine whose URL matches (trailing slash ignored); without it, the default engine. `api_key` is the decrypted key, `\"\"` when none is set. 404 `{\"error\":\"not_found\"}` when nothing matches or the account id is not a UUID.",
         "parameters": [
           {
             "name": "account_id",
@@ -140,6 +140,25 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "The caller is not a hosted Scrapix engine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "const": "forbidden"
+                    }
+                  }
+                }
+              }
+            }
           },
           "404": {
             "description": "No matching engine",
@@ -735,7 +754,7 @@
               "string",
               "null"
             ],
-            "description": "Membership role for sessions, null otherwise"
+            "description": "The caller's team role (owner, admin, member or viewer). A session has its membership role; an OAuth connection has its user's role capped at member (a viewer's connection stays viewer, an owner's or admin's acts as member); an API key has null (it acts as member). A viewer only reads: the engine refuses it every write and billed call"
           },
           "api_key_id": {
             "type": [

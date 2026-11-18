@@ -50,8 +50,8 @@ use crate::engine_jobs;
 use crate::job_kind::JobKind;
 use crate::results::{self, find_owned_job, status_str};
 use crate::{
-    billing, check_write_permission, extract_account_context, legacy_credits, map_fetch_page,
-    AccountContext, ApiError, AppState, ScrapeFormat,
+    billing, extract_account_context, legacy_credits, map_fetch_page, AccountContext, ApiError,
+    AppState, ScrapeFormat,
 };
 
 /// Maximum number of URLs (explicit + resolved from globs) per extraction.
@@ -420,6 +420,7 @@ fn token_count(model: &str) -> impl Fn(&str) -> usize + '_ {
         (status = 200, body = CreateExtractResponse),
         (status = 400, body = ApiError),
         (status = 402, description = "Not enough credits", body = ApiError),
+        (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError),
         (status = 503, description = "No AI provider is configured on the server (hosted: no AI for this account)", body = ApiError)
     ),
     security(("api_key" = []))
@@ -430,7 +431,6 @@ pub(crate) async fn create_extract(
     Json(request): Json<ExtractRequest>,
 ) -> Result<Json<CreateExtractResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     start_extract(&state, &account_ctx, request).await.map(Json)
 }
 

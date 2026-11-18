@@ -50,8 +50,7 @@ use crate::engine_jobs;
 use crate::job_kind::JobKind;
 use crate::results::{self, find_owned_job, status_str};
 use crate::{
-    billing, check_write_permission, extract_account_context, run_map, AccountContext, ApiError,
-    AppState, MapRequest,
+    billing, extract_account_context, run_map, AccountContext, ApiError, AppState, MapRequest,
 };
 
 use analysis::{
@@ -240,7 +239,8 @@ struct SuggestSummary {
     responses(
         (status = 200, body = CreateSuggestResponse),
         (status = 400, body = ApiError),
-        (status = 402, description = "Not enough credits", body = ApiError)
+        (status = 402, description = "Not enough credits", body = ApiError),
+        (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -250,7 +250,6 @@ pub(crate) async fn create_suggest(
     Json(request): Json<SuggestRequest>,
 ) -> Result<Json<CreateSuggestResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     start_suggest(&state, &account_ctx, request).await.map(Json)
 }
 

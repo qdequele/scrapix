@@ -3994,6 +3994,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     create_crawl_bulk: {
@@ -4018,6 +4027,15 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4054,6 +4072,15 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4429,6 +4456,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -4468,6 +4504,15 @@ export interface operations {
                     "application/json": components["schemas"]["JobStatusResponse"];
                 };
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -4505,6 +4550,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JobStatusResponse"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
                 };
             };
             404: {
@@ -4624,6 +4678,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     parse_upload: {
@@ -4648,6 +4711,15 @@ export interface operations {
                 };
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4693,6 +4765,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
             /** @description A browser action failed (`action_error`; `details` names the action) */
             422: {
                 headers: {
@@ -4725,6 +4806,15 @@ export interface operations {
                 content?: never;
             };
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4852,6 +4942,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     create_extract: {
@@ -4885,6 +4984,15 @@ export interface operations {
             };
             /** @description Not enough credits */
             402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4964,6 +5072,15 @@ export interface operations {
             };
             /** @description Not enough credits */
             402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Hosted: a team viewer only reads (`forbidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

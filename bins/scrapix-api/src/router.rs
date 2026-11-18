@@ -85,6 +85,10 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
 ///
 /// `route_layer` keeps the guard off the 404 fallback, so unknown paths
 /// return 404 instead of a misleading 401.
+///
+/// Hosted, the guard also enforces the team role: a viewer is refused every
+/// method that is not a read (`auth::middleware::admit`), so a route added
+/// to a guarded router needs nothing more.
 fn guard(routes: Router<Arc<AppState>>, auth: &AuthMode, ws: bool) -> Router<Arc<AppState>> {
     match auth {
         AuthMode::Disabled => routes,
@@ -581,6 +585,243 @@ mod tests {
     #[tokio::test]
     async fn disabled_auth_leaves_everything_open() {
         assert_eq!(status(app(AuthMode::Disabled), "/jobs", None).await, 200);
+    }
+
+    /// The team of every credential in the role tests.
+    const TEAM: &str = "11111111-1111-1111-1111-111111111111";
+    const SERVICE: &str = "0123456789abcdef0123456789abcdef";
+    /// A running job of [`TEAM`], present in every role-test app.
+    const JOB: &str = "job-of-the-team";
+
+    /// Every write or billed route: (method, uri, content type, a body the
+    /// route accepts).
+    fn write_routes() -> Vec<(&'static str, String, &'static str, String)> {
+        let crawl = r#"{"start_urls":["https://example.invalid/"],"index_uid":"t"}"#;
+        let json = "application/json";
+        vec![
+            ("POST", "/scrape".into(), json, r#"{"url":"https://example.invalid/"}"#.into()),
+            ("POST", "/batch/scrape".into(), json, r#"{"urls":["https://example.invalid/"]}"#.into()),
+            ("POST", "/extract".into(), json, r#"{"urls":["https://example.invalid/"],"prompt":"x"}"#.into()),
+            ("POST", "/map".into(), json, r#"{"url":"https://example.invalid/"}"#.into()),
+            ("POST", "/search".into(), json, r#"{"url":"https://example.invalid/","q":"x"}"#.into()),
+            ("POST", "/crawl".into(), json, crawl.into()),
+            ("POST", "/crawl/sync".into(), json, crawl.into()),
+            ("POST", "/crawl/bulk".into(), json, format!("[{crawl}]")),
+            ("POST", "/crawl/suggest".into(), json, r#"{"url":"https://example.invalid/"}"#.into()),
+            (
+                "POST",
+                "/parse".into(),
+                "multipart/form-data; boundary=b",
+                "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b--\r\n".into(),
+            ),
+            ("DELETE", format!("/job/{JOB}"), json, String::new()),
+            ("DELETE", format!("/job/{JOB}?purge=true"), json, String::new()),
+            ("POST", format!("/job/{JOB}/pause"), json, String::new()),
+            ("POST", format!("/job/{JOB}/resume"), json, String::new()),
+        ]
+    }
+
+    /// Every read route a team member reaches (GET only).
+    fn read_routes() -> Vec<String> {
+        vec![
+            "/jobs".into(),
+            format!("/job/{JOB}/status"),
+            format!("/job/{JOB}/results"),
+            format!("/job/{JOB}/events/history"),
+            "/extract/nope".into(),
+            "/crawl/suggest/nope".into(),
+            "/stats".into(),
+            "/errors".into(),
+            "/domains".into(),
+            "/analytics/v0/pipes".into(),
+            "/health".into(),
+            "/openapi.json".into(),
+        ]
+    }
+
+    /// A hosted app over a fake Lab that knows one credential per role, with
+    /// a running job of [`TEAM`].
+    async fn hosted_with_roles() -> (crate::lab_client::testing::FakeLab, Router) {
+        use crate::lab_client::testing::{FakeLab, INSTANCE_ID, SECRET};
+        let lab = FakeLab::start().await;
+        let with_role = |role: serde_json::Value| {
+            let mut v = FakeLab::identity(TEAM, "pro", 100);
+            v["role"] = role;
+            v
+        };
+        for role in ["viewer", "member", "admin", "owner", "auditor"] {
+            lab.set_credential("session", &format!("s_{role}"), with_role(role.into()));
+            lab.set_credential("bearer", &format!("o_{role}"), with_role(role.into()));
+        }
+        lab.set_credential("session", "s_null", with_role(serde_json::Value::Null));
+        lab.set_credential(
+            "api_key",
+            "sk_live_team",
+            with_role(serde_json::Value::Null),
+        );
+        lab.set_credential("bearer", "sk_live_team", with_role(serde_json::Value::Null));
+        lab.set_account(
+            TEAM,
+            serde_json::json!({"active": true, "account_id": TEAM, "tier": "pro",
+                               "credits": {"balance": 100}}),
+        );
+        let client = std::sync::Arc::new(crate::lab_client::LabClient::new(
+            &lab.url,
+            INSTANCE_ID,
+            SECRET,
+        ));
+        let auth = AuthMode::Saas(std::sync::Arc::new(crate::auth::AuthState::new(
+            client,
+            Some(SERVICE.into()),
+        )));
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = crate::results::test_support::test_state(&bus);
+        let mut job = scrapix_core::JobState::with_account(JOB, "idx", TEAM);
+        job.start();
+        state.insert_job(job);
+        (lab, build_router(state, &auth))
+    }
+
+    /// The headers that present `who`'s credential.
+    fn credential(who: &str) -> Vec<(&'static str, String)> {
+        match who {
+            "api_key" => vec![("X-API-Key", "sk_live_team".into())],
+            "api_key_bearer" => vec![("Authorization", "Bearer sk_live_team".into())],
+            "service" => vec![
+                ("Authorization", format!("Bearer {SERVICE}")),
+                (auth::middleware::SERVICE_ACCOUNT_HEADER, TEAM.into()),
+            ],
+            s if s.starts_with("s_") => vec![
+                ("Cookie", format!("scrapix_session={s}")),
+                ("X-Account-Id", TEAM.into()),
+            ],
+            o => vec![("Authorization", format!("Bearer {o}"))],
+        }
+    }
+
+    /// Status and `code` of `method uri` sent by `who`.
+    async fn send_as(
+        app: Router,
+        who: &str,
+        method: &str,
+        uri: &str,
+        content_type: &str,
+        body: String,
+    ) -> (u16, String) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in credential(who) {
+            req = req.header(name, value);
+        }
+        if !body.is_empty() {
+            req = req.header("Content-Type", content_type);
+        }
+        let res = app
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 24)
+            .await
+            .unwrap();
+        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        (status, code)
+    }
+
+    /// A team viewer (session or OAuth connection) only reads: every write
+    /// or billed route is a 403 `forbidden`, before any of its work.
+    #[tokio::test]
+    async fn hosted_viewer_is_refused_every_write_and_billed_route() {
+        let mut let_through = Vec::new();
+        for who in ["s_viewer", "o_viewer"] {
+            for (method, uri, content_type, body) in write_routes() {
+                let (_lab, app) = hosted_with_roles().await;
+                let got = send_as(app, who, method, &uri, content_type, body).await;
+                if got != (403, "forbidden".to_string()) {
+                    let_through.push(format!("{who} {method} {uri} -> {got:?}"));
+                }
+            }
+        }
+        assert!(
+            let_through.is_empty(),
+            "a viewer got past:\n{}",
+            let_through.join("\n")
+        );
+    }
+
+    /// A viewer still reads everything a member reads.
+    #[tokio::test]
+    async fn hosted_viewer_still_reads() {
+        for uri in read_routes() {
+            for who in ["s_viewer", "o_viewer"] {
+                let (_lab, app) = hosted_with_roles().await;
+                let viewer = send_as(app, who, "GET", &uri, "", String::new()).await;
+                let (_lab, app) = hosted_with_roles().await;
+                let member = send_as(app, "s_member", "GET", &uri, "", String::new()).await;
+                assert_ne!(viewer.0, 403, "{who} GET {uri}");
+                assert_eq!(viewer, member, "{who} GET {uri}");
+            }
+        }
+        let (_lab, app) = hosted_with_roles().await;
+        assert_eq!(
+            send_as(app, "s_viewer", "GET", "/jobs", "", String::new())
+                .await
+                .0,
+            200
+        );
+    }
+
+    /// Every other caller keeps today's behaviour: no role (API key, service
+    /// call, a Lab that sends none), member, admin, owner, and a role the
+    /// engine does not know (the Lab may add roles) are never refused for
+    /// their role.
+    #[tokio::test]
+    async fn hosted_non_viewers_are_never_refused_for_their_role() {
+        let callers = [
+            "api_key",
+            "api_key_bearer",
+            "service",
+            "s_null",
+            "s_member",
+            "s_admin",
+            "s_owner",
+            "s_auditor",
+            "o_member",
+            "o_admin",
+            "o_owner",
+            "o_auditor",
+        ];
+        for who in callers {
+            // Bodies the routes refuse (no content type), so no work starts.
+            for (method, uri, _, _) in write_routes() {
+                let (_lab, app) = hosted_with_roles().await;
+                let got = send_as(app, who, method, &uri, "", String::new()).await;
+                assert_ne!(got.1, "forbidden", "{who} {method} {uri}: {got:?}");
+                assert_ne!(got.0, 401, "{who} {method} {uri}: {got:?}");
+            }
+            let (_lab, app) = hosted_with_roles().await;
+            assert_eq!(
+                send_as(
+                    app,
+                    who,
+                    "POST",
+                    &format!("/job/{JOB}/pause"),
+                    "",
+                    String::new()
+                )
+                .await,
+                (200, String::new()),
+                "{who} pauses the team's job"
+            );
+            let (_lab, app) = hosted_with_roles().await;
+            assert_eq!(
+                send_as(app, who, "GET", "/jobs", "", String::new()).await.0,
+                200,
+                "{who}"
+            );
+        }
     }
 
     #[test]

@@ -38,9 +38,9 @@ use crate::ai_access::{resolve_ai, ResolvedAi, NO_AI_MESSAGE};
 use crate::auth::AuthenticatedAccount;
 use crate::lab_events::LabEvent;
 use crate::{
-    billing, check_write_permission, extract_account_context, extract_domain, legacy_credits,
-    require_ai_provider, run_ai_enrichment, usage_units, AccountContext, AiOptions, AiRun,
-    ApiError, AppState, ScrapeFormat, ScrapeMetadata, ScrapeResponse,
+    billing, extract_account_context, extract_domain, legacy_credits, require_ai_provider,
+    run_ai_enrichment, usage_units, AccountContext, AiOptions, AiRun, ApiError, AppState,
+    ScrapeFormat, ScrapeMetadata, ScrapeResponse,
 };
 
 /// Default size cap for documents fetched by `/scrape` and uploaded to
@@ -650,6 +650,7 @@ pub(crate) struct ParseUpload {
     responses(
         (status = 200, body = ScrapeResponse),
         (status = 400, body = ApiError),
+        (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError),
         (status = 413, description = "File larger than DOCUMENT_MAX_SIZE_MB")
     ),
     security(("api_key" = []))
@@ -660,7 +661,6 @@ pub(crate) async fn parse_upload(
     mut multipart: Multipart,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     let start_time = Instant::now();
     let max_bytes = max_document_bytes();
 
