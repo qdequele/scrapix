@@ -1136,6 +1136,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1178,6 +1188,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1246,6 +1266,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1824,6 +1854,16 @@
           "204": {
             "description": "Deleted (`purge=true`)"
           },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {
@@ -1882,6 +1922,16 @@
               }
             }
           },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "404": {
             "description": "",
             "content": {
@@ -1936,6 +1986,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -2127,6 +2187,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2167,6 +2237,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2224,6 +2304,16 @@
               }
             }
           },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "422": {
             "description": "A browser action failed (`action_error`; `details` names the action)",
             "content": {
@@ -2265,6 +2355,16 @@
           },
           "400": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3436,6 +3536,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3486,6 +3596,16 @@
           },
           "402": {
             "description": "Not enough credits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3600,6 +3720,16 @@
           },
           "402": {
             "description": "Not enough credits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Hosted: a team viewer only reads (`forbidden`)",
             "content": {
               "application/json": {
                 "schema": {

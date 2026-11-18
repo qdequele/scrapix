@@ -2779,23 +2779,6 @@ async fn extract_account_context(
     })
 }
 
-/// Check that the user's role allows write operations (scrape, map, search, crawl).
-/// API key auth and auth-disabled scenarios are always allowed.
-/// Session users must be owner, admin, or member (viewers are denied).
-fn check_write_permission(account_ctx: &Option<AccountContext>) -> Result<(), ApiError> {
-    if let Some(ctx) = account_ctx {
-        if let Some(ref role) = ctx.user_role {
-            if role == "viewer" {
-                return Err(ApiError::new(
-                    "Insufficient permissions: viewers cannot perform this action",
-                    "forbidden",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Check that the authenticated account owns the given job.
 /// Returns Ok(()) when: auth is disabled, job has no account_id (legacy), or account matches.
 /// Returns Err(not_found) when account_id doesn't match (don't leak job existence).
@@ -3867,14 +3850,13 @@ fn run_html_stage(input: HtmlStageInput) -> HtmlStageOutput {
 
 /// Scrape a single URL and return content immediately
 /// This bypasses the job queue for instant results
-#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError), (status = 422, description = "A browser action failed (`action_error`; `details` names the action)", body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/scrape", tag = "scrape", request_body = ScrapeRequest, responses((status = 200, body = ScrapeResponse), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError), (status = 422, description = "A browser action failed (`action_error`; `details` names the action)", body = ApiError)), security(("api_key" = [])))]
 async fn scrape_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     with_ai_usage(perform_scrape(&state, &account_ctx, &request))
         .await
         .map(Json)
@@ -5882,14 +5864,13 @@ async fn map_fetch_page(
 ///
 /// Each URL can be enriched with title, description (from HTML head) and
 /// lastmod, priority, changefreq (from sitemap data) depending on `get_*` flags.
-#[utoipa::path(post, path = "/map", tag = "map", request_body = MapRequest, responses((status = 200, body = MapResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/map", tag = "map", request_body = MapRequest, responses((status = 200, body = MapResponse), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)), security(("api_key" = [])))]
 async fn map_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Json(request): Json<MapRequest>,
 ) -> Result<Json<MapResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
 
     // Pre-flight (hosted): a positive balance, and JS rendering only on a
     // plan that includes it.
@@ -6284,14 +6265,13 @@ fn search_timeout() -> ApiError {
 }
 
 /// Proxy search to the account's default Meilisearch engine.
-#[utoipa::path(post, path = "/search", tag = "search", request_body = SearchRequest, responses((status = 200, description = "Meilisearch search results"), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/search", tag = "search", request_body = SearchRequest, responses((status = 200, description = "Meilisearch search results"), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)), security(("api_key" = [])))]
 async fn search_url(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
 
     // Pre-flight balance check
     if let (Some(ref lab), Some(ref ctx)) = (&state.lab_api, &account_ctx) {
@@ -6465,14 +6445,13 @@ async fn search_url(
 }
 
 /// Create a new async crawl job
-#[utoipa::path(post, path = "/crawl", tag = "crawl", request_body = scrapix_core::CrawlConfig, responses((status = 200, body = CreateCrawlResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/crawl", tag = "crawl", request_body = scrapix_core::CrawlConfig, responses((status = 200, body = CreateCrawlResponse), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)), security(("api_key" = [])))]
 async fn create_crawl(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<CreateCrawlResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     Ok(Json(
         do_create_crawl(&state, config, account_ctx.as_ref()).await?,
     ))
@@ -6482,7 +6461,7 @@ async fn create_crawl(
 ///
 /// With `include_results=true`, the response also carries the first page of
 /// the job's results (`GET /job/{id}/results`).
-#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, params(results::CrawlSyncQuery), responses((status = 200, body = results::CrawlSyncResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/crawl/sync", tag = "crawl", request_body = scrapix_core::CrawlConfig, params(results::CrawlSyncQuery), responses((status = 200, body = results::CrawlSyncResponse), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)), security(("api_key" = [])))]
 async fn create_crawl_sync(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
@@ -6490,7 +6469,6 @@ async fn create_crawl_sync(
     Json(config): Json<CrawlConfig>,
 ) -> Result<Json<results::CrawlSyncResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     // First create the async job
     let response = do_create_crawl(&state, config, account_ctx.as_ref()).await?;
     let job_id = response.job_id.clone();
@@ -6551,14 +6529,13 @@ async fn create_crawl_sync(
 }
 
 /// Create multiple crawl jobs from a batch of configs
-#[utoipa::path(post, path = "/crawl/bulk", tag = "crawl", request_body = Vec<scrapix_core::CrawlConfig>, responses((status = 200, body = BulkCrawlResponse), (status = 400, body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/crawl/bulk", tag = "crawl", request_body = Vec<scrapix_core::CrawlConfig>, responses((status = 200, body = BulkCrawlResponse), (status = 400, body = ApiError), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)), security(("api_key" = [])))]
 async fn create_crawl_bulk(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
     Json(configs): Json<Vec<CrawlConfig>>,
 ) -> Result<Json<BulkCrawlResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
 
     let total = configs.len();
     let mut jobs = Vec::with_capacity(total);
@@ -7087,7 +7064,7 @@ async fn handle_job_ws_connection(socket: WebSocket, state: Arc<AppState>, job_i
 /// job: it disappears from `GET /jobs`, and its status and stored results
 /// are gone (204). The documents a crawl indexed stay in Meilisearch. A job
 /// that is not finished returns 409: cancel it first.
-#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID"), DeleteJobQuery), responses((status = 200, description = "Cancelled", body = JobStatusResponse), (status = 204, description = "Deleted (`purge=true`)"), (status = 404, body = ApiError), (status = 409, description = "Cancel: the job is already finished. Purge: the job is not finished (or is still being finalized, retry shortly)", body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(delete, path = "/job/{id}", tag = "jobs", params(("id" = String, Path, description = "Job ID"), DeleteJobQuery), responses((status = 200, description = "Cancelled", body = JobStatusResponse), (status = 204, description = "Deleted (`purge=true`)"), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError), (status = 404, body = ApiError), (status = 409, description = "Cancel: the job is already finished. Purge: the job is not finished (or is still being finalized, retry shortly)", body = ApiError)), security(("api_key" = [])))]
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
@@ -7158,7 +7135,7 @@ impl AppState {
 ///
 /// The frontier stops dispatching the job's URLs (pages already in flight
 /// finish). Only a running job can be paused; any other status returns 409.
-#[utoipa::path(post, path = "/job/{id}/pause", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is not running", body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/job/{id}/pause", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError), (status = 404, body = ApiError), (status = 409, description = "The job is not running", body = ApiError)), security(("api_key" = [])))]
 async fn pause_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,
@@ -7171,7 +7148,7 @@ async fn pause_job(
 /// Resume a paused job
 ///
 /// Only a paused job can be resumed; any other status returns 409.
-#[utoipa::path(post, path = "/job/{id}/resume", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 404, body = ApiError), (status = 409, description = "The job is not paused", body = ApiError)), security(("api_key" = [])))]
+#[utoipa::path(post, path = "/job/{id}/resume", tag = "jobs", params(("id" = String, Path, description = "Job ID")), responses((status = 200, body = JobStatusResponse), (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError), (status = 404, body = ApiError), (status = 409, description = "The job is not paused", body = ApiError)), security(("api_key" = [])))]
 async fn resume_job(
     State(state): State<Arc<AppState>>,
     account_ext: Option<Extension<AuthenticatedAccount>>,

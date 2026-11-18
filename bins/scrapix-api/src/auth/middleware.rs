@@ -1,6 +1,6 @@
 use axum::{
     extract::{Request, State},
-    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
+    http::{header::RETRY_AFTER, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -46,6 +46,16 @@ impl AuthError {
             error: error.into(),
             code: code.into(),
             status: StatusCode::UNAUTHORIZED,
+        }
+    }
+
+    /// A team viewer sent a write or billed call: 403, in the engine's usual
+    /// `forbidden` shape.
+    pub(crate) fn viewer_write() -> Self {
+        Self {
+            error: "Insufficient permissions: viewers cannot perform this action".into(),
+            code: "forbidden".into(),
+            status: StatusCode::FORBIDDEN,
         }
     }
 
@@ -97,11 +107,12 @@ pub(crate) async fn ws_query_token_as_api_key(mut request: Request, next: Next) 
 
 /// Middleware: accept API key (X-API-Key), Bearer token (Authorization: Bearer),
 /// session cookie, or a Lab service call. Every credential is resolved by the
-/// Lab; a Lab outage is a 503, never a pass.
+/// Lab; a Lab outage is a 503, never a pass. It also enforces the team role
+/// ([`admit`]): a viewer only reads, on every route this guards.
 pub(crate) async fn validate_api_key_or_session(
     State(auth_state): State<Arc<AuthState>>,
     jar: CookieJar,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
     let lab = &auth_state.lab;
@@ -137,14 +148,14 @@ pub(crate) async fn validate_api_key_or_session(
                     "invalid_service_call",
                 )?;
                 debug!(account_id = %id.account_id, tier = %id.tier, "Service call authenticated");
-                request.extensions_mut().insert(AuthenticatedAccount {
+                let account = AuthenticatedAccount {
                     account_id: id.account_id,
                     tier: id.tier,
                     api_key_id: None,
                     role: None,
                     limits: id.limits,
-                });
-                return Ok(next.run(request).await);
+                };
+                return admit(request, account, next).await;
             }
         }
 
@@ -162,14 +173,14 @@ pub(crate) async fn validate_api_key_or_session(
         debug!(account_id = %id.account_id, tier = %id.tier, "Bearer token validated");
         // An API key sent as Bearer is introspected as `api_key` and keeps its
         // id, exactly as through `X-API-Key`; OAuth tokens carry none.
-        request.extensions_mut().insert(AuthenticatedAccount {
+        let account = AuthenticatedAccount {
             account_id: id.account_id,
             tier: id.tier,
             api_key_id: id.api_key_id,
             role: id.role,
             limits: id.limits,
-        });
-        return Ok(next.run(request).await);
+        };
+        return admit(request, account, next).await;
     }
 
     // Try API key
@@ -191,14 +202,14 @@ pub(crate) async fn validate_api_key_or_session(
             "invalid_api_key",
         )?;
         debug!(account_id = %id.account_id, tier = %id.tier, "API key validated");
-        request.extensions_mut().insert(AuthenticatedAccount {
+        let account = AuthenticatedAccount {
             account_id: id.account_id,
             tier: id.tier,
             api_key_id: id.api_key_id,
             role: None,
             limits: id.limits,
-        });
-        return Ok(next.run(request).await);
+        };
+        return admit(request, account, next).await;
     }
 
     // Fall back to session cookie
@@ -228,14 +239,40 @@ pub(crate) async fn validate_api_key_or_session(
         "invalid_session",
     )?;
     debug!(account_id = %id.account_id, tier = %id.tier, "Session validated");
-    request.extensions_mut().insert(AuthenticatedAccount {
+    let account = AuthenticatedAccount {
         account_id: id.account_id,
         tier: id.tier,
         api_key_id: None,
         role: id.role,
         limits: id.limits,
-    });
+    };
+    admit(request, account, next).await
+}
 
+/// The team role that only reads (the Lab's `role`, for sessions and OAuth
+/// connections).
+const READ_ONLY_ROLE: &str = "viewer";
+
+/// Whether `method` only reads: every engine route that writes, starts,
+/// pauses or cancels work, or is billed, is a `POST` or a `DELETE`.
+fn is_read_only(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// Last step for every credential: a viewer is refused any method that is
+/// not a read (403 `forbidden`, before the handler runs); anyone else (no
+/// role, `member`, `admin`, `owner`, or a role the engine does not know) is
+/// let through with the account attached to the request.
+async fn admit(
+    mut request: Request,
+    account: AuthenticatedAccount,
+    next: Next,
+) -> Result<Response, AuthError> {
+    if account.role.as_deref() == Some(READ_ONLY_ROLE) && !is_read_only(request.method()) {
+        debug!(account_id = %account.account_id, method = %request.method(), "Viewer refused a write");
+        return Err(AuthError::viewer_write());
+    }
+    request.extensions_mut().insert(account);
     Ok(next.run(request).await)
 }
 

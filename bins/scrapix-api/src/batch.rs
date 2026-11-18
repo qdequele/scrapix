@@ -35,8 +35,8 @@ use crate::engine_jobs::{self, Gate};
 use crate::job_kind::JobKind;
 use crate::results::{JobResultError, JobResultItem};
 use crate::{
-    check_write_permission, extract_account_context, perform_scrape, AccountContext, AiOptions,
-    ApiError, AppState, ScrapeFormat, ScrapeRequest, ScrapeSelector, ScreenshotRequestOptions,
+    extract_account_context, perform_scrape, AccountContext, AiOptions, ApiError, AppState,
+    ScrapeFormat, ScrapeRequest, ScrapeSelector, ScreenshotRequestOptions,
 };
 
 /// Maximum number of URLs in one batch.
@@ -228,7 +228,8 @@ fn redacted_options(options: &Map<String, Value>) -> Value {
     responses(
         (status = 200, body = BatchScrapeResponse),
         (status = 400, body = ApiError),
-        (status = 402, description = "The account's credit balance is exhausted", body = ApiError)
+        (status = 402, description = "The account's credit balance is exhausted", body = ApiError),
+        (status = 403, description = "Hosted: a team viewer only reads (`forbidden`)", body = ApiError)
     ),
     security(("api_key" = []))
 )]
@@ -238,7 +239,6 @@ pub(crate) async fn batch_scrape(
     Json(body): Json<Value>,
 ) -> Result<Json<BatchScrapeResponse>, ApiError> {
     let account_ctx = extract_account_context(&account_ext).await;
-    check_write_permission(&account_ctx)?;
     let batch = parse_batch_body(body)?;
     start_batch(&state, &account_ctx, batch).await.map(Json)
 }

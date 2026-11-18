@@ -70,6 +70,28 @@ The hosted Meilisearch Lab platform uses per-account API keys and sessions
 instead of a single admin key, plus OAuth 2.1 for MCP and third-party
 clients — see **API keys** and **OAuth** in the Platform docs.
 
+### Team roles
+
+A session or OAuth connection acts with the caller's team role (`owner`,
+`admin`, `member` or `viewer`; an OAuth connection is capped at `member`).
+A **viewer only reads**: every call that is not a `GET` (`/scrape`,
+`/batch/scrape`, `/extract`, `/parse`, `/map`, `/search`, `/crawl`,
+`/crawl/sync`, `/crawl/bulk`, `/crawl/suggest`, `DELETE /job/{id}`,
+`POST /job/{id}/pause` and `/resume`) is refused before it starts:
+
+```json
+HTTP/1.1 403 Forbidden
+
+{
+  "error": "Insufficient permissions: viewers cannot perform this action",
+  "code": "forbidden"
+}
+```
+
+A viewer still lists jobs and reads their status, results and events
+(including the WebSockets), the diagnostics and the analytics pipes. API
+keys act as a member, whatever role their creator has.
+
 On the hosted engine, `/ws` and `/ws/job/{id}` also require authentication
 (a `scrapix_session` cookie or Bearer token) — the console's live job
 updates rely on `SESSION_COOKIE_DOMAIN` being set to a parent domain shared

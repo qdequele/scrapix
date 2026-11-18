@@ -312,6 +312,21 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Fixed
 
+- **A team viewer could cancel, pause and resume the team's jobs.** On the
+  hosted engine, a viewer's session or OAuth connection (the Lab's
+  introspection `role: "viewer"`) was refused the product calls (`/scrape`,
+  `/crawl*`, `/map`, …), but not `DELETE /job/{id}` (cancel or purge),
+  `POST /job/{id}/pause` or `/resume`. The role is now enforced in the auth
+  middleware for every guarded route: a viewer gets 403 `forbidden` on any
+  method that is not a read (`GET`), before the handler runs, so a new route
+  is covered without a check of its own. Reads (jobs, status, results,
+  events, WebSockets, diagnostics, analytics) are unchanged. API keys,
+  service calls and the standalone engine carry no role and are unaffected,
+  and so are `member`, `admin`, `owner` and any role the engine does not
+  know. The 403 is documented on the 13 write operations in
+  `contracts/openapi.json` (and the SDKs' generated types) and
+  `contracts/openapi.engine.json`.
+
 - **Pages of Tailwind sites lost their main content.** Content extraction
   matched its non-content class names (`menu`, `nav`, `ad`, …) anywhere in
   a `class` attribute, so `<main class="group-data-[menu=opened]/body:hidden">`
