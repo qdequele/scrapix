@@ -43,7 +43,7 @@ Hosted mode only. A **standalone** engine emits no lab events and its API refuse
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | UUID | Idempotency key — the Lab stores and processes each id once. See [Ids](#ids). |
-| `type` | string | `usage.recorded`, `job.completed` or `job.failed`. |
+| `type` | string | `usage.recorded`, `job.completed`, `job.failed` or `job.cancelled`. |
 | `occurred_at` | RFC 3339 timestamp | When the engine recorded the event. |
 | `account_id` | UUID | The account to bill or notify. |
 | `api_key_id` | string or `null` | The API key that made the request, when there was one. |
@@ -113,6 +113,8 @@ was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,
 | `pages_crawled` | integer | Pages fetched. |
 | `documents_indexed` | integer | Documents sent to Meilisearch. |
 | `duration_secs` | integer | Wall-clock duration. |
+| `pages_failed` | integer | Pages that could not be fetched or processed. |
+| `documents_failed` | integer, optional | Documents Meilisearch refused (its failed document tasks for the index since the job started). Only for `Replace` crawls, whose cleanup waits for the index's tasks to settle before reading them; omitted otherwise or when the tasks cannot be read. |
 
 ### `job.failed`
 
@@ -121,9 +123,32 @@ was actually delivered (`operation: "crawl"`). Requests such as `/scrape`,
 | `job_id` | string | The failed crawl job. |
 | `error_message` | string | Why it failed (a stalled job reports its stall reason). |
 | `pages_crawled` | integer | Pages fetched before the failure. |
+| `reason` | string | Why, as a stable code the Lab words for the user (below). |
+| `index_uid` | string, optional | Target Meilisearch index, when known. |
 
-The Lab turns `job.completed` / `job.failed` into **one** email per job, sent
-to the account owner if they opted in to job emails.
+| `reason` | When |
+|----------|------|
+| `stalled` | No progress for the stall timeout. |
+| `no_pages` | The crawl ended without a page crawled. |
+| `destination_auth` | The `Replace` cleanup was refused by Meilisearch for the key (`auth` error, 401/403). |
+| `destination_unreachable` | The `Replace` cleanup could not reach Meilisearch (connection error, 502/503/504). |
+| `destination_rejected` | Any other `Replace` cleanup error (Meilisearch refused the request or the index). |
+| `internal` | Anything else. |
+
+### `job.cancelled`
+
+Sent when someone cancels a running crawl.
+
+| `data` field | Type | Description |
+|--------------|------|-------------|
+| `job_id` | string | The cancelled crawl job. |
+| `index_uid` | string, optional | Target Meilisearch index. |
+| `pages_crawled` | integer | Pages fetched before the cancel (the pages billed). |
+| `documents_indexed` | integer | Documents sent to Meilisearch before the cancel. |
+
+The Lab turns `job.completed` / `job.failed` / `job.cancelled` into **one**
+email per job, sent to the account owner if they opted in to job emails. Only
+crawls run by the pipeline send them (not batch scrapes or extracts).
 
 ## Ids
 
@@ -131,13 +156,14 @@ to the account owner if they opted in to job emails.
 |-------|------|
 | Request usage (`scrape`, `map`, `search`, `parse`, `ocr`) | UUIDv7, generated per event |
 | Crawl final usage | UUIDv5(`6f1c3a2e-6b1d-4f6e-9a57-0c3b2a9e5d41`, `"job:{job_id}:final"`) |
-| Job lifecycle (`job.completed` / `job.failed`) | UUIDv5(same namespace, `"job:{job_id}:lifecycle"`) |
+| Job lifecycle (`job.completed` / `job.failed` / `job.cancelled`) | UUIDv5(same namespace, `"job:{job_id}:lifecycle"`) |
 
 Deterministic ids make a crawl's charge and its email idempotent: if the
 engine recovers and re-finalizes a job after a crash, it produces the same
 ids, the outbox skips the duplicates, and the Lab acknowledges without
-processing them again. A job has one lifecycle id whether it completed or
-failed, so it can only ever send one email.
+processing them again. A job has one lifecycle id whether it completed,
+failed or was cancelled, so it can only ever send one email; a cancelled job
+can no longer complete or fail (the terminal transition happens once).
 
 ## Delivery
 

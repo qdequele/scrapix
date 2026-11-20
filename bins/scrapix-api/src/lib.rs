@@ -1006,28 +1006,41 @@ impl AppState {
             timestamp,
         };
 
+        let mut context = TerminalContext::default();
         let event = match decision {
             Finalize::Wait => return,
-            Finalize::FailStalled => failed(format!(
-                "Stalled: no progress for {}s",
-                self.config.job_stall_timeout.as_secs()
-            )),
-            Finalize::FailNoPages => failed(format!(
-                "No page could be crawled ({} failures)",
-                acc.pages_failed
-            )),
+            Finalize::FailStalled => {
+                context.failure = Some(lab_events::JobFailure::Stalled);
+                failed(format!(
+                    "Stalled: no progress for {}s",
+                    self.config.job_stall_timeout.as_secs()
+                ))
+            }
+            Finalize::FailNoPages => {
+                context.failure = Some(lab_events::JobFailure::NoPages);
+                failed(format!(
+                    "No page could be crawled ({} failures)",
+                    acc.pages_failed
+                ))
+            }
             Finalize::Complete => match replace_cleanup(&job, acc.documents_indexed).await {
-                Ok(documents_indexed) => CrawlEvent::JobCompleted {
-                    job_id: job_id.to_string(),
-                    account_id: job.account_id.clone(),
-                    pages_crawled: acc.pages_crawled_ok,
-                    documents_indexed,
-                    errors: acc.pages_failed,
-                    bytes_downloaded: acc.bytes_downloaded,
-                    duration_secs: job.duration_seconds().unwrap_or(0).max(0) as u64,
-                    timestamp,
-                },
-                Err(error) => failed(error),
+                Ok(cleanup) => {
+                    context.documents_failed = cleanup.documents_failed;
+                    CrawlEvent::JobCompleted {
+                        job_id: job_id.to_string(),
+                        account_id: job.account_id.clone(),
+                        pages_crawled: acc.pages_crawled_ok,
+                        documents_indexed: cleanup.documents_indexed,
+                        errors: acc.pages_failed,
+                        bytes_downloaded: acc.bytes_downloaded,
+                        duration_secs: job.duration_seconds().unwrap_or(0).max(0) as u64,
+                        timestamp,
+                    }
+                }
+                Err(error) => {
+                    context.failure = Some(lab_events::JobFailure::IndexCleanup(error.clone()));
+                    failed(error)
+                }
             },
         };
 
@@ -1035,7 +1048,7 @@ impl AppState {
         // idle detector completed, and so billed, such jobs). A Replace
         // cleanup failure stays unbilled, as before. Charged by
         // process_event, before the terminal write.
-        let failed_charge = (decision == Finalize::FailStalled).then(|| PageCharge {
+        context.failed_charge = (decision == Finalize::FailStalled).then(|| PageCharge {
             pages_http: acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
             pages_browser: acc.pages_browser,
             pages_ai: acc.pages_ai,
@@ -1047,7 +1060,7 @@ impl AppState {
         // cancelled meanwhile (e.g. during the Replace cleanup), nothing is
         // applied (nor charged) and nothing else happens here.
         if !self
-            .process_event_charging(job_id, &event, None, failed_charge)
+            .process_event_charging(job_id, &event, None, context)
             .applied
         {
             debug!(job_id = %job_id, "Job became terminal before finalize, skipping");
@@ -1237,15 +1250,16 @@ impl AppState {
             j.completed_at = Some(chrono::Utc::now());
             j.clone()
         };
-        let (pages_http, pages_browser, pages_ai, pages_ocr) =
+        let (pages_http, pages_browser, pages_ai, pages_ocr, documents_indexed) =
             self.crawl.accounting.read().get(job_id).map_or(
-                (snapshot.pages_crawled, 0, 0, 0),
+                (snapshot.pages_crawled, 0, 0, 0, snapshot.pages_indexed),
                 |acc| {
                     (
                         acc.pages_crawled_ok.saturating_sub(acc.pages_browser),
                         acc.pages_browser,
                         acc.pages_ai,
                         acc.pages_ocr,
+                        acc.documents_indexed,
                     )
                 },
             );
@@ -1257,6 +1271,24 @@ impl AppState {
             pages_ai,
             pages_ocr,
         );
+        // The job's one lifecycle event (the Lab emails the account), owed
+        // before the terminal write like completed/failed. The status was
+        // set terminal above under the jobs lock, so a later finalize can
+        // no longer apply a JobCompleted/JobFailed (`transition_terminal`),
+        // and the shared lifecycle id dedupes it in the outbox anyway.
+        if self.is_pipeline_job(job_id) {
+            self.request_job_event(
+                job_id,
+                lab_events::LabEvent::job_cancelled,
+                snapshot.account_id.clone(),
+                job_cancelled_payload(
+                    job_id,
+                    &snapshot.index_uid,
+                    pages_http + pages_browser,
+                    documents_indexed,
+                ),
+            );
+        }
         // Terminal: free the accounting so the completion loop never
         // finalizes it, and persist it (checked by the next flush before
         // the job's held acks are released).
@@ -1712,19 +1744,25 @@ impl AppState {
         event: &CrawlEvent,
         pos: Option<EventPosition>,
     ) -> EventOutcome {
-        self.process_event_charging(job_id, event, pos, None)
+        self.process_event_charging(job_id, event, pos, TerminalContext::default())
     }
 
-    /// `process_event_at`, charging a `JobFailed` that transitions the job
-    /// for `failed_charge` (a stalled job pays for the pages it crawled):
-    /// the charge is owed before the terminal write, like every other.
+    /// `process_event_at`, with what `finalize_job` knows about the terminal
+    /// event it emits (`TerminalContext`): a `JobFailed` that transitions
+    /// the job is charged for `failed_charge` (a stalled job pays for the
+    /// pages it crawled), owed before the terminal write like every other.
     fn process_event_charging(
         &self,
         job_id: &str,
         event: &CrawlEvent,
         pos: Option<EventPosition>,
-        failed_charge: Option<PageCharge>,
+        context: TerminalContext,
     ) -> EventOutcome {
+        let TerminalContext {
+            failed_charge,
+            failure,
+            documents_failed,
+        } = context;
         // Terminal transitions are applied exactly once, atomically: a second
         // JobCompleted/JobFailed for a job that is already terminal (a
         // redelivered event, or a finalize racing a cancel) must not re-bill,
@@ -2021,6 +2059,7 @@ impl AppState {
                 pages_crawled,
                 documents_indexed,
                 duration_secs,
+                errors,
                 ..
             } => {
                 let index_uid = terminal_snapshot
@@ -2031,17 +2070,24 @@ impl AppState {
                 // Queue the job completion event (the Lab emails the
                 // account). The only place a completion email is requested
                 // (R5). Owed before the terminal write (`on_terminal` below).
+                let mut payload = serde_json::json!({
+                    "job_id": job_id,
+                    "index_uid": index_uid,
+                    "pages_crawled": pages_crawled,
+                    "documents_indexed": documents_indexed,
+                    "duration_secs": duration_secs,
+                    "pages_failed": errors,
+                });
+                // Known only when the Replace cleanup read the index's
+                // failed tasks after they settled.
+                if let Some(n) = documents_failed {
+                    payload["documents_failed"] = n.into();
+                }
                 self.request_job_event(
                     job_id,
                     lab_events::LabEvent::job_completed,
                     account_id.clone().filter(|_| pipeline_terminal),
-                    serde_json::json!({
-                        "job_id": job_id,
-                        "index_uid": index_uid,
-                        "pages_crawled": pages_crawled,
-                        "documents_indexed": documents_indexed,
-                        "duration_secs": duration_secs,
-                    }),
+                    payload,
                 );
 
                 // Charge the crawled pages. D4/R4: bill for what was
@@ -2068,10 +2114,10 @@ impl AppState {
                 // No temp index cleanup needed — Replace strategy writes directly to the real index.
                 // Stale documents from a failed job will be cleaned up by the next successful crawl.
 
-                let (pages_crawled, account_id) = terminal_snapshot
+                let (pages_crawled, account_id, index_uid) = terminal_snapshot
                     .as_ref()
-                    .map(|j| (j.pages_crawled, j.account_id.clone()))
-                    .unwrap_or((0, None));
+                    .map(|j| (j.pages_crawled, j.account_id.clone(), j.index_uid.clone()))
+                    .unwrap_or((0, None, String::new()));
 
                 // A stalled job's charge (`finalize_job`), only when this
                 // event is the one that made the job terminal.
@@ -2092,11 +2138,7 @@ impl AppState {
                     job_id,
                     lab_events::LabEvent::job_failed,
                     account_id.filter(|_| pipeline_terminal),
-                    serde_json::json!({
-                        "job_id": job_id,
-                        "error_message": error,
-                        "pages_crawled": pages_crawled,
-                    }),
+                    job_failed_payload(job_id, error, pages_crawled, &index_uid, failure.as_ref()),
                 );
                 // Only now, with the charge and the email owed: persist.
                 self.on_terminal(job_id, terminal_snapshot);
@@ -2186,6 +2228,58 @@ impl From<ControlError> for ApiError {
             ),
         }
     }
+}
+
+/// The `job.failed` data: `reason` is the contract code of `failure`
+/// (`internal` when the engine did not classify it), `index_uid` when
+/// known.
+fn job_failed_payload(
+    job_id: &str,
+    error: &str,
+    pages_crawled: u64,
+    index_uid: &str,
+    failure: Option<&lab_events::JobFailure>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "job_id": job_id,
+        "error_message": error,
+        "pages_crawled": pages_crawled,
+        "reason": lab_events::failure_reason(failure.unwrap_or(&lab_events::JobFailure::Other)),
+    });
+    if !index_uid.is_empty() {
+        payload["index_uid"] = index_uid.into();
+    }
+    payload
+}
+
+/// The `job.cancelled` data: what the job did before it was cancelled.
+fn job_cancelled_payload(
+    job_id: &str,
+    index_uid: &str,
+    pages_crawled: u64,
+    documents_indexed: u64,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "job_id": job_id,
+        "pages_crawled": pages_crawled,
+        "documents_indexed": documents_indexed,
+    });
+    if !index_uid.is_empty() {
+        payload["index_uid"] = index_uid.into();
+    }
+    payload
+}
+
+/// What `finalize_job` knows about the terminal event it emits, beyond the
+/// event itself (other callers pass the default).
+#[derive(Debug, Clone, Default)]
+struct TerminalContext {
+    /// A stalled job's charge (`JobFailed` only).
+    failed_charge: Option<PageCharge>,
+    /// Why the job failed (`JobFailed` only), for the `job.failed` reason.
+    failure: Option<lab_events::JobFailure>,
+    /// Documents Meilisearch refused (`JobCompleted` of a Replace crawl).
+    documents_failed: Option<u64>,
 }
 
 /// The pages a terminal job is charged for (see `AppState::bill_job`).
@@ -2376,9 +2470,20 @@ fn crawl_event_to_ai_usage(
 /// delete stale documents from previous crawls and return the pages
 /// indexed, checked against this job's documents in Meilisearch. Non-Replace jobs return `documents_indexed`
 /// unchanged. `Err` carries the job failure message.
-async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, String> {
+/// What a successful Replace cleanup verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CleanupOutcome {
+    documents_indexed: u64,
+    /// Documents Meilisearch refused (failed tasks), when they could be read.
+    documents_failed: Option<u64>,
+}
+
+async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<CleanupOutcome, String> {
     let Some(ref replace_url) = job.swap_meilisearch_url else {
-        return Ok(documents_indexed);
+        return Ok(CleanupOutcome {
+            documents_indexed,
+            documents_failed: None,
+        });
     };
     let ms_key = job.swap_meilisearch_api_key.as_deref();
     let job_id = &job.job_id;
@@ -2400,28 +2505,6 @@ async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, 
         api_key_prefix = %key_preview,
         "Deleting stale documents before completing Replace job"
     );
-
-    // Check for failed indexing tasks before cleanup — these indicate that
-    // fire-and-forget document submissions were rejected by Meilisearch.
-    let since = job
-        .started_at
-        .map(|t| offset_datetime_from_millis(t.timestamp_millis()))
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    let failed_tasks = scrapix_storage::meilisearch::MeilisearchStorage::log_failed_tasks(
-        replace_url,
-        ms_key,
-        index_uid,
-        since,
-    )
-    .await;
-    if failed_tasks > 0 {
-        warn!(
-            job_id = %job_id,
-            index = %index_uid,
-            failed_tasks,
-            "Meilisearch had failed indexing tasks — index may be incomplete"
-        );
-    }
 
     // Only this crawl's documents: other crawls may share the index.
     let scope = scrapix_core::CrawlScope::from_start_urls(&job.start_urls);
@@ -2460,7 +2543,34 @@ async fn replace_cleanup(job: &JobState, documents_indexed: u64) -> Result<u64, 
         job_id,
     )
     .await;
-    Ok(verified_pages_indexed(documents_indexed, job_documents))
+
+    // Failed document tasks since the job started: fire-and-forget
+    // submissions Meilisearch rejected. Read after the cleanup, which
+    // waited for the index's tasks to settle, so the count is final.
+    let since = job
+        .started_at
+        .map(|t| offset_datetime_from_millis(t.timestamp_millis()))
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let failed = scrapix_storage::meilisearch::MeilisearchStorage::failed_document_tasks(
+        replace_url,
+        ms_key,
+        index_uid,
+        since,
+    )
+    .await;
+    if let Some(f) = failed.filter(|f| f.tasks > 0) {
+        warn!(
+            job_id = %job_id,
+            index = %index_uid,
+            failed_tasks = f.tasks,
+            failed_documents = f.documents,
+            "Meilisearch had failed indexing tasks — index may be incomplete"
+        );
+    }
+    Ok(CleanupOutcome {
+        documents_indexed: verified_pages_indexed(documents_indexed, job_documents),
+        documents_failed: failed.map(|f| f.documents),
+    })
 }
 
 /// Pages indexed by a Replace job: the accounted count, lowered to the
@@ -10238,7 +10348,13 @@ mod lifecycle_tests {
             "one terminal write, after both events were recorded"
         );
         assert_eq!(events_of(&outbox, "usage.recorded").len(), 1);
-        assert_eq!(events_of(&outbox, "job.completed").len(), 1);
+        let completed = events_of(&outbox, "job.completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].data["pages_failed"], 0);
+        assert!(
+            completed[0].data.get("documents_failed").is_none(),
+            "unknown without a Replace cleanup"
+        );
 
         state.flush_to_db(store.as_ref()).await;
         assert_eq!(store.writes_of("j1").len(), 1, "nothing owed any more");
@@ -10285,7 +10401,8 @@ mod lifecycle_tests {
 
         state.crawl.dirty_jobs.write().insert("j1".to_string());
         state.flush_to_db(store.as_ref()).await; // outbox back
-        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);
+                                                 // The charge and the job.cancelled event, recorded before the write.
+        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 2)]);
         assert!(store.counters.lock().iter().all(|(_, s)| !is_terminal(s)));
     }
 
@@ -10593,6 +10710,76 @@ mod lifecycle_tests {
             Some("No page could be crawled (2 failures)")
         );
         assert_eq!(emails(&state), 1);
+    }
+
+    /// Hosted: the lifecycle events say why a crawl failed and how many
+    /// pages failed in one that completed.
+    #[tokio::test]
+    async fn lifecycle_events_carry_the_failure_reason_and_failed_pages() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        // Nothing crawled: failed, no_pages.
+        running_job(&state, "j1", 1);
+        with_account(&state, "j1");
+        for e in [progress("j1", 1, 1, 0), failed("j1", "m1")] {
+            state.process_event("j1", &e);
+        }
+        state
+            .finalize_job("j1", Finalize::FailNoPages, Instant::now())
+            .await;
+        // One page crawled, one failed: completed with pages_failed 1.
+        running_job(&state, "j2", 2);
+        with_account(&state, "j2");
+        for e in [
+            progress("j2", 2, 2, 0),
+            crawled("j2", "m1"),
+            indexed("j2", "m1"),
+            failed("j2", "m2"),
+        ] {
+            state.process_event("j2", &e);
+        }
+        state
+            .finalize_job("j2", Finalize::Complete, Instant::now())
+            .await;
+        state.flush_to_db(&TerminalStore::watching(&outbox)).await;
+
+        let failed = events_of(&outbox, "job.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].data,
+            serde_json::json!({"job_id": "j1", "index_uid": "idx", "pages_crawled": 0,
+                               "error_message": "No page could be crawled (1 failures)",
+                               "reason": "no_pages"})
+        );
+        let completed = events_of(&outbox, "job.completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].data["job_id"], "j2");
+        assert_eq!(completed[0].data["pages_crawled"], 1);
+        assert_eq!(completed[0].data["pages_failed"], 1);
+        lab_events::assert_contract_valid(&outbox.events());
+    }
+
+    #[test]
+    fn job_failed_payload_defaults_to_internal_and_omits_an_unknown_index() {
+        let p = job_failed_payload("j", "boom", 2, "", None);
+        assert_eq!(
+            p,
+            serde_json::json!({"job_id": "j", "error_message": "boom", "pages_crawled": 2,
+                               "reason": "internal"})
+        );
+        let cleanup = lab_events::JobFailure::IndexCleanup(
+            "Stale document cleanup failed: Storage error: Failed to delete stale documents \
+             from docs: Meilisearch auth: invalid_api_key: The provided API key is invalid."
+                .into(),
+        );
+        let p = job_failed_payload("j", "x", 0, "docs", Some(&cleanup));
+        assert_eq!(p["reason"], "destination_auth");
+        assert_eq!(p["index_uid"], "docs");
+        assert_eq!(
+            job_cancelled_payload("j", "", 1, 0),
+            serde_json::json!({"job_id": "j", "pages_crawled": 1, "documents_indexed": 0})
+        );
     }
 
     #[tokio::test]
@@ -11207,7 +11394,12 @@ mod lifecycle_tests {
         // f2ab8d2: crawl_credits(1, 0, 0, no features) = 1.
         assert_eq!(usage[0].data["credits"], 1);
         assert_eq!(usage[0].data["job_id"], "j1");
-        assert_eq!(events_of(&outbox, "job.failed").len(), 1);
+        let failed = events_of(&outbox, "job.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["reason"], "stalled");
+        assert_eq!(failed[0].data["index_uid"], "idx");
+        assert_eq!(failed[0].data["pages_crawled"], 1);
+        lab_events::assert_contract_valid(&outbox.events());
         assert_eq!(
             store.writes_of("j1"),
             vec![(JobStatus::Failed, 2)],
@@ -11618,7 +11810,7 @@ mod lifecycle_tests {
         assert!(state
             .completion_decisions(Instant::now() + Duration::from_secs(3600))
             .is_empty());
-        assert_eq!(emails(&state), 0);
+        assert_eq!(emails(&state), 1, "the cancel's lifecycle event only");
 
         assert_eq!(state.cancel("nope").unwrap_err(), ControlError::NotFound);
 
@@ -11629,8 +11821,80 @@ mod lifecycle_tests {
         assert_eq!(usage[0].data["units"]["pages_http"], 3);
         // f2ab8d2: crawl_credits(3, 0, 0, no features) = 3.
         assert_eq!(usage[0].data["credits"], 3);
-        assert_eq!(outbox.events().len(), 1, "no lifecycle email for a cancel");
-        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 1)]);
+        let cancelled = events_of(&outbox, "job.cancelled");
+        assert_eq!(cancelled.len(), 1, "one lifecycle event for a cancel");
+        assert_eq!(
+            cancelled[0].data,
+            serde_json::json!({"job_id": "j1", "index_uid": "idx", "pages_crawled": 3,
+                               "documents_indexed": 0})
+        );
+        assert_eq!(
+            cancelled[0].id,
+            lab_events::LabEvent::job_completed("j1", ACCT, serde_json::json!({})).id,
+            "the job's one lifecycle event id"
+        );
+        assert_eq!(outbox.events().len(), 2);
+        lab_events::assert_contract_valid(&outbox.events());
+        assert_eq!(store.writes_of("j1"), vec![(JobStatus::Cancelled, 2)]);
+    }
+
+    /// A cancelled job never also completes or fails: a finalize or a
+    /// (redelivered) terminal event after the cancel changes nothing, and
+    /// the Lab gets the cancel alone.
+    #[tokio::test]
+    async fn cancelled_job_emits_no_completed_or_failed_event() {
+        let bus = ChannelBus::new();
+        let mut state = test_state(&bus);
+        let outbox = with_memory_lab(&mut state);
+        running_job(&state, "j1", 1);
+        with_account(&state, "j1");
+        for e in [
+            progress("j1", 1, 1, 0),
+            crawled("j1", "m1"),
+            indexed("j1", "m1"),
+        ] {
+            state.process_event("j1", &e);
+        }
+        state.cancel("j1").expect("running job cancels");
+        state
+            .finalize_job("j1", Finalize::Complete, Instant::now())
+            .await;
+        state
+            .finalize_job(
+                "j1",
+                Finalize::FailStalled,
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        for e in [
+            CrawlEvent::JobCompleted {
+                job_id: "j1".into(),
+                account_id: Some(ACCT.into()),
+                pages_crawled: 1,
+                documents_indexed: 1,
+                errors: 0,
+                bytes_downloaded: 0,
+                duration_secs: 1,
+                timestamp: 0,
+            },
+            CrawlEvent::JobFailed {
+                job_id: "j1".into(),
+                account_id: Some(ACCT.into()),
+                error: "late".into(),
+                timestamp: 0,
+            },
+        ] {
+            assert!(!state.process_event("j1", &e).applied);
+        }
+        assert_eq!(emails(&state), 1);
+        state.flush_to_db(&TerminalStore::watching(&outbox)).await;
+        let cancelled = events_of(&outbox, "job.cancelled");
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].data["pages_crawled"], 1);
+        assert_eq!(cancelled[0].data["documents_indexed"], 1);
+        assert!(events_of(&outbox, "job.completed").is_empty());
+        assert!(events_of(&outbox, "job.failed").is_empty());
+        assert_eq!(state.get_job("j1").unwrap().status, JobStatus::Cancelled);
     }
 
     /// SCR-72: cancelling a job doesn't go through the pipeline's

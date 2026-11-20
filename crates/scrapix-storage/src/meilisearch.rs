@@ -212,6 +212,31 @@ fn serialized_len(doc: &Document) -> usize {
     counter.0 + 1
 }
 
+/// Failed document tasks of one index over a period, and the documents
+/// they carried (documents Meilisearch refused).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailedTasks {
+    pub tasks: u64,
+    pub documents: u64,
+}
+
+/// Documents a failed `documentAdditionOrUpdate` task refused: those it
+/// received minus any it still indexed (0 for any other task).
+fn failed_task_documents(task: &meilisearch_sdk::tasks::Task) -> u64 {
+    use meilisearch_sdk::tasks::{Task, TaskType};
+    let Task::Failed { content } = task else {
+        return 0;
+    };
+    match &content.task.update_type {
+        TaskType::DocumentAdditionOrUpdate {
+            details: Some(details),
+        } => details
+            .received_documents
+            .saturating_sub(details.indexed_documents.unwrap_or(0)) as u64,
+        _ => 0,
+    }
+}
+
 /// Whether Meilisearch (or a proxy in front of it) refused a request for
 /// its size: HTTP 413 / `payload_too_large`.
 fn is_payload_too_large(e: &meilisearch_sdk::errors::Error) -> bool {
@@ -1353,48 +1378,66 @@ impl MeilisearchStorage {
         Some(page.total as u64)
     }
 
-    /// Log the failed document tasks of `index_uid` enqueued since
-    /// `since` (the job's start), so tasks of earlier jobs are not
-    /// counted. Returns how many failed (best effort: 0 when the tasks
-    /// cannot be read).
-    pub async fn log_failed_tasks(
+    /// Count (and log) the failed document tasks of `index_uid` enqueued
+    /// since `since` (the job's start), so tasks of earlier jobs are not
+    /// counted, and the documents they carried. `None` when the tasks
+    /// cannot be read (best effort). Reads at most
+    /// `FAILED_TASK_PAGES` pages of `FAILED_TASK_PAGE` tasks; `tasks` is
+    /// still Meilisearch's exact total.
+    pub async fn failed_document_tasks(
         meilisearch_url: &str,
         api_key: Option<&str>,
         index_uid: &str,
         since: time::OffsetDateTime,
-    ) -> u64 {
-        let client = match Client::new(meilisearch_url, api_key) {
-            Ok(c) => c,
-            Err(_) => return 0,
-        };
+    ) -> Option<FailedTasks> {
+        const FAILED_TASK_PAGE: u32 = 1000;
+        const FAILED_TASK_PAGES: usize = 20;
+        const LOGGED_TASKS: usize = 20;
 
-        let mut query = TasksSearchQuery::new(&client);
-        query
-            .with_index_uids([index_uid])
-            .with_statuses(["failed"])
-            .with_types(["documentAdditionOrUpdate"])
-            .with_after_enqueued_at(&since);
-
-        let result = match client.get_tasks_with(&query).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(index = %index_uid, error = %e, "Failed to query failed tasks");
-                return 0;
+        let client = Client::new(meilisearch_url, api_key).ok()?;
+        let mut failed = FailedTasks::default();
+        let mut from = None;
+        let mut logged = 0usize;
+        for _ in 0..FAILED_TASK_PAGES {
+            let mut query = TasksSearchQuery::new(&client);
+            query
+                .with_index_uids([index_uid])
+                .with_statuses(["failed"])
+                .with_types(["documentAdditionOrUpdate"])
+                .with_after_enqueued_at(&since)
+                .with_limit(FAILED_TASK_PAGE);
+            if let Some(f) = from {
+                query.with_from(f);
             }
-        };
-
-        let count = result.total;
-        if count > 0 {
-            error!(
-                index = %index_uid,
-                failed_task_count = count,
-                "Meilisearch indexing tasks failed — documents may not have been indexed"
-            );
-            for task in &result.results {
-                error!(index = %index_uid, task = ?task, "Failed Meilisearch task detail");
+            let page = match client.get_tasks_with(&query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(index = %index_uid, error = %e, "Failed to query failed tasks");
+                    return None;
+                }
+            };
+            failed.tasks = page.total;
+            for task in &page.results {
+                failed.documents += failed_task_documents(task);
+                if logged < LOGGED_TASKS {
+                    error!(index = %index_uid, task = ?task, "Failed Meilisearch task detail");
+                    logged += 1;
+                }
+            }
+            match page.next {
+                Some(next) if !page.results.is_empty() => from = Some(next),
+                _ => break,
             }
         }
-        count
+        if failed.tasks > 0 {
+            error!(
+                index = %index_uid,
+                failed_task_count = failed.tasks,
+                failed_documents = failed.documents,
+                "Meilisearch indexing tasks failed — documents may not have been indexed"
+            );
+        }
+        Some(failed)
     }
 
     /// Wait until all tasks for a specific index are finished (no enqueued/processing tasks).
@@ -1559,6 +1602,59 @@ impl MeilisearchStorageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task(status: &str, kind: &str, details: serde_json::Value) -> meilisearch_sdk::tasks::Task {
+        let mut t = serde_json::json!({
+            "uid": 1, "batchUid": 1, "indexUid": "docs", "status": status, "type": kind,
+            "canceledBy": null, "details": details,
+            "duration": "PT1S", "enqueuedAt": "2026-01-01T00:00:00Z",
+            "startedAt": "2026-01-01T00:00:00Z", "finishedAt": "2026-01-01T00:00:01Z",
+        });
+        if status == "failed" {
+            t["error"] = serde_json::json!({
+                "message": "bad", "code": "invalid_document_id",
+                "type": "invalid_request", "link": "https://docs.meilisearch.com"
+            });
+        }
+        serde_json::from_value(t).unwrap()
+    }
+
+    #[test]
+    fn failed_task_documents_counts_the_documents_a_failed_addition_refused() {
+        let add = "documentAdditionOrUpdate";
+        assert_eq!(
+            failed_task_documents(&task(
+                "failed",
+                add,
+                serde_json::json!({"receivedDocuments": 12, "indexedDocuments": 0})
+            )),
+            12
+        );
+        assert_eq!(
+            failed_task_documents(&task(
+                "failed",
+                add,
+                serde_json::json!({"receivedDocuments": 12, "indexedDocuments": null})
+            )),
+            12
+        );
+        assert_eq!(
+            failed_task_documents(&task(
+                "succeeded",
+                add,
+                serde_json::json!({"receivedDocuments": 12, "indexedDocuments": 12})
+            )),
+            0
+        );
+        assert_eq!(
+            failed_task_documents(&task(
+                "failed",
+                "documentDeletion",
+                serde_json::json!({"providedIds": 3, "deletedDocuments": 0})
+            )),
+            0
+        );
+    }
 
     #[test]
     fn test_config_default() {

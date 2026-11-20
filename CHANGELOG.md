@@ -10,6 +10,16 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **Lab events: `job.cancelled`, failure reasons and failed counts.**
+  Cancelling a running crawl now reports `job.cancelled` (pages crawled,
+  documents indexed, index) to the Lab, as the job's one lifecycle event, so
+  it can email about it. `job.failed` carries a `reason` code (`stalled`,
+  `no_pages`, `destination_auth`, `destination_unreachable`,
+  `destination_rejected`, `internal`) and the `index_uid`; `job.completed`
+  carries `pages_failed`, and `documents_failed` (documents in Meilisearch's
+  failed tasks) for `Replace` crawls. The `Replace` cleanup now counts the
+  failed tasks after the index settled, and the documents they carried.
+  Vendors the Lab's new `lab-events.schema.json`.
 - **Suggest a crawl config from a URL (`POST /crawl/suggest`).** A job
   scrapes the start page, maps the site, samples a few pages (8 by default)
   and proposes a crawl config, polled with `GET /crawl/suggest/{id}`. It
