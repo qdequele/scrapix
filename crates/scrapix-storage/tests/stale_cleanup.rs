@@ -214,6 +214,65 @@ async fn failed_tasks_are_scoped_to_the_job_start() {
         .mount(&ms)
         .await;
     let since = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
-    let failed = MeilisearchStorage::log_failed_tasks(&ms.uri(), None, INDEX, since).await;
-    assert_eq!(failed, 3, "the total, not one page of results");
+    let failed = MeilisearchStorage::failed_document_tasks(&ms.uri(), None, INDEX, since)
+        .await
+        .expect("tasks read");
+    assert_eq!(failed.tasks, 3, "the total, not one page of results");
+    assert_eq!(failed.documents, 0, "no task details on this page");
+}
+
+fn failed_addition(uid: u32, received: u64) -> serde_json::Value {
+    serde_json::json!({
+        "uid": uid, "batchUid": uid, "indexUid": INDEX, "status": "failed",
+        "type": "documentAdditionOrUpdate", "canceledBy": null,
+        "details": {"receivedDocuments": received, "indexedDocuments": 0},
+        "error": {"message": "bad", "code": "invalid_document_id",
+                  "type": "invalid_request", "link": "https://docs.meilisearch.com"},
+        "duration": "PT1S", "enqueuedAt": "2026-01-01T00:00:00Z",
+        "startedAt": "2026-01-01T00:00:00Z", "finishedAt": "2026-01-01T00:00:01Z",
+    })
+}
+
+/// The documents of every failed task are summed, page after page.
+#[tokio::test]
+async fn failed_document_tasks_sum_the_refused_documents_across_pages() {
+    let ms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(|req: &Request| {
+            let query = req.url.query().unwrap_or_default().to_string();
+            let body = if query.contains("from=7") {
+                serde_json::json!({"results": [failed_addition(7, 5)],
+                                   "total": 3, "limit": 1000, "from": 7, "next": null})
+            } else {
+                serde_json::json!({"results": [failed_addition(9, 10), failed_addition(8, 2)],
+                                   "total": 3, "limit": 1000, "from": 9, "next": 7})
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&ms)
+        .await;
+    let since = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+    let failed = MeilisearchStorage::failed_document_tasks(&ms.uri(), None, INDEX, since)
+        .await
+        .expect("tasks read");
+    assert_eq!(failed.tasks, 3);
+    assert_eq!(failed.documents, 17);
+}
+
+/// Unreadable tasks are unknown (`None`), not zero.
+#[tokio::test]
+async fn failed_document_tasks_are_unknown_when_the_tasks_cannot_be_read() {
+    let ms = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&ms)
+        .await;
+    let since = time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+    assert!(
+        MeilisearchStorage::failed_document_tasks(&ms.uri(), None, INDEX, since)
+            .await
+            .is_none()
+    );
 }

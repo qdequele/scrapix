@@ -133,6 +133,63 @@ impl LabEvent {
     pub fn job_failed(job_id: &str, account_id: &str, data: Value) -> Self {
         Self::lifecycle("job.failed", job_id, account_id, data)
     }
+
+    /// A cancelled crawl: the job's lifecycle event, like completed/failed.
+    pub fn job_cancelled(job_id: &str, account_id: &str, data: Value) -> Self {
+        Self::lifecycle("job.cancelled", job_id, account_id, data)
+    }
+}
+
+/// Why a crawl failed, as the engine knows it where it fails the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobFailure {
+    /// No progress for the stall timeout.
+    Stalled,
+    /// The crawl ended without a single page crawled.
+    NoPages,
+    /// The Replace cleanup in Meilisearch failed; carries its error message.
+    IndexCleanup(String),
+    /// Anything else (a failure the engine did not classify).
+    Other,
+}
+
+/// The `reason` code of a `job.failed` event (the contract's `reason`
+/// list). An index cleanup error is classified from the Meilisearch SDK's
+/// error text, which is all that reaches here (the storage layer
+/// stringifies it): `Meilisearch auth: …` or a 401/403 is the key,
+/// `HTTP request failed: …` (the HTTP client could not reach it) or a
+/// 502/503/504 is unreachable, anything else is Meilisearch refusing it.
+pub fn failure_reason(failure: &JobFailure) -> &'static str {
+    match failure {
+        JobFailure::Stalled => "stalled",
+        JobFailure::NoPages => "no_pages",
+        JobFailure::IndexCleanup(message) => {
+            let m = message.to_ascii_lowercase();
+            let auth = [
+                "meilisearch auth:",
+                "invalid_api_key",
+                "missing_authorization_header",
+                "responded with a 401",
+                "responded with a 403",
+                "api_key is invalid",
+                "invalid api key",
+            ];
+            let unreachable = [
+                "http request failed",
+                "responded with a 502",
+                "responded with a 503",
+                "responded with a 504",
+            ];
+            if auth.iter().any(|p| m.contains(p)) {
+                "destination_auth"
+            } else if unreachable.iter().any(|p| m.contains(p)) {
+                "destination_unreachable"
+            } else {
+                "destination_rejected"
+            }
+        }
+        JobFailure::Other => "internal",
+    }
 }
 
 #[async_trait::async_trait]
@@ -594,6 +651,9 @@ mod tests {
             c.id, d.id,
             "a job has one lifecycle email, completed or failed"
         );
+        let x = LabEvent::job_cancelled("job-1", "acc", json!({}));
+        assert_eq!(x.id, c.id, "a cancel is the job's one lifecycle event");
+        assert_eq!(x.kind, "job.cancelled");
         assert_ne!(a.id, c.id);
         assert_ne!(
             a.id,
@@ -716,6 +776,127 @@ mod tests {
                 json!({"job_id":"job-1","error_message":"boom","pages_crawled":0}),
             ),
         );
+        assert_valid(
+            &v,
+            &LabEvent::job_completed(
+                "job-1",
+                acct,
+                json!({"job_id":"job-1","index_uid":"docs","pages_crawled":12,
+                       "documents_indexed":10,"duration_secs":30,"pages_failed":3,
+                       "documents_failed":2}),
+            ),
+        );
+        for failure in [
+            JobFailure::Stalled,
+            JobFailure::NoPages,
+            JobFailure::IndexCleanup("Meilisearch auth: invalid_api_key: x. y".into()),
+            JobFailure::IndexCleanup("HTTP request failed: connection refused".into()),
+            JobFailure::IndexCleanup("Meilisearch invalid_request: bad. y".into()),
+            JobFailure::Other,
+        ] {
+            assert_valid(
+                &v,
+                &LabEvent::job_failed(
+                    "job-1",
+                    acct,
+                    json!({"job_id":"job-1","error_message":"boom","pages_crawled":4,
+                           "reason": failure_reason(&failure),"index_uid":"docs"}),
+                ),
+            );
+        }
+        assert_valid(
+            &v,
+            &LabEvent::job_cancelled(
+                "job-1",
+                acct,
+                json!({"job_id":"job-1","index_uid":"docs","pages_crawled":5,
+                       "documents_indexed":4}),
+            ),
+        );
+        assert_valid(
+            &v,
+            &LabEvent::job_cancelled("job-1", acct, json!({"job_id":"job-1"})),
+        );
+    }
+
+    #[test]
+    fn failure_reasons_map_to_the_contract_codes() {
+        let r = |f: JobFailure| failure_reason(&f);
+        assert_eq!(r(JobFailure::Stalled), "stalled");
+        assert_eq!(r(JobFailure::NoPages), "no_pages");
+        assert_eq!(r(JobFailure::Other), "internal");
+        let cleanup = |m: &str| r(JobFailure::IndexCleanup(m.into()));
+        // The Meilisearch SDK's error texts, as wrapped by the storage layer.
+        for auth in [
+            "Stale document cleanup failed: Storage error: Failed to delete stale documents \
+             from docs: Meilisearch auth: invalid_api_key: The provided API key is invalid. \
+             https://docs.meilisearch.com/errors#invalid_api_key",
+            "Meilisearch auth: missing_authorization_header: The Authorization header is missing.",
+            "MeilisearchCommunicationError: The server responded with a 401.",
+            "MeilisearchCommunicationError: The server responded with a 403. forbidden",
+        ] {
+            assert_eq!(cleanup(auth), "destination_auth", "{auth}");
+        }
+        for down in [
+            "Stale document cleanup failed: Storage error: Failed to delete stale documents \
+             from docs: HTTP request failed: error sending request: connection refused",
+            "MeilisearchCommunicationError: The server responded with a 502.",
+            "MeilisearchCommunicationError: The server responded with a 503.",
+        ] {
+            assert_eq!(cleanup(down), "destination_unreachable", "{down}");
+        }
+        for refused in [
+            "Stale document cleanup failed: Storage error: Meilisearch invalid_request: \
+             invalid_search_filter: Attribute `_crawl_scope` is not filterable.",
+            "Stale document cleanup failed: Storage error: Timed out waiting for index docs \
+             tasks to settle (300s)",
+            "",
+        ] {
+            assert_eq!(cleanup(refused), "destination_rejected", "{refused}");
+        }
+        // Every code is one the contract knows.
+        let raw = include_str!("../../../contracts/vendor/lab/lab-events.schema.json");
+        let schema: Value = serde_json::from_str(raw).unwrap();
+        let known = schema["$defs"]["reason"]["description"].as_str().unwrap();
+        for code in [
+            "stalled",
+            "no_pages",
+            "internal",
+            "destination_auth",
+            "destination_unreachable",
+            "destination_rejected",
+        ] {
+            assert!(known.contains(code), "{code} is not a known reason");
+        }
+    }
+
+    #[test]
+    fn the_contract_schema_rejects_malformed_lifecycle_events() {
+        let v = contract_validator();
+        let acct = "7f1c2a8e-0000-4000-8000-000000000001";
+        let cancelled = serde_json::to_value(LabEvent::job_cancelled(
+            "job-1",
+            acct,
+            json!({"job_id":"job-1","pages_crawled":1}),
+        ))
+        .unwrap();
+        assert!(v.is_valid(&cancelled));
+        let mut bad = cancelled.clone();
+        bad["data"]["error_message"] = json!("cancelled");
+        assert!(!v.is_valid(&bad), "a cancel carries no error");
+        let mut bad = cancelled;
+        bad["data"]["pages_crawled"] = json!(-1);
+        assert!(!v.is_valid(&bad), "negative pages");
+        let failed = serde_json::to_value(LabEvent::job_failed(
+            "job-1",
+            acct,
+            json!({"job_id":"job-1","error_message":"x","pages_crawled":0,"reason":"stalled"}),
+        ))
+        .unwrap();
+        assert!(v.is_valid(&failed));
+        let mut bad = failed;
+        bad["data"]["reason"] = json!("Stalled!");
+        assert!(!v.is_valid(&bad), "reason is a lowercase code");
     }
 
     /// Transition release: `credits` (the pre-v2 price, authoritative for
