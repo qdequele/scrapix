@@ -19,9 +19,9 @@ just sdk-generate   # = sdks/generate.sh
 just sdk-check      # = sdks/generate.sh --check (what CI runs)
 ```
 
-Generator versions are pinned (`typescript/package-lock.json`, and
+Generator versions are pinned (`typescript/pnpm-lock.yaml`, and
 `DATAMODEL_CODEGEN_VERSION` in `generate.sh`), so the output is
-deterministic. Requirements: Node.js 18+ with npm, and
+deterministic. Requirements: Node.js 18+ with pnpm, and
 [uv](https://docs.astral.sh/uv/) (the Python generator runs through `uvx`).
 
 New request fields need no client change: the TypeScript methods take the

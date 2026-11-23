@@ -1,5 +1,5 @@
 /**
- * The README / docs examples, type-checked by `npm run typecheck` (never
+ * The README / docs examples, type-checked by `pnpm run typecheck` (never
  * executed) so they stay valid when the generated types change.
  */
 import { NotFoundError, Scrapix } from "../src/index.js";

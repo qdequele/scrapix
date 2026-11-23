@@ -44,13 +44,14 @@
   "engines": {
     "node": ">=18"
   },
+  "packageManager": "pnpm@12.18.0",
   "scripts": {
     "generate": "bash ../generate.sh typescript",
     "check:generated": "bash ../generate.sh --check typescript",
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepublishOnly": "npm run check:generated && npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "pnpm run check:generated && pnpm run typecheck && pnpm test && pnpm run build"
   },
   "devDependencies": {
     "@types/node": "22.20.4",
