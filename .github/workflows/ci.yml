@@ -182,6 +182,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The Lab commit the vendored contracts are copied from (same pin as the justfile).
+      # TODO: drop LAB_REF once the Lab's main has notifications phase 2 (meilisearch/lab#165,
+      # merged into its base branch after that branch had already landed, so it never reached main).
       - run: contracts/check-drift.sh
         env:
           GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          LAB_REF: 1f65a91e436dc21467c1404f7c8023243613dee1

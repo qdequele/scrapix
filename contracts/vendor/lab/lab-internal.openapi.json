@@ -3,7 +3,7 @@
   "info": {
     "title": "Meilisearch Lab internal API",
     "version": "1",
-    "description": "Service API the hosted product engines (Scrapix, Lumen, glutony) call on the Lab (Rails) control plane instead of reading the Lab database. Every endpoint except `POST /internal/events` requires `X-Lab-Instance-Id` plus `Authorization: Bearer <LAB_INSTANCE_SECRET>`; a missing or wrong credential gets 401. For one transition release the legacy `Authorization: Bearer <LAB_SERVICE_TOKEN>` without an instance id is still accepted and acts as the hosted Scrapix engine. `POST /internal/events` is signed per deployment instead (see its description)."
+    "description": "Service API the hosted product engines (Scrapix, Lumen, glutony, meili-connect) call on the Lab (Rails) control plane instead of reading the Lab database. Every endpoint except `POST /internal/events` requires `X-Lab-Instance-Id` plus `Authorization: Bearer <LAB_INSTANCE_SECRET>`; a missing or wrong credential gets 401. For one transition release the legacy `Authorization: Bearer <LAB_SERVICE_TOKEN>` without an instance id is still accepted and acts as the hosted Scrapix engine. `POST /internal/events` is signed per deployment instead (see its description)."
   },
   "security": [
     {
@@ -303,7 +303,8 @@
                       "enum": [
                         "scrapix",
                         "lumen",
-                        "glutony"
+                        "glutony",
+                        "connect"
                       ]
                     },
                     "region": {
@@ -419,7 +420,7 @@
       "post": {
         "operationId": "postDeploys",
         "summary": "Report deploy attempts of the Lab and the hosted engines (qdq-server autodeploy)",
-        "description": "Called by qdq-server's autodeploy scripts, not by an engine: each deploy attempt of the Lab, the Scrapix engine, the hosted Gateway (Lumen) and Pipelines (glutony), once when it starts and once when it ends, listed on Admin > Deploys. Signed with the box's own key: X-Lab-Timestamp (unix seconds, within 300 s) and X-Lab-Signature: sha256=HMAC-SHA256(LAB_DEPLOYS_SECRET, \"<timestamp>.<raw body>\"); during a rotation LAB_DEPLOYS_SECRET holds both keys, comma-separated. 503 while LAB_DEPLOYS_SECRET is unset. At most 100 reports. A report is the whole attempt; its id makes a resend harmless, and a `started` report never reopens an attempt that ended. The reporter drops every id in `accepted` and `rejected`.",
+        "description": "Called by qdq-server's autodeploy scripts, not by an engine: each deploy attempt of the Lab, the Scrapix engine, the hosted Gateway (Lumen), Pipelines (glutony) and Connect (meili-connect), once when it starts and once when it ends, listed on Admin > Deploys. Signed with the box's own key: X-Lab-Timestamp (unix seconds, within 300 s) and X-Lab-Signature: sha256=HMAC-SHA256(LAB_DEPLOYS_SECRET, \"<timestamp>.<raw body>\"); during a rotation LAB_DEPLOYS_SECRET holds both keys, comma-separated. 503 while LAB_DEPLOYS_SECRET is unset. At most 100 reports. A report is the whole attempt; its id makes a resend harmless, and a `started` report never reopens an attempt that ended. The reporter drops every id in `accepted` and `rejected`.",
         "security": [],
         "parameters": [
           {
@@ -577,7 +578,8 @@
                               "lab",
                               "scrapix",
                               "gateway",
-                              "pipelines"
+                              "pipelines",
+                              "connect"
                             ]
                           },
                           "requested_by": {
@@ -818,6 +820,10 @@
           "credits": {
             "$ref": "#/components/schemas/Credits"
           },
+          "can_spend": {
+            "type": "boolean",
+            "description": "False once the spendable balance (credits.balance) is used up. Connect holds the team's syncs (`out_of_credits`) while it is false and resumes them when it is true again."
+          },
           "cache_ttl": {
             "type": "integer"
           },
@@ -953,7 +959,8 @@
               "lab",
               "scrapix",
               "gateway",
-              "pipelines"
+              "pipelines",
+              "connect"
             ]
           },
           "repo": {

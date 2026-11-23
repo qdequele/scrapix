@@ -139,8 +139,8 @@ sdk-build:
 # ---------------------------------------------------------------------------
 
 # Lab ref the vendored contracts are compared with (same pin as CI's contracts job).
-# TODO: drop LAB_REF once meilisearch/lab#17 merges (then compare against main).
-LAB_REF := env_var_or_default("LAB_REF", "42c282ce6005b14b1705711680fa70c0858e78ac")
+# TODO: drop LAB_REF once the Lab's main has notifications phase 2 (meilisearch/lab#165), then compare against main.
+LAB_REF := env_var_or_default("LAB_REF", "1f65a91e436dc21467c1404f7c8023243613dee1")
 
 # Re-copy the Lab's contracts (from $LAB_SRC if set, else GitHub at LAB_REF via gh + GH_TOKEN/LAB_REPO_TOKEN)
 sync-contracts:
