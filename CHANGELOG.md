@@ -98,6 +98,10 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Changed
 
+- The vendored `lab-events.schema.json` follows the Lab's copy, which adds
+  `sync.health_changed`, an event only Connect sends. Nothing Scrapix sends
+  changes. The drift check (`just check-contracts`, CI's "Lab contract
+  drift") compares with the Lab's `main` again instead of a pinned commit.
 - **`/map` treats `example.com` and `www.example.com` as one site.** A map
   of `example.com` whose sitemap lists `www.example.com` URLs dropped them
   all and returned only the start URL; URLs and links on either host are

@@ -188,6 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # Compared with the Lab's main, like the justfile's check-contracts.
       - run: contracts/check-drift.sh
         env:
           GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}

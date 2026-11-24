@@ -45,10 +45,10 @@ vendored `openapi.json`, the Lab's drift check fails until it re-vendors it.
   authoritative for product `scrapix`; both go next release. Owned by
   `meilisearch/lab` (`contracts/lab-events.schema.json`).
 
-Both are byte copies of the Lab's contract v2 at commit
-`42c282ce6005b14b1705711680fa70c0858e78ac` (meilisearch/lab#17). Until that
-PR merges, the Lab's `main` still has v1 (and no `lab-events.schema.json`), so
-CI pins the drift check to that commit with `LAB_REF`.
+Both are byte copies of the Lab's contracts on its `main`, once
+meilisearch/lab#188 is merged there (notifications phases 2 and 3, which
+had been merged into branches that never reached `main`; the drift check
+was pinned to a commit of those branches meanwhile).
 
 `check-drift.sh` compares the vendored copies with the Lab's `main`, or with
 `$LAB_REF` (a branch, tag or commit) when set:
