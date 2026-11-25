@@ -21,6 +21,10 @@
 //! 6. **Proposal** (`presets`): a compact `CrawlConfig`, one reason per
 //!    decision, an estimate and warnings.
 //!
+//! While it runs, `progress` says which stage it is at and what it has
+//! found so far ([`SuggestProgress`]), saved with the job's summary at each
+//! stage so any API replica serves it.
+//!
 //! The job is a regular engine job (`/jobs`, events, webhooks, cancel); the
 //! sampled pages are its results (`GET /job/{id}/results`).
 
@@ -196,6 +200,54 @@ pub(crate) struct SuggestStatusResponse {
     /// job's credits). Omitted when no AI call was made.
     #[serde(skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
     pub ai_usage: scrapix_core::AiUsage,
+    /// Where the job is and what it has found so far (`null` before it
+    /// starts); once it ended, the last stage it reached
+    pub progress: Option<SuggestProgress>,
+}
+
+/// The stage a config suggestion is at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SuggestStage {
+    /// Fetching the start page (and following its redirect)
+    #[default]
+    StartPage,
+    /// Listing the site's pages from its sitemaps
+    Mapping,
+    /// Few pages in the sitemaps: following the start page's links
+    FollowingLinks,
+    /// Scraping a few pages of the largest sections
+    Sampling,
+    /// Rendering pages that look like JavaScript app shells with a browser
+    CheckingJs,
+    /// Classifying the sections and the site: the AI confirms or corrects
+    /// the analysis (with no AI provider, it ends right away)
+    Classifying,
+}
+
+/// Where a suggestion is and what it has found so far: each field is set
+/// once its stage has found it. Once the job ended, the last stage reached.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub(crate) struct SuggestProgress {
+    pub stage: SuggestStage,
+    /// The site analyzed, after the start page's redirects (from `mapping`)
+    #[serde(default)]
+    pub site: Option<String>,
+    /// Pages found under the start URL's path (from `sampling`)
+    #[serde(default)]
+    pub pages_found: Option<usize>,
+    /// Its section keys (`/blog/`), largest first (from `sampling`)
+    #[serde(default)]
+    pub sections: Vec<String>,
+    /// Language path segments found (from `sampling`)
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// The pages being sampled, start page excluded (from `sampling`)
+    #[serde(default)]
+    pub sampling: Vec<String>,
+    /// Pages being rendered with a browser (`checking_js`)
+    #[serde(default)]
+    pub rendering: Option<usize>,
 }
 
 /// What is stored as the job's summary (results store, seq 0).
@@ -215,6 +267,8 @@ struct SuggestSummary {
     warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "scrapix_core::AiUsage::is_empty")]
     ai_usage: scrapix_core::AiUsage,
+    #[serde(default)]
+    progress: Option<SuggestProgress>,
 }
 
 // ============================================================================
@@ -382,6 +436,7 @@ pub(crate) async fn get_suggest(
         warnings: summary.warnings,
         error: job.error_message,
         ai_usage: summary.ai_usage,
+        progress: summary.progress,
     }))
 }
 
@@ -517,6 +572,17 @@ impl SuggestRunner {
         engine_jobs::fail_job(&self.state, &self.job_id, error);
     }
 
+    /// Moves `progress` on (`update` sets the stage and what it found) and
+    /// saves it with the summary.
+    async fn progress(
+        &self,
+        summary: &mut SuggestSummary,
+        update: impl FnOnce(&mut SuggestProgress),
+    ) {
+        update(summary.progress.get_or_insert_with(Default::default));
+        self.save(summary).await;
+    }
+
     fn stopped(&self) -> bool {
         engine_jobs::is_stopped(&self.state, &self.job_id)
     }
@@ -607,6 +673,7 @@ impl SuggestRunner {
         let mut summary = SuggestSummary::default();
 
         // 1. The start page (and where it redirects).
+        self.progress(&mut summary, |_| {}).await;
         let first = self.scrape(vec![start.to_string()], false).await;
         let Some(first) = first.into_iter().next() else {
             return self
@@ -662,6 +729,12 @@ impl SuggestRunner {
         };
 
         // 2. Map.
+        let site_url = site.to_string();
+        self.progress(&mut summary, |p| {
+            p.stage = SuggestStage::Mapping;
+            p.site = Some(site_url);
+        })
+        .await;
         let mapped = match self.map(&site, 0, true).await {
             Ok(links) => links,
             Err(e) => {
@@ -699,6 +772,8 @@ impl SuggestRunner {
         if under.len() < FEW_PAGES && !self.stopped() {
             // No sitemap, or one filled with other parts of the site: the
             // start page's links, one level deep.
+            self.progress(&mut summary, |p| p.stage = SuggestStage::FollowingLinks)
+                .await;
             match self.map(&site, 1, false).await {
                 Ok(links) => {
                     let mut seen: HashSet<String> = under.iter().map(|p| p.url.clone()).collect();
@@ -775,6 +850,19 @@ impl SuggestRunner {
             older_versions,
         );
         let urls: Vec<String> = picks.iter().map(|(u, _)| u.clone()).collect();
+        let (pages_found, section_keys) = (
+            under.len(),
+            sections.iter().map(|s| s.key.clone()).collect(),
+        );
+        let (language_list, sampling) = (languages.iter().cloned().collect(), urls.clone());
+        self.progress(&mut summary, |p| {
+            p.stage = SuggestStage::Sampling;
+            p.pages_found = Some(pages_found);
+            p.sections = section_keys;
+            p.languages = language_list;
+            p.sampling = sampling;
+        })
+        .await;
         let scraped = self.scrape(urls, false).await;
         let mut sampled: HashSet<String> = [first.url.clone()].into();
         for ((_, key), page) in picks.iter().zip(scraped) {
@@ -825,6 +913,12 @@ impl SuggestRunner {
                         .map(|p| (p.url.clone(), p.words))
                         .collect();
                     let urls = suspects.iter().map(|(u, _)| u.clone()).collect();
+                    let count = suspects.len();
+                    self.progress(&mut summary, |p| {
+                        p.stage = SuggestStage::CheckingJs;
+                        p.rendering = Some(count);
+                    })
+                    .await;
                     let rendered = self.scrape(urls, true).await;
                     for ((url, http_words), page) in suspects.iter().zip(rendered) {
                         if !page.success {
@@ -905,6 +999,8 @@ impl SuggestRunner {
         let mut description = None;
         let mut ai_summary_hint = None;
         if self.use_ai {
+            self.progress(&mut summary, |p| p.stage = SuggestStage::Classifying)
+                .await;
             match self
                 .classify_with_ai(&site, platform, &classified, &pages)
                 .await
@@ -1469,6 +1565,51 @@ mod tests {
             );
         }
         assert!(!response.ai_usage.is_empty());
+
+        // The progress kept once done: the last stage and what it found.
+        let progress = response.progress.as_ref().unwrap();
+        assert_eq!(progress.stage, SuggestStage::Classifying);
+        assert_eq!(progress.site.as_deref(), Some(profile.url.as_str()));
+        assert!(progress.pages_found.unwrap() > 10);
+        assert_eq!(
+            progress.sections,
+            profile
+                .sections
+                .iter()
+                .map(|s| s.key.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(progress.sections.contains(&"/blog/".to_string()));
+        assert_eq!(progress.sampling.len(), DEFAULT_SAMPLES - 1);
+        assert!(!progress.sampling.iter().any(|u| u.contains("/account/")));
+        assert_eq!(progress.rendering, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_page_leaves_the_progress_at_its_stage() {
+        let server = MockServer::start().await;
+        let base = server.uri().replace("127.0.0.1", "localhost");
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let bus = scrapix_queue::ChannelBus::new();
+        let state = test_state_with_ai(&bus, None);
+
+        let request: SuggestRequest =
+            serde_json::from_value(serde_json::json!({ "url": format!("{base}/") })).unwrap();
+        let created = start_suggest(&state, &None, request).await.unwrap();
+        let job = wait_terminal(&state, &created.job_id).await;
+        let response = get_suggest(State(state.clone()), None, Path(created.job_id))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(job.status, JobStatus::Failed);
+        let progress = response.progress.unwrap();
+        assert_eq!(progress.stage, SuggestStage::StartPage);
+        assert_eq!(progress.site, None);
+        assert_eq!(progress.pages_found, None);
     }
 
     #[tokio::test]

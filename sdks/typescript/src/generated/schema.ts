@@ -3191,6 +3191,7 @@ export interface components {
             estimate?: null | components["schemas"]["SuggestEstimate"];
             job_id: string;
             profile?: null | components["schemas"]["SiteProfile"];
+            progress?: null | components["schemas"]["SuggestProgress"];
             /** @description Why the config holds each value */
             reasons: components["schemas"]["SuggestReason"][];
             /** @description The pages the analysis scraped */
@@ -3200,6 +3201,30 @@ export interface components {
             /** @description Things to check before crawling */
             warnings: string[];
         };
+        /**
+         * @description Where a suggestion is and what it has found so far: each field is set
+         *     once its stage has found it. Once the job ended, the last stage reached.
+         */
+        SuggestProgress: {
+            /** @description Language path segments found (from `sampling`) */
+            languages?: string[];
+            /** @description Pages found under the start URL's path (from `sampling`) */
+            pages_found?: number | null;
+            /** @description Pages being rendered with a browser (`checking_js`) */
+            rendering?: number | null;
+            /** @description The pages being sampled, start page excluded (from `sampling`) */
+            sampling?: string[];
+            /** @description Its section keys (`/blog/`), largest first (from `sampling`) */
+            sections?: string[];
+            /** @description The site analyzed, after the start page's redirects (from `mapping`) */
+            site?: string | null;
+            stage: components["schemas"]["SuggestStage"];
+        };
+        /**
+         * @description The stage a config suggestion is at.
+         * @enum {string}
+         */
+        SuggestStage: "start_page" | "mapping" | "following_links" | "sampling" | "checking_js" | "classifying";
     };
     responses: never;
     parameters: never;

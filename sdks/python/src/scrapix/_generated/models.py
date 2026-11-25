@@ -2080,6 +2080,19 @@ class SuggestSample(BaseModel):
     """
 
 
+class SuggestStage(str, Enum):
+    """
+    The stage a config suggestion is at.
+    """
+
+    start_page = "start_page"
+    mapping = "mapping"
+    following_links = "following_links"
+    sampling = "sampling"
+    checking_js = "checking_js"
+    classifying = "classifying"
+
+
 class Action3(BaseModel):
     """
     Scroll the page by `amount` viewport heights (default 1).
@@ -2663,6 +2676,43 @@ class SuggestRequest(BaseModel):
     """
 
 
+class SuggestProgress(BaseModel):
+    """
+    Where a suggestion is and what it has found so far: each field is set
+    once its stage has found it. Once the job ended, the last stage reached.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        populate_by_name=True,
+    )
+    languages: Optional[list[str]] = None
+    """
+    Language path segments found (from `sampling`)
+    """
+    pages_found: Optional[int] = Field(None, ge=0)
+    """
+    Pages found under the start URL's path (from `sampling`)
+    """
+    rendering: Optional[int] = Field(None, ge=0)
+    """
+    Pages being rendered with a browser (`checking_js`)
+    """
+    sampling: Optional[list[str]] = None
+    """
+    The pages being sampled, start page excluded (from `sampling`)
+    """
+    sections: Optional[list[str]] = None
+    """
+    Its section keys (`/blog/`), largest first (from `sampling`)
+    """
+    site: Optional[str] = None
+    """
+    The site analyzed, after the start page's redirects (from `mapping`)
+    """
+    stage: SuggestStage
+
+
 class BatchScrapeRequest(BaseModel):
     """
     Request body for `POST /batch/scrape`. Every field besides `urls`,
@@ -3106,6 +3156,7 @@ class SuggestStatusResponse(BaseModel):
     estimate: Optional[SuggestEstimate] = None
     job_id: str
     profile: Optional[SiteProfile] = None
+    progress: Optional[SuggestProgress] = None
     reasons: list[SuggestReason]
     """
     Why the config holds each value

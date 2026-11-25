@@ -10,6 +10,12 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ### Added
 
+- **Live progress on config suggestions.** `GET /crawl/suggest/{id}` now
+  has `progress` while the job runs: its `stage` (`start_page`, `mapping`,
+  `following_links`, `sampling`, `checking_js`, `classifying`) and what it
+  has found so far: the site after redirects, the pages found, the section
+  keys, the languages, the pages being sampled and the pages rendered for
+  the JavaScript check. Once the job ended it keeps the last stage reached.
 - **Lab events: `job.cancelled`, failure reasons and failed counts.**
   Cancelling a running crawl now reports `job.cancelled` (pages crawled,
   documents indexed, index) to the Lab, as the job's one lifecycle event, so
