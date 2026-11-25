@@ -175,9 +175,9 @@ All API schemas are exported: `ScrapeRequest`, `ScrapeResponse`,
 just sdk-generate   # regenerate src/generated/schema.ts from the spec
 just sdk-check      # fail if the generated code is stale
 cd sdks/typescript
-npm ci
-npm run typecheck && npm test
-npm run build
+pnpm install --frozen-lockfile
+pnpm run typecheck && pnpm test
+pnpm run build
 ```
 
 Do not edit `src/generated/`: it is overwritten by `just sdk-generate`.

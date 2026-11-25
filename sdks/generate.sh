@@ -8,7 +8,7 @@
 #
 # Generators are pinned so the output is deterministic:
 #   - TypeScript: openapi-typescript, pinned in sdks/typescript/package.json
-#     (+ package-lock.json); installed with `npm ci` if missing.
+#     (+ pnpm-lock.yaml); installed with `pnpm install --frozen-lockfile` if missing.
 #   - Python: datamodel-code-generator, pinned below, run through `uvx` on a
 #     pinned Python so no global install is needed.
 #
@@ -16,7 +16,7 @@
 #   sdks/typescript/src/generated/schema.ts
 #   sdks/python/src/scrapix/_generated/models.py
 # The hand-written clients import from them; a spec change that breaks the
-# clients shows up in `npm run typecheck` / the Python tests.
+# clients shows up in `pnpm run typecheck` / the Python tests.
 set -euo pipefail
 
 DATAMODEL_CODEGEN_VERSION="0.83.0"
@@ -50,7 +50,7 @@ done
 gen_typescript() {
     local out="$1"
     if [ ! -x "$TS_DIR/node_modules/.bin/openapi-typescript" ]; then
-        (cd "$TS_DIR" && npm ci --no-audit --no-fund --silent)
+        (cd "$TS_DIR" && pnpm install --frozen-lockfile --silent)
     fi
     (cd "$TS_DIR" && node_modules/.bin/openapi-typescript "$SPEC" --output "$out" >/dev/null)
 }

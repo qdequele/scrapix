@@ -126,12 +126,12 @@ sdk-check:
 
 # Typecheck, lint and test both SDKs (mocked HTTP, no live services)
 sdk-test:
-    cd sdks/typescript && npm ci --no-audit --no-fund && npm run typecheck && npm test
+    cd sdks/typescript && pnpm install --frozen-lockfile && pnpm run typecheck && pnpm test
     cd sdks/python && uv run --group dev ruff check . && uv run --group dev ruff format --check . && uv run --group dev mypy && uv run --group dev pytest
 
 # Build both SDK packages locally (npm tarball + Python sdist/wheel); never publishes
 sdk-build:
-    cd sdks/typescript && npm ci --no-audit --no-fund && npm run build && npm pack --pack-destination dist
+    cd sdks/typescript && pnpm install --frozen-lockfile && pnpm run build && pnpm pack --pack-destination dist
     cd sdks/python && uv build
 
 # ---------------------------------------------------------------------------
