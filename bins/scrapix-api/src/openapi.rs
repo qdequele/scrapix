@@ -98,6 +98,8 @@ use utoipa::OpenApi;
         crate::suggest::SuggestStatusResponse,
         crate::suggest::SiteProfile,
         crate::suggest::SuggestSample,
+        crate::suggest::SuggestProgress,
+        crate::suggest::SuggestStage,
         crate::suggest::analysis::SiteType,
         crate::suggest::analysis::SectionKind,
         crate::suggest::analysis::SitePlatform,

@@ -8529,6 +8529,17 @@
               }
             ]
           },
+          "progress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SuggestProgress",
+                "description": "Where the job is and what it has found so far (`null` before it\nstarts); once it ended, the last stage it reached"
+              }
+            ]
+          },
           "reasons": {
             "type": "array",
             "items": {
@@ -8555,6 +8566,74 @@
             "description": "Things to check before crawling"
           }
         }
+      },
+      "SuggestProgress": {
+        "type": "object",
+        "description": "Where a suggestion is and what it has found so far: each field is set\nonce its stage has found it. Once the job ended, the last stage reached.",
+        "required": [
+          "stage"
+        ],
+        "properties": {
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Language path segments found (from `sampling`)"
+          },
+          "pages_found": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Pages found under the start URL's path (from `sampling`)",
+            "minimum": 0
+          },
+          "rendering": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Pages being rendered with a browser (`checking_js`)",
+            "minimum": 0
+          },
+          "sampling": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pages being sampled, start page excluded (from `sampling`)"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Its section keys (`/blog/`), largest first (from `sampling`)"
+          },
+          "site": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The site analyzed, after the start page's redirects (from `mapping`)"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/SuggestStage"
+          }
+        }
+      },
+      "SuggestStage": {
+        "type": "string",
+        "description": "The stage a config suggestion is at.",
+        "enum": [
+          "start_page",
+          "mapping",
+          "following_links",
+          "sampling",
+          "checking_js",
+          "classifying"
+        ]
       }
     },
     "securitySchemes": {

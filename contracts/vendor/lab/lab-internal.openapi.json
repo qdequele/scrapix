@@ -605,6 +605,105 @@
           }
         }
       }
+    },
+    "/internal/deploys/pipeline": {
+      "post": {
+        "operationId": "postDeployPipelines",
+        "summary": "Report what each product has merged and not deployed (qdq-server autodeploy)",
+        "description": "Called by qdq-server's autodeploy on each tick, signed like POST /internal/deploys. Per product, the commits merged after the deployed one and not deployed yet, each with the verdict of its CI against the box's own required checks, and whether the product is paused. The Lab keeps the newest snapshot per product and shows, on Admin > Deploys, where each merged pull request is: CI running, CI failed, waiting for the next tick, paused. Optional: a box that never sends it leaves the page without CI stages. At most one snapshot per product per call. The reporter does not retry: the next tick sends a newer one.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "X-Lab-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Lab-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pipelines"
+                ],
+                "properties": {
+                  "pipelines": {
+                    "type": "array",
+                    "maxItems": 5,
+                    "items": {
+                      "$ref": "#/components/schemas/DeployPipeline"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored and refused snapshots",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "accepted",
+                    "rejected"
+                  ],
+                  "properties": {
+                    "accepted": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "The products stored"
+                    },
+                    "rejected": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "product": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body or more than 5 snapshots"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "LAB_DEPLOYS_SECRET is not set"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1064,6 +1163,174 @@
             ],
             "format": "date-time",
             "description": "Null while the attempt runs"
+          },
+          "ci_green_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the last required check of `commit_sha` went green (a release-gated product: when the release was published). Optional: sent by boxes that know it"
+          },
+          "commits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 100,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{7,40}$"
+            },
+            "description": "The commits the attempt ships, newest first: the first parents of the branch after `previous_commit_sha` up to `commit_sha`. Admin > Deploys ties them to their pull requests. Optional: without it the Lab uses the pull requests merged between the two commits"
+          }
+        }
+      },
+      "DeployPipeline": {
+        "type": "object",
+        "required": [
+          "product",
+          "repo",
+          "checked_at"
+        ],
+        "properties": {
+          "product": {
+            "type": "string",
+            "enum": [
+              "lab",
+              "scrapix",
+              "gateway",
+              "pipelines",
+              "connect"
+            ]
+          },
+          "repo": {
+            "type": "string",
+            "description": "owner/name on GitHub"
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the tick looked. A snapshot older than the one stored is acknowledged and dropped"
+          },
+          "deployed_commit_sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "40 hex chars: what the box runs"
+          },
+          "deployed_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "An operator paused the product's autodeploy"
+          },
+          "gate": {
+            "type": "string",
+            "enum": [
+              "ci",
+              "release"
+            ],
+            "description": "`ci`: deploys the newest commit whose required checks are green; `release`: deploys published releases (the Gateway)"
+          },
+          "required_checks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 30,
+            "description": "The CI jobs the box waits for"
+          },
+          "max_attempts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Failed deploys of one commit before the box gives up on it"
+          },
+          "lookback": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "How many commits behind a tip that is not green the box looks for a green one to deploy; 0 (the default): it deploys the tip only"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the product waits when CI does not say it. Cut at 500 chars. Never secrets"
+          },
+          "commits": {
+            "type": "array",
+            "maxItems": 50,
+            "description": "The commits merged after `deployed_commit_sha` and not deployed yet, first parents of the branch, newest first",
+            "items": {
+              "type": "object",
+              "required": [
+                "sha"
+              ],
+              "properties": {
+                "sha": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{40}$"
+                },
+                "committed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "ci": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "green",
+                    "pending",
+                    "red",
+                    "unknown",
+                    null
+                  ],
+                  "description": "Its CI against `required_checks`; `unknown`: GitHub did not answer; null: not read (a commit behind a green one ships with it)"
+                },
+                "failed_checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "pending_checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "ci_green_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "attempts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Failed deploys of this commit so far"
+                }
+              }
+            }
           }
         }
       }
