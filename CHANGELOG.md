@@ -8,6 +8,8 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-26
+
 ### Added
 
 - **Live progress on config suggestions.** `GET /crawl/suggest/{id}` now
@@ -601,4 +603,5 @@ SDKs in `sdks/` are versioned and tagged on their own (`sdk-*-vX.Y.Z`).
   a crawl without `meilisearch` writes to the team's default instance. They
   document `index_strategy` instead of the legacy `replace_index`.
 
-[Unreleased]: https://github.com/qdequele/scrapix/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/qdequele/scrapix/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/qdequele/scrapix/compare/v0.5.0...v0.6.0
